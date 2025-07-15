@@ -1,0 +1,243 @@
+
+services:
+  # Infrastructure Services
+  postgres:
+    image: postgres:15
+    container_name: trading-bot-postgres
+    environment:
+      POSTGRES_USER: carloslarramba
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: trading_bot_futures
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/create_all_trading_bot_tables.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - trading-bot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carloslarramba -d trading_bot_futures"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading-bot-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - trading-bot-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Configuration Service
+  config-service:
+    build: ./services/config-service
+    container_name: trading-bot-config
+    ports:
+      - "8001:8001"
+    environment:
+      - CONFIG_PATH=/app/config/config.yaml
+      - DOCKER_ENV=true
+    volumes:
+      - ./config:/app/config
+    networks:
+      - trading-bot-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Database Service
+  database-service:
+    build: ./services/database-service
+    container_name: trading-bot-database
+    ports:
+      - "8002:8002"
+    environment:
+      - CONFIG_SERVICE_URL=http://config-service:8001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=trading_bot_futures
+      - DB_USER=carloslarramba
+      - DB_PASSWORD=mypassword
+      - DB_POOL_SIZE=10
+    networks:
+      - trading-bot-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      config-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Exchange Service
+  exchange-service:
+    build: ./services/exchange-service
+    container_name: trading-bot-exchange
+    ports:
+      - "8003:8003"
+    environment:
+      - CONFIG_SERVICE_URL=http://config-service:8001
+      - DATABASE_SERVICE_URL=http://database-service:8002
+    networks:
+      - trading-bot-network
+    depends_on:
+      config-service:
+        condition: service_healthy
+      database-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Strategy Service
+  strategy-service:
+    build: ./services/strategy-service
+    container_name: trading-bot-strategy
+    ports:
+      - "8004:8004"
+    environment:
+      - CONFIG_SERVICE_URL=http://config-service:8001
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - DATABASE_SERVICE_URL=http://database-service:8002
+    volumes:
+      - ./:/app/strategies
+    networks:
+      - trading-bot-network
+    depends_on:
+      config-service:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+      database-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Orchestrator Service
+  orchestrator-service:
+    build: ./services/orchestrator-service
+    container_name: trading-bot-orchestrator
+    ports:
+      - "8005:8005"
+    environment:
+      - CONFIG_SERVICE_URL=http://config-service:8001
+      - DATABASE_SERVICE_URL=http://database-service:8002
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - STRATEGY_SERVICE_URL=http://strategy-service:8004
+    networks:
+      - trading-bot-network
+    depends_on:
+      config-service:
+        condition: service_healthy
+      database-service:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+      strategy-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Web Dashboard Service
+  web-dashboard-service:
+    build: ./services/web-dashboard-service
+    container_name: trading-bot-web
+    ports:
+      - "8006:8006"
+    environment:
+      - CONFIG_SERVICE_URL=http://config-service:8001
+      - DATABASE_SERVICE_URL=http://database-service:8002
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - STRATEGY_SERVICE_URL=http://strategy-service:8004
+      - ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8005
+    volumes:
+      - ./web/static:/app/static
+      - ./web/templates:/app/templates
+    networks:
+      - trading-bot-network
+    depends_on:
+      config-service:
+        condition: service_healthy
+      database-service:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+      strategy-service:
+        condition: service_healthy
+      orchestrator-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Monitoring Services (Optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading-bot-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - trading-bot-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading-bot-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - trading-bot-network
+    depends_on:
+      - prometheus
+
+networks:
+  trading-bot-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  grafana_data: 

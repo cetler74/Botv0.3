@@ -1,0 +1,47 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Ignore logs
+logs/
+*.log
+
+# Ignore virtual environments
+.venv/
+venv/
+ENV/
+
+# Ignore dependency folders/files
+node_modules/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore application state
+*.sqlite3
+*.db
+*.pid
+*.lock
+*.bak
+
+# Ignore environment files
+.env
+.env.*
+
+# Ignore coverage and test output
+htmlcov/
+.coverage
+coverage.xml
+test-results.xml
+
+# Do not ignore config templates or source code
+!config/
+!config/*.example
+!env.example 

@@ -1,0 +1,43 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+redis==5.0.1
+celery==5.3.4
+
+# Exchange APIs
+ccxt==4.1.77
+python-binance==1.0.19
+
+# Data processing - Python 3.9 compatible versions
+pandas==2.1.4
+numpy==1.25.2
+ta==0.10.2
+
+# Web framework and UI
+jinja2==3.1.2
+aiofiles==23.2.1
+
+# Configuration and logging
+python-dotenv==1.0.0
+structlog==23.2.0
+pyyaml>=6.0
+
+# Async support
+asyncio-mqtt==0.16.1
+aiohttp==3.9.1
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.24.1
+psutil==5.9.6
+fastapi[testing]==0.104.1
+
+# Development
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1 

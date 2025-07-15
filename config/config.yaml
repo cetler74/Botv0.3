@@ -1,0 +1,149 @@
+alerts:
+  channels:
+    database: true
+    email: false
+    webhook: false
+  enabled: true
+  thresholds:
+    api_error: 5
+    balance_low: 50
+    daily_loss: 0.05
+    trade_failure: 3
+balance_manager:
+  check_interval_seconds: 30
+  max_balance_usage: 0.9
+  min_balance_threshold: 10
+database:
+  host: localhost
+  max_overflow: 20
+  name: trading_bot_futures
+  password: mypassword
+  pool_size: 10
+  port: 5432
+  user: carloslarramba
+database_manager:
+  backup_interval_hours: 24
+  connection_timeout: 30
+  max_retries: 3
+  query_timeout: 60
+exchange_manager:
+  max_retries: 3
+  rate_limit_delay: 0.1
+  request_timeout: 30
+  retry_delay: 1
+exchanges:
+  binance:
+    base_currency: USDC
+    max_pairs: 10
+    min_volatility: 0.02
+    min_volume_24h: 1000000
+    sandbox: false
+  bybit:
+    base_currency: USDC
+    max_pairs: 8
+    min_volatility: 0.015
+    min_volume_24h: 500000
+    sandbox: false
+  cryptocom:
+    base_currency: USDC
+    max_pairs: 8
+    min_volatility: 0.015
+    min_volume_24h: 500000
+    sandbox: false
+invalid:
+  path: test
+logging:
+  backup_count: 5
+  file: logs/trading_bot.log
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  level: INFO
+  max_file_size: 10485760
+pair_selector:
+  scoring_weights:
+    market_cap: 0.2
+    spread: 0.1
+    volatility: 0.3
+    volume_24h: 0.4
+  selection_criteria:
+    max_spread_percentage: 0.5
+    max_volatility: 0.1
+    min_market_cap: 100000000
+    min_volatility: 0.01
+    min_volume_24h: 1000000
+  update_interval_minutes: 60
+redis:
+  db: 0
+  host: localhost
+  max_connections: 20
+  password: ''
+  port: 6379
+strategies:
+  engulfing_multi_tf:
+    enabled: true
+    parameters:
+      long_period: 30
+      medium_period: 15
+      short_period: 5
+      volume_confirmation: true
+  heikin_ashi:
+    enabled: true
+    parameters:
+      min_volume: 500
+      trend_period: 14
+      volume_threshold: 1.2
+  multi_timeframe_confluence:
+    enabled: true
+    parameters:
+      confluence_threshold: 0.7
+      long_period: 30
+      medium_period: 15
+      short_period: 5
+  strategy_pnl_enhanced:
+    enabled: true
+    parameters:
+      atr_period: 14
+      dynamic_stop_loss: true
+      volatility_multiplier: 1.2
+  vwma_hull:
+    enabled: true
+    parameters:
+      hull_period: 10
+      min_absolute_volume: 1000
+      trend_threshold: 0.02
+      volatility_adjustment: true
+      volume_method: percentile
+      volume_percentile: 0.2
+      volume_threshold: 1.1
+      volume_window: 50
+      vwma_period: 20
+strategy_manager:
+  analysis_timeout: 30
+  max_concurrent_analyses: 10
+  signal_cache_duration: 300
+trading:
+  max_concurrent_trades: 10
+  max_daily_loss: 0.05
+  max_daily_trades: 50
+  max_total_loss: 0.15
+  max_trades_per_exchange: 3
+  mode: simulation
+  position_size_percentage: 0.1
+  profit_protection:
+    enabled: true
+    lock_percentage: 0.01
+    trigger_percentage: 0.02
+  stop_loss_percentage: 0.03
+  take_profit_percentage: 0.06
+  trailing_stop:
+    enabled: true
+    step_percentage: 0.005
+    trigger_percentage: 0.03
+trading_manager:
+  cycle_interval_seconds: 60
+  exit_cycle_first: true
+  max_cycle_duration: 300
+web_ui:
+  debug: false
+  host: 0.0.0.0
+  port: 8000
+  refresh_interval_seconds: 5
