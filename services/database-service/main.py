@@ -663,6 +663,123 @@ async def resolve_alert(alert_id: str):
         logger.error(f"Failed to resolve alert {alert_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Strategy Performance Endpoints
+@app.get("/api/v1/performance/strategy/{strategy_name}")
+async def get_strategy_performance(strategy_name: str, period: str = "30d"):
+    """Get performance metrics for a strategy"""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    
+    try:
+        # Calculate date range based on period
+        if period == "7d":
+            since_date = datetime.utcnow() - timedelta(days=7)
+        elif period == "30d":
+            since_date = datetime.utcnow() - timedelta(days=30)
+        elif period == "90d":
+            since_date = datetime.utcnow() - timedelta(days=90)
+        else:
+            since_date = datetime.utcnow() - timedelta(days=30)  # Default to 30 days
+        
+        # Get strategy performance from database
+        query = """
+            SELECT * FROM trading.strategy_performance 
+            WHERE strategy_name = %s AND last_updated >= %s
+            ORDER BY last_updated DESC
+            LIMIT 1
+        """
+        result = await db_manager.execute_single_query(query, (strategy_name, since_date))
+        
+        if result:
+            return {
+                "strategy_name": result["strategy_name"],
+                "total_trades": result["total_trades"],
+                "winning_trades": result["winning_trades"],
+                "win_rate": float(result["win_rate"]),
+                "total_pnl": float(result["total_pnl"]),
+                "sharpe_ratio": float(result["sharpe_ratio"]),
+                "max_drawdown": float(result["max_drawdown"]),
+                "period": period
+            }
+        else:
+            # Return default values if no data found
+            return {
+                "strategy_name": strategy_name,
+                "total_trades": 0,
+                "winning_trades": 0,
+                "win_rate": 0.0,
+                "total_pnl": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "period": period
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get strategy performance for {strategy_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/performance/strategy/{strategy_name}/update")
+async def update_strategy_performance(strategy_name: str, performance_data: Dict[str, Any]):
+    """Update performance metrics for a strategy"""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    
+    try:
+        # Extract performance data
+        exchange = performance_data.get('exchange', 'unknown')
+        pair = performance_data.get('pair', 'unknown')
+        total_trades = performance_data.get('total_trades', 0)
+        winning_trades = performance_data.get('winning_trades', 0)
+        losing_trades = performance_data.get('losing_trades', 0)
+        total_pnl = performance_data.get('total_pnl', 0.0)
+        win_rate = performance_data.get('win_rate', 0.0)
+        avg_win = performance_data.get('avg_win', 0.0)
+        avg_loss = performance_data.get('avg_loss', 0.0)
+        max_drawdown = performance_data.get('max_drawdown', 0.0)
+        sharpe_ratio = performance_data.get('sharpe_ratio', 0.0)
+        
+        query = """
+            INSERT INTO trading.strategy_performance (
+                strategy_name, exchange, pair, total_trades, winning_trades, losing_trades,
+                total_pnl, win_rate, avg_win, avg_loss, max_drawdown, sharpe_ratio, last_updated
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (strategy_name, exchange, pair) 
+            DO UPDATE SET 
+                total_trades = EXCLUDED.total_trades,
+                winning_trades = EXCLUDED.winning_trades,
+                losing_trades = EXCLUDED.losing_trades,
+                total_pnl = EXCLUDED.total_pnl,
+                win_rate = EXCLUDED.win_rate,
+                avg_win = EXCLUDED.avg_win,
+                avg_loss = EXCLUDED.avg_loss,
+                max_drawdown = EXCLUDED.max_drawdown,
+                sharpe_ratio = EXCLUDED.sharpe_ratio,
+                last_updated = EXCLUDED.last_updated
+        """
+        
+        await db_manager.execute_query(query, (
+            strategy_name,
+            exchange,
+            pair,
+            total_trades,
+            winning_trades,
+            losing_trades,
+            total_pnl,
+            win_rate,
+            avg_win,
+            avg_loss,
+            max_drawdown,
+            sharpe_ratio,
+            datetime.utcnow()
+        ))
+        
+        logger.info(f"Updated performance for strategy {strategy_name}")
+        return {"message": f"Performance updated for {strategy_name}"}
+        
+    except Exception as e:
+        logger.error(f"Failed to update strategy performance for {strategy_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Market Data Cache Endpoints
 @app.post("/api/v1/cache/market-data")
 async def cache_market_data(cache_data: MarketDataCache):

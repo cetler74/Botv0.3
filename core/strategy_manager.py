@@ -47,7 +47,12 @@ class StrategyManager:
             try:
                 # Import strategy module
                 if strategy_name in ['vwma_hull', 'heikin_ashi', 'multi_timeframe_confluence', 'engulfing_multi_tf']:
-                    module_name = f"{strategy_name}_strategy" if strategy_name != 'vwma_hull' else 'vwma_hull_strategy'
+                    module_name = (
+                        'strategy.vwma_hull_strategy' if strategy_name == 'vwma_hull' else
+                        'strategy.heikin_ashi_strategy' if strategy_name == 'heikin_ashi' else
+                        'strategy.multi_timeframe_confluence_strategy' if strategy_name == 'multi_timeframe_confluence' else
+                        'strategy.engulfing_multi_tf'
+                    )
                     class_name = strategy_classes[strategy_name]
                     
                     # Import the strategy module
@@ -103,9 +108,6 @@ class StrategyManager:
                 try:
                     strategy_instance = strategy_data['instance']
                     
-                    # Initialize strategy for this pair
-                    await strategy_instance.initialize(pair)
-                    
                     # Update strategy with market data (use primary timeframe)
                     primary_timeframe = timeframes[0]
                     if primary_timeframe in market_data:
@@ -129,7 +131,7 @@ class StrategyManager:
                     strategy_data['last_analysis'] = datetime.utcnow()
                     
                 except Exception as e:
-                    logger.error(f"Error analyzing {pair} with {strategy_name}: {e}")
+                    logger.error(f"Error analyzing {pair} on {exchange_name} with {strategy_name}: {e}")
                     analysis_results['strategies'][strategy_name] = {
                         'error': str(e),
                         'timestamp': datetime.utcnow().isoformat()
@@ -274,9 +276,6 @@ class StrategyManager:
                 try:
                     strategy_instance = strategy_data['instance']
                     
-                    # Initialize strategy for this pair
-                    await strategy_instance.initialize(pair)
-                    
                     # Get market data for exit analysis
                     market_data = await self.exchange_manager.get_market_data_for_strategy(
                         exchange_name, pair, ['1h', '15m']
@@ -319,10 +318,7 @@ class StrategyManager:
     async def apply_profit_protection(self, trade_data: Dict[str, Any], current_price: float) -> Tuple[bool, Optional[str]]:
         """Apply profit protection logic using existing strategy_pnl module"""
         try:
-            # Import profit protection functions
-            from strategy_pnl import check_profit_protection_enhanced
-            
-            # Create a state object for profit protection
+            from strategy.strategy_pnl import check_profit_protection_enhanced
             class ProfitProtectionState:
                 def __init__(self):
                     self.profit_protection_active = False
@@ -330,19 +326,22 @@ class StrategyManager:
                     self.consecutive_decreases = 0
                     self.last_unrealized_pnl = 0.0
                     self.profit_protection_activated_at = None
-                    
             state = ProfitProtectionState()
-            
-            # Calculate unrealized PnL
-            entry_price = float(trade_data.get('entry_price', 0))
-            position_size = float(trade_data.get('position_size', 0))
-            
-            if entry_price <= 0 or position_size <= 0:
+            entry_price = trade_data.get('entry_price')
+            position_size = trade_data.get('position_size')
+            if entry_price is None or position_size is None:
+                logger.error(f"[ProfitProtection] Trade {trade_data.get('trade_id')} missing entry_price or position_size. Skipping.")
                 return False, None
-                
+            try:
+                entry_price = float(entry_price)
+                position_size = float(position_size)
+            except Exception as e:
+                logger.error(f"[ProfitProtection] Trade {trade_data.get('trade_id')} invalid entry_price or position_size: {e}. Skipping.")
+                return False, None
+            if entry_price <= 0 or position_size <= 0:
+                logger.error(f"[ProfitProtection] Trade {trade_data.get('trade_id')} entry_price or position_size <= 0. Skipping.")
+                return False, None
             unrealized_pnl = (current_price - entry_price) * position_size
-            
-            # Check profit protection
             should_exit, reason, risk_data = check_profit_protection_enhanced(
                 state=state,
                 unrealized_pnl=unrealized_pnl,
@@ -352,65 +351,67 @@ class StrategyManager:
                 trade_id=trade_data.get('trade_id'),
                 current_price=current_price
             )
-            
-            if should_exit:
-                # Update trade data with risk management info
+            if should_exit and self.database_manager:
                 await self.database_manager.update_trade(
                     trade_data['trade_id'],
                     {
                         'profit_protection': 'active' if state.profit_protection_active else 'inactive',
                         'unrealized_pnl': unrealized_pnl,
-                        'highest_price': max(current_price, float(trade_data.get('highest_price', 0)))
+                        'highest_price': max(current_price, float(trade_data.get('highest_price', 0) or 0))
                     }
                 )
-                
             return should_exit, reason
-            
         except Exception as e:
             logger.error(f"Error applying profit protection: {e}")
             return False, None
-            
+
     async def apply_trailing_stop(self, trade_data: Dict[str, Any], current_price: float) -> Tuple[bool, Optional[str]]:
         """Apply trailing stop logic using existing strategy_pnl module"""
         try:
-            # Import trailing stop functions
-            from strategy_pnl import manage_trailing_stop_enhanced
-            
-            # Create a state object for trailing stop
+            from strategy.strategy_pnl import manage_trailing_stop_enhanced
             class TrailingStopState:
                 def __init__(self):
                     self.trailing_stop_active = False
                     self.trailing_stop_level = 0.0
                     self.highest_price_seen = 0.0
-                    self.position = 'long'  # Assuming long positions for now
-                    
+                    self.position = 'long'
             state = TrailingStopState()
-            
-            # Get market data for ATR calculation
             exchange_name = trade_data.get('exchange')
             pair = trade_data.get('pair')
-            
+            entry_price = trade_data.get('entry_price')
+            position_size = trade_data.get('position_size')
             if not exchange_name or not pair:
+                logger.error(f"[TrailingStop] Trade {trade_data.get('trade_id')} missing exchange or pair. Skipping.")
                 return False, None
-                
+            if entry_price is None or position_size is None:
+                logger.error(f"[TrailingStop] Trade {trade_data.get('trade_id')} missing entry_price or position_size. Skipping.")
+                return False, None
+            try:
+                entry_price = float(entry_price)
+                position_size = float(position_size)
+            except Exception as e:
+                logger.error(f"[TrailingStop] Trade {trade_data.get('trade_id')} invalid entry_price or position_size: {e}. Skipping.")
+                return False, None
+            if entry_price <= 0 or position_size <= 0:
+                logger.error(f"[TrailingStop] Trade {trade_data.get('trade_id')} entry_price or position_size <= 0. Skipping.")
+                return False, None
+            if not self.exchange_manager:
+                logger.error(f"[TrailingStop] Exchange manager not initialized. Skipping.")
+                return False, None
             market_data = await self.exchange_manager.get_ohlcv(exchange_name, pair, '1h', 50)
-            
             if market_data is None:
+                logger.error(f"[TrailingStop] Trade {trade_data.get('trade_id')} missing market data. Skipping.")
                 return False, None
-                
-            # Apply trailing stop
             should_exit, reason, risk_data = manage_trailing_stop_enhanced(
                 state=state,
                 current_price=current_price,
-                entry_price=float(trade_data.get('entry_price', 0)),
-                position_size=float(trade_data.get('position_size', 0)),
+                entry_price=entry_price,
+                position_size=position_size,
                 config=self.config,
                 ohlcv_data=market_data,
                 trade_id=trade_data.get('trade_id')
             )
-            
-            if should_exit:
-                # Update trade data with trailing stop info
+            if should_exit and self.database_manager:
                 await self.database_manager.update_trade(
                     trade_data['trade_id'],
                     {
@@ -419,21 +420,31 @@ class StrategyManager:
                         'highest_price': state.highest_price_seen
                     }
                 )
-                
             return should_exit, reason
-            
         except Exception as e:
             logger.error(f"Error applying trailing stop: {e}")
             return False, None
             
-    async def get_strategy_performance(self, strategy_name: str, exchange_name: str, pair: str) -> Dict[str, Any]:
+    async def get_strategy_performance(self, strategy_name: str, exchange: str = "unknown", pair: str = "unknown") -> Dict[str, Any]:
         """Get performance metrics for a specific strategy"""
         try:
             if self.database_manager:
-                performance = await self.database_manager.get_strategy_performance(
-                    strategy_name, exchange_name, pair
-                )
-                return performance or {}
+                # If exchange and pair are not provided, get the most recent performance for the strategy
+                if exchange == "unknown" or pair == "unknown":
+                    # Get all performance records for this strategy and return the most recent
+                    query = """
+                        SELECT * FROM trading.strategy_performance 
+                        WHERE strategy_name = %s
+                        ORDER BY last_updated DESC
+                        LIMIT 1
+                    """
+                    result = await self.database_manager.execute_single_query(query, (strategy_name,))
+                    return result or {}
+                else:
+                    performance = await self.database_manager.get_strategy_performance(
+                        strategy_name, exchange, pair
+                    )
+                    return performance or {}
             return {}
             
         except Exception as e:
@@ -502,3 +513,14 @@ class StrategyManager:
             
         except Exception as e:
             logger.error(f"Error cleaning up cache: {e}") 
+
+    def get_strategies(self):
+        """Return all enabled strategy instances as a list."""
+        return [data['instance'] for data in self.strategies.values() if data['enabled']]
+
+    def get_strategy(self, exchange_name=None):
+        """Return the strategy instance for the given exchange. Currently always returns 'heikin_ashi'."""
+        strat = self.strategies.get('heikin_ashi', {})
+        instance = strat.get('instance')
+        logger.debug(f"[StrategyManager.get_strategy] Returning: {type(instance)} {instance}")
+        return instance 

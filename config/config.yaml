@@ -21,6 +21,7 @@ database:
   pool_size: 10
   port: 5432
   user: carloslarramba
+  options: "-c search_path=trading,public"
 database_manager:
   backup_interval_hours: 24
   connection_timeout: 30
@@ -85,12 +86,14 @@ strategies:
       medium_period: 15
       short_period: 5
       volume_confirmation: true
+      target_timeframes: ['1h', '15m']
   heikin_ashi:
     enabled: true
     parameters:
       min_volume: 500
       trend_period: 14
       volume_threshold: 1.2
+    target_timeframes: ['1h', '15m']
   multi_timeframe_confluence:
     enabled: true
     parameters:
@@ -98,12 +101,14 @@ strategies:
       long_period: 30
       medium_period: 15
       short_period: 5
+    target_timeframes: ['1h', '15m']
   strategy_pnl_enhanced:
     enabled: true
     parameters:
       atr_period: 14
       dynamic_stop_loss: true
       volatility_multiplier: 1.2
+    target_timeframes: ['1h', '15m']
   vwma_hull:
     enabled: true
     parameters:
@@ -116,6 +121,7 @@ strategies:
       volume_threshold: 1.1
       volume_window: 50
       vwma_period: 20
+    target_timeframes: ['1h', '15m']
 strategy_manager:
   analysis_timeout: 30
   max_concurrent_analyses: 10
@@ -131,13 +137,13 @@ trading:
   profit_protection:
     enabled: true
     lock_percentage: 0.01
-    trigger_percentage: 0.02
+    trigger_percentage: 0.005
   stop_loss_percentage: 0.03
   take_profit_percentage: 0.06
   trailing_stop:
     enabled: true
     step_percentage: 0.005
-    trigger_percentage: 0.03
+    trigger_percentage: 0.005
 trading_manager:
   cycle_interval_seconds: 60
   exit_cycle_first: true

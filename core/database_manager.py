@@ -23,33 +23,72 @@ class DatabaseManager:
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.pool = None
+        self.pool: SimpleConnectionPool = None  # type: ignore
         self._initialize_connection_pool()
         
     def _initialize_connection_pool(self) -> None:
         """Initialize database connection pool"""
         try:
-            db_config = self.config.get('database', {})
-            self.pool = SimpleConnectionPool(
+            db_config = self.config  # Use the config dict directly
+            options = db_config.get('options', None)
+            pool_args = dict(
                 minconn=1,
                 maxconn=db_config.get('pool_size', 10),
                 host=db_config.get('host', 'localhost'),
                 port=db_config.get('port', 5432),
-                database=db_config.get('name', 'trading_bot'),
+                database=db_config.get('name', 'trading_bot_futures'),
                 user=db_config.get('user', 'carloslarramba'),
-                password=db_config.get('password', ''),
-                cursor_factory=RealDictCursor
+                password=db_config.get('password', '')
             )
+            if options:
+                pool_args['options'] = options
+            self.pool = SimpleConnectionPool(**pool_args)
             logger.info("Database connection pool initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize database connection pool: {e}")
             raise
             
+    def _get_connection(self):
+        """Get a connection from the pool and log connection context for debugging."""
+        if not self.pool:
+            raise RuntimeError("Connection pool is not initialized.")
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SHOW search_path;")
+                search_path = cur.fetchone()
+                cur.execute("SELECT current_database(), current_user;")
+                db_user = cur.fetchone()
+                logging.getLogger(__name__).info(f"DB/User: {db_user}, search_path: {search_path}")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not log DB context: {e}")
+        return conn
+
+    def log_connection_info(self):
+        """Log the current database, user, and search_path for debugging."""
+        if not self.pool:
+            logger.warning("Connection pool is not initialized.")
+            return
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW search_path;")
+                search_path = cur.fetchone()
+                cur.execute("SELECT current_database(), current_user;")
+                db_user = cur.fetchone()
+                logger.info(f"[DB INFO] DB/User: {db_user}, search_path: {search_path}")
+        except Exception as e:
+            logger.warning(f"Could not log DB context: {e}")
+        finally:
+            self.pool.putconn(conn)
+
     @asynccontextmanager
     async def get_connection(self):
         """Get database connection from pool"""
         conn = None
         try:
+            if not self.pool:
+                raise RuntimeError("Connection pool is not initialized.")
             conn = self.pool.getconn()
             yield conn
         except Exception as e:
@@ -58,13 +97,13 @@ class DatabaseManager:
             logger.error(f"Database connection error: {e}")
             raise
         finally:
-            if conn:
+            if conn and self.pool:
                 self.pool.putconn(conn)
                 
     async def execute_query(self, query: str, params: Optional[Tuple] = None) -> List[Dict[str, Any]]:
         """Execute a query and return results"""
         async with self.get_connection() as conn:
-            with conn.cursor() as cursor:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(query, params)
                 if query.strip().upper().startswith('SELECT'):
                     return cursor.fetchall()
@@ -150,6 +189,12 @@ class DatabaseManager:
     async def create_trade(self, trade_data: Dict[str, Any]) -> Optional[str]:
         """Create new trade record"""
         try:
+            # Validate entry_price and position_size
+            entry_price = trade_data.get('entry_price')
+            position_size = trade_data.get('position_size')
+            if entry_price is None or position_size is None or entry_price <= 0 or position_size <= 0:
+                logger.error(f"Invalid trade data: entry_price={entry_price}, position_size={position_size}. Trade not created.")
+                return None
             trade_id = str(uuid.uuid4())
             query = """
                 INSERT INTO trades (
@@ -339,9 +384,8 @@ class DatabaseManager:
         try:
             query = """
                 INSERT INTO strategy_performance (
-                    strategy_name, exchange, pair, total_trades, winning_trades,
-                    losing_trades, total_pnl, win_rate, avg_win, avg_loss,
-                    max_drawdown, sharpe_ratio, last_updated
+                    strategy_name, exchange, pair, total_trades, winning_trades, losing_trades,
+                    total_pnl, win_rate, avg_win, avg_loss, max_drawdown, sharpe_ratio, last_updated
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (strategy_name, exchange, pair) 
                 DO UPDATE SET 
@@ -356,17 +400,30 @@ class DatabaseManager:
                     sharpe_ratio = EXCLUDED.sharpe_ratio,
                     last_updated = EXCLUDED.last_updated
             """
+            # Calculate metrics based on the actual table structure
+            total_trades = performance_data.get('total_trades', 0)
+            winning_trades = performance_data.get('winning_trades', 0)
+            losing_trades = performance_data.get('losing_trades', 0)
+            total_pnl = performance_data.get('total_pnl', 0.0)
+            win_rate = performance_data.get('win_rate', 0.0)
+            avg_win = performance_data.get('avg_win', 0.0)
+            avg_loss = performance_data.get('avg_loss', 0.0)
+            max_drawdown = performance_data.get('max_drawdown', 0.0)
+            sharpe_ratio = performance_data.get('sharpe_ratio', 0.0)
+            
             params = (
-                strategy_name, exchange, pair,
-                performance_data.get('total_trades', 0),
-                performance_data.get('winning_trades', 0),
-                performance_data.get('losing_trades', 0),
-                performance_data.get('total_pnl', 0.0),
-                performance_data.get('win_rate', 0.0),
-                performance_data.get('avg_win', 0.0),
-                performance_data.get('avg_loss', 0.0),
-                performance_data.get('max_drawdown', 0.0),
-                performance_data.get('sharpe_ratio', 0.0),
+                strategy_name,
+                exchange,
+                pair,
+                total_trades,
+                winning_trades,
+                losing_trades,
+                total_pnl,
+                win_rate,
+                avg_win,
+                avg_loss,
+                max_drawdown,
+                sharpe_ratio,
                 datetime.utcnow()
             )
             await self.execute_query(query, params)
@@ -380,6 +437,8 @@ class DatabaseManager:
         query = """
             SELECT * FROM strategy_performance 
             WHERE strategy_name = %s AND exchange = %s AND pair = %s
+            ORDER BY last_updated DESC
+            LIMIT 1
         """
         return await self.execute_single_query(query, (strategy_name, exchange, pair))
         
@@ -447,15 +506,25 @@ class DatabaseManager:
                 ORDER BY entry_time DESC
             """
             trades = await self.execute_query(query, (exchange, since_date))
-            
             # Calculate metrics
             total_trades = len(trades)
             closed_trades = [t for t in trades if t['status'] == 'CLOSED']
-            winning_trades = [t for t in closed_trades if float(t['realized_pnl']) > 0]
-            
-            total_pnl = sum(float(t['realized_pnl']) for t in closed_trades)
+            winning_trades = []
+            total_pnl = 0.0
+            for t in closed_trades:
+                try:
+                    realized_pnl = t.get('realized_pnl')
+                    if realized_pnl is None:
+                        continue
+                    realized_pnl = float(realized_pnl)
+                    if realized_pnl > 0:
+                        winning_trades.append(t)
+                    total_pnl += realized_pnl
+                except Exception as e:
+                    logger.error(f"Trade {t.get('trade_id')} invalid realized_pnl '{t.get('realized_pnl')}': {e}. Skipping.")
+                    continue
             win_rate = len(winning_trades) / len(closed_trades) if closed_trades else 0
-            
+            avg_pnl = total_pnl / len(closed_trades) if closed_trades else 0
             return {
                 'exchange': exchange,
                 'period_days': days,
@@ -464,7 +533,7 @@ class DatabaseManager:
                 'winning_trades': len(winning_trades),
                 'total_pnl': total_pnl,
                 'win_rate': win_rate,
-                'avg_pnl_per_trade': total_pnl / len(closed_trades) if closed_trades else 0
+                'avg_pnl_per_trade': avg_pnl
             }
         except Exception as e:
             logger.error(f"Failed to get exchange performance for {exchange}: {e}")
