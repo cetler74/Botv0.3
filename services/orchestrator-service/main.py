@@ -131,8 +131,7 @@ class TradingOrchestrator:
                 response = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
                 response.raise_for_status()
                 exchanges = response.json()['exchanges']
-            
-            for exchange_name in exchanges:
+                
                 # Check if simulation mode
                 mode_response = await client.get(f"{config_service_url}/api/v1/config/mode")
                 mode_response.raise_for_status()
@@ -140,61 +139,113 @@ class TradingOrchestrator:
                 
                 if mode_data['is_simulation']:
                     # In simulation mode, get balance from database
-                    balance_response = await client.get(f"{database_service_url}/api/v1/balances/{exchange_name}")
-                    if balance_response.status_code == 200:
-                        balance = balance_response.json()
+                    for exchange_name in exchanges:
+                        try:
+                            balance_response = await client.get(f"{database_service_url}/api/v1/balances/{exchange_name}")
+                            if balance_response.status_code == 200:
+                                balance = balance_response.json()
+                                self.balances[exchange_name] = {
+                                    'total': float(balance['balance']),
+                                    'available': float(balance['available_balance']),
+                                    'total_pnl': float(balance['total_pnl']),
+                                    'daily_pnl': float(balance['daily_pnl'])
+                                }
+                                logger.info(f"Loaded balance for {exchange_name}: {balance['available_balance']}")
+                            else:
+                                # Initialize with default values
+                                self.balances[exchange_name] = {
+                                    'total': 10000.0,  # Default simulation balance
+                                    'available': 10000.0,
+                                    'total_pnl': 0.0,
+                                    'daily_pnl': 0.0
+                                }
+                                logger.info(f"Using default balance for {exchange_name}: 10000.0")
+                        except Exception as balance_error:
+                            logger.error(f"Error getting balance for {exchange_name}: {balance_error}")
+                            # Initialize with default values
+                            self.balances[exchange_name] = {
+                                'total': 10000.0,
+                                'available': 10000.0,
+                                'total_pnl': 0.0,
+                                'daily_pnl': 0.0
+                            }
+                else:
+                    # In live mode, get balance from exchange
+                    for exchange_name in exchanges:
+                        try:
+                            balance_response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
+                            if balance_response.status_code == 200:
+                                balance = balance_response.json()
+                                self.balances[exchange_name] = {
+                                    'total': balance['total'].get('USDC', 0),
+                                    'available': balance['free'].get('USDC', 0),
+                                    'total_pnl': 0.0,  # Will be calculated from trades
+                                    'daily_pnl': 0.0   # Will be calculated from trades
+                                }
+                            else:
+                                logger.warning(f"Could not get balance for {exchange_name}")
+                        except Exception as balance_error:
+                            logger.error(f"Error getting balance for {exchange_name}: {balance_error}")
+                        
+            logger.info(f"Initialized balances for {len(exchanges)} exchanges: {list(self.balances.keys())}")
+            
+        except Exception as e:
+            logger.error(f"Error initializing balances: {e}")
+            # Set default balances on error
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
+                    response.raise_for_status()
+                    exchanges = response.json()['exchanges']
+                    
+                    for exchange_name in exchanges:
                         self.balances[exchange_name] = {
-                            'total': float(balance['balance']),
-                            'available': float(balance['available_balance']),
-                            'total_pnl': float(balance['total_pnl']),
-                            'daily_pnl': float(balance['daily_pnl'])
-                        }
-                    else:
-                        # Initialize with default values
-                        self.balances[exchange_name] = {
-                            'total': 10000.0,  # Default simulation balance
+                            'total': 10000.0,
                             'available': 10000.0,
                             'total_pnl': 0.0,
                             'daily_pnl': 0.0
                         }
-                else:
-                    # In live mode, get balance from exchange
-                    balance_response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
-                    if balance_response.status_code == 200:
-                        balance = balance_response.json()
-                        self.balances[exchange_name] = {
-                            'total': balance['total'].get('USDC', 0),
-                            'available': balance['free'].get('USDC', 0),
-                            'total_pnl': 0.0,  # Will be calculated from trades
-                            'daily_pnl': 0.0   # Will be calculated from trades
-                        }
-                        
-            logger.info(f"Initialized balances for {len(exchanges)} exchanges")
-            
-        except Exception as e:
-            logger.error(f"Error initializing balances: {e}")
+                    logger.info(f"Set default balances for {len(exchanges)} exchanges due to initialization error")
+            except Exception as fallback_error:
+                logger.error(f"Failed to set default balances: {fallback_error}")
             
     async def _initialize_pair_selections(self) -> None:
         """Initialize pair selections for all exchanges"""
         try:
-            # Get exchanges from config service
             async with httpx.AsyncClient() as client:
                 response = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
                 response.raise_for_status()
                 exchanges = response.json()['exchanges']
-            
-            for exchange_name in exchanges:
-                # Get latest pair selection from database
-                pairs_response = await client.get(f"{database_service_url}/api/v1/pairs/{exchange_name}")
-                if pairs_response.status_code == 200:
-                    pairs_data = pairs_response.json()
-                    self.pair_selections[exchange_name] = pairs_data.get('pairs', [])
-                else:
-                    # Initialize with empty list
-                    self.pair_selections[exchange_name] = []
+
+                for exchange_name in exchanges:
+                    # Get exchange configuration to check max_pairs limit
+                    exchange_config_response = await client.get(f"{config_service_url}/api/v1/config/exchanges/{exchange_name}")
+                    if exchange_config_response.status_code == 200:
+                        exchange_config = exchange_config_response.json()
+                        max_pairs = exchange_config.get('max_pairs', 10)
+                    else:
+                        max_pairs = 10  # Default fallback
                     
+                    # Get latest pair selection from database
+                    pairs_response = await client.get(f"{database_service_url}/api/v1/pairs/{exchange_name}")
+                    if pairs_response.status_code == 200:
+                        pairs_data = pairs_response.json()
+                        all_pairs = pairs_data.get('pairs', [])
+                        
+                        # Enforce max_pairs limit
+                        if len(all_pairs) > max_pairs:
+                            logger.warning(f"Exchange {exchange_name} has {len(all_pairs)} pairs, limiting to {max_pairs} as per configuration")
+                            self.pair_selections[exchange_name] = all_pairs[:max_pairs]
+                        else:
+                            self.pair_selections[exchange_name] = all_pairs
+                        
+                        logger.info(f"Exchange {exchange_name}: {len(self.pair_selections[exchange_name])}/{max_pairs} pairs selected")
+                    else:
+                        self.pair_selections[exchange_name] = []
+                        logger.warning(f"No pairs found for exchange {exchange_name}")
+
             logger.info(f"Initialized pair selections for {len(exchanges)} exchanges")
-            
+
         except Exception as e:
             logger.error(f"Error initializing pair selections: {e}")
             
@@ -315,9 +366,17 @@ class TradingOrchestrator:
                 response = await client.get(f"{database_service_url}/api/v1/trades/open")
                 response.raise_for_status()
                 open_trades = response.json()['trades']
+            logger.info(f"Exit cycle processing {len(open_trades)} open trades")
             
+            processed_count = 0
+            skipped_count = 0
             for trade in open_trades:
+                processed_count += 1
+                if trade['entry_price'] <= 0:
+                    skipped_count += 1
                 await self._check_trade_exit(trade)
+                
+            logger.info(f"Exit cycle completed: {processed_count} trades processed, {skipped_count} skipped")
                 
         except Exception as e:
             logger.error(f"Error in exit cycle: {e}")
@@ -325,45 +384,163 @@ class TradingOrchestrator:
     async def _check_trade_exit(self, trade: Dict[str, Any]) -> None:
         """Check if a trade should be exited"""
         try:
-            exchange = trade['exchange']
-            pair = trade['pair']
-            
+            trade_id = trade.get('trade_id')
+            if not trade_id or not isinstance(trade_id, str):
+                logger.warning(f"[ExitCheck] Skipping: invalid or missing trade_id: {trade_id}")
+                return
+
+            # Defensive: Validate and convert entry_price, position_size
+            try:
+                entry_price = trade.get('entry_price')
+                position_size = trade.get('position_size')
+                if entry_price is None or position_size is None:
+                    raise ValueError("entry_price or position_size is None")
+                entry_price = float(entry_price)
+                position_size = float(position_size)
+                if entry_price == 0.0 or position_size == 0.0:
+                    raise ValueError("entry_price or position_size is zero")
+            except Exception as e:
+                logger.warning(f"[Trade {trade_id}] [ExitCheck] Skipping: invalid entry/size: {e}")
+                return
+
             # Get current price
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"{exchange_service_url}/api/v1/market/ticker/{exchange}/{pair}")
-                response.raise_for_status()
-                ticker = response.json()
-                current_price = ticker['last']
-            
-            # Check stop loss and take profit
-            entry_price = trade['entry_price']
-            position_size = trade['position_size']
-            
-            # Calculate PnL
-            if trade['position_size'] > 0:  # Long position
-                pnl_percentage = ((current_price - entry_price) / entry_price) * 100
-            else:  # Short position
-                pnl_percentage = ((entry_price - current_price) / entry_price) * 100
-                
-            # Check exit conditions
+            try:
+                exchange = trade.get('exchange')
+                pair = trade.get('pair')
+                exchange_pair = pair.replace('/', '') if pair else ''
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(f"{exchange_service_url}/api/v1/market/ticker/{exchange}/{exchange_pair}")
+                    response.raise_for_status()
+                    ticker = response.json()
+                    current_price = float(ticker.get('last', 0.0))
+                if current_price == 0.0:
+                    raise ValueError("current_price is zero")
+            except Exception as e:
+                logger.warning(f"[Trade {trade_id}] [ExitCheck] Skipping: invalid current_price: {e}")
+                return
+
+            # Defensive: Validate and convert trail_stop_trigger
+            raw_stop = trade.get('trail_stop_trigger')
+            try:
+                if raw_stop is None:
+                    raise ValueError
+                current_stop_loss = float(raw_stop)
+            except Exception:
+                current_stop_loss = -2.0  # Default -2%
+            logger.info(f"[Trade {trade_id}] [ExitCheck] Using stop loss: {current_stop_loss}")
+
+            # Calculate PnL and update trade data
+            try:
+                if position_size > 0:  # Long position
+                    pnl_percentage = ((current_price - entry_price) / entry_price) * 100
+                    unrealized_pnl = (current_price - entry_price) * position_size
+                else:  # Short position
+                    pnl_percentage = ((entry_price - current_price) / entry_price) * 100
+                    unrealized_pnl = (entry_price - current_price) * position_size
+            except Exception as e:
+                logger.warning(f"[Trade {trade_id}] [ExitCheck] Skipping: error calculating PnL: {e}")
+                return
+
+            # Update highest price if current price is higher
+            highest_price = trade.get('highest_price')
+            try:
+                if highest_price is None:
+                    highest_price = entry_price
+                highest_price = float(highest_price)
+                if current_price > highest_price:
+                    highest_price = current_price
+            except Exception:
+                highest_price = current_price
+
+            # Update trade with current data
+            await self._update_trade_data(trade_id, {
+                'unrealized_pnl': unrealized_pnl,
+                'highest_price': highest_price,
+                'current_price': current_price
+            })
+
+            # Check exit conditions with profit protection
             exit_reason = None
             should_exit = False
+
+            # Profit protection: Move stop loss to breakeven when profit reaches 1%
+            profit_protection_status = trade.get('profit_protection')
+            logger.info(f"[Trade {trade_id}] [ProfitProtection] Checking conditions - PnL: {pnl_percentage:.2f}%, Current Stop: {current_stop_loss:.2f}%, Target: 1.0%, Status: {profit_protection_status}")
             
-            # Stop loss check (assuming 2% stop loss)
-            if pnl_percentage <= -2.0:
+            # Only trigger profit protection if it hasn't been activated yet
+            if pnl_percentage >= 1.0 and not profit_protection_status:
+                # Move to guarantee 0.5% profit instead of just breakeven
+                new_stop_loss = 0.5  # Guarantee 0.5% profit
+                logger.info(f"[Trade {trade_id}] [ProfitProtection] ✅ TRIGGERED: PnL {pnl_percentage:.2f}% >= 1.0% AND no profit protection active")
+                logger.info(f"[Trade {trade_id}] [ProfitProtection] Moving stop loss: {current_stop_loss:.2f}% → {new_stop_loss:.2f}% (guaranteeing 0.5% profit)")
+                await self._update_trade_data(trade_id, {
+                    'trail_stop_trigger': new_stop_loss,
+                    'profit_protection': 'profit_guaranteed',
+                    'profit_protection_trigger': pnl_percentage
+                })
+                current_stop_loss = new_stop_loss
+            else:
+                # Fix the log message to show the correct logic
+                if pnl_percentage < 1.0:
+                    reason = f"PnL {pnl_percentage:.2f}% < 1.0%"
+                    logger.info(f"[Trade {trade_id}] [ProfitProtection] ❌ NOT TRIGGERED: {reason}")
+                elif profit_protection_status:
+                    reason = f"profit protection already active: {profit_protection_status}"
+                    logger.info(f"[Trade {trade_id}] [ProfitProtection] ✅ ACTIVE: {reason}")
+                else:
+                    reason = "unknown condition"
+                    logger.info(f"[Trade {trade_id}] [ProfitProtection] ❌ NOT TRIGGERED: {reason}")
+
+            # Trailing stop: Move stop loss up as price increases (when PnL >= 2.0%)
+            logger.info(f"[Trade {trade_id}] [TrailingStop] Checking conditions - PnL: {pnl_percentage:.2f}%, Current Stop: {current_stop_loss:.2f}%, Target: 2.0%")
+            if pnl_percentage >= 2.0:
+                trailing_stop = pnl_percentage - 1.0  # Keep 1% profit locked in
+                logger.info(f"[Trade {trade_id}] [TrailingStop] Calculating trailing stop: {pnl_percentage:.2f}% - 1.0% = {trailing_stop:.2f}%")
+                logger.info(f"[Trade {trade_id}] [TrailingStop] Comparing: new stop {trailing_stop:.2f}% > current stop {current_stop_loss:.2f}%")
+                if trailing_stop > current_stop_loss:
+                    logger.info(f"[Trade {trade_id}] [TrailingStop] ✅ UPDATED: PnL {pnl_percentage:.2f}% >= 2.0% AND new stop {trailing_stop:.2f}% > current {current_stop_loss:.2f}%")
+                    logger.info(f"[Trade {trade_id}] [TrailingStop] Moving stop loss: {current_stop_loss:.2f}% → {trailing_stop:.2f}% (locking {trailing_stop:.2f}% profit)")
+                    await self._update_trade_data(trade_id, {
+                        'trail_stop_trigger': trailing_stop,
+                        'trail_stop': 'active',
+                        'profit_protection': 'trailing'
+                    })
+                    current_stop_loss = trailing_stop
+                else:
+                    logger.info(f"[Trade {trade_id}] [TrailingStop] ❌ NOT UPDATED: new stop {trailing_stop:.2f}% <= current stop {current_stop_loss:.2f}% (already higher)")
+            else:
+                logger.info(f"[Trade {trade_id}] [TrailingStop] ❌ NOT TRIGGERED: PnL {pnl_percentage:.2f}% < 2.0% (need 2.0%+ for trailing)")
+
+            # Stop loss check
+            logger.info(f"[Trade {trade_id}] [StopLoss] Checking exit - PnL: {pnl_percentage:.2f}%, Stop Level: {current_stop_loss:.2f}%")
+            if pnl_percentage <= current_stop_loss:
                 should_exit = True
-                exit_reason = "stop_loss"
-                
-            # Take profit check (assuming 5% take profit)
-            elif pnl_percentage >= 5.0:
+                exit_reason = f"stop_loss_{current_stop_loss:.1f}%"
+                logger.info(f"[Trade {trade_id}] [StopLoss] ✅ EXIT TRIGGERED: PnL {pnl_percentage:.2f}% <= stop loss {current_stop_loss:.2f}%")
+            else:
+                logger.info(f"[Trade {trade_id}] [StopLoss] ❌ NO EXIT: PnL {pnl_percentage:.2f}% > stop loss {current_stop_loss:.2f}%")
+
+            # Take profit check (5% take profit)
+            logger.info(f"[Trade {trade_id}] [TakeProfit] Checking exit - PnL: {pnl_percentage:.2f}%, Target: 5.0%")
+            if pnl_percentage >= 5.0:
                 should_exit = True
-                exit_reason = "take_profit"
-                
+                exit_reason = "take_profit_5%"
+                logger.info(f"[Trade {trade_id}] [TakeProfit] ✅ EXIT TRIGGERED: PnL {pnl_percentage:.2f}% >= 5.0%")
+            else:
+                logger.info(f"[Trade {trade_id}] [TakeProfit] ❌ NO EXIT: PnL {pnl_percentage:.2f}% < 5.0%")
+
+            # Log current status for monitoring
+            if pnl_percentage > 0:
+                logger.info(f"[Trade {trade_id}] [Status] Current: PnL {pnl_percentage:.2f}%, Stop Loss: {current_stop_loss:.2f}%, Highest: {highest_price:.6f}, Current: {current_price:.6f}")
+
             if should_exit:
-                await self._execute_trade_exit(trade, current_price, exit_reason)
-                
+                logger.info(f"[Trade {trade_id}] [Exit] 🚨 EXECUTING EXIT: {exit_reason}")
+                await self._execute_trade_exit(trade, current_price, exit_reason or "unknown")
+            else:
+                logger.info(f"[Trade {trade_id}] [Exit] ❌ NO EXIT: Continuing to monitor")
+
         except Exception as e:
-            logger.error(f"Error checking trade exit for {trade.get('trade_id', 'unknown')}: {e}")
+            logger.error(f"[Trade {trade.get('trade_id', 'unknown')}] Error in _check_trade_exit: {e}")
             
     async def _execute_trade_exit(self, trade: Dict[str, Any], exit_price: float, reason: str) -> None:
         """Execute trade exit"""
@@ -374,23 +551,57 @@ class TradingOrchestrator:
             
             logger.info(f"Executing trade exit: {trade_id} at {exit_price} ({reason})")
             
+            # Calculate realized PnL
+            entry_price = trade['entry_price']
+            position_size = trade['position_size']
+            realized_pnl = (exit_price - entry_price) * position_size
+            
             # Update trade in database
             update_data = {
                 'exit_price': exit_price,
                 'exit_time': datetime.utcnow().isoformat(),
                 'status': 'CLOSED',
-                'exit_reason': reason
+                'exit_reason': reason,
+                'realized_pnl': realized_pnl
             }
             
             async with httpx.AsyncClient() as client:
                 response = await client.put(f"{database_service_url}/api/v1/trades/{trade_id}", json=update_data)
                 response.raise_for_status()
             
+            # Calculate original position value in USDC (what was deducted on entry)
+            original_position_value = entry_price * position_size
+            
+            # Restore available balance and add realized PnL
+            current_available = self.balances[exchange]['available']
+            new_available_balance = current_available + original_position_value + realized_pnl
+            
+            # Update balance in database
+            balance_update_data = {
+                'exchange': exchange,
+                'balance': self.balances[exchange]['total'] + realized_pnl,
+                'available_balance': new_available_balance,
+                'total_pnl': self.balances[exchange]['total_pnl'] + realized_pnl,
+                'daily_pnl': self.balances[exchange]['daily_pnl'] + realized_pnl,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            balance_response = await client.put(f"{database_service_url}/api/v1/balances/{exchange}", json=balance_update_data)
+            if balance_response.status_code == 200:
+                # Update local balance cache
+                self.balances[exchange]['available'] = new_available_balance
+                self.balances[exchange]['total'] += realized_pnl
+                self.balances[exchange]['total_pnl'] += realized_pnl
+                self.balances[exchange]['daily_pnl'] += realized_pnl
+                logger.info(f"Updated balance for {exchange}: available={current_available} -> {new_available_balance}, PnL={realized_pnl}")
+            else:
+                logger.error(f"Failed to update balance for {exchange}: {balance_response.status_code}")
+            
             # Remove from active trades
             if trade_id in self.active_trades:
                 del self.active_trades[trade_id]
                 
-            logger.info(f"Trade {trade_id} closed successfully")
+            logger.info(f"Trade {trade_id} closed successfully with PnL: {realized_pnl}")
             
         except Exception as e:
             logger.error(f"Error executing trade exit for {trade.get('trade_id', 'unknown')}: {e}")
@@ -399,17 +610,40 @@ class TradingOrchestrator:
         """Run entry cycle to check for new trade opportunities"""
         try:
             logger.info("Running entry cycle...")
-            
             # Check available balance
             if not await self._check_available_balance():
                 logger.info("Insufficient balance for new trades")
                 return
-                
+            # Check trade limits
+            if not await self._check_trade_limits():
+                logger.info("Trade limits reached, skipping entry cycle")
+                return
             # Check each exchange and pair
             for exchange_name, pairs in self.pair_selections.items():
+                # Log trade count for this exchange before processing
+                open_trades_count = 0
+                max_trades = 3
+                try:
+                    async with httpx.AsyncClient() as db_client:
+                        response = await db_client.get(f"{database_service_url}/api/v1/trades/open")
+                        response.raise_for_status()
+                        open_trades = response.json()['trades']
+                        open_trades_count = sum(1 for t in open_trades if t['exchange'] == exchange_name)
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(f"{config_service_url}/api/v1/config/trading")
+                        response.raise_for_status()
+                        trading_config = response.json()
+                        max_trades = trading_config.get('max_trades_per_exchange', 3)
+                except Exception as e:
+                    logger.warning(f"[EntryCycle] Could not fetch open trades or config for {exchange_name}: {e}")
+                logger.info(f"[EntryCycle] {exchange_name}: open_trades={open_trades_count}, max_trades={max_trades}")
+                if open_trades_count >= max_trades:
+                    logger.info(f"[EntryCycle] Trade limit reached for {exchange_name}: {open_trades_count}/{max_trades}. Skipping entry for this exchange.")
+                    continue
+                else:
+                    logger.info(f"[EntryCycle] Trade limit NOT reached for {exchange_name}: {open_trades_count}/{max_trades}. Processing entry cycle for this exchange.")
                 for pair in pairs:
                     await self._check_pair_entry(exchange_name, pair)
-                    
         except Exception as e:
             logger.error(f"Error in entry cycle: {e}")
             
@@ -417,32 +651,100 @@ class TradingOrchestrator:
         """Check if there's sufficient balance for new trades"""
         try:
             total_available = 0
+            logger.info(f"Checking available balance. Current balances: {self.balances}")
+            
             for exchange_name, balance in self.balances.items():
-                total_available += balance['available']
+                available = balance.get('available', 0)
+                total_available += available
+                logger.info(f"Exchange {exchange_name}: available={available}")
                 
+            logger.info(f"Total available balance: {total_available}")
+            
             # Check if we have at least $100 available
-            return total_available >= 100.0
+            has_sufficient = total_available >= 100.0
+            logger.info(f"Sufficient balance for new trades: {has_sufficient}")
+            return has_sufficient
             
         except Exception as e:
             logger.error(f"Error checking available balance: {e}")
             return False
             
-    async def _check_pair_entry(self, exchange_name: str, pair: str) -> None:
-        """Check if a pair should be entered"""
+    async def _check_trade_limits(self) -> bool:
+        """Check if trade limits allow new trades"""
         try:
-            # Get strategy signals
+            # Get trading configuration
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{strategy_service_url}/api/v1/signals/consensus/{exchange_name}/{pair}")
+                response = await client.get(f"{config_service_url}/api/v1/config/trading")
                 response.raise_for_status()
-                consensus = response.json()
+                trading_config = response.json()
+            max_concurrent_trades = trading_config.get('max_concurrent_trades', 10)
+            max_trades_per_exchange = trading_config.get('max_trades_per_exchange', 3)
+            # Get current open trades - use a new client to avoid closed client issues
+            async with httpx.AsyncClient() as db_client:
+                response = await db_client.get(f"{database_service_url}/api/v1/trades/open")
+                response.raise_for_status()
+                open_trades = response.json()['trades']
+            total_open_trades = len(open_trades)
+            logger.info(f"Current open trades: {total_open_trades}, max allowed: {max_concurrent_trades}")
+            # Check total concurrent trades limit
+            if total_open_trades >= max_concurrent_trades:
+                logger.info(f"Maximum concurrent trades reached: {total_open_trades}/{max_concurrent_trades}")
+                return False
+            # Check per-exchange limits
+            trades_per_exchange = {}
+            for trade in open_trades:
+                exchange = trade['exchange']
+                trades_per_exchange[exchange] = trades_per_exchange.get(exchange, 0) + 1
+            # Log all exchanges' trade counts
+            for exchange in self.balances.keys():
+                count = trades_per_exchange.get(exchange, 0)
+                logger.info(f"[EntryCycle] {exchange}: open_trades={count}, max_trades={max_trades_per_exchange}")
+                if count >= max_trades_per_exchange:
+                    logger.info(f"[EntryCycle] Trade limit reached for {exchange}: {count}/{max_trades_per_exchange}. No new entries will be processed for this exchange.")
+                else:
+                    logger.info(f"[EntryCycle] Trade limit NOT reached for {exchange}: {count}/{max_trades_per_exchange}. New entries can be processed for this exchange.")
+            # Still enforce the original logic for overall entry cycle
+            for exchange, count in trades_per_exchange.items():
+                if count >= max_trades_per_exchange:
+                    logger.info(f"Maximum trades per exchange reached for {exchange}: {count}/{max_trades_per_exchange}")
+                    return False
+            logger.info(f"Trade limits check passed: {total_open_trades} open trades")
+            return True
+        except Exception as e:
+            logger.error(f"Error checking trade limits: {e}")
+            return False
             
-            signal = consensus['consensus_signal']
-            confidence = consensus['confidence']
-            agreement = consensus['agreement']
+    async def _check_pair_entry(self, exchange_name: str, pair: str) -> None:
+        """Check if a pair should be entered - each strategy is independent"""
+        try:
+            # Handle different symbol formats for different exchanges
+            # All exchanges use format without slashes for strategy service
+            strategy_pair = pair.replace('/', '')
             
-            # Check if we should enter a trade
-            if signal == 'buy' and confidence > 0.7 and agreement > 60:
-                await self._execute_trade_entry(exchange_name, pair, consensus)
+            # Get individual strategy signals instead of consensus
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}")
+                response.raise_for_status()
+                signals_data = response.json()
+            
+            # Check each strategy independently
+            strategies = signals_data.get('strategies', {})
+            for strategy_name, signal_data in strategies.items():
+                signal = signal_data.get('signal')
+                confidence = signal_data.get('confidence', 0)
+                strength = signal_data.get('strength', 0)
+                
+                # If any strategy generates a buy signal, execute the trade
+                if signal == 'buy' and confidence > 0.5:  # Minimum confidence threshold
+                    logger.info(f"Strategy {strategy_name} generated BUY signal for {pair} on {exchange_name} (confidence: {confidence:.2f})")
+                    await self._execute_trade_entry(exchange_name, pair, {
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength
+                    })
+                    # Only execute one trade per pair per cycle to avoid over-trading
+                    break
                 
         except Exception as e:
             logger.error(f"Error checking pair entry for {pair} on {exchange_name}: {e}")
@@ -450,28 +752,58 @@ class TradingOrchestrator:
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
         """Execute trade entry"""
         try:
-            # Calculate position size
+            # Calculate position size in USDC
             balance = self.balances[exchange_name]['available']
-            position_size = balance * 0.1  # Use 10% of available balance
+            position_value_usdc = balance * 0.1  # Use 10% of available balance
+            
+            # Get current market price for entry
+            entry_price = await self._get_current_price(exchange_name, pair)
+            
+            # Calculate position size in cryptocurrency units
+            position_size_units = position_value_usdc / entry_price if entry_price > 0 else 0
             
             # Create trade record
             trade_id = str(uuid.uuid4())
+            strategy_name = signal.get('strategy', 'unknown')
             trade_data = {
                 'trade_id': trade_id,
                 'pair': pair,
                 'exchange': exchange_name,
-                'entry_price': 0.0,  # Will be filled by order execution
+                'entry_price': entry_price,
                 'status': 'OPEN',
-                'position_size': position_size,
-                'strategy': 'consensus',
+                'position_size': position_size_units,  # Store cryptocurrency units, not USDC value
+                'strategy': strategy_name,
                 'entry_time': datetime.utcnow().isoformat(),
-                'entry_reason': f"Consensus signal: {signal['consensus_signal']} (confidence: {signal['confidence']:.2f})"
+                'entry_reason': f"{strategy_name} strategy signal: {signal['signal']} (confidence: {signal['confidence']:.2f}, strength: {signal['strength']:.2f})"
             }
             
             # Save trade to database
             async with httpx.AsyncClient() as client:
                 response = await client.post(f"{database_service_url}/api/v1/trades", json=trade_data)
                 response.raise_for_status()
+            
+            # Update available balance in database after successful trade creation
+            new_available_balance = balance - position_value_usdc
+            balance_update_data = {
+                'exchange': exchange_name,
+                'balance': self.balances[exchange_name]['total'],
+                'available_balance': new_available_balance,
+                'total_pnl': self.balances[exchange_name]['total_pnl'],
+                'daily_pnl': self.balances[exchange_name]['daily_pnl'],
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            # Update balance in database
+            try:
+                balance_response = await client.put(f"{database_service_url}/api/v1/balances/{exchange_name}", json=balance_update_data)
+                if balance_response.status_code == 200:
+                    # Update local balance cache
+                    self.balances[exchange_name]['available'] = new_available_balance
+                    logger.info(f"Updated available balance for {exchange_name}: {balance} -> {new_available_balance} (deducted {position_value_usdc})")
+                else:
+                    logger.error(f"Failed to update balance for {exchange_name}: {balance_response.status_code}")
+            except Exception as balance_error:
+                logger.error(f"Error updating balance for {exchange_name}: {balance_error}")
             
             # Add to active trades
             self.active_trades[trade_id] = trade_data
@@ -480,6 +812,35 @@ class TradingOrchestrator:
             
         except Exception as e:
             logger.error(f"Error executing trade entry for {pair} on {exchange_name}: {e}")
+            
+    async def _update_trade_data(self, trade_id: str, update_data: Dict[str, Any]) -> None:
+        """Update trade data in database"""
+        try:
+            logger.info(f"Updating trade {trade_id} with data: {update_data}")
+            async with httpx.AsyncClient() as client:
+                response = await client.put(f"{database_service_url}/api/v1/trades/{trade_id}", json=update_data)
+                response.raise_for_status()
+                logger.info(f"Successfully updated trade {trade_id}")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Error updating trade data for {trade_id}: {e}")
+            logger.error(f"Response content: {e.response.text}")
+        except Exception as e:
+            logger.error(f"Error updating trade data for {trade_id}: {e}")
+            
+    async def _get_current_price(self, exchange_name: str, pair: str) -> float:
+        """Get current market price for a pair"""
+        try:
+            # Convert pair format for exchange service (remove slashes)
+            exchange_symbol = pair.replace('/', '')
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{exchange_service_url}/api/v1/market/ticker/{exchange_name}/{exchange_symbol}")
+                response.raise_for_status()
+                ticker_data = response.json()
+                return float(ticker_data.get('last', 0.0))
+        except Exception as e:
+            logger.error(f"Error getting current price for {pair} on {exchange_name}: {e}")
+            return 0.0
             
     async def _run_maintenance_tasks(self) -> None:
         """Run maintenance tasks"""
@@ -496,17 +857,45 @@ class TradingOrchestrator:
     async def _update_balances(self) -> None:
         """Update balances from exchanges"""
         try:
-            for exchange_name in self.balances.keys():
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
-                    if response.status_code == 200:
-                        balance = response.json()
-                        self.balances[exchange_name] = {
-                            'total': balance['total'].get('USDC', 0),
-                            'available': balance['free'].get('USDC', 0),
-                            'total_pnl': 0.0,  # Will be calculated from trades
-                            'daily_pnl': 0.0   # Will be calculated from trades
-                        }
+            # Check if we're in simulation mode
+            async with httpx.AsyncClient() as client:
+                mode_response = await client.get(f"{config_service_url}/api/v1/config/mode")
+                mode_response.raise_for_status()
+                mode_data = mode_response.json()
+                
+                if mode_data['is_simulation']:
+                    # In simulation mode, update from database instead of exchange
+                    for exchange_name in self.balances.keys():
+                        try:
+                            balance_response = await client.get(f"{database_service_url}/api/v1/balances/{exchange_name}")
+                            if balance_response.status_code == 200:
+                                balance = balance_response.json()
+                                self.balances[exchange_name] = {
+                                    'total': float(balance['balance']),
+                                    'available': float(balance['available_balance']),
+                                    'total_pnl': float(balance['total_pnl']),
+                                    'daily_pnl': float(balance['daily_pnl'])
+                                }
+                                logger.debug(f"Updated balance for {exchange_name} from database: {balance['available_balance']}")
+                        except Exception as balance_error:
+                            logger.error(f"Error updating balance for {exchange_name} from database: {balance_error}")
+                else:
+                    # In live mode, update from exchange
+                    for exchange_name in self.balances.keys():
+                        try:
+                            response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
+                            if response.status_code == 200:
+                                balance = response.json()
+                                self.balances[exchange_name] = {
+                                    'total': balance['total'].get('USDC', 0),
+                                    'available': balance['free'].get('USDC', 0),
+                                    'total_pnl': 0.0,  # Will be calculated from trades
+                                    'daily_pnl': 0.0   # Will be calculated from trades
+                                }
+                            else:
+                                logger.warning(f"Could not get balance for {exchange_name}")
+                        except Exception as balance_error:
+                            logger.error(f"Error getting balance for {exchange_name}: {balance_error}")
                         
         except Exception as e:
             logger.error(f"Error updating balances: {e}")
@@ -598,13 +987,13 @@ async def emergency_stop():
 async def get_trading_status():
     """Get trading status"""
     uptime = None
-    if start_time:
-        uptime = datetime.utcnow() - start_time
+    if orchestrator.start_time:
+        uptime = datetime.utcnow() - orchestrator.start_time
         
     return TradingStatus(
-        status=trading_status,
-        cycle_count=cycle_count,
-        active_trades=len(active_trades),
+        status="running" if orchestrator.running else "stopped",
+        cycle_count=orchestrator.cycle_count,
+        active_trades=len(orchestrator.active_trades),
         total_pnl=0.0,  # Would calculate from trades
         last_cycle=datetime.utcnow(),
         uptime=uptime or timedelta(0)
@@ -787,8 +1176,9 @@ async def get_pair_candidates(exchange: str):
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    """Initialize orchestrator on startup"""
+    """Initialize orchestrator and start trading loop on startup"""
     await orchestrator.initialize()
+    await orchestrator.start_trading()
 
 @app.on_event("shutdown")
 async def shutdown_event():

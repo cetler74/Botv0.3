@@ -6,19 +6,18 @@ Main orchestrator that coordinates all components and manages trading cycles
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import signal
 import sys
 import os
-
-# Add the project root to the path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import uuid
+import httpx
 from core.config_manager import ConfigManager
 from core.database_manager import DatabaseManager
 from core.exchange_manager import ExchangeManager
 from core.strategy_manager import StrategyManager
 from core.pair_selector import PairSelector, BinancePairSelector, BybitPairSelector
+from core.balance_manager import BalanceManager
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +41,11 @@ class TradingOrchestrator:
     
     def __init__(self, config_path: str = "config/config.yaml"):
         self.config_path = config_path
-        self.config_manager = None
-        self.database_manager = None
+        self.config_manager: Optional[ConfigManager] = None
+        self.database_manager: Optional[DatabaseManager] = None
         self.exchange_manager = None
         self.strategy_manager = None
+        self.balance_manager = None
         self.running = False
         self.cycle_count = 0
         
@@ -77,6 +77,12 @@ class TradingOrchestrator:
             self.database_manager = DatabaseManager(db_config)
             logger.info("Database manager initialized")
             
+            # Log DB connection info
+            self.database_manager.log_connection_info()
+            
+            # Force DB connection context log
+            self.database_manager._get_connection()
+            
             # Set database manager in config manager for alerts
             self.config_manager.set_database_manager(self.database_manager)
             
@@ -95,6 +101,14 @@ class TradingOrchestrator:
             )
             logger.info("Strategy manager initialized")
             
+            # Initialize balance manager
+            self.balance_manager = BalanceManager(
+                self.database_manager,
+                self.config_manager
+            )
+            await self.balance_manager.initialize_balances()
+            logger.info("Balance manager initialized")
+            
             # Initialize balances
             await self._initialize_balances()
             
@@ -110,6 +124,8 @@ class TradingOrchestrator:
             
     async def _initialize_balances(self) -> None:
         """Initialize balance tracking for all exchanges"""
+        assert self.config_manager is not None, "config_manager must be initialized"
+        assert self.database_manager is not None, "database_manager must be initialized"
         try:
             exchanges = self.config_manager.get_all_exchanges()
             
@@ -150,6 +166,8 @@ class TradingOrchestrator:
             
     async def _initialize_pair_selections(self) -> None:
         """Dynamically select and persist pairs for all exchanges"""
+        assert self.config_manager is not None, "config_manager must be initialized"
+        assert self.database_manager is not None, "database_manager must be initialized"
         try:
             exchanges = self.config_manager.get_all_exchanges()
             for exchange_name in exchanges:
@@ -205,7 +223,7 @@ class TradingOrchestrator:
             
             while self.running:
                 try:
-                    cycle_start = datetime.utcnow()
+                    cycle_start = datetime.now(timezone.utc)
                     self.cycle_count += 1
                     
                     logger.info(f"Starting trading cycle {self.cycle_count}")
@@ -221,7 +239,7 @@ class TradingOrchestrator:
                     await self._run_maintenance_tasks()
                     
                     # Calculate cycle duration
-                    cycle_duration = (datetime.utcnow() - cycle_start).total_seconds()
+                    cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
                     logger.info(f"Completed trading cycle {self.cycle_count} in {cycle_duration:.2f}s")
                     
                     # Wait for next cycle
@@ -241,78 +259,86 @@ class TradingOrchestrator:
         """Run exit cycle to check for exit signals"""
         try:
             logger.info("Running exit cycle...")
-            
-            # Get all open trades
-            open_trades = await self.database_manager.get_open_trades()
-            
-            if not open_trades:
-                logger.info("No open trades to check")
-                return
-                
-            logger.info(f"Checking {len(open_trades)} open trades for exit signals")
-            
-            for trade in open_trades:
-                try:
+            for exchange_name in self.pair_selections.keys():
+                # Get open trades
+                open_trades = []
+                if self.database_manager is not None and hasattr(self.database_manager, 'get_open_trades'):
+                    open_trades = await self.database_manager.get_open_trades(exchange_name)
+                for trade in open_trades:
+                    # Check trade exit conditions (profit protection, trailing stop, strategy signals)
                     await self._check_trade_exit(trade)
-                except Exception as e:
-                    logger.error(f"Error checking exit for trade {trade.get('trade_id')}: {e}")
-                    
         except Exception as e:
             logger.error(f"Error in exit cycle: {e}")
-            
+
     async def _check_trade_exit(self, trade: Dict[str, Any]) -> None:
         """Check if a specific trade should be exited"""
         try:
-            trade_id = trade['trade_id']
-            exchange_name = trade['exchange']
-            pair = trade['pair']
+            trade_id = trade.get('trade_id')
+            exchange_name = trade.get('exchange')
+            pair = trade.get('pair')
             
-            # Get current price
+            # Defensive checks for required fields
+            if not exchange_name or not pair:
+                logger.error(f"Trade {trade_id} missing exchange or pair. Skipping.")
+                return
+                
+            # Validate pair is not empty
+            if not pair.strip():
+                logger.error(f"Trade {trade_id} has empty pair. Skipping.")
+                return
+                
             ticker = await self.exchange_manager.get_ticker(exchange_name, pair)
             if not ticker:
                 logger.warning(f"Could not get ticker for {pair} on {exchange_name}")
                 return
-                
-            current_price = float(ticker['last'])
-            
+            last_price = ticker.get('last')
+            if last_price is None:
+                logger.error(f"Trade {trade_id} ticker missing 'last' price. Skipping.")
+                return
+            try:
+                current_price = float(last_price)
+            except Exception as e:
+                logger.error(f"Trade {trade_id} invalid last price '{last_price}': {e}. Skipping.")
+                return
+            entry_price = trade.get('entry_price')
+            position_size = trade.get('position_size')
+            if entry_price is None or position_size is None:
+                logger.error(f"Trade {trade_id} missing entry_price or position_size. Skipping.")
+                return
+            try:
+                entry_price = float(entry_price)
+                position_size = float(position_size)
+            except Exception as e:
+                logger.error(f"Trade {trade_id} invalid entry_price or position_size: {e}. Skipping.")
+                return
             # Check profit protection
-            should_exit, reason = await self.strategy_manager.apply_profit_protection(
-                trade, current_price
-            )
-            
+            logger.info(f"[RiskMgmt] Checking profit protection for trade {trade_id}: entry={entry_price}, current={current_price}, pnl_pct={((current_price-entry_price)/entry_price)*100:.2f}%")
+            should_exit, reason = await self.strategy_manager.apply_profit_protection(trade, current_price)
             if should_exit:
+                logger.info(f"[RiskMgmt] Profit protection triggered for trade {trade_id} (reason: {reason})")
                 await self._execute_trade_exit(trade, current_price, reason)
                 return
-                
             # Check trailing stop
-            should_exit, reason = await self.strategy_manager.apply_trailing_stop(
-                trade, current_price
-            )
-            
+            logger.info(f"[RiskMgmt] Checking trailing stop for trade {trade_id}: entry={entry_price}, current={current_price}, pnl_pct={((current_price-entry_price)/entry_price)*100:.2f}%")
+            should_exit, reason = await self.strategy_manager.apply_trailing_stop(trade, current_price)
             if should_exit:
+                logger.info(f"[RiskMgmt] Trailing stop triggered for trade {trade_id} (reason: {reason})")
                 await self._execute_trade_exit(trade, current_price, reason)
                 return
-                
             # Check strategy exit signals
-            exit_signals = await self.strategy_manager.check_exit_signals(
-                exchange_name, pair, trade
-            )
-            
+            exit_signals = await self.strategy_manager.check_exit_signals(exchange_name, pair, trade)
             if exit_signals:
-                await self._execute_trade_exit(trade, current_price, "strategy_exit")
+                # Use the first exit signal's reason if available
+                reason = exit_signals[0].get('reason', 'strategy_exit')
+                await self._execute_trade_exit(trade, current_price, reason)
                 return
-                
             # Update unrealized PnL
-            entry_price = float(trade.get('entry_price', 0))
-            position_size = float(trade.get('position_size', 0))
-            
             if entry_price > 0 and position_size > 0:
                 unrealized_pnl = (current_price - entry_price) * position_size
                 await self.database_manager.update_trade(trade_id, {
                     'unrealized_pnl': unrealized_pnl,
-                    'highest_price': max(current_price, float(trade.get('highest_price', 0)))
+                    'highest_price': max(current_price, float(trade.get('highest_price', 0) or 0))
                 })
-                
         except Exception as e:
             logger.error(f"Error checking trade exit: {e}")
             
@@ -347,14 +373,15 @@ class TradingOrchestrator:
                 await self.database_manager.update_trade(trade_id, {
                     'exit_price': exit_price,
                     'exit_id': exit_order['id'],
-                    'exit_time': datetime.utcnow(),
+                    'exit_time': datetime.now(timezone.utc),
                     'realized_pnl': realized_pnl,
                     'status': 'CLOSED',
                     'exit_reason': reason
                 })
                 
-                # Update balance
-                await self._update_balance_after_trade(exchange_name, realized_pnl)
+                # Release balance and add PnL
+                position_size_value = position_size * exit_price  # Convert position units to value
+                await self.balance_manager.release_balance(exchange_name, position_size_value, realized_pnl)
                 
                 # Update strategy performance
                 await self.strategy_manager.update_strategy_performance(
@@ -373,45 +400,89 @@ class TradingOrchestrator:
         """Run entry cycle to check for entry signals"""
         try:
             logger.info("Running entry cycle...")
-            
             # Check available balance
-            if not await self._check_available_balance():
-                logger.info("Insufficient balance for new trades")
-                return
-                
+            if self._check_available_balance is not None:
+                if not await self._check_available_balance():
+                    logger.info("Insufficient balance for new trades")
+                    return
             # Check for entry signals on all pairs
             for exchange_name, pairs in self.pair_selections.items():
+                logger.info(f"[EntryCycle] Checking exchange: {exchange_name} with pairs: {pairs}")
                 if not pairs:
+                    logger.warning(f"[EntryCycle] No pairs selected for {exchange_name}, skipping.")
                     continue
-                    
+                # Get valid symbols from exchange markets
+                markets = await self.exchange_manager.get_markets(exchange_name)
+                valid_symbols = set(markets.keys())
+                logger.debug(f"[EntryCycle] Valid symbols for {exchange_name}: {valid_symbols}")
                 # Check max trades per exchange
-                open_trades = await self.database_manager.get_open_trades(exchange_name)
-                max_trades = self.config_manager.get_trading_config().get('max_trades_per_exchange', 3)
-                
+                open_trades = []
+                if self.database_manager is not None and hasattr(self.database_manager, 'get_open_trades'):
+                    open_trades = await self.database_manager.get_open_trades(exchange_name)
+                max_trades = 3
+                if self.config_manager is not None and hasattr(self.config_manager, 'get_trading_config'):
+                    max_trades = self.config_manager.get_trading_config().get('max_trades_per_exchange', 3)
+                logger.info(f"[EntryCycle] {exchange_name}: open_trades={len(open_trades)}, max_trades={max_trades}")
                 if len(open_trades) >= max_trades:
-                    logger.info(f"Maximum trades reached for {exchange_name}")
+                    logger.info(f"[EntryCycle] Trade limit reached for {exchange_name}: {len(open_trades)}/{max_trades}. Skipping entry for this exchange.")
                     continue
-                    
-                # Check each pair for entry signals
+                else:
+                    logger.info(f"[EntryCycle] Trade limit NOT reached for {exchange_name}: {len(open_trades)}/{max_trades}. Processing entry cycle for this exchange.")
                 for pair in pairs:
-                    try:
-                        await self._check_pair_entry(exchange_name, pair)
-                    except Exception as e:
-                        logger.error(f"Error checking entry for {pair} on {exchange_name}: {e}")
+                    # Validate pair before making API calls
+                    if not pair or not isinstance(pair, str) or pair.strip() == "":
+                        logger.warning(f"[EntryCycle] Skipping invalid or empty pair: {pair} for {exchange_name}")
+                        continue
+                    if pair not in valid_symbols:
+                        logger.warning(f"[EntryCycle] Skipping pair not in valid symbols: {pair} for {exchange_name}")
+                        continue
+                    logger.info(f"[Orchestrator] Analyzing pair: {pair} on {exchange_name}")
+                    # Use strategy manager to check entry signals (this includes detailed reasons)
+                    entry_signals = await self.strategy_manager.check_entry_signals(exchange_name, pair)
+                    logger.debug(f"[EntryCycle] Entry signals for {pair} on {exchange_name}: {entry_signals}")
+                    if entry_signals:
+                        # Get the best signal
+                        best_signal = max(entry_signals, key=lambda x: x.get('confidence', 0))
+                        min_confidence = self.config_manager.get_trading_config().get('min_confidence', 0.6)
+                        logger.info(f"[EntryCycle] Best signal for {pair} on {exchange_name}: {best_signal}, min_confidence={min_confidence}")
+                        if best_signal.get('confidence', 0) >= min_confidence:
+                            logger.info(f"[Orchestrator] Auto-trading on signal: {pair} {best_signal}")
+                            await self._execute_trade_entry(exchange_name, pair, best_signal)
+                        else:
+                            logger.info(f"[Orchestrator] Signal confidence {best_signal.get('confidence', 0)} below threshold {min_confidence} for {pair}")
+                    else:
+                        logger.info(f"[EntryCycle] No entry signals for {pair} on {exchange_name}")
                         
         except Exception as e:
             logger.error(f"Error in entry cycle: {e}")
             
     async def _check_available_balance(self) -> bool:
-        """Check if there's sufficient balance for new trades"""
+        """Check if there's sufficient balance for new trades by checking the trading.balance table"""
+        assert self.config_manager is not None, "config_manager must be initialized"
+        assert self.database_manager is not None, "database_manager must be initialized"
         try:
-            total_available = 0
             min_balance = self.config_manager.get_balance_manager_config().get('min_balance_threshold', 10)
             
-            for exchange_name, balance in self.balances.items():
-                total_available += balance['available']
+            # Get all balances from the database
+            balances = await self.database_manager.get_all_balances()
+            
+            if not balances:
+                logger.warning("No balances found in database")
+                return False
                 
-            return total_available >= min_balance
+            # Check each exchange has sufficient available balance
+            for balance in balances:
+                exchange = balance['exchange']
+                available_balance = float(balance['available_balance'])
+                
+                logger.info(f"[BalanceCheck] {exchange}: available_balance={available_balance}, min_threshold={min_balance}")
+                
+                if available_balance < min_balance:
+                    logger.warning(f"[BalanceCheck] Insufficient balance on {exchange}: {available_balance} < {min_balance}")
+                    return False
+                    
+            logger.info(f"[BalanceCheck] All exchanges have sufficient balance")
+            return True
             
         except Exception as e:
             logger.error(f"Error checking available balance: {e}")
@@ -444,20 +515,31 @@ class TradingOrchestrator:
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
         """Execute trade entry"""
         try:
-            # Calculate position size
-            balance = self.balances[exchange_name]
-            position_size_pct = self.config_manager.get_trading_config().get('position_size_percentage', 0.1)
-            position_size = balance['available'] * position_size_pct
+            # Calculate position size (10% of available balance)
+            position_value = 1000.0  # Fixed position size for now
             
+            # Check if we have sufficient available balance
+            if not await self.balance_manager.check_available_balance(exchange_name, position_value):
+                logger.error(f"Insufficient balance for trade entry on {exchange_name}")
+                return
+                
+            # Reserve balance for this trade
+            if not await self.balance_manager.reserve_balance(exchange_name, position_value):
+                logger.error(f"Failed to reserve balance for trade on {exchange_name}")
+                return
+                
             # Get current price
             ticker = await self.exchange_manager.get_ticker(exchange_name, pair)
             if not ticker:
+                logger.error(f"Could not get ticker for {pair} on {exchange_name}")
                 return
                 
             current_price = float(ticker['last'])
             
             # Calculate actual position size in units
-            position_units = position_size / current_price
+            position_units = position_value / current_price
+            
+            logger.info(f"[TradeEntry] {exchange_name} {pair}: position_value={position_value}, position_units={position_units}, current_price={current_price}")
             
             # Execute entry order
             if self.config_manager.is_simulation_mode():
@@ -472,48 +554,50 @@ class TradingOrchestrator:
                 )
                 
             if entry_order:
-                # Create trade record
+                # Get trading config for profit protection and trailing stop settings
+                trading_config = self.config_manager.get_trading_config()
+                profit_protection_trigger = trading_config.get('profit_protection_trigger', 0.02)  # 2% default
+                trail_stop_trigger = trading_config.get('trail_stop_trigger', 0.01)  # 1% default
+                
+                # Create trade record with all available fields
+                entry_reason = signal.get('reason') or f"Signal: {signal.get('signal')}, Confidence: {signal.get('confidence'):.2f}"
                 trade_data = {
                     'pair': pair,
                     'exchange': exchange_name,
                     'entry_price': current_price,
+                    'exit_price': None,  # Will be set on exit
+                    'status': 'OPEN',
                     'entry_id': entry_order['id'],
-                    'entry_time': datetime.utcnow(),
+                    'exit_id': None,  # Will be set on exit
+                    'entry_time': datetime.now(timezone.utc),
+                    'exit_time': None,  # Will be set on exit
+                    'unrealized_pnl': 0.0,
+                    'realized_pnl': 0.0,
+                    'highest_price': current_price,  # Initialize with entry price
+                    'profit_protection': 'inactive',
+                    'profit_protection_trigger': profit_protection_trigger,
+                    'trail_stop': 'inactive',
+                    'trail_stop_trigger': trail_stop_trigger,
                     'position_size': position_units,
+                    'fees': 0.0,  # Will be calculated from order if available
                     'strategy': signal.get('strategy', 'consensus'),
-                    'entry_reason': f"Signal: {signal.get('signal')}, Confidence: {signal.get('confidence'):.2f}"
+                    'entry_reason': entry_reason,
+                    'exit_reason': None  # Will be set on exit
                 }
                 
+                logger.info(f"Attempting to create trade with data: {trade_data}")
                 trade_id = await self.database_manager.create_trade(trade_data)
-                
+                logger.info(f"create_trade returned trade_id: {trade_id}")
                 if trade_id:
-                    # Update balance
-                    self.balances[exchange_name]['available'] -= position_size
-                    
-                    logger.info(f"Successfully entered trade {trade_id} for {pair} on {exchange_name}")
+                    # Do NOT update balance in database here; balance_manager already did it
+                    logger.info(f"Successfully entered trade {trade_id} for {pair} on {exchange_name}.")
+                else:
+                    logger.error(f"Trade creation failed for data: {trade_data}")
                     
         except Exception as e:
             logger.error(f"Error executing trade entry: {e}")
             
-    async def _update_balance_after_trade(self, exchange_name: str, pnl: float) -> None:
-        """Update balance after trade completion"""
-        try:
-            if exchange_name in self.balances:
-                self.balances[exchange_name]['total_pnl'] += pnl
-                self.balances[exchange_name]['daily_pnl'] += pnl
-                
-                # Update database
-                balance = self.balances[exchange_name]
-                await self.database_manager.update_balance(
-                    exchange_name,
-                    balance['total'],
-                    balance['available'],
-                    balance['total_pnl'],
-                    balance['daily_pnl']
-                )
-                
-        except Exception as e:
-            logger.error(f"Error updating balance: {e}")
+
             
     async def _run_maintenance_tasks(self) -> None:
         """Run maintenance tasks"""
@@ -584,4 +668,15 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Ensure logs directory exists
+    os.makedirs("logs", exist_ok=True)
+    # Set up file handler
+    file_handler = logging.FileHandler("logs/orchestrator.log")
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+    file_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(file_handler)
+    logging.getLogger().setLevel(logging.INFO)
+    # TEST LOG
+    logging.getLogger().info("TEST LOG: Logging is working and configured!")
+    # Initialize orchestrator
     asyncio.run(main()) 
