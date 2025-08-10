@@ -2430,48 +2430,28 @@ class TradingOrchestrator:
     async def _get_current_price(self, exchange_name: str, pair: str) -> float:
         """Get current market price for a pair - Enhanced with real-time price feed service"""
         try:
-            # First try to get price from the enhanced price feed service status endpoint
+            # First try to get price from the enhanced price feed service direct endpoint
             price_feed_service_url = "http://price-feed-service:8007"
             
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    # Get the cached prices from the status endpoint
-                    response = await client.get(f"{price_feed_service_url}/status")
+                    # URL-encode the pair to handle slashes (CRO/USD -> CRO%2FUSD)
+                    from urllib.parse import quote
+                    encoded_pair = quote(pair, safe='')
+                    
+                    # Try the direct price endpoint first
+                    response = await client.get(f"{price_feed_service_url}/api/v1/price/{exchange_name}/{encoded_pair}")
                     
                     if response.status_code == 200:
                         data = response.json()
-                        price_cache = data.get('price_cache', {})
-                        cache_size = data.get('price_cache_size', 0)
-                        
-                        logger.info(f"🔍 Price feed cache lookup: {exchange_name}/{pair}, cache_size={cache_size}, has_price_cache={price_cache is not None}")
-                        
-                        # If price_cache is empty but cache_size > 0, there might be a formatting error
-                        if not price_cache and cache_size > 0:
-                            logger.warning(f"⚠️ Price cache formatting error: cache_size={cache_size} but no price_cache data")
-                        
-                        # Try different cache key formats
-                        possible_keys = [
-                            f"{exchange_name}:{pair}",
-                            f"{exchange_name.lower()}:{pair}",
-                            f"{exchange_name.upper()}:{pair}",
-                            f"{exchange_name}:{pair.upper()}",
-                            f"{exchange_name}:{pair.lower()}"
-                        ]
-                        
-                        logger.info(f"🔍 Trying cache keys: {possible_keys}")
-                        
-                        for cache_key in possible_keys:
-                            if price_cache and cache_key in price_cache:
-                                cached_price = price_cache[cache_key]
-                                price = float(cached_price.get('price', 0))
-                                if price > 0:
-                                    source = cached_price.get('source', 'unknown')
-                                    logger.info(f"📈 Got price from feed service cache: {exchange_name}/{pair} = ${price:.8f} (source={source}, key={cache_key})")
-                                    return price
-                        
-                        if price_cache:
-                            available_keys = list(price_cache.keys())
-                            logger.info(f"🔍 No match found. Available cache keys: {available_keys}")
+                        price = float(data.get('price', 0))
+                        if price > 0:
+                            cache_hit = data.get('cache_hit', False)
+                            source = data.get('source', 'unknown')
+                            logger.info(f"📈 Got price from feed service: {exchange_name}/{pair} = ${price:.8f} (cache_hit={cache_hit}, source={source})")
+                            return price
+                    else:
+                        logger.info(f"🔍 Price feed endpoint returned {response.status_code} for {exchange_name}/{pair} (tried {encoded_pair})")
                             
             except Exception as feed_e:
                 logger.info(f"⚠️ Price feed service unavailable, falling back to REST API: {feed_e}")

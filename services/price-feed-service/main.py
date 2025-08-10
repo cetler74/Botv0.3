@@ -532,8 +532,12 @@ async def get_status():
         
         # Format price cache for external consumption
         formatted_cache = {}
+        cache_size = len(price_feed_manager.price_cache)
+        logger.info(f"🔧 Formatting cache: size={cache_size}")
+        
         try:
             for cache_key, cache_data in price_feed_manager.price_cache.items():
+                logger.info(f"🔧 Processing cache key: {cache_key}")
                 timestamp = cache_data.get('timestamp', datetime.utcnow())
                 # Ensure timestamp is properly formatted
                 if hasattr(timestamp, 'isoformat'):
@@ -548,6 +552,7 @@ async def get_status():
                     'timestamp': timestamp_str,
                     'source': cache_data.get('source', 'unknown')
                 }
+            logger.info(f"🔧 Formatted cache complete: {len(formatted_cache)} items")
         except Exception as cache_e:
             logger.error(f"Error formatting price cache: {cache_e}")
             import traceback
