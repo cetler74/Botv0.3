@@ -40,41 +40,36 @@ class StrategyManager:
             'strategy_pnl_enhanced': 'StrategyPnLEnhanced'
         }
         
+        # Explicit module mapping to match actual filenames
+        strategy_module_map = {
+            'vwma_hull': 'strategy.vwma_hull_strategy',
+            'heikin_ashi': 'strategy.heikin_ashi_strategy',
+            'multi_timeframe_confluence': 'strategy.multi_timeframe_confluence_strategy',
+            'engulfing_multi_tf': 'strategy.engulfing_multi_tf',
+        }
         for strategy_name, strategy_config in strategies_config.items():
             if not strategy_config.get('enabled', False):
                 continue
-                
             try:
-                # Import strategy module
-                if strategy_name in ['vwma_hull', 'heikin_ashi', 'multi_timeframe_confluence', 'engulfing_multi_tf']:
-                    module_name = (
-                        'strategy.vwma_hull_strategy' if strategy_name == 'vwma_hull' else
-                        'strategy.heikin_ashi_strategy' if strategy_name == 'heikin_ashi' else
-                        'strategy.multi_timeframe_confluence_strategy' if strategy_name == 'multi_timeframe_confluence' else
-                        'strategy.engulfing_multi_tf'
-                    )
-                    class_name = strategy_classes[strategy_name]
-                    
-                    # Import the strategy module
-                    module = importlib.import_module(module_name)
-                    strategy_class = getattr(module, class_name)
-                    
-                    # Create strategy instance
-                    strategy_instance = strategy_class(
-                        config=strategy_config,
-                        exchange=self.exchange_manager,
-                        database=self.database_manager
-                    )
-                    
-                    self.strategies[strategy_name] = {
-                        'instance': strategy_instance,
-                        'config': strategy_config,
-                        'enabled': True,
-                        'last_analysis': None
-                    }
-                    
-                    logger.info(f"Initialized strategy: {strategy_name}")
-                    
+                module_name = strategy_module_map.get(strategy_name)
+                if not module_name:
+                    logger.error(f"No module mapping for strategy: {strategy_name}")
+                    continue
+                class_name = strategy_classes[strategy_name]
+                module = importlib.import_module(module_name)
+                strategy_class = getattr(module, class_name)
+                strategy_instance = strategy_class(
+                    config=strategy_config,
+                    exchange=self.exchange_manager,
+                    database=self.database_manager
+                )
+                self.strategies[strategy_name] = {
+                    'instance': strategy_instance,
+                    'config': strategy_config,
+                    'enabled': True,
+                    'last_analysis': None
+                }
+                logger.info(f"Initialized strategy: {strategy_name}")
             except Exception as e:
                 logger.error(f"Failed to initialize strategy {strategy_name}: {e}")
                 continue
@@ -87,11 +82,9 @@ class StrategyManager:
             market_data = await self.exchange_manager.get_market_data_for_strategy(
                 exchange_name, pair, timeframes
             )
-            
             if not market_data:
                 logger.warning(f"No market data available for {pair} on {exchange_name}")
                 return {}
-                
             analysis_results = {
                 'pair': pair,
                 'exchange': exchange_name,
@@ -99,120 +92,112 @@ class StrategyManager:
                 'strategies': {},
                 'consensus': {}
             }
-            
             # Run analysis for each enabled strategy
             for strategy_name, strategy_data in self.strategies.items():
                 if not strategy_data['enabled']:
                     continue
-                    
                 try:
                     strategy_instance = strategy_data['instance']
-                    
                     # Update strategy with market data (use primary timeframe)
                     primary_timeframe = timeframes[0]
                     if primary_timeframe in market_data:
                         await strategy_instance.update(market_data[primary_timeframe])
-                    
-                    # Generate signal
-                    signal, confidence, strength = await strategy_instance.generate_signal(
+                    # Generate signal (expecting 4-tuple: signal, confidence, strength, reason)
+                    signal_result = await strategy_instance.generate_signal(
                         market_data[primary_timeframe], None, pair, primary_timeframe
                     )
-                    
+                    if isinstance(signal_result, (tuple, list)) and len(signal_result) >= 4:
+                        signal, confidence, strength, reason = signal_result
+                    else:
+                        signal, confidence, strength = signal_result[:3]
+                        reason = ''
                     # Store results
                     analysis_results['strategies'][strategy_name] = {
                         'signal': signal,
                         'confidence': confidence,
                         'strength': strength,
+                        'reason': reason,
                         'market_regime': getattr(strategy_instance.state, 'market_regime', 'unknown'),
                         'timestamp': datetime.utcnow().isoformat()
                     }
-                    
                     # Update last analysis time
                     strategy_data['last_analysis'] = datetime.utcnow()
-                    
                 except Exception as e:
                     logger.error(f"Error analyzing {pair} on {exchange_name} with {strategy_name}: {e}")
                     analysis_results['strategies'][strategy_name] = {
                         'error': str(e),
                         'timestamp': datetime.utcnow().isoformat()
                     }
-                    
             # Calculate consensus
             analysis_results['consensus'] = self._calculate_consensus(analysis_results['strategies'])
-            
             # Cache results
             cache_key = f"{exchange_name}_{pair}_{int(datetime.utcnow().timestamp() / 300)}"  # 5-minute cache
             self.signal_cache[cache_key] = analysis_results
-            
             return analysis_results
-            
         except Exception as e:
             logger.error(f"Error analyzing pair {pair} on {exchange_name}: {e}")
             return {}
-            
+
     def _calculate_consensus(self, strategy_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate consensus from multiple strategy results"""
+        """Calculate consensus from multiple strategy results, including reasons."""
         try:
             valid_signals = []
             total_confidence = 0
             total_strength = 0
             signal_counts = {'buy': 0, 'sell': 0, 'hold': 0}
-            
+            reasons = []
             for strategy_name, result in strategy_results.items():
                 if 'error' in result:
                     continue
-                    
                 signal = result.get('signal', 'hold')
                 confidence = result.get('confidence', 0)
                 strength = result.get('strength', 0)
-                
+                reason = result.get('reason', '')
                 if signal in ['buy', 'sell', 'hold']:
                     valid_signals.append({
                         'strategy': strategy_name,
                         'signal': signal,
                         'confidence': confidence,
-                        'strength': strength
+                        'strength': strength,
+                        'reason': reason
                     })
-                    
                     signal_counts[signal] += 1
                     total_confidence += confidence
                     total_strength += strength
-                    
+                    if reason:
+                        reasons.append(f"{strategy_name}: {reason}")
             if not valid_signals:
                 return {
                     'signal': 'hold',
                     'confidence': 0,
                     'strength': 0,
                     'agreement': 0,
-                    'participating_strategies': 0
+                    'participating_strategies': 0,
+                    'reason': ''
                 }
-                
             # Determine consensus signal
             max_count = max(signal_counts.values())
             consensus_signal = 'hold'
-            
             if signal_counts['buy'] == max_count and signal_counts['buy'] > 0:
                 consensus_signal = 'buy'
             elif signal_counts['sell'] == max_count and signal_counts['sell'] > 0:
                 consensus_signal = 'sell'
-                
             # Calculate agreement percentage
             total_strategies = len(valid_signals)
             agreement = (max_count / total_strategies) * 100 if total_strategies > 0 else 0
-            
             # Calculate average confidence and strength
             avg_confidence = total_confidence / total_strategies if total_strategies > 0 else 0
             avg_strength = total_strength / total_strategies if total_strategies > 0 else 0
-            
+            consensus_reason = ' | '.join(reasons) if reasons else ''
             return {
                 'signal': consensus_signal,
                 'confidence': avg_confidence,
                 'strength': avg_strength,
                 'agreement': agreement,
                 'participating_strategies': total_strategies,
-                'signal_distribution': signal_counts
+                'signal_distribution': signal_counts,
+                'reason': consensus_reason
             }
-            
         except Exception as e:
             logger.error(f"Error calculating consensus: {e}")
             return {
@@ -220,45 +205,73 @@ class StrategyManager:
                 'confidence': 0,
                 'strength': 0,
                 'agreement': 0,
-                'participating_strategies': 0
+                'participating_strategies': 0,
+                'reason': ''
             }
-            
+
     async def check_entry_signals(self, exchange_name: str, pair: str) -> List[Dict[str, Any]]:
-        """Check for entry signals across all strategies"""
+        """Check for entry signals across all strategies, including detailed reason."""
         try:
             # Analyze the pair
             analysis = await self.analyze_pair(exchange_name, pair)
-            
-            if not analysis or 'consensus' not in analysis:
+            if not analysis or 'strategies' not in analysis:
                 return []
                 
-            consensus = analysis['consensus']
+            signals = []
             
-            # Check if consensus meets entry criteria
-            min_confidence = self.config.get('strategy_manager', {}).get('min_confidence', 0.6)
-            min_agreement = self.config.get('strategy_manager', {}).get('min_agreement', 50)
-            
-            if (consensus['signal'] in ['buy', 'sell'] and 
-                consensus['confidence'] >= min_confidence and
-                consensus['agreement'] >= min_agreement):
+            # Check individual strategy signals first
+            for strategy_name, strategy_result in analysis['strategies'].items():
+                if 'error' in strategy_result:
+                    continue
+                    
+                signal = strategy_result.get('signal', 'hold')
+                confidence = strategy_result.get('confidence', 0)
+                reason = strategy_result.get('reason', '')
                 
-                return [{
-                    'pair': pair,
-                    'signal': consensus['signal'],
-                    'confidence': consensus['confidence'],
-                    'strength': consensus['strength'],
-                    'strategy': 'consensus',
-                    'exchange': exchange_name,
-                    'details': {
-                        'agreement': consensus['agreement'],
-                        'participating_strategies': consensus['participating_strategies'],
-                        'signal_distribution': consensus['signal_distribution'],
-                        'individual_signals': analysis['strategies']
-                    }
-                }]
+                # Lower threshold for individual strategies
+                min_confidence = 0.5  # Lower threshold for individual strategies
                 
-            return []
+                if signal in ['buy', 'sell'] and confidence >= min_confidence:
+                    signals.append({
+                        'pair': pair,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strategy_result.get('strength', 0),
+                        'strategy': strategy_name,
+                        'exchange': exchange_name,
+                        'reason': reason,
+                        'details': {
+                            'strategy_name': strategy_name,
+                            'market_regime': strategy_result.get('market_regime', 'unknown')
+                        }
+                    })
             
+            # Also check consensus if available
+            if 'consensus' in analysis:
+                consensus = analysis['consensus']
+                min_confidence = self.config.get('strategy_manager', {}).get('min_confidence', 0.6)
+                min_agreement = self.config.get('strategy_manager', {}).get('min_agreement', 50)
+                
+                if (consensus['signal'] in ['buy', 'sell'] and 
+                    consensus['confidence'] >= min_confidence and
+                    consensus['agreement'] >= min_agreement):
+                    signals.append({
+                        'pair': pair,
+                        'signal': consensus['signal'],
+                        'confidence': consensus['confidence'],
+                        'strength': consensus['strength'],
+                        'strategy': 'consensus',
+                        'exchange': exchange_name,
+                        'reason': consensus.get('reason', ''),
+                        'details': {
+                            'agreement': consensus['agreement'],
+                            'participating_strategies': consensus['participating_strategies'],
+                            'signal_distribution': consensus['signal_distribution'],
+                            'individual_signals': analysis['strategies']
+                        }
+                    })
+            
+            return signals
         except Exception as e:
             logger.error(f"Error checking entry signals for {pair} on {exchange_name}: {e}")
             return []
@@ -267,50 +280,51 @@ class StrategyManager:
         """Check for exit signals across all strategies"""
         try:
             exit_signals = []
-            
             # Check each strategy for exit signals
             for strategy_name, strategy_data in self.strategies.items():
                 if not strategy_data['enabled']:
                     continue
-                    
                 try:
                     strategy_instance = strategy_data['instance']
-                    
                     # Get market data for exit analysis
                     market_data = await self.exchange_manager.get_market_data_for_strategy(
                         exchange_name, pair, ['1h', '15m']
                     )
-                    
                     if not market_data:
                         continue
-                        
                     # Update strategy with market data
                     primary_timeframe = '1h'
                     if primary_timeframe in market_data:
                         await strategy_instance.update(market_data[primary_timeframe])
-                    
                     # Check for exit signals
-                    should_exit = await strategy_instance.should_exit()
+                    exit_result = await strategy_instance.should_exit()
                     
+                    # Handle both tuple and boolean returns for compatibility
+                    if isinstance(exit_result, tuple) and len(exit_result) >= 2:
+                        should_exit, reason = exit_result
+                    elif isinstance(exit_result, bool):
+                        should_exit = exit_result
+                        reason = 'strategy_exit' if should_exit else None
+                    else:
+                        logger.warning(f"Unexpected return type from {strategy_name}.should_exit(): {type(exit_result)}")
+                        continue
+                        
                     if should_exit:
                         exit_signals.append({
                             'pair': pair,
                             'signal': 'exit',
                             'strategy': strategy_name,
                             'exchange': exchange_name,
-                            'reason': 'strategy_exit',
+                            'reason': reason or 'strategy_exit',
                             'details': {
                                 'strategy_name': strategy_name,
                                 'market_regime': getattr(strategy_instance.state, 'market_regime', 'unknown')
                             }
                         })
-                        
                 except Exception as e:
                     logger.error(f"Error checking exit signals for {strategy_name} on {pair}: {e}")
                     continue
-                    
             return exit_signals
-            
         except Exception as e:
             logger.error(f"Error checking exit signals for {pair} on {exchange_name}: {e}")
             return []

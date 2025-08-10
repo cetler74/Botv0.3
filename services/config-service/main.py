@@ -157,7 +157,7 @@ class HealthResponse(BaseModel):
 
 # Global configuration state
 config_data: Dict[str, Any] = {}
-config_path: Path = Path("config/config.yaml")
+config_path: Path = Path(os.getenv("CONFIG_PATH", "config/config.yaml"))
 last_modified: Optional[datetime] = None
 _config_cache: Optional[Dict[str, Any]] = None
 
@@ -338,6 +338,14 @@ async def get_exchanges_config():
     
     return redact_config({'exchanges': config_data.get('exchanges', {})}, testing=bool(os.getenv("TESTING")))['exchanges']
 
+@app.get("/api/v1/config/exchanges/internal")
+async def get_exchanges_config_internal():
+    """Get all exchange configurations without redaction (for internal service use)"""
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    
+    return config_data.get('exchanges', {})
+
 @app.get("/api/v1/config/exchanges/list")
 async def get_exchange_list():
     """Get list of configured exchanges"""
@@ -376,6 +384,13 @@ async def get_strategies_config():
         raise HTTPException(status_code=503, detail="Configuration not loaded")
     
     return config_data.get('strategies', {})
+
+@app.get("/api/v1/config/realtime")
+async def get_realtime_config():
+    """Get real-time pricing and WebSocket configuration"""
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    return config_data.get('realtime', {})
 
 @app.get("/api/v1/config/strategies/enabled")
 async def get_enabled_strategies():

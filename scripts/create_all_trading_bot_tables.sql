@@ -60,6 +60,33 @@ CREATE TABLE IF NOT EXISTS trading.trades (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Orders table to track individual order details and status
+CREATE TABLE IF NOT EXISTS trading.orders (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(255) UNIQUE NOT NULL,
+    trade_id UUID REFERENCES trading.trades(trade_id),
+    exchange VARCHAR(50) NOT NULL,
+    symbol VARCHAR(50) NOT NULL,
+    order_type VARCHAR(20) NOT NULL, -- 'market', 'limit', 'stop'
+    side VARCHAR(10) NOT NULL, -- 'buy', 'sell'
+    amount DECIMAL(20,8) NOT NULL,
+    price DECIMAL(20,8),
+    filled_amount DECIMAL(20,8) DEFAULT 0,
+    filled_price DECIMAL(20,8),
+    status VARCHAR(20) NOT NULL, -- 'pending', 'filled', 'cancelled', 'rejected'
+    fees DECIMAL(20,8) DEFAULT 0,
+    fee_rate DECIMAL(10,6),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    filled_at TIMESTAMP WITH TIME ZONE,
+    cancelled_at TIMESTAMP WITH TIME ZONE,
+    timeout_seconds INTEGER DEFAULT 300,
+    retry_count INTEGER DEFAULT 0,
+    error_message TEXT,
+    exchange_order_id VARCHAR(255),
+    client_order_id VARCHAR(255)
+);
+
 -- Alerts table to store system alerts and notifications
 CREATE TABLE IF NOT EXISTS trading.alerts (
     id SERIAL PRIMARY KEY,
@@ -126,6 +153,12 @@ CREATE INDEX IF NOT EXISTS idx_trades_status ON trading.trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_pair ON trading.trades(pair);
 CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trading.trades(entry_time);
 CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trading.trades(exit_time);
+CREATE INDEX IF NOT EXISTS idx_orders_trade_id ON trading.orders(trade_id);
+CREATE INDEX IF NOT EXISTS idx_orders_exchange ON trading.orders(exchange);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON trading.orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON trading.orders(created_at);
+CREATE INDEX IF NOT EXISTS idx_orders_symbol ON trading.orders(symbol);
+CREATE INDEX IF NOT EXISTS idx_orders_order_type ON trading.orders(order_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_level ON trading.alerts(level);
 CREATE INDEX IF NOT EXISTS idx_alerts_category ON trading.alerts(category);
 CREATE INDEX IF NOT EXISTS idx_alerts_resolved ON trading.alerts(resolved);
@@ -137,6 +170,7 @@ CREATE INDEX IF NOT EXISTS idx_strategy_performance_exchange ON trading.strategy
 -- Create unique constraints
 CREATE UNIQUE INDEX IF NOT EXISTS idx_balance_exchange_unique ON trading.balance(exchange);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_cache_unique ON trading.market_data_cache(exchange, pair, data_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_performance_unique ON trading.strategy_performance(strategy_name, exchange, pair);
 
 -- Create functions for automatic timestamp updates
 CREATE OR REPLACE FUNCTION trading.update_updated_at_column()
@@ -152,6 +186,9 @@ CREATE TRIGGER update_balance_updated_at BEFORE UPDATE ON trading.balance
     FOR EACH ROW EXECUTE FUNCTION trading.update_updated_at_column();
 
 CREATE TRIGGER update_trades_updated_at BEFORE UPDATE ON trading.trades
+    FOR EACH ROW EXECUTE FUNCTION trading.update_updated_at_column();
+
+CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON trading.orders
     FOR EACH ROW EXECUTE FUNCTION trading.update_updated_at_column();
 
 -- Create function to calculate daily PnL
@@ -186,6 +223,10 @@ BEGIN
     RETURN total_pnl;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Ensure 'entry_time' column exists in trading.trades
+ALTER TABLE IF EXISTS trading.trades
+ADD COLUMN IF NOT EXISTS entry_time TIMESTAMP;
 
 -- Insert initial data
 INSERT INTO trading.balance (exchange, balance, available_balance, total_pnl, daily_pnl)

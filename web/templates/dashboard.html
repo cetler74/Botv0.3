@@ -2,11 +2,15 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Trading Bot Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css?v=20240723" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css?v=20240723" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20240723" rel="stylesheet">
+
     <style>
         .gradient-bg {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -27,24 +31,123 @@
         .status-online { background-color: #10b981; }
         .status-offline { background-color: #ef4444; }
         .status-warning { background-color: #f59e0b; }
+        /* Custom badge styles for fallback */
+        .badge {
+          display: inline-block;
+          padding: 0.25em 0.6em;
+          font-size: 75%;
+          font-weight: 700;
+          line-height: 1;
+          color: #fff;
+          text-align: center;
+          white-space: nowrap;
+          vertical-align: baseline;
+          border-radius: 0.25rem;
+        }
+        .bg-success { background-color: #10b981 !important; }
+        .bg-secondary { background-color: #6b7280 !important; }
+        
+        /* Mobile-specific styles */
+        @media (max-width: 768px) {
+            .mobile-hidden { display: none; }
+            .mobile-full-width { width: 100%; }
+            .mobile-text-sm { font-size: 0.875rem; }
+            .mobile-text-xs { font-size: 0.75rem; }
+            .mobile-p-3 { padding: 0.75rem; }
+            .mobile-mb-4 { margin-bottom: 1rem; }
+            .mobile-grid-1 { grid-template-columns: 1fr; }
+            .mobile-flex-col { flex-direction: column; }
+            .mobile-space-y-2 > * + * { margin-top: 0.5rem; }
+        }
+        
+        /* Tablet-specific styles */
+        @media (min-width: 769px) and (max-width: 1024px) {
+            .tablet-grid-2 { grid-template-columns: repeat(2, 1fr); }
+            .tablet-text-lg { font-size: 1.125rem; }
+        }
+        
+        /* Laptop-specific styles */
+        @media (min-width: 1025px) and (max-width: 1440px) {
+            .laptop-grid-3 { grid-template-columns: repeat(3, 1fr); }
+            .laptop-text-xl { font-size: 1.25rem; }
+        }
+        
+        /* Desktop-specific styles */
+        @media (min-width: 1441px) {
+            .desktop-grid-3 { grid-template-columns: repeat(3, 1fr); }
+            .desktop-text-2xl { font-size: 1.5rem; }
+        }
+        
+        /* Touch-friendly elements */
+        .touch-target {
+            min-height: 44px;
+            min-width: 44px;
+        }
+        
+        /* Smooth scrolling for mobile */
+        html {
+            scroll-behavior: smooth;
+        }
+        
+        /* Better table responsiveness */
+        .responsive-table {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        
+        /* Mobile navigation improvements */
+        .mobile-nav-toggle {
+            display: none;
+        }
+        
+        @media (max-width: 768px) {
+            .mobile-nav-toggle {
+                display: block;
+            }
+            
+            .nav-menu {
+                display: none;
+            }
+            
+            .nav-menu.active {
+                display: flex;
+                flex-direction: column;
+                position: absolute;
+                top: 100%;
+                left: 0;
+                right: 0;
+                background: rgba(102, 126, 234, 0.95);
+                backdrop-filter: blur(10px);
+                z-index: 50;
+            }
+        }
     </style>
 </head>
 <body class="bg-gray-100">
     <!-- Navigation -->
-    <nav class="gradient-bg text-white shadow-lg">
+    <nav class="gradient-bg text-white shadow-lg relative">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex justify-between h-16">
                 <div class="flex items-center">
                     <i class="fas fa-chart-line text-2xl mr-3"></i>
-                    <h1 class="text-xl font-bold">Trading Bot Dashboard</h1>
+                    <h1 class="text-xl font-bold mobile-text-lg">Trading Bot Dashboard</h1>
                 </div>
-                <div class="flex items-center space-x-4">
+                
+                <!-- Mobile menu button -->
+                <button class="mobile-nav-toggle touch-target md:hidden" id="mobile-menu-toggle">
+                    <i class="fas fa-bars text-xl"></i>
+                </button>
+                
+                <!-- Desktop navigation -->
+                <div class="nav-menu hidden md:flex items-center space-x-4" id="nav-menu">
                     <div class="flex items-center">
                         <span class="status-indicator status-online" id="connection-status"></span>
-                        <span id="connection-text">Connected</span>
+                        <span id="connection-text" class="mobile-text-sm">Connected</span>
                     </div>
-                    <button id="emergency-stop" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors">
-                        <i class="fas fa-stop-circle mr-2"></i>Emergency Stop
+                    <button id="emergency-stop" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors touch-target">
+                        <i class="fas fa-stop-circle mr-2"></i>
+                        <span class="mobile-hidden">Emergency Stop</span>
+                        <span class="md:hidden">Stop</span>
                     </button>
                 </div>
             </div>
@@ -52,127 +155,319 @@
     </nav>
 
     <!-- Main Content -->
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div class="w-full px-2 sm:px-4 py-4 sm:py-6 lg:py-8">
+        <!-- Add missing control buttons and status indicators for dashboard.js compatibility -->
+        <div class="flex space-x-2 mb-4">
+          <button id="start-btn" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg text-sm font-medium text-white">Start</button>
+          <button id="stop-btn" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded-lg text-sm font-medium text-white">Stop</button>
+          <button id="emergency-btn" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm font-medium text-white">Emergency</button>
+          <span id="status-indicator" class="badge bg-secondary ml-4">Status</span>
+        </div>
+        <div class="flex space-x-4 mb-4">
+          <div><span class="font-medium">Trading Status:</span> <span id="bot-trading-status" class="font-mono"></span></div>
+          <div><span class="font-medium">Cycle Count:</span> <span id="bot-cycle-count" class="font-mono"></span></div>
+          <div><span class="font-medium">Uptime:</span> <span id="bot-uptime" class="font-mono"></span></div>
+        </div>
+        <!-- Bot/System Status Section -->
+        <div id="bot-status-section" class="mb-8">
+            <div class="bg-white rounded-lg shadow-md p-6 flex flex-col md:flex-row md:items-center md:justify-between">
+                <div class="mb-4 md:mb-0">
+                    <h2 class="text-lg font-semibold text-gray-900">Bot & System Status</h2>
+                    <div id="bot-status-services" class="flex flex-wrap gap-4 mt-2"></div>
+                </div>
+                <div class="flex flex-col md:items-end gap-2">
+                    <div><span class="font-medium">Trading Status:</span> <span id="bot-trading-status" class="font-mono"></span></div>
+                    <div><span class="font-medium">Cycle Count:</span> <span id="bot-cycle-count" class="font-mono"></span></div>
+                    <div><span class="font-medium">Uptime:</span> <span id="bot-uptime" class="font-mono"></span></div>
+                </div>
+            </div>
+        </div>
+        <script>
+            async function fetchBotStatus() {
+                try {
+                    const resp = await fetch('/api/bot-status');
+                    if (!resp.ok) throw new Error('Failed to fetch bot status');
+                    const data = await resp.json();
+                    // Service health indicators
+                    const servicesDiv = document.getElementById('bot-status-services');
+                    servicesDiv.innerHTML = '';
+                    for (const [name, status] of Object.entries(data.services)) {
+                        let color = 'bg-gray-400';
+                        if (status === 'healthy') color = 'bg-green-500';
+                        else if (status.startsWith('unhealthy')) color = 'bg-yellow-500';
+                        else if (status.startsWith('unreachable')) color = 'bg-red-500';
+                        servicesDiv.innerHTML += `<span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium text-white ${color} mr-2 mb-2">${name}: ${status}</span>`;
+                    }
+                    // Trading status, cycle count, uptime
+                    const trading = data.trading_status || {};
+                    document.getElementById('bot-trading-status').textContent = trading.status || 'unknown';
+                    document.getElementById('bot-cycle-count').textContent = trading.cycle_count !== undefined ? trading.cycle_count : 'N/A';
+                    if (trading.uptime !== undefined) {
+                        // Format uptime (seconds to human readable)
+                        let seconds = trading.uptime;
+                        if (typeof seconds === 'string') seconds = parseInt(seconds);
+                        const d = Math.floor(seconds / (3600*24));
+                        const h = Math.floor((seconds % (3600*24)) / 3600);
+                        const m = Math.floor((seconds % 3600) / 60);
+                        const s = Math.floor(seconds % 60);
+                        let uptimeStr = '';
+                        if (d > 0) uptimeStr += `${d}d `;
+                        if (h > 0 || uptimeStr) uptimeStr += `${h}h `;
+                        if (m > 0 || uptimeStr) uptimeStr += `${m}m `;
+                        uptimeStr += `${s}s`;
+                        document.getElementById('bot-uptime').textContent = uptimeStr;
+                    } else {
+                        document.getElementById('bot-uptime').textContent = 'N/A';
+                    }
+                } catch (e) {
+                    document.getElementById('bot-status-services').innerHTML = '<span class="text-red-600">Error loading bot status</span>';
+                    document.getElementById('bot-trading-status').textContent = 'unknown';
+                    document.getElementById('bot-cycle-count').textContent = 'N/A';
+                    document.getElementById('bot-uptime').textContent = 'N/A';
+                }
+            }
+            // Fetch on load and every 30s
+            fetchBotStatus();
+            setInterval(fetchBotStatus, 30000);
+        </script>
+        <!-- End Bot/System Status Section -->
         <!-- Portfolio Overview -->
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 sm:gap-6 mb-6 sm:mb-8 w-full">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-blue-100 text-blue-600">
                         <i class="fas fa-wallet text-xl"></i>
                     </div>
                     <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600">Total Balance</p>
-                        <p class="text-2xl font-bold text-gray-900" id="total-balance">$0.00</p>
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Total Balance</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl cursor-help" id="total-balance" title="Loading...">$0.00</p>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-cyan-100 text-cyan-600">
+                        <i class="fas fa-coins text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Available Balance</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl cursor-help" id="available-balance" title="Loading...">$0.00</p>
                     </div>
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-green-100 text-green-600">
                         <i class="fas fa-chart-line text-xl"></i>
                     </div>
                     <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600">Total PnL</p>
-                        <p class="text-2xl font-bold text-gray-900" id="total-pnl">$0.00</p>
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Total PnL</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl cursor-help" id="total-pnl" title="Loading...">$0.00</p>
                     </div>
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-yellow-100 text-yellow-600">
                         <i class="fas fa-calendar-day text-xl"></i>
                     </div>
                     <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600">Daily PnL</p>
-                        <p class="text-2xl font-bold text-gray-900" id="daily-pnl">$0.00</p>
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Daily PnL</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="daily-pnl">$0.00</p>
                     </div>
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-purple-100 text-purple-600">
                         <i class="fas fa-exchange-alt text-xl"></i>
                     </div>
                     <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600">Open Trades</p>
-                        <p class="text-2xl font-bold text-gray-900" id="open-trades">0</p>
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Open Trades</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="open-trades">0</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-indigo-100 text-indigo-600">
+                        <i class="fas fa-chart-area text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Total Unrealized PnL</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="total-unrealized-pnl">$0.00</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-emerald-100 text-emerald-600">
+                        <i class="fas fa-trophy text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Win Rate</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="win-rate">0%</p>
                     </div>
                 </div>
             </div>
         </div>
-
-        <!-- Charts and Analytics -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
-            <!-- PnL Chart -->
-            <div class="bg-white rounded-lg shadow-md p-6">
-                <h3 class="text-lg font-semibold text-gray-900 mb-4">PnL Over Time</h3>
-                <canvas id="pnl-chart" width="400" height="200"></canvas>
-            </div>
-
-            <!-- Performance by Exchange -->
-            <div class="bg-white rounded-lg shadow-md p-6">
-                <h3 class="text-lg font-semibold text-gray-900 mb-4">Performance by Exchange</h3>
-                <canvas id="exchange-chart" width="400" height="200"></canvas>
-            </div>
+        <div class="mb-4">
+            <button id="toggle-exchange-breakdown" class="bg-gray-200 hover:bg-gray-300 px-4 py-2 rounded text-sm font-medium text-gray-700">
+                Show per-exchange breakdown
+            </button>
         </div>
-
-        <!-- Trades and Alerts -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Recent Trades -->
-            <div class="lg:col-span-2 bg-white rounded-lg shadow-md p-6">
-                <div class="flex justify-between items-center mb-4">
-                    <h3 class="text-lg font-semibold text-gray-900">Recent Trades</h3>
-                    <button id="refresh-trades" class="text-blue-600 hover:text-blue-800">
-                        <i class="fas fa-sync-alt"></i>
-                    </button>
-                </div>
-                <div class="overflow-x-auto">
+        <div id="exchange-breakdown-section" class="mb-8" style="display: none;">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-900 mb-4">Per-Exchange Balances</h3>
+                <div class="responsive-table">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pair</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Exchange</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Entry Price</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Current Price</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PnL</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Exchange</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total Balance</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Available Balance</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total PnL</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Timestamp</th>
                             </tr>
                         </thead>
-                        <tbody id="trades-table-body" class="bg-white divide-y divide-gray-200">
-                            <!-- Trades will be populated here -->
+                        <tbody id="exchange-breakdown-table-body" class="bg-white divide-y divide-gray-200">
+                            <!-- Per-exchange rows will be populated here -->
                         </tbody>
                     </table>
                 </div>
             </div>
+        </div>
 
-            <!-- Alerts -->
-            <div class="bg-white rounded-lg shadow-md p-6">
-                <div class="flex justify-between items-center mb-4">
-                    <h3 class="text-lg font-semibold text-gray-900">Alerts</h3>
-                    <span class="bg-red-100 text-red-800 text-xs font-medium px-2.5 py-0.5 rounded" id="alerts-count">0</span>
+
+
+        <!-- Recent Trades -->
+        <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
+            <div class="flex mobile-flex-col justify-between items-center mobile-space-y-2 mb-4">
+                <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm">Recent Trades</h3>
+                <div class="flex mobile-flex-col space-x-2 mobile-space-x-0 mobile-space-y-2">
+                    <input type="text" id="trade-search" placeholder="Search by Trade ID..." class="border border-gray-300 rounded px-3 py-1 text-sm mobile-full-width w-48">
+                    <select id="trades-filter" class="border border-gray-300 rounded px-3 py-1 text-sm mobile-full-width">
+                        <option value="all">All Trades</option>
+                        <option value="OPEN">Open Only</option>
+                        <option value="CLOSED">Closed Only</option>
+                        <option value="PENDING_EXIT">Pending Exit</option>
+                    </select>
+                    <button id="refresh-trades" class="text-blue-600 hover:text-blue-800 touch-target">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
                 </div>
-                <div id="alerts-list" class="space-y-3">
-                    <!-- Alerts will be populated here -->
-                </div>
+            </div>
+            <div class="flex space-x-2 mb-2">
+              <label><input type="checkbox" class="toggle-col" data-col="profit-trigger" checked> Profit Trigger</label>
+              <label><input type="checkbox" class="toggle-col" data-col="trailing-stop" checked> Trailing Stop</label>
+              <label><input type="checkbox" class="toggle-col" data-col="highest-price" checked> Highest Price</label>
+            </div>
+            <div class="responsive-table w-full">
+                <table class="min-w-full w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Trade ID</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Pair</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden">Exchange</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden">Entry Time</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Current Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Amount (units)</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Notional Value ($)</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Unrealized PnL</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Status</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden">Entry Reason</th>
+                            <th class="profit-trigger-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Profit Trigger</th>
+                            <th class="trailing-stop-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Trailing Stop</th>
+                            <th class="highest-price-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Highest Price</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trades-table-body" class="bg-white divide-y divide-gray-200">
+                        <!-- Trades will be populated here -->
+                    </tbody>
+                </table>
             </div>
         </div>
 
         <!-- Exchange Status -->
-        <div class="mt-8 bg-white rounded-lg shadow-md p-6">
-            <h3 class="text-lg font-semibold text-gray-900 mb-4">Exchange Status</h3>
+        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
+            <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm mb-4">Exchange Status</h3>
             <div id="exchange-status" class="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <!-- Exchange status will be populated here -->
             </div>
         </div>
 
         <!-- Strategy Performance -->
-        <div class="mt-8 bg-white rounded-lg shadow-md p-6">
-            <h3 class="text-lg font-semibold text-gray-900 mb-4">Strategy Performance</h3>
+        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
+            <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm mb-4">Strategy Performance</h3>
             <div id="strategy-performance" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <!-- Strategy performance will be populated here -->
+            </div>
+        </div>
+
+        <!-- Trade History -->
+        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
+            <div class="flex mobile-flex-col justify-between items-center mobile-space-y-2 mb-4">
+                <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm">Trade History</h3>
+                <div class="flex mobile-flex-col space-x-2 mobile-space-x-0 mobile-space-y-2">
+                    <button id="refresh-history" class="text-blue-600 hover:text-blue-800 touch-target">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+                    <select id="history-filter" class="border border-gray-300 rounded px-3 py-1 text-sm mobile-full-width">
+                        <option value="all">All Trades</option>
+                        <option value="profitable">Profitable Only</option>
+                        <option value="losing">Losing Only</option>
+                        <option value="today">Today</option>
+                        <option value="week">This Week</option>
+                        <option value="month">This Month</option>
+                    </select>
+                </div>
+            </div>
+            <div class="flex space-x-2 mb-2">
+              <label><input type="checkbox" class="toggle-col" data-col="profit-trigger" checked> Profit Trigger</label>
+              <label><input type="checkbox" class="toggle-col" data-col="trailing-stop" checked> Trailing Stop</label>
+              <label><input type="checkbox" class="toggle-col" data-col="highest-price" checked> Highest Price</label>
+            </div>
+            <div class="responsive-table w-full">
+                <table class="min-w-full w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Trade ID</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Pair</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exchange</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Time</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Amount</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Time</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Reason</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Reason</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Realized PnL</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">PnL %</th>
+                            <th class="profit-trigger-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Profit Trigger</th>
+                            <th class="trailing-stop-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Trailing Stop</th>
+                            <th class="highest-price-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Highest Price</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trade-history-table-body" class="bg-white divide-y divide-gray-200">
+                        <!-- Trade history will be populated here -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="mt-4 flex justify-between items-center">
+                <div class="text-sm text-gray-500">
+                    <span id="history-summary">Showing 0 trades</span>
+                </div>
+                <div class="flex space-x-2">
+                    <button id="prev-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">Previous</button>
+                    <span id="page-info" class="px-3 py-1 text-sm text-gray-600">Page 1</span>
+                    <button id="next-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">Next</button>
+                </div>
             </div>
         </div>
     </div>
@@ -240,12 +535,55 @@
         // Dashboard update function
         function updateDashboard(data) {
             if (data.portfolio) {
+                // Update main values
                 document.getElementById('total-balance').textContent = `$${data.portfolio.total_balance?.toFixed(2) || '0.00'}`;
+                document.getElementById('available-balance').textContent = `$${data.portfolio.available_balance?.toFixed(2) || '0.00'}`;
                 document.getElementById('total-pnl').textContent = `$${data.portfolio.total_pnl?.toFixed(2) || '0.00'}`;
                 document.getElementById('daily-pnl').textContent = `$${data.portfolio.daily_pnl?.toFixed(2) || '0.00'}`;
-                document.getElementById('open-trades').textContent = data.portfolio.open_trades_count || 0;
-                document.getElementById('alerts-count').textContent = data.alerts_count || 0;
+                document.getElementById('open-trades').textContent = data.portfolio.active_trades || 0;
+                document.getElementById('total-unrealized-pnl').textContent = `$${data.portfolio.total_unrealized_pnl?.toFixed(2) || '0.00'}`;
+                document.getElementById('win-rate').textContent = `${data.portfolio.win_rate?.toFixed(1) || '0.0'}%`;
+                
+                // Generate tooltips with per-exchange breakdown
+                if (data.portfolio.exchanges) {
+                    const totalBalanceTooltip = generateBalanceTooltip(data.portfolio.exchanges, 'balance');
+                    const availableBalanceTooltip = generateBalanceTooltip(data.portfolio.exchanges, 'available_balance');
+                    const pnlTooltip = generatePnLTooltip(data.portfolio.exchanges);
+                    
+                    document.getElementById('total-balance').setAttribute('title', totalBalanceTooltip);
+                    document.getElementById('available-balance').setAttribute('title', availableBalanceTooltip);
+                    document.getElementById('total-pnl').setAttribute('title', pnlTooltip);
+                }
+                
+
             }
+        }
+
+        // Generate tooltip content for balance breakdown
+        function generateBalanceTooltip(exchanges, balanceType) {
+            const title = balanceType === 'balance' ? 'Total Balance by Exchange:' : 'Available Balance by Exchange:';
+            let tooltip = title + '\n';
+            
+            Object.entries(exchanges).forEach(([exchangeName, data]) => {
+                const value = balanceType === 'balance' ? data.balance : (data.available_balance || data.available);
+                const exchangeDisplayName = exchangeName.charAt(0).toUpperCase() + exchangeName.slice(1);
+                tooltip += `${exchangeDisplayName}: $${value?.toFixed(2) || '0.00'}\n`;
+            });
+            
+            return tooltip.trim();
+        }
+
+        // Generate PnL tooltip content
+        function generatePnLTooltip(exchanges) {
+            let tooltip = 'Total PnL by Exchange:\n';
+            
+            Object.entries(exchanges).forEach(([exchangeName, data]) => {
+                const value = data.total_pnl || 0;
+                const exchangeDisplayName = exchangeName.charAt(0).toUpperCase() + exchangeName.slice(1);
+                tooltip += `${exchangeDisplayName}: $${value.toFixed(2)}\n`;
+            });
+            
+            return tooltip.trim();
         }
 
         // API functions
@@ -269,15 +607,7 @@
             }
         }
 
-        async function fetchAlerts() {
-            try {
-                const response = await fetch('/api/alerts');
-                const data = await response.json();
-                updateAlertsList(data.alerts);
-            } catch (error) {
-                console.error('Error fetching alerts:', error);
-            }
-        }
+
 
         async function fetchExchanges() {
             try {
@@ -291,69 +621,128 @@
 
         async function fetchStrategies() {
             try {
-                const response = await fetch('/api/strategies');
+                const resp = await fetch('/api/strategies');
+                if (!resp.ok) throw new Error('Failed to fetch strategies');
+                const strategies = await resp.json();
+                if (strategies && Array.isArray(strategies.enabled_strategies)) {
+                    updateStrategyPerformance(strategies);
+                } else {
+                    updateStrategyPerformance({ enabled_strategies: [] });
+                }
+            } catch (e) {
+                updateStrategyPerformance({ enabled_strategies: [] });
+                console.error('Error fetching strategies:', e);
+            }
+        }
+
+        // Trade History variables
+        let currentPage = 1;
+        let totalPages = 1;
+        let currentFilter = 'all';
+        const itemsPerPage = 20;
+
+        async function fetchTradeHistory(page = 1, filter = 'all') {
+            try {
+                const response = await fetch(`/api/trade-history?page=${page}&filter=${filter}&limit=${itemsPerPage}`);
                 const data = await response.json();
-                updateStrategyPerformance(data);
+                updateTradeHistoryTable(data.trades);
+                updatePagination(data.total, data.page, data.total_pages);
+                updateHistorySummary(data.total, data.trades.length);
             } catch (error) {
-                console.error('Error fetching strategies:', error);
+                console.error('Error fetching trade history:', error);
             }
         }
 
         // Update functions
+        // Variables for trades filtering
+        let allTrades = [];
+        let filteredTrades = [];
+        let currentTradesFilter = 'all';
+        let currentTradesSearch = '';
+
         function updateTradesTable(trades) {
+            allTrades = trades || [];
+            applyTradesFilter();
+        }
+
+        function applyTradesFilter() {
             const tbody = document.getElementById('trades-table-body');
             tbody.innerHTML = '';
             
-            trades.forEach(trade => {
+            // Apply status filter
+            let filtered = allTrades;
+            if (currentTradesFilter !== 'all') {
+                filtered = allTrades.filter(trade => trade.status === currentTradesFilter);
+            }
+            
+            // Apply search filter
+            if (currentTradesSearch) {
+                filtered = filtered.filter(trade => 
+                    trade.trade_id && trade.trade_id.toLowerCase().includes(currentTradesSearch.toLowerCase())
+                );
+            }
+            
+            filteredTrades = filtered;
+            
+            if (filtered.length === 0) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td colspan="10" class="px-4 py-8 text-center text-gray-500">
+                        No trades found
+                    </td>
+                `;
+                tbody.appendChild(row);
+                return;
+            }
+            
+            filtered.forEach(trade => {
                 const row = document.createElement('tr');
                 const pnl = trade.unrealized_pnl || 0;
                 const pnlClass = pnl >= 0 ? 'text-green-600' : 'text-red-600';
+                const entryTime = trade.entry_time ? new Date(trade.entry_time).toLocaleString() : 'N/A';
+                const entryReason = trade.entry_reason || 'N/A';
+                const truncatedReason = entryReason.length > 30 ? entryReason.substring(0, 30) + '...' : entryReason;
+                
+                // Shorten trade ID for display
+                const shortTradeId = trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A';
+                
+                // Apply row styling for CLOSED trades (faded out)
+                if (trade.status === 'CLOSED') {
+                    row.className = 'opacity-60 bg-gray-50';
+                }
+                
+                // Determine status badge class
+                let statusClass = 'bg-gray-100 text-gray-800';
+                if (trade.status === 'OPEN') {
+                    statusClass = 'bg-green-100 text-green-800';
+                } else if (trade.status === 'CLOSED') {
+                    statusClass = 'bg-red-100 text-red-800';
+                } else if (trade.status === 'PENDING_EXIT') {
+                    statusClass = 'bg-yellow-100 text-yellow-800';
+                }
                 
                 row.innerHTML = `
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${trade.pair}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${trade.exchange}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${pnlClass}">$${pnl.toFixed(2)}</td>
-                    <td class="px-6 py-4 whitespace-nowrap">
-                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${trade.status === 'OPEN' ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'}">
-                            ${trade.status}
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-mono text-gray-900" title="${trade.trade_id || 'N/A'}">${shortTradeId}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${trade.pair || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.exchange || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${entryTime}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.position_size?.toFixed(6) || '0.000000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm ${pnlClass}">$${pnl.toFixed(2)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${statusClass}">
+                            ${trade.status || 'N/A'}
                         </span>
                     </td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" title="${entryReason}">${truncatedReason}</td>
                 `;
                 tbody.appendChild(row);
             });
         }
 
-        function updateAlertsList(alerts) {
-            const alertsList = document.getElementById('alerts-list');
-            alertsList.innerHTML = '';
-            
-            alerts.forEach(alert => {
-                const alertDiv = document.createElement('div');
-                const levelClass = alert.level === 'ERROR' ? 'border-red-200 bg-red-50' : 
-                                 alert.level === 'WARNING' ? 'border-yellow-200 bg-yellow-50' : 
-                                 'border-blue-200 bg-blue-50';
-                
-                alertDiv.className = `border-l-4 ${levelClass} p-4`;
-                alertDiv.innerHTML = `
-                    <div class="flex">
-                        <div class="flex-shrink-0">
-                            <i class="fas fa-exclamation-circle ${alert.level === 'ERROR' ? 'text-red-400' : alert.level === 'WARNING' ? 'text-yellow-400' : 'text-blue-400'}"></i>
-                        </div>
-                        <div class="ml-3">
-                            <p class="text-sm font-medium ${alert.level === 'ERROR' ? 'text-red-800' : alert.level === 'WARNING' ? 'text-yellow-800' : 'text-blue-800'}">
-                                ${alert.category}
-                            </p>
-                            <p class="text-sm ${alert.level === 'ERROR' ? 'text-red-700' : alert.level === 'WARNING' ? 'text-yellow-700' : 'text-blue-700'}">
-                                ${alert.message}
-                            </p>
-                        </div>
-                    </div>
-                `;
-                alertsList.appendChild(alertDiv);
-            });
-        }
+
 
         function updateExchangeStatus(exchanges) {
             const exchangeStatus = document.getElementById('exchange-status');
@@ -381,20 +770,157 @@
         function updateStrategyPerformance(strategies) {
             const strategyPerformance = document.getElementById('strategy-performance');
             strategyPerformance.innerHTML = '';
+            if (strategies && Array.isArray(strategies.enabled_strategies)) {
+                strategies.enabled_strategies.forEach(strategy => {
+                    const strategyDiv = document.createElement('div');
+                    strategyDiv.className = 'p-4 border rounded-lg';
+                    strategyDiv.innerHTML = `
+                        <h4 class="font-medium text-gray-900">${strategy}</h4>
+                        <p class="text-sm text-gray-500">Enabled</p>
+                    `;
+                    strategyPerformance.appendChild(strategyDiv);
+                });
+            } else {
+                strategyPerformance.innerHTML = '<span class="text-red-600">No enabled strategies found</span>';
+            }
+        }
+
+        function updateTradeHistoryTable(trades) {
+            const tbody = document.getElementById('trade-history-table-body');
+            tbody.innerHTML = '';
             
-            strategies.enabled_strategies.forEach(strategy => {
-                const strategyDiv = document.createElement('div');
-                strategyDiv.className = 'p-4 border rounded-lg';
-                strategyDiv.innerHTML = `
-                    <h4 class="font-medium text-gray-900">${strategy}</h4>
-                    <p class="text-sm text-gray-500">Enabled</p>
+            if (!trades || trades.length === 0) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td colspan="12" class="px-4 py-8 text-center text-gray-500">
+                        No closed trades found
+                    </td>
                 `;
-                strategyPerformance.appendChild(strategyDiv);
+                tbody.appendChild(row);
+                return;
+            }
+            
+            trades.forEach(trade => {
+                const row = document.createElement('tr');
+                const realizedPnl = trade.realized_pnl || 0;
+                const realizedPnlPct = trade.realized_pnl_pct || 0;
+                const pnlClass = realizedPnl >= 0 ? 'text-green-600' : 'text-red-600';
+                const pnlPctClass = realizedPnlPct >= 0 ? 'text-green-600' : 'text-red-600';
+                
+                const entryTime = trade.entry_time ? new Date(trade.entry_time).toLocaleString() : 'N/A';
+                const exitTime = trade.exit_time ? new Date(trade.exit_time).toLocaleString() : 'N/A';
+                const entryReason = trade.entry_reason || 'N/A';
+                const exitReason = trade.exit_reason || 'N/A';
+                
+                // Truncate long reasons for display
+                const truncatedEntryReason = entryReason.length > 30 ? entryReason.substring(0, 30) + '...' : entryReason;
+                const truncatedExitReason = exitReason.length > 30 ? exitReason.substring(0, 30) + '...' : exitReason;
+                
+                // Shorten trade ID for display
+                const shortTradeId = trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A';
+                
+                row.innerHTML = `
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-mono text-gray-900" title="${trade.trade_id || 'N/A'}">${shortTradeId}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${trade.pair || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.exchange || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${entryTime}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.position_size?.toFixed(2) || '0.00'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${exitTime}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.exit_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" title="${entryReason}">${truncatedEntryReason}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" title="${exitReason}">${truncatedExitReason}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-medium ${pnlClass}">$${realizedPnl.toFixed(2)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-medium ${pnlPctClass}">${realizedPnlPct.toFixed(2)}%</td>
+                `;
+                tbody.appendChild(row);
             });
         }
 
+        function updatePagination(total, currentPage, totalPages) {
+            const prevButton = document.getElementById('prev-page');
+            const nextButton = document.getElementById('next-page');
+            const pageInfo = document.getElementById('page-info');
+            
+            prevButton.disabled = currentPage <= 1;
+            nextButton.disabled = currentPage >= totalPages;
+            
+            pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
+        }
+
+        function updateHistorySummary(total, currentCount) {
+            const summary = document.getElementById('history-summary');
+            summary.textContent = `Showing ${currentCount} of ${total} trades`;
+        }
+
+        function updateExchangeBreakdownTable(exchangeData) {
+            const tbody = document.getElementById('exchange-breakdown-table-body');
+            tbody.innerHTML = '';
+
+            if (!exchangeData || exchangeData.length === 0) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td colspan="5" class="px-4 py-8 text-center text-gray-500">
+                        No per-exchange balance data available
+                    </td>
+                `;
+                tbody.appendChild(row);
+                return;
+            }
+
+            exchangeData.forEach(exchange => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${exchange.exchange || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${exchange.total_balance?.toFixed(2) || '0.00'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${exchange.available_balance?.toFixed(2) || '0.00'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${exchange.total_pnl?.toFixed(2) || '0.00'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${exchange.timestamp ? new Date(exchange.timestamp).toLocaleString() : 'N/A'}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+
+
         // Event listeners
         document.getElementById('refresh-trades').addEventListener('click', fetchTrades);
+        
+        // Trades filtering and search event listeners
+        document.getElementById('trades-filter').addEventListener('change', (e) => {
+            currentTradesFilter = e.target.value;
+            applyTradesFilter();
+        });
+        
+        document.getElementById('trade-search').addEventListener('input', (e) => {
+            currentTradesSearch = e.target.value;
+            applyTradesFilter();
+        });
+        
+        // Trade History event listeners
+        document.getElementById('refresh-history').addEventListener('click', () => {
+            fetchTradeHistory(currentPage, currentFilter);
+        });
+        
+        document.getElementById('history-filter').addEventListener('change', (e) => {
+            currentFilter = e.target.value;
+            currentPage = 1;
+            fetchTradeHistory(currentPage, currentFilter);
+        });
+        
+        document.getElementById('prev-page').addEventListener('click', () => {
+            if (currentPage > 1) {
+                currentPage--;
+                fetchTradeHistory(currentPage, currentFilter);
+            }
+        });
+        
+        document.getElementById('next-page').addEventListener('click', () => {
+            if (currentPage < totalPages) {
+                currentPage++;
+                fetchTradeHistory(currentPage, currentFilter);
+            }
+        });
         
         document.getElementById('emergency-stop').addEventListener('click', function() {
             document.getElementById('emergency-modal').classList.remove('hidden');
@@ -417,12 +943,105 @@
             }
         });
 
+        // Toggle exchange breakdown
+        document.getElementById('toggle-exchange-breakdown').addEventListener('click', function() {
+            const breakdownSection = document.getElementById('exchange-breakdown-section');
+            const button = document.getElementById('toggle-exchange-breakdown');
+            breakdownSection.style.display = breakdownSection.style.display === 'none' ? 'block' : 'none';
+            button.textContent = breakdownSection.style.display === 'none' ? 'Show per-exchange breakdown' : 'Hide per-exchange breakdown';
+        });
+
+        // User agent detection and responsive behavior
+        function detectDeviceType() {
+            const userAgent = navigator.userAgent.toLowerCase();
+            const isMobile = /mobile|android|iphone|ipad|phone|blackberry|opera mini|iemobile/.test(userAgent);
+            const isTablet = /tablet|ipad/.test(userAgent) && !isMobile;
+            const isLaptop = /windows|macintosh|linux/.test(userAgent) && !isMobile && !isTablet;
+            
+            // Add device-specific classes to body
+            document.body.classList.add(isMobile ? 'mobile-device' : isTablet ? 'tablet-device' : 'desktop-device');
+            
+            // Adjust chart options based on device
+            if (isMobile) {
+                // Mobile-specific chart configurations
+                if (pnlChart) {
+                    pnlChart.options.plugins.legend.display = false;
+                    pnlChart.options.scales.x.ticks.font.size = 10;
+                    pnlChart.options.scales.y.ticks.font.size = 10;
+                    pnlChart.update();
+                }
+                if (exchangeChart) {
+                    exchangeChart.options.plugins.legend.display = false;
+                    exchangeChart.update();
+                }
+            }
+            
+            console.log(`Device detected: ${isMobile ? 'Mobile' : isTablet ? 'Tablet' : 'Desktop'}`);
+            return { isMobile, isTablet, isLaptop };
+        }
+        
+        // Mobile navigation toggle
+        function initializeMobileNavigation() {
+            const mobileMenuToggle = document.getElementById('mobile-menu-toggle');
+            const navMenu = document.getElementById('nav-menu');
+            
+            if (mobileMenuToggle && navMenu) {
+                mobileMenuToggle.addEventListener('click', function() {
+                    navMenu.classList.toggle('active');
+                });
+                
+                // Close mobile menu when clicking outside
+                document.addEventListener('click', function(event) {
+                    if (!navMenu.contains(event.target) && !mobileMenuToggle.contains(event.target)) {
+                        navMenu.classList.remove('active');
+                    }
+                });
+            }
+        }
+        
+        // Responsive table handling
+        function initializeResponsiveTables() {
+            const tables = document.querySelectorAll('.responsive-table');
+            tables.forEach(table => {
+                // Add horizontal scroll indicator for mobile
+                if (window.innerWidth <= 768) {
+                    const scrollIndicator = document.createElement('div');
+                    scrollIndicator.className = 'text-xs text-gray-500 text-center py-2 mobile-only';
+                    scrollIndicator.textContent = '← Scroll horizontally to see more data →';
+                    table.parentNode.insertBefore(scrollIndicator, table);
+                }
+            });
+        }
+        
+        // Touch-friendly interactions
+        function initializeTouchInteractions() {
+            // Add touch feedback to buttons
+            const touchTargets = document.querySelectorAll('.touch-target');
+            touchTargets.forEach(target => {
+                target.addEventListener('touchstart', function() {
+                    this.style.opacity = '0.7';
+                });
+                target.addEventListener('touchend', function() {
+                    this.style.opacity = '1';
+                });
+            });
+        }
+        
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
+            // Detect device and apply responsive behavior
+            const deviceInfo = detectDeviceType();
+            
+            // Initialize mobile-specific features
+            initializeMobileNavigation();
+            initializeResponsiveTables();
+            initializeTouchInteractions();
+            
+            // Initialize data
             connectWebSocket();
             fetchPortfolio();
             fetchTrades();
-            fetchAlerts();
+            fetchTradeHistory();
             fetchExchanges();
             fetchStrategies();
             
@@ -430,9 +1049,16 @@
             setInterval(() => {
                 fetchPortfolio();
                 fetchTrades();
-                fetchAlerts();
             }, 30000);
+            
+            // Handle window resize for responsive behavior
+            window.addEventListener('resize', function() {
+                const newDeviceInfo = detectDeviceType();
+                initializeResponsiveTables();
+            });
         });
     </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js?v=20240723"></script>
+    <script src="/static/js/dashboard.js?v=20240723"></script>
 </body>
 </html> 

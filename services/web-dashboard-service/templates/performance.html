@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance Monitoring - Trading Bot</title>
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        .performance-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .metric-card {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: transform 0.2s;
+        }
+        
+        .metric-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        }
+        
+        .metric-title {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        
+        .metric-value {
+            font-size: 28px;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        
+        .metric-subtitle {
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .success-rate { color: #28a745; }
+        .warning-rate { color: #ffc107; }
+        .danger-rate { color: #dc3545; }
+        
+        .alert-card {
+            background: #fff3cd;
+            border: 1px solid #ffeeba;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        
+        .alert-card.danger {
+            background: #f8d7da;
+            border-color: #f5c6cb;
+            border-left-color: #dc3545;
+        }
+        
+        .exchange-breakdown {
+            margin-top: 20px;
+        }
+        
+        .exchange-card {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        
+        .exchange-header {
+            display: flex;
+            justify-content: between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .exchange-name {
+            font-weight: bold;
+            font-size: 16px;
+            text-transform: uppercase;
+        }
+        
+        .exchange-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 15px;
+            margin-top: 10px;
+        }
+        
+        .stat-item {
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 20px;
+            font-weight: bold;
+            display: block;
+        }
+        
+        .stat-label {
+            font-size: 11px;
+            color: #666;
+            text-transform: uppercase;
+        }
+        
+        .sync-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 20px 0;
+            padding: 15px;
+            background: #e8f5e8;
+            border-radius: 6px;
+            border-left: 4px solid #28a745;
+        }
+        
+        .sync-status.error {
+            background: #f8d7da;
+            border-left-color: #dc3545;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #28a745;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-indicator.error {
+            background: #dc3545;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .refresh-button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 10px 0;
+            transition: background 0.2s;
+        }
+        
+        .refresh-button:hover {
+            background: #0056b3;
+        }
+        
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">Trading Bot - Performance Monitor</div>
+        <div class="nav-links">
+            <a href="/dashboard">Dashboard</a>
+            <a href="/orders">Orders</a>
+            <a href="/performance" class="active">Performance</a>
+            <a href="/profitability">Profitability</a>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="header">
+            <h1><i class="fas fa-chart-line"></i> Performance Monitoring</h1>
+            <button class="refresh-button" onclick="refreshMetrics()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+
+        <!-- Sync Service Status -->
+        <div id="sync-status" class="sync-status">
+            <div class="status-indicator"></div>
+            <div>
+                <strong>Order Sync Service:</strong>
+                <span id="sync-status-text">Loading...</span>
+            </div>
+        </div>
+
+        <!-- Alerts Section -->
+        <div id="alerts-container"></div>
+
+        <!-- Performance Overview -->
+        <div class="performance-grid">
+            <div class="metric-card">
+                <div class="metric-title">Overall Success Rate</div>
+                <div class="metric-value" id="overall-success-rate">--%</div>
+                <div class="metric-subtitle">All order types</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Limit Order Success</div>
+                <div class="metric-value" id="limit-success-rate">--%</div>
+                <div class="metric-subtitle" id="limit-orders-count">-- orders</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Recent 24h Performance</div>
+                <div class="metric-value" id="recent-success-rate">--%</div>
+                <div class="metric-subtitle" id="recent-orders-count">-- orders</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Active Pending Orders</div>
+                <div class="metric-value" id="pending-orders">--</div>
+                <div class="metric-subtitle">Currently pending</div>
+            </div>
+        </div>
+
+        <!-- Exchange Breakdown -->
+        <div class="exchange-breakdown">
+            <h2>Exchange Performance Breakdown</h2>
+            <div id="exchange-breakdown-container">
+                <!-- Exchange cards will be dynamically populated -->
+            </div>
+        </div>
+
+        <!-- Detailed Metrics -->
+        <div class="performance-grid" style="margin-top: 30px;">
+            <div class="metric-card">
+                <div class="metric-title">Total Orders</div>
+                <div class="metric-value" id="total-orders">--</div>
+                <div class="metric-subtitle">All time</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Orders Filled</div>
+                <div class="metric-value" id="filled-orders">--</div>
+                <div class="metric-subtitle">Successfully completed</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Orders Cancelled</div>
+                <div class="metric-value" id="cancelled-orders">--</div>
+                <div class="metric-subtitle">Timed out or manually cancelled</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Orders Failed</div>
+                <div class="metric-value" id="failed-orders">--</div>
+                <div class="metric-subtitle">System errors</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let isLoading = false;
+        
+        function formatSuccessRate(rate) {
+            if (rate >= 20) return 'success-rate';
+            if (rate >= 10) return 'warning-rate';
+            return 'danger-rate';
+        }
+        
+        async function refreshMetrics() {
+            if (isLoading) return;
+            
+            isLoading = true;
+            document.body.classList.add('loading');
+            
+            try {
+                // Fetch performance metrics from order sync service
+                const response = await fetch('/api/v1/performance/metrics');
+                const data = await response.json();
+                
+                updateMetrics(data);
+                updateAlerts(data.alerts || []);
+                updateExchangeBreakdown(data.exchange_breakdown || {});
+                updateSyncStatus(data.sync_service_status || {});
+                
+            } catch (error) {
+                console.error('Error fetching metrics:', error);
+                updateSyncStatus({}, true);
+            } finally {
+                isLoading = false;
+                document.body.classList.remove('loading');
+            }
+        }
+        
+        function updateMetrics(data) {
+            // Overall metrics
+            const limitOrders = data.limit_orders || {};
+            const totalOrders = data.total_orders || 0;
+            const recentOrders = data.recent_24h || {};
+            
+            document.getElementById('overall-success-rate').textContent = 
+                totalOrders > 0 ? ((limitOrders.filled || 0) / totalOrders * 100).toFixed(1) + '%' : '0.0%';
+            
+            document.getElementById('limit-success-rate').textContent = (limitOrders.success_rate || 0).toFixed(1) + '%';
+            document.getElementById('limit-success-rate').className = 'metric-value ' + formatSuccessRate(limitOrders.success_rate || 0);
+            document.getElementById('limit-orders-count').textContent = `${limitOrders.total || 0} orders`;
+            
+            document.getElementById('recent-success-rate').textContent = (recentOrders.success_rate || 0).toFixed(1) + '%';
+            document.getElementById('recent-success-rate').className = 'metric-value ' + formatSuccessRate(recentOrders.success_rate || 0);
+            document.getElementById('recent-orders-count').textContent = `${recentOrders.total || 0} orders`;
+            
+            document.getElementById('pending-orders').textContent = limitOrders.pending || 0;
+            
+            // Detailed metrics
+            document.getElementById('total-orders').textContent = totalOrders;
+            document.getElementById('filled-orders').textContent = limitOrders.filled || 0;
+            document.getElementById('cancelled-orders').textContent = (limitOrders.cancelled || 0) + (limitOrders.expired || 0);
+            document.getElementById('failed-orders').textContent = limitOrders.failed || 0;
+        }
+        
+        function updateAlerts(alerts) {
+            const container = document.getElementById('alerts-container');
+            container.innerHTML = '';
+            
+            alerts.forEach(alert => {
+                const alertDiv = document.createElement('div');
+                alertDiv.className = `alert-card ${alert.severity === 'error' ? 'danger' : ''}`;
+                alertDiv.innerHTML = `
+                    <strong><i class="fas fa-exclamation-triangle"></i> ${alert.type.replace('_', ' ').toUpperCase()}:</strong>
+                    ${alert.message}
+                `;
+                container.appendChild(alertDiv);
+            });
+        }
+        
+        function updateExchangeBreakdown(exchanges) {
+            const container = document.getElementById('exchange-breakdown-container');
+            container.innerHTML = '';
+            
+            Object.entries(exchanges).forEach(([exchange, data]) => {
+                if (data.total === 0) return; // Skip exchanges with no orders
+                
+                const exchangeDiv = document.createElement('div');
+                exchangeDiv.className = 'exchange-card';
+                exchangeDiv.innerHTML = `
+                    <div class="exchange-header">
+                        <span class="exchange-name">${exchange}</span>
+                        <span class="${formatSuccessRate(data.success_rate)}">${data.success_rate.toFixed(1)}%</span>
+                    </div>
+                    <div class="exchange-stats">
+                        <div class="stat-item">
+                            <span class="stat-value">${data.total}</span>
+                            <span class="stat-label">Total</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value">${data.filled}</span>
+                            <span class="stat-label">Filled</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value">${data.pending}</span>
+                            <span class="stat-label">Pending</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value">${data.cancelled + data.expired}</span>
+                            <span class="stat-label">Cancelled</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value">${data.failed}</span>
+                            <span class="stat-label">Failed</span>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(exchangeDiv);
+            });
+        }
+        
+        function updateSyncStatus(status, error = false) {
+            const statusDiv = document.getElementById('sync-status');
+            const statusText = document.getElementById('sync-status-text');
+            const indicator = statusDiv.querySelector('.status-indicator');
+            
+            if (error) {
+                statusDiv.className = 'sync-status error';
+                indicator.className = 'status-indicator error';
+                statusText.textContent = 'Connection Error - Unable to fetch metrics';
+                return;
+            }
+            
+            if (status.is_running) {
+                statusDiv.className = 'sync-status';
+                indicator.className = 'status-indicator';
+                statusText.innerHTML = `
+                    Active - Sync interval: ${status.sync_interval || 30}s, 
+                    Timeout threshold: ${status.timeout_threshold || 300}s
+                `;
+            } else {
+                statusDiv.className = 'sync-status error';
+                indicator.className = 'status-indicator error';
+                statusText.textContent = 'Stopped - Order synchronization not active';
+            }
+        }
+        
+        // Auto-refresh every 30 seconds
+        setInterval(refreshMetrics, 30000);
+        
+        // Initial load
+        refreshMetrics();
+    </script>
+</body>
+</html>

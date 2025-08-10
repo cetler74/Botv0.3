@@ -1,0 +1,151 @@
+groups:
+  - name: trading-bot-alerts
+    rules:
+      # Service Health Alerts
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Service {{ $labels.job }} has been down for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on {{ $labels.job }}"
+          description: "Service {{ $labels.job }} has error rate of {{ $value }} errors per second."
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency on {{ $labels.job }}"
+          description: "95th percentile latency is {{ $value }}s on {{ $labels.job }}."
+
+      # Trading Specific Alerts
+      - alert: NoTradesExecuted
+        expr: increase(orchestrator_trades_total[1h]) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No trades executed in the last hour"
+          description: "The trading bot has not executed any trades in the last hour."
+
+      - alert: LargeLoss
+        expr: increase(orchestrator_trades_pnl_sum[1h]) < -1000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Large loss detected"
+          description: "The trading bot has lost more than $1000 in the last hour: {{ $value }}"
+
+      - alert: ExchangeAPIErrors
+        expr: rate(exchange_api_errors_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High exchange API error rate"
+          description: "Exchange {{ $labels.exchange }} has error rate of {{ $value }} errors per second."
+
+      - alert: DatabaseQueryErrors
+        expr: rate(database_queries_total{status="error"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High database error rate"
+          description: "Database service has error rate of {{ $value }} errors per second."
+
+      - alert: StrategyAnalysisFailures
+        expr: rate(strategy_analyses_total{result="error"}[5m]) > 0.2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High strategy analysis failure rate"
+          description: "Strategy {{ $labels.strategy }} has failure rate of {{ $value }} per second."
+
+      # Balance and Risk Management Alerts
+      - alert: LowBalance
+        expr: orchestrator_balance_total < 100
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading balance is critically low"
+          description: "Current balance is {{ $value }}, which is below the minimum threshold."
+
+      - alert: BalanceDecreasing
+        expr: (orchestrator_balance_total - orchestrator_balance_total offset 1h) / orchestrator_balance_total offset 1h * 100 < -5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Balance decreasing rapidly"
+          description: "Balance has decreased by more than 5% in the last hour."
+
+      # System Resource Alerts
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is above 80%: {{ $value }}%"
+
+      - alert: HighCPUUsage
+        expr: 100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is above 80%: {{ $value }}%"
+
+      - alert: DiskSpaceLow
+        expr: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100 > 85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low"
+          description: "Disk usage is above 85%: {{ $value }}%"
+
+      # Trading Strategy Alerts
+      - alert: StrategyNotAnalyzing
+        expr: increase(strategy_analyses_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Strategy not performing analysis"
+          description: "Strategy {{ $labels.strategy }} has not performed any analysis in the last 10 minutes."
+
+      - alert: NoActiveStrategies
+        expr: strategy_active_strategies == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No active strategies"
+          description: "There are currently no active trading strategies running."
+
+      - alert: AllStrategiesGeneratingSameSignal
+        expr: count(count by (signal_type) (increase(strategy_signals_total[5m]))) == 1 and increase(strategy_signals_total[5m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "All strategies generating same signal"
+          description: "All strategies are generating the same type of signal, which may indicate a problem with diversification."

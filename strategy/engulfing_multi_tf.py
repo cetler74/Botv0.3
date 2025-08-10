@@ -43,14 +43,13 @@ import pandas as pd
 import numpy as np
 import traceback
 from typing import Dict, Any, Optional, Tuple
-from analysis.technical_analysis import TechnicalAnalysis as TechnicalIndicators
-import talib
+import pandas_ta as ta
 from datetime import datetime, timezone, timedelta
 import os
-from strategy.condition_logger import ConditionLogger
 from strategy.base_strategy import BaseStrategy
 from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, manage_trailing_stop, restore_profit_protection_state
 import asyncio
+from strategy.condition_logger import ConditionLogger
 
 class EngulfingMultiTimeframeStrategy(BaseStrategy):
     STRATEGY_NAME = "Engulfing Multi-Timeframe"
@@ -72,13 +71,10 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         if hasattr(exchange_handler, 'db_handler') and database is None:
             database = exchange_handler.db_handler
         
-        # Ensure we have required parameters
+        # Ensure we have required parameters - make exchange and database optional for strategy service compatibility
         if config is None:
             raise ValueError("Config must be provided to EngulfingMultiTimeframeStrategy")
-        if exchange is None:
-            raise ValueError("Exchange must be provided to EngulfingMultiTimeframeStrategy")
-        if database is None:
-            raise ValueError("Database must be provided to EngulfingMultiTimeframeStrategy")
+        # Note: exchange and database can be None during initialization and will be set per analysis
         
         # Call the BaseStrategy constructor
         super().__init__(
@@ -98,22 +94,32 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         self.condition_logger = ConditionLogger()
 
         # --- Timeframes ---
-        self.target_timeframes = self.config.parameters['target_timeframes']
+        self.target_timeframes = self.config['parameters']['target_timeframes']
         if not isinstance(self.target_timeframes, list) or not self.target_timeframes:
             raise ValueError("target_timeframes must be a non-empty list")
         self.logger.info(f"[{self.STRATEGY_NAME}] Using timeframes: {self.target_timeframes}")
 
-        # --- Configurable Parameters ---
-        self.sma_period = self.config.parameters['sma_period']
-        self.adx_period = self.config.parameters['adx_period']
-        self.adx_entry_threshold = self.config.parameters['adx_entry_threshold']
-        self.volume_lookback = self.config.parameters['volume_avg_period']
+        # --- Configurable Parameters with Safe Defaults ---
+        params = self.config.get('parameters', {})
         
-        # Renamed from min_engulfing_size to min_engulfing_size_multiplier for clarity
-        self.min_engulfing_size_multiplier = self.config.parameters['min_engulfing_size_multiplier']
+        # Technical Indicators
+        self.sma_period = params.get('sma_period', 50)
+        self.adx_period = params.get('adx_period', 14)
+        self.adx_entry_threshold = params.get('adx_entry_threshold', 25)
+        self.atr_period = params.get('atr_period', 14)
+        
+        # Volume Analysis
+        self.volume_lookback = params.get('volume_avg_period', 10)
+        self.use_volume_confirmation = params.get('use_volume_confirmation', True)
+        self.require_adx_and_volume_confirmation = params.get('require_adx_and_volume_confirmation', True)
+        self.strict_volume_adx = params.get('strict_volume_adx', False)
+        
+        # Engulfing Pattern Settings
+        self.min_engulfing_size_multiplier = params.get('min_engulfing_size_multiplier', 0.6)
+        self.min_bearish_engulfing = params.get('min_bearish_engulfing', 1.2)
         
         # Ensure confirmation_timeframes is always an integer
-        confirmation_timeframes_config = self.config.parameters['confirmation_timeframes']
+        confirmation_timeframes_config = params.get('confirmation_timeframes', 2)
         if isinstance(confirmation_timeframes_config, list):
             self.confirmation_timeframes = len(confirmation_timeframes_config)
         elif isinstance(confirmation_timeframes_config, str) and confirmation_timeframes_config.isdigit():
@@ -123,38 +129,33 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         
         self.logger.info(f"[{self.STRATEGY_NAME}] Using confirmation_timeframes: {self.confirmation_timeframes} (type: {type(self.confirmation_timeframes).__name__})")
         
-        # Configuration for ADX/Volume confirmation logic
-        self.use_volume_confirmation = self.config.parameters['use_volume_confirmation']
-        self.require_adx_and_volume_confirmation = self.config.parameters['require_adx_and_volume_confirmation']
-        self.strict_volume_adx = self.config.parameters['strict_volume_adx']
-        
         # Timeframe weights for confidence calculation
-        self.timeframe_weights = self.config.parameters['timeframe_weights']
-        # Default weights if not specified - higher timeframes have more weight
-        if not self.timeframe_weights:
-            self.timeframe_weights = {
-                '1d': 4.0,
-                '4h': 2.0,
-                '1h': 1.0,
-                '15m': 0.5,
-                '5m': 0.25
-            }
+        self.timeframe_weights = params.get('timeframe_weights', {
+            '4h': 0.4,
+            '1h': 0.3,
+            '15m': 0.2,
+            '5m': 0.1
+        })
         
-        # Cooldown and confidence settings
-        self.cooldown_minutes = self.config.parameters['cooldown_minutes']
-        self.min_confidence = self.config.parameters['min_confidence']
+        # Trade Management
+        self.cooldown_minutes = params.get('cooldown_minutes', 60)
+        self.min_confidence = params.get('min_confidence', 0.6)
+        self.max_trade_duration_hours = params.get('max_trade_duration_hours', 24)
         
-        # ATR settings for dynamic SL/TP
-        self.atr_period = self.config.parameters['atr_period']
-        self.atr_multiplier_tp = self.config.parameters['atr_multiplier_tp']
-        self.atr_multiplier_sl = self.config.parameters['atr_multiplier_sl']
-        self.use_atr_for_exits = self.config.parameters['use_atr_for_exits']
+        # Risk Management - ATR settings
+        self.atr_multiplier_tp = params.get('atr_multiplier_tp', 2.0)
+        self.atr_multiplier_sl = params.get('atr_multiplier_sl', 1.5)
+        self.use_atr_for_exits = params.get('use_atr_for_exits', True)
+        self.use_atr_levels = params.get('use_atr_levels', True)
         
-        # Exit rule settings
-        self.take_profit_pct = self.config.parameters['take_profit_pct']
-        self.stop_loss_pct = self.config.parameters['stop_loss_pct']
-        self.max_trade_duration_hours = self.config.parameters['max_trade_duration_hours']
-        self.min_bearish_engulfing = self.config.parameters['min_bearish_engulfing']
+        # Risk Management - Fixed percentages
+        self.take_profit_pct = params.get('take_profit_pct', 2.0)
+        self.stop_loss_pct = params.get('stop_loss_pct', 1.0)
+        self.fixed_tp_pct = params.get('fixed_tp_pct', 2.5)
+        self.fixed_sl_pct = params.get('fixed_sl_pct', 1.2)
+        
+        # Strategy Behavior
+        self.regime_aware = params.get('regime_aware', True)
 
         # --- Data Containers ---
         self.indicators = {tf: {} for tf in self.target_timeframes}
@@ -174,13 +175,15 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         mode_str = 'SIMULATION/BACKTEST' if self.simulation_mode else 'LIVE'
         self.logger.info(f"[{self.STRATEGY_NAME}] Initialized in {mode_str} mode.")
 
-        # New attribute for ATR-based trailing stops
-        self.use_atr_levels = self.config.parameters['use_atr_levels']
-        
-        # Fix the attribute that was missing in the previous error
-        self.fixed_tp_pct = self.config.parameters['fixed_tp_pct']
-        self.fixed_sl_pct = self.config.parameters['fixed_sl_pct']
-        self.regime_aware = self.config.parameters['regime_aware']
+        # Log all loaded parameters for debugging
+        self.logger.info(f"[{self.STRATEGY_NAME}] Loaded parameters:")
+        self.logger.info(f"  - SMA Period: {self.sma_period}")
+        self.logger.info(f"  - ADX Period: {self.adx_period}, Threshold: {self.adx_entry_threshold}")
+        self.logger.info(f"  - ATR Period: {self.atr_period}, TP Mult: {self.atr_multiplier_tp}, SL Mult: {self.atr_multiplier_sl}")
+        self.logger.info(f"  - Volume Confirmation: {self.use_volume_confirmation}, Lookback: {self.volume_lookback}")
+        self.logger.info(f"  - Min Confidence: {self.min_confidence}, Cooldown: {self.cooldown_minutes}min")
+        self.logger.info(f"  - Regime Aware: {self.regime_aware}, Use ATR Exits: {self.use_atr_for_exits}")
+        self.logger.info(f"  - Timeframe Weights: {self.timeframe_weights}")
 
     def _get_trading_config_value(self, key: str, default: Any = None) -> Any:
         """Safely get a value from the trading config, handling Pydantic objects."""
@@ -311,7 +314,7 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                 self.logger.debug(f"[CACHE HIT] ADX for {pair} {tf} (period={self.adx_period})")
                 adx = indicators_cache[cache_key_adx]
             else:
-                adx = TechnicalIndicators.adx(df, self.adx_period)
+                adx = ta.adx(df['high'], df['low'], df['close'], length=self.adx_period)
                 if indicators_cache is not None:
                     indicators_cache[cache_key_adx] = adx
                     self.logger.debug(f"[CACHE STORE] ADX for {pair} {tf} (period={self.adx_period})")
@@ -320,7 +323,7 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                 self.logger.debug(f"[CACHE HIT] ATR for {pair} {tf} (period={self.atr_period})")
                 atr = indicators_cache[cache_key_atr]
             else:
-                atr = TechnicalIndicators.atr(df, self.atr_period)
+                atr = talib.ATR(df['high'].to_numpy(), df['low'].to_numpy(), df['close'].to_numpy(), timeperiod=self.atr_period)
                 if indicators_cache is not None:
                     indicators_cache[cache_key_atr] = atr
                     self.logger.debug(f"[CACHE STORE] ATR for {pair} {tf} (period={self.atr_period})")
@@ -643,12 +646,44 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         # ... rest of the logic unchanged ...
         return {'signals': indicators}
 
-    async def generate_signal(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> Tuple[str, float, float]:
+    async def generate_signal(self, market_data, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None, exchange_adapter=None) -> Tuple[str, float, float]:
         """Generate trading signal with optimizer integration and enhanced logging, using indicator cache if provided."""
-        # Use ohlcv and indicators_cache as needed in your logic
-        # ... rest of the logic unchanged ...
-        # For now, return a dummy signal for illustration
-        return 'hold', 0.0, 0.0
+        try:
+            # Handle different market_data formats
+            if isinstance(market_data, dict):
+                # Multi-timeframe data - use primary timeframe or first available
+                primary_tf = timeframe or self.target_timeframes[0]
+                if primary_tf in market_data:
+                    ohlcv = market_data[primary_tf]
+                else:
+                    # Use first available timeframe
+                    ohlcv = next(iter(market_data.values()))
+            else:
+                # Single DataFrame
+                ohlcv = market_data
+            
+            if ohlcv is None or ohlcv.empty:
+                self.logger.warning(f"[{self.STRATEGY_NAME}] No market data available for {pair}")
+                return 'hold', 0.0, 0.0
+            
+            # Use exchange_adapter if provided, otherwise use self.exchange
+            exchange_to_use = exchange_adapter or self.exchange
+            
+            # For now, return a basic signal while the full implementation is being worked on
+            # TODO: Implement full engulfing pattern detection logic
+            pattern = 'none'  # placeholder
+            adx_strong = False    # placeholder
+            price_above_sma = False  # placeholder
+            volume_spike = False     # placeholder
+            
+            confidence = self._calculate_signal_confidence(pattern, price_above_sma, adx_strong, volume_spike)
+            
+            # Return 3-tuple as expected by the interface
+            return 'hold', confidence, 0.0
+            
+        except Exception as e:
+            self.logger.error(f"[{self.STRATEGY_NAME}] Error in generate_signal for {pair}: {e}", exc_info=True)
+            return 'hold', 0.0, 0.0
 
     def _calculate_signal_confidence(self, pattern: str, price_above_sma: bool, 
                                    adx_strong: bool, volume_spike: bool) -> float:
@@ -859,24 +894,20 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
             self.logger.error(f"Error calculating position size: {str(e)}")
             return 0.01  # Fallback to 1%
 
-    async def should_exit(self) -> bool:
+    async def should_exit(self) -> Tuple[bool, Optional[str]]:
         """
         Check if the current position should be exited.
-        
         Returns:
-            True if position should be exited
+            (True, reason) if position should be exited, (False, None) otherwise
         """
         try:
             # If no position or position is 'none', skip exit checks
             if not hasattr(self, 'state') or self.state.position == 'none':
-                return False
-                
+                return False, None
             # Get current price
             if not hasattr(self, '_current_ohlcv') or self._current_ohlcv is None:
-                return False
-                
+                return False, None
             current_price = self._current_ohlcv['close'].iloc[-1]
-            
             # Only check basic stop loss and take profit - let orchestrator handle profit protection
             # Check stop loss
             if (self.state.position == 'long' and self.state.stop_loss is not None and 
@@ -886,8 +917,7 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                     {'current_price': current_price, 'stop_loss': self.state.stop_loss}
                 )
                 self.logger.info(f"[{self.STRATEGY_NAME}] Exiting due to stop loss")
-                return True
-                
+                return True, 'stop_loss'
             # Check take profit
             if (self.state.position == 'long' and self.state.take_profit is not None and 
                 current_price >= self.state.take_profit):
@@ -896,13 +926,11 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                     {'current_price': current_price, 'take_profit': self.state.take_profit}
                 )
                 self.logger.info(f"[{self.STRATEGY_NAME}] Exiting due to take profit")
-                return True
-                
-            return False
-            
+                return True, 'take_profit'
+            return False, None
         except Exception as e:
             self.logger.error(f"[{self.STRATEGY_NAME}] Error in should_exit: {e}")
-            return False
+            return False, None
 
     async def check_entry_signal(self, pair: str, market_data: Dict[str, pd.DataFrame], current_price: float) -> Tuple[bool, Dict[str, Any]]:
         """Check for entry signal for a specific pair."""
@@ -956,8 +984,10 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         # Set the pair on the logger before logging
         if self._condition_logger:
             self._condition_logger.pair = pair
-        # TODO: Pass real context/market_regime/volatility if available
-        await self._condition_logger.log_condition(name, value, desc, result, condition_type, market_regime=market_regime, volatility=volatility, context=context) 
+        # Pass available context/market_regime/volatility
+        current_market_regime = getattr(self.state, 'market_regime', market_regime) if hasattr(self, 'state') else market_regime
+        current_volatility = getattr(self.state, 'volatility', volatility) if hasattr(self, 'state') else volatility
+        await self._condition_logger.log_condition(name, value, desc, result, condition_type, market_regime=current_market_regime, volatility=current_volatility, context=context) 
 
     async def check_exit(self, *args, **kwargs):
         """
@@ -972,3 +1002,47 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error in check_exit: {e}")
             return False 
+
+    async def analyze_pair(self, pair, min_candles=None):
+        timeframes = ['1h', '15m']
+        results = {}
+        for timeframe in timeframes:
+            self.logger.info(f"[EngulfingMultiTF] Analyzing {pair} on {timeframe}")
+            df = await self.exchange.get_ohlcv(self.exchange_name, pair, timeframe, limit=min_candles or 50)
+            if df is None or len(df) < (min_candles or 50):
+                self.logger.warning(f"Not enough data for {pair} on {timeframe}")
+                results[timeframe] = ('hold', 0, {})
+                continue
+            # Example indicator calculation and checks
+            import talib
+            indicators = {}
+            try:
+                adx = talib.ADX(df['high'].to_numpy(), df['low'].to_numpy(), df['close'].to_numpy(), timeperiod=14)
+                rsi = talib.RSI(df['close'].to_numpy(), timeperiod=14)
+                indicators = {
+                    'adx': adx[-1],
+                    'rsi': rsi[-1],
+                }
+            except Exception as e:
+                self.logger.error(f"[EngulfingMultiTF] Indicator calculation error for {pair} on {timeframe}: {e}")
+                results[timeframe] = ('hold', 0, {})
+                continue
+            self.logger.info(f"[EngulfingMultiTF] {pair} {timeframe} indicators: {indicators}")
+            for name, value in indicators.items():
+                if pd.isna(value):
+                    self.logger.warning(f"[EngulfingMultiTF] Indicator {name} is NaN for {pair} on {timeframe}, holding.")
+                    results[timeframe] = ('hold', 0, indicators)
+                    break
+            else:
+                adx_pass = indicators['adx'] > self.adx_threshold
+                self.logger.info(f"[EngulfingMultiTF] ADX check: current={indicators['adx']}, target>{self.adx_threshold}, result={'PASS' if adx_pass else 'FAIL'}")
+                rsi_pass = indicators['rsi'] > 50
+                self.logger.info(f"[EngulfingMultiTF] RSI check: current={indicators['rsi']}, target>50, result={'PASS' if rsi_pass else 'FAIL'}")
+                checks = [adx_pass, rsi_pass]
+                if all(checks):
+                    self.logger.info(f"[EngulfingMultiTF] Signal for {pair} on {timeframe}: BUY (all conditions met)")
+                    results[timeframe] = ('buy', 1, indicators)
+                else:
+                    self.logger.info(f"[EngulfingMultiTF] Signal for {pair} on {timeframe}: HOLD (not all conditions met)")
+                    results[timeframe] = ('hold', 0, indicators)
+        return results 

@@ -47,17 +47,35 @@ class ExchangeManager:
                 exchange_class = exchange_class_map[exchange_name]
                 
                 # Initialize exchange with configuration
+                api_key = config.get('api_key', '').strip()
+                api_secret = config.get('api_secret', '').strip()
+                if exchange_name == 'binance':
+                    print('[DEBUG] BINANCE apiKey:', repr(api_key))
+                    print('[DEBUG] BINANCE secret:', repr(api_secret))
                 exchange_config = {
-                    'apiKey': config.get('api_key', ''),
-                    'secret': config.get('api_secret', ''),
+                    'apiKey': api_key,
+                    'secret': api_secret,
                     'sandbox': config.get('sandbox', False),
                     'enableRateLimit': True,
                     'rateLimit': 100,  # 100ms between requests
                     'timeout': 30000,  # 30 seconds
                 }
+                if exchange_name == 'bybit':
+                    exchange_config['accountType'] = 'UNIFIED'
+                if exchange_name == 'binance':
+                    exchange_config['options'] = {'defaultType': 'spot'}
                 
                 # Create exchange instance
                 exchange = exchange_class(exchange_config)
+                if exchange_name == 'binance':
+                    exchange.verbose = True
+                    # Monkey-patch the request method to log the endpoint
+                    orig_request = exchange.request
+                    async def debug_request(*args, **kwargs):
+                        logger.info(f"[DEBUG] CCXT REQUEST: method={args[1] if len(args)>1 else ''} url={args[0] if len(args)>0 else ''}")
+                        return await orig_request(*args, **kwargs)
+                    exchange.request = debug_request
+                    logger.info(f"[DEBUG] Monkey-patch applied for {exchange_name}")
                 
                 # Store exchange and its configuration
                 self.exchanges[exchange_name] = {
@@ -118,17 +136,24 @@ class ExchangeManager:
         try:
             await self._rate_limit(exchange_name)
             exchange = self.exchanges[exchange_name]['instance']
-            
+            # Validate symbol
+            markets = await exchange.load_markets()
+            if symbol not in markets:
+                import difflib
+                suggestion = difflib.get_close_matches(symbol, markets.keys(), n=1)
+                msg = f"Symbol {symbol} not found on {exchange_name}."
+                if suggestion:
+                    msg += f" Did you mean: {suggestion[0]}?"
+                logger.error(msg)
+                await self._handle_exchange_error(exchange_name, Exception(msg), f"get_ticker({symbol})")
+                return None
             ticker = await exchange.fetch_ticker(symbol)
-            
             # Cache the data
             if self.database_manager:
                 await self.database_manager.cache_market_data(
                     exchange_name, symbol, 'ticker', ticker, expires_in_minutes=1
                 )
-                
             return ticker
-            
         except Exception as e:
             await self._handle_exchange_error(exchange_name, e, f"get_ticker({symbol})")
             return None
@@ -136,7 +161,13 @@ class ExchangeManager:
     async def get_ohlcv(self, exchange_name: str, symbol: str, timeframe: str = '1h', 
                        limit: int = 100) -> Optional[pd.DataFrame]:
         """Get OHLCV data for a symbol"""
+        # Defensive check for symbol validity
+        if not isinstance(symbol, str) or '/' not in symbol:
+            logger.error(f"Invalid symbol passed to get_ohlcv: {symbol} (exchange: {exchange_name}, timeframe: {timeframe})")
+            return None
+        logger.info(f"[DEBUG] get_ohlcv called with symbol={symbol}, timeframe={timeframe}, limit={limit}")
         try:
+            logger.info(f"Requesting OHLCV for {symbol} on {exchange_name} ({timeframe}, limit={limit})")
             await self._rate_limit(exchange_name)
             exchange = self.exchanges[exchange_name]['instance']
             
@@ -146,29 +177,35 @@ class ExchangeManager:
                     exchange_name, symbol, f'ohlcv_{timeframe}'
                 )
                 if cached_data:
+                    logger.info(f"Loaded {len(cached_data)} cached candles for {symbol} on {exchange_name} ({timeframe})")
                     return pd.DataFrame(cached_data)
             
             # Fetch from exchange
             ohlcv_data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             
             if not ohlcv_data:
+                logger.warning(f"No OHLCV data returned for {symbol} on {exchange_name} ({timeframe})")
                 return None
                 
             # Convert to DataFrame
             df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
+            logger.info(f"Fetched {len(df)} candles for {symbol} on {exchange_name} ({timeframe})")
             
             # Cache the data
             if self.database_manager:
+                df_reset = df.reset_index()
+                df_reset['timestamp'] = df_reset['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                 await self.database_manager.cache_market_data(
                     exchange_name, symbol, f'ohlcv_{timeframe}', 
-                    df.reset_index().to_dict('records'), expires_in_minutes=5
+                    df_reset.to_dict('records'), expires_in_minutes=5
                 )
                 
             return df
             
         except Exception as e:
+            logger.error(f"Exchange error on {exchange_name} during get_ohlcv({symbol}, {timeframe}): {e}")
             await self._handle_exchange_error(exchange_name, e, f"get_ohlcv({symbol}, {timeframe})")
             return None
             
@@ -198,33 +235,32 @@ class ExchangeManager:
         try:
             await self._rate_limit(exchange_name)
             exchange = self.exchanges[exchange_name]['instance']
-            
+            logger.info(f"[DEBUG] About to call fetch_balance for {exchange_name}")
             balance = await exchange.fetch_balance()
-            
-            # Extract relevant information
-            base_currency = self.exchanges[exchange_name]['config'].get('base_currency', 'USDC')
-            
+
+            # Return the full free/total/used dicts
             balance_info = {
-                'total': float(balance.get('total', {}).get(base_currency, 0)),
-                'free': float(balance.get('free', {}).get(base_currency, 0)),
-                'used': float(balance.get('used', {}).get(base_currency, 0)),
-                'currency': base_currency,
+                'free': balance.get('free', {}),
+                'total': balance.get('total', {}),
+                'used': balance.get('used', {}),
                 'timestamp': datetime.utcnow().isoformat()
             }
-            
-            # Update database
+
+            # Optionally, update database with base currency as before
+            base_currency = self.exchanges[exchange_name]['config'].get('base_currency', 'USDC')
             if self.database_manager:
                 await self.database_manager.update_balance(
                     exchange_name,
-                    balance_info['total'],
-                    balance_info['free'],
-                    0,  # total_pnl will be calculated separately
-                    0   # daily_pnl will be calculated separately
+                    float(balance.get('total', {}).get(base_currency, 0)),
+                    float(balance.get('free', {}).get(base_currency, 0)),
+                    0, 0
                 )
-                
+
             return balance_info
-            
+
         except Exception as e:
+            logger.error(f"Exception in get_balance for {exchange_name}: {e}")
+            logger.error(f"Exception type: {type(e)}, args: {e.args}")
             await self._handle_exchange_error(exchange_name, e, "get_balance")
             return None
             
@@ -336,20 +372,22 @@ class ExchangeManager:
             return {}
             
     async def get_trading_pairs(self, exchange_name: str, base_currency: str = 'USDC') -> List[str]:
-        """Get available trading pairs for an exchange"""
+        """Get available trading pairs for an exchange (returns valid symbol keys for fetch_ohlcv)"""
         try:
             markets = await self.get_markets(exchange_name)
-            
-            # Filter for perpetual futures with the specified base currency
-            pairs = []
-            for symbol, market in markets.items():
-                if (market.get('type') == 'swap' and  # Perpetual futures
-                    market.get('quote') == base_currency and
-                    market.get('active')):
-                    pairs.append(symbol)
-                    
+            # Only return symbols that are valid keys in the markets dict and match the base_currency
+            pairs = [symbol for symbol, market in markets.items()
+                     if market.get('type') == 'swap' and
+                        market.get('quote') == base_currency and
+                        market.get('active') and
+                        symbol in markets]
+            # If no 'swap' markets, fallback to spot pairs with the correct quote
+            if not pairs:
+                pairs = [symbol for symbol, market in markets.items()
+                         if market.get('quote') == base_currency and
+                            market.get('active') and
+                            symbol in markets]
             return pairs
-            
         except Exception as e:
             logger.error(f"Failed to get trading pairs for {exchange_name}: {e}")
             return []

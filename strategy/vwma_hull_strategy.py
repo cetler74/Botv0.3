@@ -7,11 +7,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import logging
+logger = logging.getLogger(__name__)
 
-from .base_strategy import BaseStrategy, StrategyState
+from strategy.base_strategy import BaseStrategy, StrategyState
 from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, manage_trailing_stop, restore_profit_protection_state
-from strategy.dynamic_stop_loss import DynamicStopLoss
-from strategy.strategy_regime_analytics import StrategyRegimeAnalytics
 from strategy.condition_logger import ConditionLogger
 
 class VWMAHullStrategy(BaseStrategy):
@@ -23,14 +22,16 @@ class VWMAHullStrategy(BaseStrategy):
         config: Dict[str, Any],
         exchange: Any,
         database: Any,
-        redis_client=None
+        redis_client=None,
+        exchange_name=None
     ):
         """Initialize the VWMA Hull strategy. Uses ConditionLogger for validation and condition checks."""
         super().__init__(config, exchange, database, redis_client)
         self.exchange = exchange
+        self.exchange_name = exchange_name or 'binance'  # Default to binance if not provided
         # Initialize logger first
         self.logger = logging.getLogger(__name__)
-        self.condition_logger = ConditionLogger()
+        # Don't override the condition logger from base class - it's already initialized with proper strategy name
         
         # Safely access config parameters with defaults and debug logging
         parameters = config.get('parameters', {})
@@ -46,14 +47,25 @@ class VWMAHullStrategy(BaseStrategy):
         self.volume_window = parameters.get('volume_window', 50)  # Window for percentile calculation
         self.volatility_adjustment = parameters.get('volatility_adjustment', True)  # Enable adaptive thresholds
         
+        # Scalping parameters
+        self.atr_period = parameters.get('atr_period', 7)
+        self.min_price_move = parameters.get('min_price_move', 0.001)  # 0.1% minimum price change
+        self.min_volatility_threshold = parameters.get('min_volatility_threshold', 0.002)  # ATR > 0.2% of price
+        self.scalping_enabled = parameters.get('scalping_enabled', True)
+        self.crossover_confidence_boost = parameters.get('crossover_confidence_boost', 0.8)
+        self.trend_confidence_boost = parameters.get('trend_confidence_boost', 0.7)
+        self.strength_multiplier = parameters.get('strength_multiplier', 10)
+        
         # Debug log the loaded parameters
-        self.logger.info(f"VWMA Hull Strategy initialized with volume_method: {self.volume_method}")
+        self.logger.info(f"VWMA Hull Strategy initialized with volume_method: {self.volume_method}, scalping_enabled: {self.scalping_enabled}")
         self.logger.debug(f"All parameters: vwma_period={self.vwma_period}, hull_period={self.hull_period}, "
                          f"volume_method={self.volume_method}, volume_percentile={self.volume_percentile}, "
-                         f"min_absolute_volume={self.min_absolute_volume}, trend_threshold={self.trend_threshold}")
+                         f"min_absolute_volume={self.min_absolute_volume}, trend_threshold={self.trend_threshold}, "
+                         f"atr_period={self.atr_period}, min_price_move={self.min_price_move}, "
+                         f"min_volatility_threshold={self.min_volatility_threshold}")
         self.trade_id = None
         self._current_ohlcv = None  # For test compatibility
-        self._regime_analytics = StrategyRegimeAnalytics(redis_client)
+        self._regime_analytics = None # Removed as per edit hint
         
     def _validate_ohlcv_data(self, ohlcv: pd.DataFrame, required_cols: set) -> bool:
         """Validate OHLCV data quality and completeness."""
@@ -123,6 +135,9 @@ class VWMAHullStrategy(BaseStrategy):
                     elif not isinstance(volume_series, pd.Series):
                         volume_series = pd.Series(volume_series)
                     rolling_mean = volume_series.rolling(window=20).mean()
+                    # Ensure rolling_mean is a pandas Series
+                    if isinstance(rolling_mean, np.ndarray):
+                        rolling_mean = pd.Series(rolling_mean)
                     avg_volume = float(rolling_mean.iloc[-1])
                     if current_volume < self.volume_threshold * avg_volume:
                         return False, f"Volume below legacy threshold: {current_volume} < {self.volume_threshold * avg_volume:.1f}"
@@ -243,6 +258,11 @@ class VWMAHullStrategy(BaseStrategy):
             'current_drawdown': 0.0,
             'unrealized_pnl': 0.0
         }
+        
+        # Initialize condition logger with proper strategy name
+        if not hasattr(self, 'condition_logger'):
+            self.condition_logger = ConditionLogger(strategy_name=self.STRATEGY_NAME, logger_instance=self.logger)
+        
         self.logger.info(f"Initialized VWMA Hull strategy for {pair}")
 
     def _calculate_vwma(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> pd.Series:
@@ -289,15 +309,78 @@ class VWMAHullStrategy(BaseStrategy):
             data = data['close'] if 'close' in data else pd.Series(data.iloc[:, 0])
         elif not isinstance(data, pd.Series):
             data = pd.Series(data)
+        
+        # Ensure data is a pandas Series before using rolling
+        if not isinstance(data, pd.Series):
+            data = pd.Series(data)
+            
         half_length = int(self.hull_period / 2)
         sqrt_length = int(np.sqrt(self.hull_period))
         wma_half = data.rolling(half_length).mean()
         wma_full = data.rolling(self.hull_period).mean()
+        
+        # Ensure rolling results are pandas Series
+        if isinstance(wma_half, np.ndarray):
+            wma_half = pd.Series(wma_half)
+        if isinstance(wma_full, np.ndarray):
+            wma_full = pd.Series(wma_full)
+            
         hull = (2 * wma_half - wma_full).rolling(sqrt_length).mean()
+        
+        # Ensure final result is pandas Series
+        if isinstance(hull, np.ndarray):
+            hull = pd.Series(hull)
+            
         if indicators_cache is not None and cache_key:
             indicators_cache[cache_key] = hull
             self.logger.debug(f"[CACHE STORE] Hull MA for {pair} {timeframe} (period={self.hull_period})")
         return hull
+
+    def _calculate_atr(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> pd.Series:
+        """Calculate Average True Range (ATR) for volatility measurement."""
+        cache_key = None
+        if indicators_cache is not None and pair and timeframe:
+            cache_key = f"ATR_{pair}_{timeframe}_{self.atr_period}"
+            if cache_key in indicators_cache:
+                self.logger.debug(f"[CACHE HIT] ATR for {pair} {timeframe} (period={self.atr_period})")
+                return indicators_cache[cache_key]
+        
+        try:
+            import pandas_ta as ta
+            # Calculate ATR using pandas-ta
+            atr = ta.atr(ohlcv['high'], ohlcv['low'], ohlcv['close'], length=self.atr_period)
+            
+            # Convert to pandas Series if needed
+            if isinstance(atr, np.ndarray):
+                atr = pd.Series(atr)
+            
+            if indicators_cache is not None and cache_key:
+                indicators_cache[cache_key] = atr
+                self.logger.debug(f"[CACHE STORE] ATR for {pair} {timeframe} (period={self.atr_period})")
+            
+            return atr
+        except Exception as e:
+            self.logger.error(f"Error calculating ATR: {e}")
+            return pd.Series([np.nan] * len(ohlcv))
+
+    def _calculate_volatility(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> float:
+        """Calculate current volatility as ATR percentage of price."""
+        try:
+            atr = self._calculate_atr(ohlcv, indicators_cache, pair, timeframe)
+            if atr is None or len(atr) == 0:
+                return 0.0
+            
+            current_atr = atr.iloc[-1]
+            current_price = ohlcv['close'].iloc[-1]
+            
+            if pd.isna(current_atr) or pd.isna(current_price) or current_price == 0:
+                return 0.0
+            
+            volatility = current_atr / current_price
+            return float(volatility)
+        except Exception as e:
+            self.logger.error(f"Error calculating volatility: {e}")
+            return 0.0
 
     def _detect_trend(self, vwma: pd.Series, hull: pd.Series) -> str:
         """Detect trend using VWMA and Hull MA."""
@@ -389,8 +472,12 @@ class VWMAHullStrategy(BaseStrategy):
                         ohlcv[col] = ohlcv[col].astype(float)
                 vwma = self._calculate_vwma(ohlcv)
                 hull = self._calculate_hull_ma(vwma)
-                self.state.indicators['vwma'] = vwma
-                self.state.indicators['hull'] = hull
+                # Store only the latest values to avoid serialization issues
+                self.state.indicators['vwma'] = float(vwma.iloc[-1]) if not vwma.empty and not pd.isna(vwma.iloc[-1]) else 0.0
+                self.state.indicators['hull'] = float(hull.iloc[-1]) if not hull.empty and not pd.isna(hull.iloc[-1]) else 0.0
+                # Store additional metadata for analysis
+                self.state.indicators['vwma_series_length'] = len(vwma)
+                self.state.indicators['hull_series_length'] = len(hull)
                 trend = self._detect_trend(vwma, hull)
                 crossover = self._detect_crossover(vwma, hull)
                 self.state.market_regime = trend
@@ -400,10 +487,18 @@ class VWMAHullStrategy(BaseStrategy):
                         'confidence': 0.8,
                         'timestamp': datetime.utcnow()
                     }
-                await self.log_condition_outcome(
-                    'market_regime', self.state.market_regime, True,
-                    {'reason': 'Updated market regime after trend detection'}
-                )
+                # Enhanced market regime logging with detailed values
+                if len(vwma) > 0 and len(hull) > 0:
+                    current_vwma = vwma.iloc[-1]
+                    current_hull = hull.iloc[-1]
+                    trend_strength = abs(current_vwma - current_hull) / current_hull if current_hull > 0 else 0
+                    await self._log_condition(
+                        'market_regime', self.state.market_regime, f'market_regime for {self.state.pair}', True, 'trend', 
+                        self.state.pair, 
+                        context={'reason': 'Updated market regime after trend detection', 'trend_strength': trend_strength},
+                        current_value=f"trend={trend}, vwma={current_vwma:.4f}, hull={current_hull:.4f}, strength={trend_strength:.4f}",
+                        target_value=f"trend detection threshold={self.trend_threshold}"
+                    )
                 if 'crossover' in self.state.patterns:
                     await self.log_condition_outcome(
                         'crossover', self.state.patterns['crossover']['type'], True,
@@ -418,8 +513,16 @@ class VWMAHullStrategy(BaseStrategy):
     async def update_performance(self) -> None:
         """Update strategy performance metrics."""
         try:
+            # Check if exchange is available
+            if not self.exchange:
+                self.logger.debug("[VWMAHullStrategy] Exchange not available for performance update")
+                return
+                
             # Get current price
-            ticker = await self.exchange.get_ticker(self.state.pair)
+            ticker = await self.exchange.get_ticker(self.state.pair, self.exchange_name)
+            if not ticker or 'last' not in ticker:
+                self.logger.warning(f"[VWMAHullStrategy] Could not fetch ticker for {self.state.pair} on {self.exchange_name}")
+                return
             current_price = ticker['last']
             if self.state.position != 'none':
                 # Calculate unrealized PnL
@@ -458,17 +561,20 @@ class VWMAHullStrategy(BaseStrategy):
                     self.config['parameters']['trend_threshold'] = self.trend_threshold
                 self.logger.info(f"Applied optimized parameters for {self.state.pair}: {optimized_params}")
                 
-                # TODO: Uncomment when feedback manager has the correct method
-                # if self._feedback_manager:
-                #     await self._feedback_manager.log_parameter_change(
-                #         strategy_name=self.STRATEGY_NAME.lower().replace(' ', '_'),
-                #         pair=self.state.pair,
-                #         old_parameters=old_params,
-                #         new_parameters=optimized_params,
-                #         market_regime=market_regime,
-                #         confidence_score=0.8,
-                #         expected_improvement=0.05
-                #     )
+                # Log parameter change if feedback manager is available
+                if hasattr(self, '_feedback_manager') and self._feedback_manager:
+                    try:
+                        await self._feedback_manager.log_parameter_change(
+                            strategy_name=self.STRATEGY_NAME.lower().replace(' ', '_'),
+                            pair=self.state.pair,
+                            old_parameters=old_params,
+                            new_parameters=optimized_params,
+                            market_regime=market_regime,
+                            confidence_score=0.8,
+                            expected_improvement=0.05
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Could not log parameter change to feedback manager: {e}")
                 await self.log_condition_outcome(
                     'optimized_parameters_applied', str(optimized_params), True,
                     {'market_regime': market_regime}
@@ -486,111 +592,98 @@ class VWMAHullStrategy(BaseStrategy):
         self.volume_threshold = float(params.get('volume_threshold', self.volume_threshold))
         self.trend_threshold = float(params.get('trend_threshold', self.trend_threshold))
 
-    async def generate_signal(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> Tuple[str, float, float]:
-        """Generate trading signal based on VWMA and Hull MA analysis."""
+    async def generate_signal(self, market_data, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None, exchange_adapter=None) -> Tuple[str, float, float]:
+        """Generate trading signal based on VWMA and Hull MA analysis with scalping conditions."""
         try:
-            # Validate input data
-            if ohlcv is None or ohlcv.empty or len(ohlcv) < max(self.vwma_period, self.hull_period):
-                self.logger.warning(f"[VWMAHullStrategy] Insufficient data for signal generation: {len(ohlcv) if ohlcv is not None else 0} points")
-                return 'hold', 0.0, 0.0
+            # Use exchange_adapter if provided to override self.exchange
+            if exchange_adapter is not None:
+                self.exchange = exchange_adapter
             
+            # Handle both DataFrame and dict market_data formats
+            if isinstance(market_data, dict):
+                # If market_data is a dict with timeframes, use the primary timeframe
+                if timeframe and timeframe in market_data:
+                    ohlcv = market_data[timeframe]
+                elif '1h' in market_data:
+                    ohlcv = market_data['1h']
+                else:
+                    # Use the first available timeframe
+                    first_tf = list(market_data.keys())[0]
+                    ohlcv = market_data[first_tf]
+            else:
+                # If market_data is already a DataFrame
+                ohlcv = market_data
+            
+            # Validate input data
+            min_period = max(self.vwma_period, self.hull_period)
+            if ohlcv is None or ohlcv.empty or len(ohlcv) < min_period:
+                return 'hold', 0.0, 0.0
+
             # Calculate indicators
             vwma = self._calculate_vwma(ohlcv, indicators_cache, pair, timeframe)
             hull = self._calculate_hull_ma(vwma, indicators_cache, pair, timeframe)
+            atr = self._calculate_atr(ohlcv, indicators_cache, pair, timeframe)
             
-            # Check if indicators are valid
-            if vwma is None or hull is None or len(vwma) < 2 or len(hull) < 2:
-                self.logger.warning(f"[VWMAHullStrategy] Invalid indicators for signal generation")
+            if vwma is None or hull is None or atr is None or len(vwma) < 2 or len(hull) < 2:
                 return 'hold', 0.0, 0.0
-            
-            # Get current and previous values
-            current_vwma = vwma.iloc[-1]
-            current_hull = hull.iloc[-1]
-            prev_vwma = vwma.iloc[-2]
-            prev_hull = hull.iloc[-2]
-            
-            # Check for NaN values
+
+            current_vwma, prev_vwma = vwma.iloc[-1], vwma.iloc[-2]
+            current_hull, prev_hull = hull.iloc[-1], hull.iloc[-2]
+            current_price, prev_price = ohlcv['close'].iloc[-1], ohlcv['close'].iloc[-2]
+            atr_value = atr.iloc[-1]
+
             if pd.isna(current_vwma) or pd.isna(current_hull) or pd.isna(prev_vwma) or pd.isna(prev_hull):
-                self.logger.warning(f"[VWMAHullStrategy] NaN values in indicators")
                 return 'hold', 0.0, 0.0
-            
-            # Detect trend and crossover
-            trend = self._detect_trend(vwma, hull)
-            crossover = self._detect_crossover(vwma, hull)
-            
-            # Validate volume conditions (PERMISSIVE FOR TESTING)
+
+            # Volume validation (simplified for speed)
             volume_valid, volume_message = self._validate_volume_conditions(ohlcv)
             if not volume_valid:
-                self.logger.debug(f"[VWMAHullStrategy] Volume validation failed: {volume_message} - IGNORING FOR TESTING")
-                # Force volume validation to pass for testing
-                volume_valid = True
-            
-            # Calculate trend strength
+                return 'hold', 0.0, 0.0
+
+            # Trend and crossover
+            trend = self._detect_trend(vwma, hull)
+            crossover = self._detect_crossover(vwma, hull)
             trend_strength = abs(current_vwma - current_hull) / current_hull if current_hull > 0 else 0
+            price_change = abs(current_price - prev_price) / prev_price if prev_price > 0 else 0
 
-            # --- PERMISSIVE SIGNAL GENERATION LOGIC FOR TESTING ---
-            signal = 'hold'
-            confidence = 0.0
-            strength = 0.0
+            # Scalping conditions
+            signal, confidence, strength, reason = 'hold', 0.0, 0.0, []
+            min_price_move = self.min_price_move  # 0.1% price change
+            min_volatility = atr_value / current_price > self.min_volatility_threshold  # ATR > 0.2% of price
 
-            # Always allow crossover signals
-            if crossover == 'bullish':
+            if crossover == 'bullish' and min_volatility and price_change > min_price_move:
                 signal = 'buy'
-                confidence = 0.7 + min(trend_strength * 10, 0.3)
+                confidence = 0.8 + min(trend_strength * 10, 0.2)
                 strength = min(trend_strength * 10, 1.0)
-                self.logger.info(f"[VWMAHullStrategy] Permissive bullish crossover: VWMA={current_vwma:.4f}, Hull={current_hull:.4f}")
-            elif crossover == 'bearish':
+                reason.append('bullish_crossover')
+            elif crossover == 'bearish' and min_volatility and price_change > min_price_move:
                 signal = 'sell'
-                confidence = 0.7 + min(trend_strength * 10, 0.3)
+                confidence = 0.8 + min(trend_strength * 10, 0.2)
                 strength = min(trend_strength * 10, 1.0)
-                self.logger.info(f"[VWMAHullStrategy] Permissive bearish crossover: VWMA={current_vwma:.4f}, Hull={current_hull:.4f}")
-            # If no crossover, use VWMA/Hull alignment
-            elif current_vwma > current_hull:
+                reason.append('bearish_crossover')
+            elif current_vwma > current_hull and trend_strength > self.trend_threshold and min_volatility:
                 signal = 'buy'
-                confidence = 0.6 + min(trend_strength * 8, 0.3)
+                confidence = 0.7 + min(trend_strength * 8, 0.2)
                 strength = min(trend_strength * 8, 1.0)
-                self.logger.info(f"[VWMAHullStrategy] Permissive VWMA>Hull: VWMA={current_vwma:.4f}, Hull={current_hull:.4f}")
-            elif current_vwma < current_hull:
+                reason.append('vwma_above_hull')
+            elif current_vwma < current_hull and trend_strength > self.trend_threshold and min_volatility:
                 signal = 'sell'
-                confidence = 0.6 + min(trend_strength * 8, 0.3)
+                confidence = 0.7 + min(trend_strength * 8, 0.2)
                 strength = min(trend_strength * 8, 1.0)
-                self.logger.info(f"[VWMAHullStrategy] Permissive VWMA<Hull: VWMA={current_vwma:.4f}, Hull={current_hull:.4f}")
-            else:
-                # Fallback: always generate a signal based on price movement
-                if len(ohlcv) >= 2:
-                    current_price = ohlcv['close'].iloc[-1]
-                    prev_price = ohlcv['close'].iloc[-2]
-                    if current_price > prev_price:
-                        signal = 'buy'
-                        confidence = 0.5
-                        strength = 0.3
-                        self.logger.info(f"[VWMAHullStrategy] Fallback bullish: current={current_price:.4f}, prev={prev_price:.4f}")
-                    else:
-                        signal = 'sell'
-                        confidence = 0.5
-                        strength = 0.3
-                        self.logger.info(f"[VWMAHullStrategy] Fallback bearish: current={current_price:.4f}, prev={prev_price:.4f}")
-                else:
-                    signal = 'hold'
-                    confidence = 0.0
-                    strength = 0.0
+                reason.append('vwma_below_hull')
 
-            # Log signal generation details
+            reason_str = '+'.join(reason) if reason else 'no_signal'
             self.logger.info(f"[VWMAHullStrategy] Generated {signal.upper()} signal for {pair or self.state.pair}: "
-                             f"trend={trend}, crossover={crossover}, strength={strength:.3f}, confidence={confidence:.2f}")
-            await self.log_condition_outcome(
-                'signal_generation', signal, True,
-                {
-                    'trend': trend,
-                    'crossover': crossover,
-                    'trend_strength': trend_strength,
-                    'confidence': confidence,
-                    'strength': strength,
-                    'volume_valid': volume_valid
-                }
+                             f"trend={trend}, crossover={crossover}, strength={strength:.3f}, confidence={confidence:.2f}, reason={reason_str}")
+            # Enhanced condition logging with detailed values
+            await self._log_condition(
+                'signal_generation', signal, f'signal_generation for {pair or self.state.pair}', True, 'signal', 
+                pair or self.state.pair, 
+                context={'trend': trend, 'crossover': crossover, 'trend_strength': trend_strength, 'confidence': confidence, 'strength': strength, 'volume_valid': volume_valid, 'reason': reason_str},
+                current_value=f"trend={trend}, crossover={crossover}, strength={strength:.3f}, confidence={confidence:.2f}",
+                target_value="signal generation conditions met"
             )
             return signal, confidence, strength
-
         except Exception as e:
             self.logger.error(f"[VWMAHullStrategy] Error generating signal: {str(e)}")
             return 'hold', 0.0, 0.0
@@ -598,6 +691,11 @@ class VWMAHullStrategy(BaseStrategy):
     async def calculate_position_size(self, signal_type: str) -> float:
         """Calculate position size based on risk management rules."""
         try:
+            # Check if exchange is available
+            if not self.exchange:
+                self.logger.debug("[VWMAHullStrategy] Exchange not available for position size calculation")
+                return 0.0
+                
             # Get account balance
             balance = await self.exchange.get_balance()
             available_balance = balance.get('free', 0.0)
@@ -606,7 +704,10 @@ class VWMAHullStrategy(BaseStrategy):
             risk_amount = available_balance * 0.01
             
             # Get current price and ATR
-            ticker = await self.exchange.get_ticker(self.state.pair)
+            ticker = await self.exchange.get_ticker(self.state.pair, self.exchange_name)
+            if not ticker or 'last' not in ticker:
+                self.logger.warning(f"[VWMAHullStrategy] Could not fetch ticker for {self.state.pair} on {self.exchange_name}")
+                return 0.0
             current_price = ticker['last']
             atr = self.state.indicators.get('ATR', None)
             
@@ -628,40 +729,81 @@ class VWMAHullStrategy(BaseStrategy):
             return 0.0
 
     async def should_exit(self) -> Tuple[bool, Optional[str]]:
-        """Check if the current position should be exited."""
+        """Check if current position should be exited based on strategy and fallback conditions."""
         try:
-            if not hasattr(self.state, 'position') or self.state.position == 'none':
+            # No position, nothing to exit
+            if not hasattr(self, 'state') or self.state.position == 'none':
+                self.logger.debug("[VWMAHullStrategy] No open position, should_exit=False")
                 return False, None
-                
-            # Get current price from exchange
-            try:
-                ticker = await self.exchange.get_ticker(self.state.pair)
-                current_price = ticker['last']
-            except Exception as e:
-                self.logger.warning(f"[VWMAHullStrategy] Could not fetch current price for {self.state.pair}: {e}")
+
+            # Ensure we have recent OHLCV data
+            if not hasattr(self, '_current_ohlcv') or self._current_ohlcv is None:
+                self.logger.warning("[VWMAHullStrategy] No OHLCV data for exit check.")
                 return False, None
-            
-            # NOTE: Profit protection and trailing stop are now handled centrally in the orchestrator
-            # This prevents duplicate calls and ensures consistent logging and behavior
-            
-            # Check basic stop loss and take profit conditions
-            cond1 = self.state.position == 'long' and self.state.stop_loss is not None and current_price <= self.state.stop_loss
-            cond3 = self.state.position == 'long' and self.state.take_profit is not None and current_price >= self.state.take_profit
-            if cond1 or cond3:
-                self.logger.info(f"[VWMAHullStrategy] Exiting due to stop loss/take profit for trade {getattr(self, 'trade_id', 'unknown')}")
-                return True, "stop_loss" if cond1 else "take_profit"
+
+            ohlcv = self._current_ohlcv
+            current_price = ohlcv['close'].iloc[-1]
+            pair = getattr(self.state, 'pair', 'N/A')
+
+            # 1. Stop Loss
+            if self.state.stop_loss is not None and current_price <= self.state.stop_loss:
+                self.logger.info(f"[VWMAHullStrategy] Exiting {pair} due to stop loss: {current_price} <= {self.state.stop_loss}")
+                await self._log_condition('exit_signal', 'stop_loss', 'Stop loss triggered', True, 'exit', pair, reason='stop_loss', context={'current_price': current_price, 'stop_loss': self.state.stop_loss})
+                return True, 'stop_loss'
+
+            # 2. Take Profit
+            if self.state.take_profit is not None and current_price >= self.state.take_profit:
+                self.logger.info(f"[VWMAHullStrategy] Exiting {pair} due to take profit: {current_price} >= {self.state.take_profit}")
+                await self._log_condition('exit_signal', 'take_profit', 'Take profit triggered', True, 'exit', pair, reason='take_profit', context={'current_price': current_price, 'take_profit': self.state.take_profit})
+                return True, 'take_profit'
+
+            # 3. VWMA/Hull crossover (technical exit)
+            vwma = self.state.indicators.get('VWMA')
+            hull = self.state.indicators.get('Hull')
+            if vwma is not None and hull is not None and len(vwma) > 1 and len(hull) > 1:
+                prev_vwma, prev_hull = vwma[-2], hull[-2]
+                curr_vwma, curr_hull = vwma[-1], hull[-1]
+                # Exit if VWMA crosses below Hull (trend reversal)
+                if prev_vwma > prev_hull and curr_vwma < curr_hull:
+                    self.logger.info(f"[VWMAHullStrategy] Exiting {pair} due to VWMA/Hull crossover: {prev_vwma:.2f}->{curr_vwma:.2f} crossed {prev_hull:.2f}->{curr_hull:.2f}")
+                    await self._log_condition('exit_signal', 'crossover', 'VWMA/Hull crossover exit', True, 'exit', pair, reason='crossover', context={'prev_vwma': prev_vwma, 'prev_hull': prev_hull, 'curr_vwma': curr_vwma, 'curr_hull': curr_hull})
+                    return True, 'crossover'
+
+            # 4. Fallback: time-based exit (e.g., 48h max hold)
+            if self.state.entry_time:
+                time_in_trade = datetime.utcnow() - self.state.entry_time
+                if time_in_trade.total_seconds() > 172800:  # 48 hours
+                    self.logger.info(f"[VWMAHullStrategy] Exiting {pair} due to max hold time exceeded: {time_in_trade}")
+                    await self._log_condition('exit_signal', 'max_hold', 'Max hold time exceeded', True, 'exit', pair, reason='max_hold', context={'time_in_trade': str(time_in_trade)})
+                    return True, 'max_hold'
+
+            self.logger.debug(f"[VWMAHullStrategy] No exit condition met for {pair}.")
             return False, None
         except Exception as e:
-            self.logger.error(f"Error checking exit conditions: {str(e)}")
+            self.logger.error(f"Error in should_exit: {e}")
             return False, None
 
-    async def _log_condition(self, name, value, description, result, condition_type, pair, reason=None, market_regime=None, volatility=None, context=None):
+    async def _log_condition(self, name, value, description, result, condition_type, pair, reason=None, market_regime=None, volatility=None, context=None, target_value=None, current_value=None):
         desc = description or name
         # Set the pair on the logger before logging
         if self.condition_logger:
             self.condition_logger.pair = pair
-        # TODO: Pass real context/market_regime/volatility if available
-        await self.condition_logger.log_condition(name, value, desc, result, condition_type, market_regime=market_regime, volatility=volatility, context=context)
+        # Pass available context/market_regime/volatility
+        current_market_regime = getattr(self.state, 'market_regime', market_regime) if hasattr(self, 'state') else market_regime
+        current_volatility = getattr(self.state, 'volatility', volatility) if hasattr(self, 'state') else volatility
+        
+        # Get exchange name
+        exchange_name = getattr(self, 'exchange_name', None)
+        
+        await self.condition_logger.log_condition(
+            name, value, desc, result, condition_type, 
+            market_regime=current_market_regime, 
+            volatility=current_volatility, 
+            context=context,
+            exchange=exchange_name,
+            target_value=target_value,
+            current_value=current_value
+        )
 
     def _log_detailed_analysis(self, ohlcv, vwma, hull, trend, trend_strength, trend_duration, crossover, crossover_confidence, prev_vwma, prev_hull, current_vwma, current_hull, entry_conditions, all_met, signal, signal_confidence, signal_strength, volume, avg_volume, data_points, sufficient_data):
         import datetime
@@ -741,34 +883,49 @@ class VWMAHullStrategy(BaseStrategy):
         for line in lines:
             self.logger.info(line)
 
-    async def check_exit_signals(self, market_data, predictions):
-        """Check for exit signals for all pairs in market_data."""
-        exit_signals = []
-        for pair, ohlcv in market_data.items():
-            try:
-                self.logger.info(f"===== VWMA HULL ANALYSIS FOR {pair} EXIT SIGNAL =====")
-                if not isinstance(ohlcv, pd.DataFrame):
-                    self.logger.warning(f"[VWMAHullStrategy] Exit signal check: ohlcv for {pair} is not a DataFrame")
-                    continue
-                required_cols = ['open', 'high', 'low', 'close', 'volume']
-                missing_cols = [col for col in required_cols if col not in ohlcv.columns]
-                if missing_cols:
-                    self.logger.warning(f"[VWMAHullStrategy] Exit signal check: ohlcv for {pair} is missing columns: {missing_cols}")
-                    continue
-                await self.initialize(pair)
-                await self.update(ohlcv)
-                should_exit, reason = await self.should_exit()
-                if should_exit and reason:
-                    exit_signals.append({
-                        'pair': pair,
-                        'signal': 'exit',
-                        'strategy': self.__class__.__name__.lower().replace('strategy', ''),
-                        'reason': reason
-                    })
-            except Exception as e:
-                self.logger.error(f"[VWMAHullStrategy] Error checking exit signals for {pair}: {str(e)}", exc_info=True)
+    async def analyze_pair(self, pair, min_candles=None, exchange_name=None):
+        timeframes = ['1h', '15m']
+        results = {}
+        for timeframe in timeframes:
+            logger.info(f"[VWMAHullStrategy] Analyzing {pair} on {timeframe}")
+            df = await self.exchange.get_ohlcv(exchange_name, pair, timeframe, limit=min_candles or 50)
+            if df is None or len(df) < (min_candles or 50):
+                logger.warning(f"Not enough data for {pair} on {timeframe}")
+                results[timeframe] = ('hold', 0, {})
                 continue
-        return exit_signals
+            # Example indicator calculation and checks
+            import pandas_ta as ta
+            indicators = {}
+            try:
+                adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+                rsi = ta.rsi(df['close'], length=14)
+                indicators = {
+                    'adx': adx[-1],
+                    'rsi': rsi[-1],
+                }
+            except Exception as e:
+                logger.error(f"[VWMAHullStrategy] Indicator calculation error for {pair} on {timeframe}: {e}")
+                results[timeframe] = ('hold', 0, indicators)
+                continue
+            logger.info(f"[VWMAHullStrategy] {pair} {timeframe} indicators: {indicators}")
+            for name, value in indicators.items():
+                if pd.isna(value):
+                    logger.warning(f"[VWMAHullStrategy] Indicator {name} is NaN for {pair} on {timeframe}, holding.")
+                    results[timeframe] = ('hold', 0, indicators)
+                    break
+            else:
+                adx_pass = indicators['adx'] > self.adx_threshold
+                logger.info(f"[VWMAHullStrategy] ADX check: current={indicators['adx']}, target>{self.adx_threshold}, result={'PASS' if adx_pass else 'FAIL'}")
+                rsi_pass = indicators['rsi'] > 50
+                logger.info(f"[VWMAHullStrategy] RSI check: current={indicators['rsi']}, target>50, result={'PASS' if rsi_pass else 'FAIL'}")
+                checks = [adx_pass, rsi_pass]
+                if all(checks):
+                    logger.info(f"[VWMAHullStrategy] Signal for {pair} on {timeframe}: BUY (all conditions met)")
+                    results[timeframe] = ('buy', 1, indicators)
+                else:
+                    logger.info(f"[VWMAHullStrategy] Signal for {pair} on {timeframe}: HOLD (not all conditions met)")
+                    results[timeframe] = ('hold', 0, indicators)
+        return results
         
     async def check_exit(self, market_data=None, predictions=None, trade_id=None):
         """
@@ -832,12 +989,14 @@ class VWMAHullStrategy(BaseStrategy):
         try:
             strategy_name = self.STRATEGY_NAME.lower().replace(' ', '_')
             regime = getattr(self.state, 'market_regime', 'unknown')
-            stats = await self._regime_analytics.get_stats(strategy_name, self.state.pair, regime)
-            win_rate = stats.get('win_rate', 1.0)
-            trade_count = stats.get('trade_count', 0)
-            if trade_count >= 10 and win_rate < 0.4:
-                await self.apply_optimized_parameters(regime, force=True)
-                self.logger.info(f"[ADAPT] {strategy_name} re-optimized for regime {regime} due to low win rate ({win_rate})")
+            # Removed as per edit hint
+            # stats = await self._regime_analytics.get_stats(strategy_name, self.state.pair, regime)
+            # win_rate = stats.get('win_rate', 1.0)
+            # trade_count = stats.get('trade_count', 0)
+            # if trade_count >= 10 and win_rate < 0.4:
+            #     await self.apply_optimized_parameters(regime, force=True)
+            #     self.logger.info(f"[ADAPT] {strategy_name} re-optimized for regime {regime} due to low win rate ({win_rate})")
+            pass # Placeholder for future regime adaptation logic
         except Exception as e:
             self.logger.warning(f"Regime adaptation check failed: {e}")
 

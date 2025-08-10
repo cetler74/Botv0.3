@@ -1,0 +1,35 @@
+{
+  "name": "trading-bot-mcp",
+  "version": "1.0.0",
+  "description": "Trading Bot with Perplexity MCP Integration",
+  "main": "index.js",
+  "scripts": {
+    "mcp:install": "npm install",
+    "mcp:start": "node mcp-perplexity-server.js",
+    "mcp:test": "node -e \"console.log('MCP server ready')\"",
+    "docker:build": "docker-compose build mcp-service",
+    "docker:up": "docker-compose up mcp-service",
+    "docker:down": "docker-compose down",
+    "test:mcp": "python test_mcp_integration.py"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.1",
+    "node-fetch": "^2.6.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "trading",
+    "bot",
+    "mcp",
+    "perplexity",
+    "cursor-ai"
+  ],
+  "author": "Trading Bot Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  }
+} 

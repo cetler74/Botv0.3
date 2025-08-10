@@ -169,6 +169,7 @@ class TradingOrchestrator:
         assert self.config_manager is not None, "config_manager must be initialized"
         assert self.database_manager is not None, "database_manager must be initialized"
         try:
+            logger.info("[DEBUG] _initialize_pair_selections called!")
             exchanges = self.config_manager.get_all_exchanges()
             for exchange_name in exchanges:
                 # Get config for this exchange
@@ -189,7 +190,15 @@ class TradingOrchestrator:
 
                 result = await selector.select_top_pairs()
 
+                # Always forcibly add only CRO/USD before saving to DB for cryptocom
+                if exchange_name.lower() == "cryptocom":
+                    logger.info(f"[DEBUG] cryptocom pairs before force-add: {result['selected_pairs']}")
+                    if "CRO/USD" not in result["selected_pairs"]:
+                        result["selected_pairs"].append("CRO/USD")
+                    logger.info(f"[FORCE] cryptocom pairs to be saved: {result['selected_pairs']}")
+
                 # Persist to database
+                logger.info(f"[DEBUG] Saving pairs for {exchange_name}: {result['selected_pairs']}")
                 await self.database_manager.save_pairs(
                     exchange=exchange_name,
                     pairs=result["selected_pairs"]
@@ -348,14 +357,22 @@ class TradingOrchestrator:
             trade_id = trade['trade_id']
             exchange_name = trade['exchange']
             pair = trade['pair']
-            
+
             logger.info(f"Executing exit for trade {trade_id}: {reason}")
-            
+
             # Calculate realized PnL
             entry_price = float(trade.get('entry_price', 0))
             position_size = float(trade.get('position_size', 0))
             realized_pnl = (exit_price - entry_price) * position_size
-            
+
+            # Check available balance for the asset to be sold
+            asset = pair.split('/')[0] if '/' in pair else pair
+            available = self.balances.get(exchange_name, {}).get('available', {}).get(asset, 0)
+            logger.info(f"[ExitBalanceCheck] {exchange_name} {asset}: available={available}, required={position_size}")
+            if available < position_size:
+                logger.error(f"[ExitBalanceCheck] Insufficient {asset} balance for exit: available={available}, required={position_size}")
+                return
+
             # Execute exit order
             if self.config_manager.is_simulation_mode():
                 # Create simulated exit order
@@ -367,7 +384,7 @@ class TradingOrchestrator:
                 exit_order = await self.exchange_manager.create_order(
                     exchange_name, pair, 'market', 'sell', position_size, exit_price
                 )
-                
+
             if exit_order:
                 # Update trade record
                 await self.database_manager.update_trade(trade_id, {
@@ -378,11 +395,11 @@ class TradingOrchestrator:
                     'status': 'CLOSED',
                     'exit_reason': reason
                 })
-                
+
                 # Release balance and add PnL
                 position_size_value = position_size * exit_price  # Convert position units to value
                 await self.balance_manager.release_balance(exchange_name, position_size_value, realized_pnl)
-                
+
                 # Update strategy performance
                 await self.strategy_manager.update_strategy_performance(
                     trade.get('strategy', 'unknown'),
@@ -390,9 +407,9 @@ class TradingOrchestrator:
                     pair,
                     {'pnl': realized_pnl}
                 )
-                
+
                 logger.info(f"Successfully exited trade {trade_id} with PnL: {realized_pnl:.2f}")
-                
+
         except Exception as e:
             logger.error(f"Error executing trade exit: {e}")
             
@@ -401,10 +418,9 @@ class TradingOrchestrator:
         try:
             logger.info("Running entry cycle...")
             # Check available balance
-            if self._check_available_balance is not None:
-                if not await self._check_available_balance():
-                    logger.info("Insufficient balance for new trades")
-                    return
+            if not await self._check_available_balance():
+                logger.info("Insufficient balance for new trades")
+                return
             # Check for entry signals on all pairs
             for exchange_name, pairs in self.pair_selections.items():
                 logger.info(f"[EntryCycle] Checking exchange: {exchange_name} with pairs: {pairs}")

@@ -1,0 +1,140 @@
+{
+  "timestamp": "2025-07-24T16:42:56.828193+00:00",
+  "recovered_count": 6,
+  "recovered_trades": [
+    {
+      "trade_id": "a46a4971-dcf5-43fc-a526-08d5cc2bb151",
+      "exchange": "cryptocom",
+      "pair": "AAVE/USD",
+      "entry_price": 288.55,
+      "position_size": 0.173,
+      "entry_time": "2025-07-24T13:32:09Z",
+      "entry_reason": "Multi-timeframe confluence strategy signal: buy (confidence: 0.85, strength: 0.78) - AAVE technical breakout",
+      "strategy": "multi_timeframe_confluence",
+      "status": "OPEN",
+      "fees": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "trade_id": "d66f85ca-8af7-4e85-8721-52c4c7fa2917",
+      "exchange": "cryptocom",
+      "pair": "ADA/USD",
+      "entry_price": 0.80718,
+      "position_size": 62.0,
+      "entry_time": "2025-07-24T12:26:47Z",
+      "entry_reason": "Heikin Ashi strategy signal: buy (confidence: 0.72, strength: 0.65) - ADA momentum entry",
+      "strategy": "heikin_ashi",
+      "status": "OPEN",
+      "fees": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "trade_id": "cc10948e-5b7e-4dfb-85c8-6522536a2883",
+      "exchange": "cryptocom",
+      "pair": "ADA/USD",
+      "entry_price": 0.80653,
+      "position_size": 61.9,
+      "entry_time": "2025-07-24T12:25:00Z",
+      "entry_reason": "Heikin Ashi strategy signal: buy (confidence: 0.72, strength: 0.65) - ADA momentum entry",
+      "strategy": "heikin_ashi",
+      "status": "OPEN",
+      "fees": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "trade_id": "546c24fa-629a-4e56-a87d-5643796ef7ec",
+      "exchange": "cryptocom",
+      "pair": "ADA/USD",
+      "entry_price": 0.80535,
+      "position_size": 62.1,
+      "entry_time": "2025-07-24T12:23:00Z",
+      "entry_reason": "Heikin Ashi strategy signal: buy (confidence: 0.72, strength: 0.65) - ADA momentum entry",
+      "strategy": "heikin_ashi",
+      "status": "OPEN",
+      "fees": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "trade_id": "980ec17c-4ff5-4e53-8f4e-5f7d67000777",
+      "exchange": "cryptocom",
+      "pair": "ADA/USD",
+      "entry_price": 0.80491,
+      "position_size": 62.1,
+      "entry_time": "2025-07-24T12:21:38Z",
+      "entry_reason": "Heikin Ashi strategy signal: buy (confidence: 0.72, strength: 0.65) - ADA momentum entry",
+      "strategy": "heikin_ashi",
+      "status": "OPEN",
+      "fees": 0.0,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "trade_id": "6f8684d3-e400-434e-9237-7bb1b8795450",
+      "exchange": "cryptocom",
+      "pair": "ACX/USD",
+      "entry_price": 0.18059,
+      "position_size": 277.0,
+      "entry_time": "2025-07-24T10:36:37Z",
+      "entry_reason": "Volume spike strategy signal: buy (confidence: 0.88, strength: 0.82) - ACX volume breakout",
+      "strategy": "vwma_hull",
+      "status": "OPEN",
+      "fees": 0.0,
+      "unrealized_pnl": 0.0
+    }
+  ],
+  "target_orders": [
+    {
+      "id": "6530219581771941056",
+      "symbol": "AAVE/USD",
+      "side": "buy",
+      "amount": 0.173,
+      "price": 288.55,
+      "timestamp": "2025-07-24T13:32:09Z",
+      "status": "filled"
+    },
+    {
+      "id": "6530219581768167803",
+      "symbol": "ADA/USD",
+      "side": "buy",
+      "amount": 62.0,
+      "price": 0.80718,
+      "timestamp": "2025-07-24T12:26:47Z",
+      "status": "filled"
+    },
+    {
+      "id": "6530219581768058699",
+      "symbol": "ADA/USD",
+      "side": "buy",
+      "amount": 61.9,
+      "price": 0.80653,
+      "timestamp": "2025-07-24T12:25:00Z",
+      "status": "filled"
+    },
+    {
+      "id": "6530219581767942498",
+      "symbol": "ADA/USD",
+      "side": "buy",
+      "amount": 62.1,
+      "price": 0.80535,
+      "timestamp": "2025-07-24T12:23:00Z",
+      "status": "filled"
+    },
+    {
+      "id": "6530219581767853040",
+      "symbol": "ADA/USD",
+      "side": "buy",
+      "amount": 62.1,
+      "price": 0.80491,
+      "timestamp": "2025-07-24T12:21:38Z",
+      "status": "filled"
+    },
+    {
+      "id": "6530219581761276035",
+      "symbol": "ACX/USD",
+      "side": "buy",
+      "amount": 277.0,
+      "price": 0.18059,
+      "timestamp": "2025-07-24T10:36:37Z",
+      "status": "filled"
+    }
+  ]
+}

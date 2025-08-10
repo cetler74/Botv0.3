@@ -198,12 +198,12 @@ body {
 
 /* Trade status colors */
 .trade-status-open {
-    color: #007bff;
+    color: #16a34a;
     font-weight: 600;
 }
 
 .trade-status-closed {
-    color: #28a745;
+    color: #dc2626;
     font-weight: 600;
 }
 
@@ -212,19 +212,28 @@ body {
     font-weight: 600;
 }
 
+/* CLOSED trade row styling - faded out appearance */
+.opacity-60 {
+    opacity: 0.6;
+}
+
+.bg-gray-50 {
+    background-color: #f9fafb;
+}
+
 /* PnL colors */
 .pnl-positive {
-    color: #28a745;
+    color: #16a34a !important;
     font-weight: 600;
 }
 
 .pnl-negative {
-    color: #dc3545;
+    color: #dc2626 !important;
     font-weight: 600;
 }
 
 .pnl-neutral {
-    color: #6c757d;
+    color: #6b7280 !important;
     font-weight: 600;
 }
 

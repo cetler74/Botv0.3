@@ -1,86 +1,390 @@
 """
-Exchange Service for the Multi-Exchange Trading Bot
-Multi-exchange operations and market data management
+Exchange Service for the Multi-Exchange Trading Bot - FIXED VERSION
+Multi-exchange operations and market data management with proper WebSocket support
 """
 
 import asyncio
+import json
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta
-import ccxt
-import ccxt.async_support as ccxt_async
-import pandas as pd
-import numpy as np
-from decimal import Decimal
-import time
-import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
 import os
+import time
+import websockets
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Set
+
+import ccxt.async_support as ccxt
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Exchange Service",
-    description="Multi-exchange operations and market data management",
-    version="1.0.0"
-)
+app = FastAPI(title="Exchange Service", version="1.0.0")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class WebSocketExchangeHandler:
+    """Exchange-specific WebSocket handler"""
+    
+    def __init__(self, exchange_name: str, exchange_config: dict):
+        self.exchange_name = exchange_name
+        self.exchange_config = exchange_config
+        self.websocket_url = exchange_config.get('websocket_url')
+        self.api_key = exchange_config.get('api_key')
+        self.secret = exchange_config.get('secret')
+        self.connection = None
+        self.is_connected = False
+        self.last_update = None
+        self.order_callbacks = {}  # order_id -> callback function
+        self.subscribed_symbols: Set[str] = set()
+        
+    async def connect(self) -> bool:
+        """Establish WebSocket connection to exchange"""
+        try:
+            if not self.websocket_url:
+                logger.warning(f"No WebSocket URL configured for {self.exchange_name}")
+                return False
+                
+            logger.info(f"Connecting to {self.exchange_name} WebSocket: {self.websocket_url}")
+            self.connection = await websockets.connect(self.websocket_url)
+            self.is_connected = True
+            self.last_update = datetime.utcnow().isoformat()
+            
+            # Start listening for messages
+            asyncio.create_task(self._listen_for_messages())
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to {self.exchange_name} WebSocket: {e}")
+            self.is_connected = False
+            return False
+    
+    async def disconnect(self):
+        """Close WebSocket connection"""
+        if self.connection:
+            try:
+                await self.connection.close()
+            except:
+                pass
+            finally:
+                self.connection = None
+                self.is_connected = False
+                logger.info(f"Disconnected from {self.exchange_name} WebSocket")
+    
+    async def _listen_for_messages(self):
+        """Listen for incoming WebSocket messages"""
+        try:
+            async for message in self.connection:
+                try:
+                    data = json.loads(message)
+                    # Try to parse ticker updates first; if not, handle as order update
+                    handled_ticker = await self._handle_ticker_update(data)
+                    if not handled_ticker:
+                        await self._handle_order_update(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON message from {self.exchange_name}: {message}")
+                except Exception as e:
+                    logger.error(f"Error processing message from {self.exchange_name}: {e}")
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"WebSocket connection closed for {self.exchange_name}")
+            self.is_connected = False
+        except Exception as e:
+            logger.error(f"Error in WebSocket listener for {self.exchange_name}: {e}")
+            self.is_connected = False
+    
+    async def _handle_order_update(self, data: dict):
+        """Handle order update from WebSocket - FIXED VERSION"""
+        try:
+            # CRITICAL FIX: Ensure data is dict, not list
+            if isinstance(data, list):
+                # If data is a list, process each item
+                for item in data:
+                    if isinstance(item, dict):
+                        await self._process_single_order_update(item)
+            elif isinstance(data, dict):
+                await self._process_single_order_update(data)
+            else:
+                logger.warning(f"Unexpected data type from {self.exchange_name}: {type(data)}")
+                
+        except Exception as e:
+            logger.error(f"Error handling order update from {self.exchange_name}: {e}")
+
+    async def _handle_ticker_update(self, data: dict) -> bool:
+        """Try to handle incoming message as a ticker update. Return True if handled."""
+        try:
+            # Binance combined tickers: list of objects with 's','c','b','a'
+            if self.exchange_name.lower() == 'binance':
+                if isinstance(data, list):
+                    for item in data:
+                        symbol = item.get('s')
+                        if not symbol:
+                            continue
+                        last = item.get('c')
+                        bid = item.get('b')
+                        ask = item.get('a')
+                        _update_ticker_cache(self.exchange_name, symbol, last, bid, ask)
+                    self.last_update = datetime.utcnow().isoformat()
+                    return True
+                elif isinstance(data, dict) and data.get('s') and data.get('c'):
+                    symbol = data.get('s')
+                    _update_ticker_cache(self.exchange_name, symbol, data.get('c'), data.get('b'), data.get('a'))
+                    self.last_update = datetime.utcnow().isoformat()
+                    return True
+
+            # Bybit v5 public spot tickers
+            if self.exchange_name.lower() == 'bybit':
+                if isinstance(data, dict) and data.get('topic') and 'tickers' in str(data.get('topic')):
+                    payload = data.get('data') or []
+                    if isinstance(payload, dict):
+                        payload = [payload]
+                    for item in payload:
+                        symbol = item.get('symbol')
+                        last = item.get('lastPrice') or item.get('last_price')
+                        bid = item.get('bid1Price') or item.get('bid_price')
+                        ask = item.get('ask1Price') or item.get('ask_price')
+                        if symbol:
+                            _update_ticker_cache(self.exchange_name, symbol, last, bid, ask)
+                    self.last_update = datetime.utcnow().isoformat()
+                    return True
+
+            # Crypto.com public ticker
+            if self.exchange_name.lower() == 'cryptocom':
+                if isinstance(data, dict) and data.get('result') and isinstance(data['result'], dict):
+                    items = data['result'].get('data') or []
+                    if isinstance(items, dict):
+                        items = [items]
+                    for item in items:
+                        # instrument name could be like BTC_USD; normalize by removing non-alnum
+                        instr = item.get('i') or item.get('instrument_name') or item.get('s')
+                        if not instr:
+                            continue
+                        symbol = ''.join(ch for ch in str(instr) if ch.isalnum())
+                        last = item.get('a') or item.get('c') or item.get('last')
+                        bid = item.get('b')
+                        ask = item.get('k') or item.get('a')
+                        _update_ticker_cache(self.exchange_name, symbol, last, bid, ask)
+                    self.last_update = datetime.utcnow().isoformat()
+                    return True
+
+        except Exception as e:
+            logger.debug(f"Ticker parse not handled for {self.exchange_name}: {e}")
+        return False
+
+    async def subscribe(self, symbols: List[str]) -> None:
+        """Track desired ticker subscriptions and send subscription frames for exchanges that require it."""
+        try:
+            new_syms = set(symbols)
+            self.subscribed_symbols |= new_syms
+            # Binance all-tickers stream needs no per-symbol subscribe when using !ticker@arr
+            if self.exchange_name.lower() == 'binance':
+                return
+            # Bybit subscribe
+            if self.exchange_name.lower() == 'bybit' and self.connection:
+                topics = [f"tickers.{sym}" for sym in new_syms]
+                msg = {"op": "subscribe", "args": topics}
+                await self.connection.send(json.dumps(msg))
+            # Crypto.com subscribe
+            if self.exchange_name.lower() == 'cryptocom' and self.connection:
+                # Crypto.com expects instrument_name like BTC_USD; try to infer by inserting underscore before USD/USDC
+                args = []
+                for s in new_syms:
+                    if s.endswith('USD'):
+                        args.append({"instrument_name": f"{s[:-3]}_USD"})
+                    elif s.endswith('USDC'):
+                        args.append({"instrument_name": f"{s[:-4]}_USDC"})
+                if args:
+                    msg = {"id": int(time.time()), "method": "subscribe", "params": {"channels": ["ticker"]}, "nonce": int(time.time()*1000)}
+                    # Some implementations require channels with instrument_name; keep simple here
+                    await self.connection.send(json.dumps(msg))
+        except Exception as e:
+            logger.warning(f"Subscription error for {self.exchange_name}: {e}")
+
+    async def unsubscribe(self, symbols: List[str]) -> None:
+        try:
+            remove_syms = set(symbols)
+            self.subscribed_symbols -= remove_syms
+            # Optional: send unsubscribe frames if needed for specific exchanges
+            if self.exchange_name.lower() == 'bybit' and self.connection:
+                topics = [f"tickers.{sym}" for sym in remove_syms]
+                msg = {"op": "unsubscribe", "args": topics}
+                await self.connection.send(json.dumps(msg))
+            if self.exchange_name.lower() == 'cryptocom' and self.connection:
+                # Send generic unsubscribe
+                msg = {"id": int(time.time()), "method": "unsubscribe", "params": {"channels": ["ticker"]}, "nonce": int(time.time()*1000)}
+                await self.connection.send(json.dumps(msg))
+        except Exception as e:
+            logger.warning(f"Unsubscribe error for {self.exchange_name}: {e}")
+    
+    async def _process_single_order_update(self, data: dict):
+        """Process a single order update - FIXED VERSION"""
+        try:
+            # Extract order information based on exchange format
+            order_id = self._extract_order_id(data)
+            status = self._extract_order_status(data)
+            
+            if order_id and status:
+                # Update last update time
+                self.last_update = datetime.utcnow().isoformat()
+                
+                # Notify registered callbacks
+                if order_id in self.order_callbacks:
+                    callback = self.order_callbacks[order_id]
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(status, data)
+                    else:
+                        callback(status, data)
+                
+                logger.info(f"Order update from {self.exchange_name}: {order_id} -> {status}")
+                
+        except Exception as e:
+            logger.error(f"Error processing single order update from {self.exchange_name}: {e}")
+    
+    def _extract_order_id(self, data: dict) -> Optional[str]:
+        """Extract order ID from exchange-specific message format"""
+        try:
+            if not isinstance(data, dict):
+                return None
+                
+            # Exchange-specific order ID extraction
+            if self.exchange_name == 'binance':
+                return data.get('i') or data.get('c') or data.get('orderId')  # Binance format
+            elif self.exchange_name == 'cryptocom':
+                return data.get('order_id') or data.get('id')  # Crypto.com format
+            elif self.exchange_name == 'bybit':
+                return data.get('orderId') or data.get('order_id')  # Bybit format
+            else:
+                return data.get('order_id') or data.get('id') or data.get('orderId')
+        except Exception as e:
+            logger.error(f"Error extracting order ID from {self.exchange_name}: {e}")
+            return None
+    
+    def _extract_order_status(self, data: dict) -> Optional[str]:
+        """Extract order status from exchange-specific message format"""
+        try:
+            if not isinstance(data, dict):
+                return None
+                
+            # Exchange-specific status extraction
+            if self.exchange_name == 'binance':
+                status = data.get('X') or data.get('status')
+            elif self.exchange_name == 'cryptocom':
+                status = data.get('status')
+            elif self.exchange_name == 'bybit':
+                status = data.get('orderStatus') or data.get('status')
+            else:
+                status = data.get('status')
+            
+            # Normalize status
+            if status:
+                status = status.lower()
+                if status in ['filled', 'complete', 'closed']:
+                    return 'filled'
+                elif status in ['canceled', 'cancelled']:
+                    return 'cancelled'
+                elif status in ['pending', 'new', 'open']:
+                    return 'pending'
+                else:
+                    return status
+                    
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting order status from {self.exchange_name}: {e}")
+            return None
+    
+    def register_order_callback(self, order_id: str, callback):
+        """Register callback for specific order updates"""
+        self.order_callbacks[order_id] = callback
+        logger.debug(f"Registered callback for order {order_id} on {self.exchange_name}")
+    
+    def unregister_order_callback(self, order_id: str):
+        """Unregister callback for specific order"""
+        if order_id in self.order_callbacks:
+            del self.order_callbacks[order_id]
+            logger.debug(f"Unregistered callback for order {order_id} on {self.exchange_name}")
+
+class WebSocketManager:
+    """Manages WebSocket connections for all exchanges"""
+    
+    def __init__(self):
+        self.handlers: Dict[str, WebSocketExchangeHandler] = {}
+    
+    async def initialize_handler(self, exchange_name: str, exchange_config: dict):
+        """Initialize WebSocket handler for an exchange"""
+        try:
+            handler = WebSocketExchangeHandler(exchange_name, exchange_config)
+            self.handlers[exchange_name] = handler
+            
+            # Only connect if websocket_url is provided
+            if exchange_config.get('websocket_url'):
+                await handler.connect()
+                logger.info(f"WebSocket handler initialized for {exchange_name}")
+            else:
+                logger.info(f"WebSocket handler created for {exchange_name} (no URL provided)")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize WebSocket handler for {exchange_name}: {e}")
+    
+    def get_handler(self, exchange_name: str) -> Optional[WebSocketExchangeHandler]:
+        """Get WebSocket handler for an exchange"""
+        return self.handlers.get(exchange_name)
+    
+    async def shutdown_all(self):
+        """Shutdown all WebSocket connections"""
+        for handler in self.handlers.values():
+            await handler.disconnect()
+        self.handlers.clear()
+        logger.info("All WebSocket handlers shutdown")
+    
+    def register_order_callback(self, exchange_name: str, order_id: str, callback):
+        """Register callback for specific exchange and order"""
+        handler = self.get_handler(exchange_name)
+        if handler:
+            handler.register_order_callback(order_id, callback)
+    
+    def unregister_order_callback(self, exchange_name: str, order_id: str):
+        """Unregister callback for specific exchange and order"""
+        handler = self.get_handler(exchange_name)
+        if handler:
+            handler.unregister_order_callback(order_id)
+
+# Global WebSocket manager
+websocket_manager = WebSocketManager()
+
+# In-memory ticker cache: key = f"{exchange}:{symbol_no_slash}", value dict(last,bid,ask,timestamp)
+ticker_cache: Dict[str, Dict[str, Any]] = {}
+
+def _normalize_symbol_key(exchange: str, symbol: str) -> str:
+    # Symbol expected without slash by most callers (e.g., BTCUSD, BTCUSDC)
+    normalized = ''.join(ch for ch in str(symbol) if ch.isalnum())
+    return f"{exchange}:{normalized}"
+
+def _update_ticker_cache(exchange: str, symbol: str, last: Any, bid: Any, ask: Any) -> None:
+    try:
+        key = _normalize_symbol_key(exchange, symbol)
+        last_f = float(last) if last is not None else None
+        bid_f = float(bid) if bid is not None else None
+        ask_f = float(ask) if ask is not None else None
+        if last_f is None:
+            return
+        ticker_cache[key] = {
+            'last': last_f,
+            'bid': bid_f,
+            'ask': ask_f,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.debug(f"Failed to update ticker cache for {exchange}:{symbol}: {e}")
 
 # Data Models
-class MarketData(BaseModel):
+class OrderRequest(BaseModel):
     exchange: str
     symbol: str
-    data_type: str  # 'ticker', 'ohlcv', 'orderbook'
-    data: Dict[str, Any]
-    timestamp: datetime
-
-class Order(BaseModel):
-    exchange: str
-    symbol: str
-    order_type: str  # 'market', 'limit', 'stop'
-    side: str  # 'buy', 'sell'
+    order_type: str  # 'market' or 'limit'
+    side: str  # 'buy' or 'sell'
     amount: float
     price: Optional[float] = None
-    order_id: Optional[str] = None
-    status: str = 'pending'
-
-class ExchangeHealth(BaseModel):
-    exchange: str
-    status: str  # 'healthy', 'degraded', 'down'
-    response_time: float
-    last_check: datetime
-    error_count: int
-
-class Balance(BaseModel):
-    exchange: str
-    total: float
-    free: float
-    used: float
-    timestamp: datetime
-
-class Position(BaseModel):
-    exchange: str
-    symbol: str
-    side: str  # 'long', 'short'
-    size: float
-    entry_price: float
-    current_price: float
-    unrealized_pnl: float
-    timestamp: datetime
+    client_order_id: Optional[str] = None  # Phase 0: Support idempotency
 
 class HealthResponse(BaseModel):
     status: str
@@ -92,73 +396,111 @@ class HealthResponse(BaseModel):
 # Global variables
 exchanges = {}
 rate_limits = {}
+exchange_manager = None
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
 database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database_service:8002")
 
 class ExchangeManager:
-    """Manages multiple exchange connections and operations"""
+    """FIXED Exchange Manager with proper error handling"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self._initialize_exchanges()
         
     def _initialize_exchanges(self) -> None:
-        """Initialize exchange connections"""
+        """Initialize exchange connections - FIXED VERSION"""
+        global exchanges
         exchange_configs = self.config.get('exchanges', {})
         
         for exchange_name, config in exchange_configs.items():
             try:
-                # Map exchange names to CCXT exchange classes
-                exchange_class_map = {
-                    'binance': ccxt_async.binance,
-                    'cryptocom': ccxt_async.cryptocom,
-                    'bybit': ccxt_async.bybit
-                }
+                logger.info(f"Initializing {exchange_name} exchange...")
                 
-                if exchange_name not in exchange_class_map:
-                    logger.warning(f"Unsupported exchange: {exchange_name}")
-                    continue
-                    
-                exchange_class = exchange_class_map[exchange_name]
+                # Get exchange class
+                exchange_class = getattr(ccxt, exchange_name)
                 
-                # Initialize exchange with configuration
+                # Prepare configuration
+                api_key = config.get('api_key', '')
+                api_secret = config.get('api_secret', '')
+                
+                # Log credential status (without revealing actual values)
+                logger.info(f"Exchange {exchange_name} credentials: API key {'✅' if api_key else '❌'}, Secret {'✅' if api_secret else '❌'}")
+                
                 exchange_config = {
-                    'apiKey': config.get('api_key', ''),
-                    'secret': config.get('api_secret', ''),
+                    'apiKey': api_key,
+                    'secret': api_secret,
                     'sandbox': config.get('sandbox', False),
                     'enableRateLimit': True,
                     'rateLimit': 100,  # 100ms between requests
-                    'timeout': 30000,  # 30 seconds
                 }
                 
-                # Create exchange instance
-                exchange = exchange_class(exchange_config)
+                # Exchange-specific configurations
+                if exchange_name == 'binance':
+                    exchange_config.update({
+                        'options': {
+                            'defaultType': 'spot',
+                            'warnOnFetchOpenOrdersWithoutSymbol': False  # Suppress rate limit warning
+                        }
+                    })
+                elif exchange_name == 'bybit':
+                    exchange_config.update({
+                        'options': {
+                            'defaultType': 'unified'  # Use unified trading account
+                        }
+                    })
+                elif exchange_name == 'cryptocom':
+                    exchange_config.update({
+                        'options': {
+                            'createMarketBuyOrderRequiresPrice': False
+                        }
+                    })
+                    # Crypto.com specific: ensure credentials are properly set
+                    logger.info(f"CryptoCom config: sandbox={exchange_config.get('sandbox')}, "
+                              f"apiKey_length={len(exchange_config.get('apiKey', ''))}, "
+                              f"secret_length={len(exchange_config.get('secret', ''))}")
                 
-                # Store exchange and its configuration
-                exchanges[exchange_name] = {
-                    'instance': exchange,
-                    'config': config,
-                    'last_request': 0,
-                    'request_count': 0,
-                    'health': {
-                        'status': 'unknown',
-                        'last_check': None,
-                        'response_time': 0,
-                        'error_count': 0
+                # CRITICAL FIX: Create exchange instance properly
+                try:
+                    exchange = exchange_class(exchange_config)
+                    
+                    # Verify the instance is properly created
+                    if not hasattr(exchange, 'fetch_ticker'):
+                        raise Exception(f"Invalid exchange instance for {exchange_name}")
+                        
+                    # Store exchange and its configuration
+                    exchanges[exchange_name] = {
+                        'instance': exchange,  # This should be a proper CCXT instance
+                        'config': config,
+                        'last_request': 0,
+                        'request_count': 0,
+                        'health': {
+                            'status': 'unknown',
+                            'last_check': None,
+                            'response_time': 0,
+                            'error_count': 0
+                        }
                     }
-                }
-                
-                # Initialize rate limiting
-                rate_limits[exchange_name] = {
-                    'last_request': 0,
-                    'request_count': 0,
-                    'rate_limit_delay': config.get('rate_limit_delay', 0.1)
-                }
-                
-                logger.info(f"Initialized {exchange_name} exchange")
-                
+                    
+                    # Initialize rate limiting
+                    rate_limits[exchange_name] = {
+                        'last_request': 0,
+                        'request_count': 0,
+                        'rate_limit_delay': config.get('rate_limit_delay', 0.1)
+                    }
+                    
+                    # Initialize WebSocket handler
+                    websocket_config = config.copy()
+                    websocket_config['websocket_url'] = config.get('websocket_url')
+                    asyncio.create_task(websocket_manager.initialize_handler(exchange_name, websocket_config))
+                    
+                    logger.info(f"✅ Successfully initialized {exchange_name} exchange")
+                    
+                except Exception as init_error:
+                    logger.error(f"❌ Failed to create {exchange_name} instance: {init_error}")
+                    raise init_error
+                    
             except Exception as e:
-                logger.error(f"Failed to initialize {exchange_name} exchange: {e}")
+                logger.error(f"❌ Failed to initialize {exchange_name} exchange: {e}")
                 
     async def _rate_limit(self, exchange_name: str) -> None:
         """Apply rate limiting for exchange requests"""
@@ -188,60 +530,65 @@ class ExchangeManager:
         try:
             async with httpx.AsyncClient() as client:
                 alert_data = {
-                    'alert_id': f"exchange_error_{exchange_name}_{int(time.time())}",
-                    'level': 'ERROR',
-                    'category': 'EXCHANGE',
-                    'message': error_msg,
                     'exchange': exchange_name,
-                    'details': {
-                        'operation': operation,
-                        'error_type': type(error).__name__,
-                        'timestamp': datetime.utcnow().isoformat()
-                    },
-                    'timestamp': datetime.utcnow(),
+                    'operation': operation,
+                    'error_message': str(error),
+                    'severity': 'warning',
+                    'timestamp': datetime.utcnow().isoformat(),
                     'resolved': False
                 }
                 await client.post(f"{database_service_url}/api/v1/alerts", json=alert_data)
-        except Exception as e:
-            logger.error(f"Failed to create alert: {e}")
+        except Exception as alert_error:
+            logger.warning(f"Failed to create alert for exchange error: {alert_error}")
 
-# Global exchange manager
-exchange_manager = None
-
-async def get_config_from_service() -> Dict[str, Any]:
+async def get_config_from_service():
     """Get configuration from config service"""
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{config_service_url}/api/v1/config/exchanges")
-            response.raise_for_status()
-            return response.json()
+            # Try the internal endpoint first for unmasked credentials
+            response = await client.get(f"{config_service_url}/api/v1/config/exchanges/internal")
+            if response.status_code == 200:
+                return response.json()
+            else:
+                # Fallback to regular endpoint
+                response = await client.get(f"{config_service_url}/api/v1/config/exchanges")
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    raise Exception(f"Config service returned {response.status_code}")
     except Exception as e:
         logger.error(f"Failed to get config from service: {e}")
-        # Fallback to environment variables
-        return {
-            'binance': {
-                'api_key': os.getenv('BINANCE_API_KEY', ''),
-                'api_secret': os.getenv('BINANCE_API_SECRET', ''),
-                'sandbox': os.getenv('BINANCE_SANDBOX', 'true').lower() == 'true',
-                'base_currency': 'USDC',
-                'max_pairs': 10,
-                'min_volume_24h': 1000000,
-                'min_volatility': 0.02
+        raise
+
+# Status endpoint
+@app.get("/status")
+async def get_status():
+    """Get service status"""
+    return {
+        "service": "exchange-service",
+        "status": "running",
+        "exchanges": {
+            name: {
+                "status": info['health']['status'],
+                "last_check": info['health']['last_check'],
+                "error_count": info['health']['error_count'],
+                "websocket_connected": websocket_manager.get_handler(name).is_connected if websocket_manager.get_handler(name) else False
             }
+            for name, info in exchanges.items()
         }
+    }
 
 async def initialize_exchanges():
-    """Initialize exchange connections"""
+    """Initialize exchange connections - FIXED VERSION"""
     global exchange_manager
     try:
         config = await get_config_from_service()
         exchange_manager = ExchangeManager({'exchanges': config})
-        logger.info("Exchange service initialized successfully")
+        logger.info("✅ Exchange service initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize exchange service: {e}")
+        logger.error(f"❌ Failed to initialize exchange service: {e}")
         raise
 
-# API Endpoints
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
@@ -257,78 +604,165 @@ async def health_check():
 @app.get("/ready")
 async def readiness_check():
     """Readiness check endpoint"""
-    if not exchange_manager:
-        raise HTTPException(status_code=503, detail="Exchange manager not initialized")
-    return {"status": "ready"}
-
-@app.get("/live")
-async def liveness_check():
-    """Liveness check endpoint"""
-    return {"status": "alive"}
+    if not exchange_manager or len(exchanges) == 0:
+        raise HTTPException(status_code=503, detail="Exchange service not ready")
+    return {"status": "ready", "exchanges": len(exchanges)}
 
 # Market Data Endpoints
-@app.get("/api/v1/market/ticker/{exchange}/{symbol}")
+@app.get("/api/v1/market/ticker-live/{exchange}/{symbol:path}")
+async def get_ticker_live(exchange: str, symbol: str, stale_threshold_seconds: int = 30):
+    """Return last WS ticker if fresh; 204 if unavailable or stale."""
+    try:
+        key = _normalize_symbol_key(exchange, symbol)
+        data = ticker_cache.get(key)
+        if not data:
+            return Response(status_code=204)
+        ts = data.get('timestamp')
+        if not ts:
+            return Response(status_code=204)
+        try:
+            age = (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds()
+        except Exception:
+            age = 9999
+        if age > stale_threshold_seconds:
+            return Response(status_code=204)
+        return {
+            'symbol': symbol,
+            'last': data.get('last'),
+            'bid': data.get('bid'),
+            'ask': data.get('ask'),
+            'timestamp': data.get('timestamp'),
+            'source': 'websocket'
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/v1/market/ticker/{exchange}/{symbol:path}")
 async def get_ticker(exchange: str, symbol: str):
-    """Get ticker information for a symbol"""
+    """Get ticker information for a symbol - FIXED VERSION"""
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
     try:
+        # Convert symbol format for different exchanges
+        exchange_symbol = symbol
+        if exchange == 'cryptocom':
+            # Crypto.com needs symbols with slashes, convert from BTCUSD to BTC/USD
+            if '/' not in symbol:
+                if len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(symbol) >= 6 and symbol.endswith('USDC'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
+                
+            # Add :USD or :USDC suffix when needed without introducing double slashes
+            if ':' not in exchange_symbol:
+                if exchange_symbol.endswith('/USD'):
+                    exchange_symbol = exchange_symbol.replace('/USD', '/USD:USD')
+                elif exchange_symbol.endswith('/USDC'):
+                    exchange_symbol = exchange_symbol.replace('/USDC', '/USDC:USDC')
+        elif exchange in ['binance', 'bybit']:
+            # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD
+            if len(symbol) >= 6 and symbol.endswith('USD'):
+                base = symbol[:-3]
+                exchange_symbol = f"{base}/USD"
+            elif len(symbol) >= 6 and symbol.endswith('USDC'):
+                base = symbol[:-4]
+                exchange_symbol = f"{base}/USDC"
+        
         await exchange_manager._rate_limit(exchange)
+        
+        # CRITICAL FIX: Ensure we get the actual CCXT instance
         exchange_instance = exchanges[exchange]['instance']
         
-        start_time = time.time()
-        ticker = await exchange_instance.fetch_ticker(symbol)
-        response_time = time.time() - start_time
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'fetch_ticker'):
+            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_ticker method")
+        
+        # Retry logic with exponential backoff
+        max_retries = 3
+        retry_delay = 1  # Start with 1 second
+        ticker = None
+        
+        for attempt in range(max_retries):
+            try:
+                start_time = time.time()
+                # CRITICAL FIX: Make sure this is actually async and properly awaited
+                ticker = await exchange_instance.fetch_ticker(exchange_symbol)
+                response_time = time.time() - start_time
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    raise e  # Re-raise the exception
+                    
+                logger.warning(f"Ticker fetch attempt {attempt + 1} failed for {exchange_symbol} on {exchange}: {e}. Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                await exchange_manager._rate_limit(exchange)  # Apply rate limit between retries
         
         # Update health
         exchanges[exchange]['health']['status'] = 'healthy'
         exchanges[exchange]['health']['response_time'] = response_time
         exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
-        # Cache the data
-        try:
-            async with httpx.AsyncClient() as client:
-                cache_data = {
-                    'exchange': exchange,
-                    'pair': symbol,
-                    'data_type': 'ticker',
-                    'data': ticker,
-                    'timestamp': datetime.utcnow(),
-                    'expires_at': datetime.utcnow() + timedelta(minutes=1)
-                }
-                await client.post(f"{database_service_url}/api/v1/cache/market-data", json=cache_data)
-        except Exception as e:
-            logger.warning(f"Failed to cache ticker data: {e}")
         
         return ticker
         
     except Exception as e:
+        error_msg = str(e).lower()
+        # Handle symbol not found errors with 404 instead of 500
+        if any(phrase in error_msg for phrase in ['does not have market symbol', 'symbol not found', 'invalid symbol', 'market not found']):
+            logger.warning(f"Symbol {exchange_symbol} not found on {exchange}: {e}")
+            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found on {exchange}")
+        
         await exchange_manager._handle_exchange_error(exchange, e, f"get_ticker({symbol})")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/market/ohlcv/{exchange}/{symbol}")
-async def get_ohlcv(exchange: str, symbol: str, timeframe: str = '1h', limit: int = 100):
-    """Get OHLCV data for a symbol"""
+@app.get("/api/v1/market/orderbook/{exchange}/{symbol:path}")
+async def get_orderbook(exchange: str, symbol: str, limit: int = 20):
+    """Get orderbook information for a symbol - FIXED VERSION"""
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
     try:
-        # Check cache first
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"{database_service_url}/api/v1/cache/market-data/{exchange}/{symbol}/ohlcv_{timeframe}")
-                if response.status_code == 200:
-                    cached_data = response.json()
-                    return cached_data['data']
-        except Exception:
-            pass  # Continue to fetch from exchange
+        # Convert symbol format for different exchanges
+        exchange_symbol = symbol
+        if exchange == 'cryptocom':
+            # Crypto.com needs symbols with slashes, convert from BTCUSD to BTC/USD
+            if '/' not in symbol:
+                if len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(symbol) >= 7 and symbol.endswith('USDC'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
+            # Add :USD or :USDC suffix when needed without introducing double slashes
+            if ':' not in exchange_symbol:
+                if exchange_symbol.endswith('/USD'):
+                    exchange_symbol = exchange_symbol.replace('/USD', '/USD:USD')
+                elif exchange_symbol.endswith('/USDC'):
+                    exchange_symbol = exchange_symbol.replace('/USDC', '/USDC:USDC')
+        elif exchange in ['binance', 'bybit']:
+            # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD
+            if '/' not in symbol:
+                if len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(symbol) >= 7 and symbol.endswith('USDC'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
         
         await exchange_manager._rate_limit(exchange)
+        
+        # CRITICAL FIX: Ensure we get the actual CCXT instance
         exchange_instance = exchanges[exchange]['instance']
         
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'fetch_order_book'):
+            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_order_book method")
+        
         start_time = time.time()
-        ohlcv_data = await exchange_instance.fetch_ohlcv(symbol, timeframe, limit=limit)
+        # CRITICAL FIX: Make sure this is actually async and properly awaited
+        orderbook = await exchange_instance.fetch_order_book(exchange_symbol, limit=limit)
         response_time = time.time() - start_time
         
         # Update health
@@ -336,183 +770,27 @@ async def get_ohlcv(exchange: str, symbol: str, timeframe: str = '1h', limit: in
         exchanges[exchange]['health']['response_time'] = response_time
         exchanges[exchange]['health']['last_check'] = datetime.utcnow()
         
-        if not ohlcv_data:
-            raise HTTPException(status_code=404, detail="No OHLCV data available")
-        
-        # Convert to DataFrame for processing
-        df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # Cache the data
-        try:
-            async with httpx.AsyncClient() as client:
-                cache_data = {
-                    'exchange': exchange,
-                    'pair': symbol,
-                    'data_type': f'ohlcv_{timeframe}',
-                    'data': df.to_dict('records'),
-                    'timestamp': datetime.utcnow(),
-                    'expires_at': datetime.utcnow() + timedelta(minutes=5)
-                }
-                await client.post(f"{database_service_url}/api/v1/cache/market-data", json=cache_data)
-        except Exception as e:
-            logger.warning(f"Failed to cache OHLCV data: {e}")
-        
-        return df.to_dict('records')
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange, e, f"get_ohlcv({symbol}, {timeframe})")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/market/orderbook/{exchange}/{symbol}")
-async def get_order_book(exchange: str, symbol: str, limit: int = 20):
-    """Get order book for a symbol"""
-    if not exchange_manager or exchange not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
-    
-    try:
-        await exchange_manager._rate_limit(exchange)
-        exchange_instance = exchanges[exchange]['instance']
-        
-        start_time = time.time()
-        order_book = await exchange_instance.fetch_order_book(symbol, limit)
-        response_time = time.time() - start_time
-        
-        # Update health
-        exchanges[exchange]['health']['status'] = 'healthy'
-        exchanges[exchange]['health']['response_time'] = response_time
-        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
-        # Cache the data
-        try:
-            async with httpx.AsyncClient() as client:
-                cache_data = {
-                    'exchange': exchange,
-                    'pair': symbol,
-                    'data_type': 'orderbook',
-                    'data': order_book,
-                    'timestamp': datetime.utcnow(),
-                    'expires_at': datetime.utcnow() + timedelta(minutes=1)
-                }
-                await client.post(f"{database_service_url}/api/v1/cache/market-data", json=cache_data)
-        except Exception as e:
-            logger.warning(f"Failed to cache orderbook data: {e}")
-        
-        return order_book
+        return orderbook
         
     except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange, e, f"get_order_book({symbol})")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/market/pairs/{exchange}")
-async def get_trading_pairs(exchange: str, base_currency: str = 'USDC'):
-    """Get trading pairs for an exchange"""
-    if not exchange_manager or exchange not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
-    
-    try:
-        await exchange_manager._rate_limit(exchange)
-        exchange_instance = exchanges[exchange]['instance']
-        
-        start_time = time.time()
-        markets = await exchange_instance.fetch_markets()
-        response_time = time.time() - start_time
-        
-        # Update health
-        exchanges[exchange]['health']['status'] = 'healthy'
-        exchanges[exchange]['health']['response_time'] = response_time
-        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
-        # Filter pairs by base currency
-        pairs = []
-        for market in markets:
-            if market['quote'] == base_currency and market['active']:
-                pairs.append(market['symbol'])
-        
-        return {"pairs": pairs, "total": len(pairs)}
-        
-    except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange, e, "get_trading_pairs")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Trading Operations Endpoints
-@app.post("/api/v1/trading/order")
-async def create_order(order: Order):
-    """Create a new order"""
-    if not exchange_manager or order.exchange not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {order.exchange} not found")
-    
-    try:
-        await exchange_manager._rate_limit(order.exchange)
-        exchange_instance = exchanges[order.exchange]['instance']
-        
-        # Prepare order parameters
-        params = {}
-        if order.order_type == 'market':
-            params['type'] = 'market'
-        elif order.order_type == 'limit':
-            params['type'] = 'limit'
-            if not order.price:
-                raise HTTPException(status_code=400, detail="Price required for limit orders")
-        
-        start_time = time.time()
-        result = await exchange_instance.create_order(
-            symbol=order.symbol,
-            type=params.get('type', 'market'),
-            side=order.side,
-            amount=order.amount,
-            price=order.price,
-            params=params
-        )
-        response_time = time.time() - start_time
-        
-        # Update health
-        exchanges[order.exchange]['health']['status'] = 'healthy'
-        exchanges[order.exchange]['health']['response_time'] = response_time
-        exchanges[order.exchange]['health']['last_check'] = datetime.utcnow()
-        
-        return result
-        
-    except Exception as e:
-        await exchange_manager._handle_exchange_error(order.exchange, e, f"create_order({order.symbol})")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/v1/trading/order/{exchange}/{order_id}")
-async def cancel_order(exchange: str, order_id: str, symbol: str):
-    """Cancel an order"""
-    if not exchange_manager or exchange not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
-    
-    try:
-        await exchange_manager._rate_limit(exchange)
-        exchange_instance = exchanges[exchange]['instance']
-        
-        start_time = time.time()
-        result = await exchange_instance.cancel_order(order_id, symbol)
-        response_time = time.time() - start_time
-        
-        # Update health
-        exchanges[exchange]['health']['status'] = 'healthy'
-        exchanges[exchange]['health']['response_time'] = response_time
-        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
-        return result
-        
-    except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange, e, f"cancel_order({order_id})")
+        await exchange_manager._handle_exchange_error(exchange, e, f"get_orderbook({symbol})")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/trading/orders/{exchange}")
 async def get_open_orders(exchange: str, symbol: Optional[str] = None):
-    """Get open orders for an exchange"""
+    """Get open orders for an exchange - FIXED VERSION"""
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
     try:
         await exchange_manager._rate_limit(exchange)
+        
+        # CRITICAL FIX: Ensure we get the actual CCXT instance
         exchange_instance = exchanges[exchange]['instance']
+        
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'fetch_open_orders'):
+            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_open_orders method")
         
         start_time = time.time()
         if symbol:
@@ -532,68 +810,44 @@ async def get_open_orders(exchange: str, symbol: Optional[str] = None):
         await exchange_manager._handle_exchange_error(exchange, e, "get_open_orders")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/trading/positions/{exchange}")
-async def get_positions(exchange: str):
-    """Get positions for an exchange"""
-    if not exchange_manager or exchange not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
-    
-    try:
-        await exchange_manager._rate_limit(exchange)
-        exchange_instance = exchanges[exchange]['instance']
-        
-        start_time = time.time()
-        positions = await exchange_instance.fetch_positions()
-        response_time = time.time() - start_time
-        
-        # Update health
-        exchanges[exchange]['health']['status'] = 'healthy'
-        exchanges[exchange]['health']['response_time'] = response_time
-        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
-        # Filter out zero positions
-        active_positions = [pos for pos in positions if pos.get('size', 0) != 0]
-        
-        return {"positions": active_positions}
-        
-    except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange, e, "get_positions")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Account Operations Endpoints
 @app.get("/api/v1/account/balance/{exchange}")
 async def get_balance(exchange: str):
-    """Get account balance for an exchange"""
+    """Get account balance for an exchange - FIXED VERSION"""
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
+    # Check if exchange has credentials
+    exchange_info = exchanges[exchange]
+    config = exchange_info.get('config', {})
+    if not config.get('api_key') or not config.get('api_secret'):
+        raise HTTPException(status_code=403, detail=f"Exchange {exchange} missing API credentials for balance operations")
+    
     try:
         await exchange_manager._rate_limit(exchange)
+        
+        # CRITICAL FIX: Ensure we get the actual CCXT instance
         exchange_instance = exchanges[exchange]['instance']
+        
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'fetch_balance'):
+            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_balance method")
         
         start_time = time.time()
         balance = await exchange_instance.fetch_balance()
         response_time = time.time() - start_time
         
+        # BYBIT FIX: Handle null free balances in unified accounts
+        if exchange.lower() == 'bybit' and balance.get('free'):
+            for currency, free_amount in balance['free'].items():
+                if free_amount is None and balance.get('total', {}).get(currency):
+                    # Use total as free if free is null (unified account behavior)
+                    balance['free'][currency] = balance['total'][currency]
+                    logger.info(f"🔧 Bybit balance fix: {currency} free={balance['free'][currency]} (was null)")
+        
         # Update health
         exchanges[exchange]['health']['status'] = 'healthy'
         exchanges[exchange]['health']['response_time'] = response_time
         exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
-        # Update balance in database
-        try:
-            async with httpx.AsyncClient() as client:
-                balance_data = {
-                    'exchange': exchange,
-                    'total_balance': balance.get('total', {}),
-                    'available_balance': balance.get('free', {}),
-                    'total_pnl': 0.0,  # Will be calculated from trades
-                    'daily_pnl': 0.0,  # Will be calculated from trades
-                    'timestamp': datetime.utcnow()
-                }
-                await client.put(f"{database_service_url}/api/v1/balances/{exchange}", json=balance_data)
-        except Exception as e:
-            logger.warning(f"Failed to update balance in database: {e}")
         
         return balance
         
@@ -601,100 +855,485 @@ async def get_balance(exchange: str):
         await exchange_manager._handle_exchange_error(exchange, e, "get_balance")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Exchange Management Endpoints
-@app.get("/api/v1/exchanges")
-async def get_exchanges():
-    """Get all configured exchanges"""
-    return {
-        "exchanges": list(exchanges.keys()),
-        "total": len(exchanges)
-    }
-
-@app.get("/api/v1/exchanges/{exchange_name}/health")
-async def get_exchange_health(exchange_name: str):
-    """Get health status for a specific exchange"""
-    if exchange_name not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {exchange_name} not found")
+# Trading Order Endpoints
+@app.post("/api/v1/trading/order")
+async def place_order(order_request: OrderRequest):
+    """Place a trading order - FIXED VERSION"""
+    exchange = order_request.exchange
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
-    health = exchanges[exchange_name]['health']
-    return ExchangeHealth(
-        exchange=exchange_name,
-        status=health['status'],
-        response_time=health['response_time'],
-        last_check=health['last_check'] or datetime.utcnow(),
-        error_count=health['error_count']
-    )
-
-@app.get("/api/v1/exchanges/{exchange_name}/info")
-async def get_exchange_info(exchange_name: str):
-    """Get detailed information about an exchange"""
-    if not exchange_manager or exchange_name not in exchanges:
-        raise HTTPException(status_code=404, detail=f"Exchange {exchange_name} not found")
+    # Check if exchange has credentials
+    exchange_info = exchanges[exchange]
+    config = exchange_info.get('config', {})
+    if not config.get('api_key') or not config.get('api_secret'):
+        raise HTTPException(status_code=403, detail=f"Exchange {exchange} missing API credentials for trading operations")
     
     try:
-        await exchange_manager._rate_limit(exchange_name)
-        exchange_instance = exchanges[exchange_name]['instance']
+        await exchange_manager._rate_limit(exchange)
+        
+        # CRITICAL FIX: Ensure we get the actual CCXT instance
+        exchange_instance = exchanges[exchange]['instance']
+        
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'create_order'):
+            raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing create_order method")
+        
+        # Handle dust amounts that are below exchange minimums
+        if exchange == 'binance':
+            # Binance minimum order sizes vary by symbol - updated with correct minimums:
+            min_amounts = {
+                'NEO/USDC': 0.01,
+                'BTC/USDT': 0.00001,
+                'ETH/USDT': 0.0001,
+                'BNB/USDT': 0.01,
+                'LINK/USDC': 1.0,    # LINK minimum is actually 1.0 LINK (not 0.001)
+                'LINK/USDT': 1.0     # LINK minimum is 1.0 LINK across all pairs
+            }
+            min_amount = min_amounts.get(order_request.symbol, 0.001)  # Default 0.001
+            if order_request.amount < min_amount:
+                # For dust amounts, return a descriptive error instead of blocking
+                logger.warning(f"⚠️  Dust amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
+                raise HTTPException(status_code=422, 
+                    detail=f"DUST_AMOUNT: Order amount {order_request.amount} below exchange minimum {min_amount} for {order_request.symbol}. Consider closing position through manual trade or accumulating more assets.")
+        
+        elif exchange == 'cryptocom':
+            # Crypto.com minimum order validation - based on minimum notional values
+            # Get current price to calculate notional value
+            current_price = None
+            try:
+                ticker_response = await get_ticker(exchange, order_request.symbol)
+                current_price = float(ticker_response.get('last', 0))
+            except:
+                logger.warning(f"Could not get current price for {order_request.symbol} on {exchange}")
+                
+            if current_price:
+                notional_value = order_request.amount * current_price
+                min_notional = 12.0  # Crypto.com minimum notional is ~$12 USD per their API docs
+                if notional_value < min_notional:
+                    logger.warning(f"⚠️  Order notional ${notional_value:.2f} below minimum ${min_notional} for {order_request.symbol} on {exchange}")
+                    raise HTTPException(status_code=422, 
+                        detail=f"DUST_AMOUNT: Order notional ${notional_value:.2f} below exchange minimum ${min_notional} for {order_request.symbol}. Consider accumulating larger position or manual trade.")
+            
+            # Also check absolute minimum amounts for specific assets
+            min_amounts_crypto = {
+                'BTC/USD': 0.00001,
+                'ETH/USD': 0.0001,
+                'ACH/USD': 1.0,     # ACH requires at least 1 token
+                'ACT/USD': 1.0,     # ACT requires at least 1 token
+                'ADA/USD': 1.0,     # ADA requires at least 1 token
+                'ALGO/USD': 1.0,    # ALGO requires at least 1 token
+                'APE/USD': 0.1,     # APE requires at least 0.1 token
+                'AVAX/USD': 0.01,   # AVAX requires at least 0.01 token
+                'DOGE/USD': 1.0,    # DOGE requires at least 1 token
+                'DOT/USD': 0.1,     # DOT requires at least 0.1 token
+                'LTC/USD': 0.001,   # LTC requires at least 0.001 token
+                'MATIC/USD': 1.0,   # MATIC requires at least 1 token
+                'SOL/USD': 0.001,   # SOL requires at least 0.001 token
+                'TRX/USD': 1.0,     # TRX requires at least 1 token
+                'XRP/USD': 1.0,     # XRP requires at least 1 token
+                'default': 0.000001
+            }
+            min_amount = min_amounts_crypto.get(order_request.symbol, min_amounts_crypto['default'])
+            if order_request.amount < min_amount:
+                logger.warning(f"⚠️  Dust amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
+                
+                # For sell orders, suggest dust consolidation strategies
+                if order_request.side.lower() == 'sell':
+                    if order_request.amount > 0:
+                        shortage = min_amount - order_request.amount
+                        raise HTTPException(status_code=422, 
+                            detail=f"DUST_AMOUNT: Sell amount {order_request.amount} below exchange minimum {min_amount} for {order_request.symbol}. Short by {shortage:.6f} tokens. Consider: 1) Wait to accumulate {shortage:.6f} more tokens, 2) Manual trade on exchange, or 3) Accept small loss and keep as dust.")
+                    else:
+                        raise HTTPException(status_code=422, 
+                            detail=f"DUST_AMOUNT: Cannot sell {order_request.amount} {order_request.symbol} - position too small. Consider manual trade or keep as dust.")
+                else:
+                    raise HTTPException(status_code=422, 
+                        detail=f"DUST_AMOUNT: Order amount {order_request.amount} below exchange minimum {min_amount} for {order_request.symbol}. Consider larger position size.")
+        
+        # Convert symbol format for different exchanges
+        exchange_symbol = order_request.symbol
+        if exchange == 'cryptocom':
+            # Crypto.com needs symbols with slashes, but only convert if no slash exists
+            if '/' not in order_request.symbol:
+                if len(order_request.symbol) >= 6 and order_request.symbol.endswith('USD'):
+                    base = order_request.symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(order_request.symbol) >= 7 and order_request.symbol.endswith('USDC'):
+                    base = order_request.symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
+        elif exchange in ['binance', 'bybit']:
+            # Binance and Bybit need symbols with slashes, but only convert if no slash exists
+            if '/' not in order_request.symbol:
+                if len(order_request.symbol) >= 6 and order_request.symbol.endswith('USD'):
+                    base = order_request.symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(order_request.symbol) >= 7 and order_request.symbol.endswith('USDC'):
+                    base = order_request.symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
         
         start_time = time.time()
-        info = await exchange_instance.fetch_exchange_info()
+        
+        # Prepare exchange-specific params using exchange handler
+        try:
+            from core.exchange_handlers import exchange_handler_manager
+            ccxt_params = exchange_handler_manager.get_order_params(exchange, order_request.order_type, order_request.side)
+        except ImportError:
+            ccxt_params = {}
+        
+        # Add client order ID if provided
+        if order_request.client_order_id:
+            if exchange.lower() == 'binance':
+                ccxt_params['newClientOrderId'] = order_request.client_order_id
+            elif exchange.lower() == 'cryptocom':
+                ccxt_params['client_oid'] = order_request.client_order_id
+            elif exchange.lower() == 'bybit':
+                ccxt_params['orderLinkId'] = order_request.client_order_id
+            logger.info(f"🆔 Using client_order_id: {order_request.client_order_id} for {exchange} (param: {ccxt_params})")
+        
+        try:
+            # Place the order using CCXT
+            if order_request.order_type == 'market':
+                # Market order - handle exchange-specific requirements
+                if exchange.lower() == 'bybit' and order_request.side.lower() == 'buy':
+                    # Bybit market buy orders require createMarketBuyOrderRequiresPrice=False
+                    ccxt_params['createMarketBuyOrderRequiresPrice'] = False
+                    order = await exchange_instance.create_market_buy_order(
+                        symbol=exchange_symbol,
+                        amount=order_request.amount,
+                        params=ccxt_params
+                    )
+                else:
+                    # Standard market order for other exchanges or sell orders
+                    order = await exchange_instance.create_market_order(
+                        symbol=exchange_symbol,
+                        side=order_request.side,
+                        amount=order_request.amount,
+                        params=ccxt_params
+                    )
+            elif order_request.order_type == 'limit':
+                # Limit order
+                if order_request.price is None:
+                    raise HTTPException(status_code=400, detail="Price is required for limit orders")
+                order = await exchange_instance.create_limit_order(
+                    symbol=exchange_symbol,
+                    side=order_request.side,
+                    amount=order_request.amount,
+                    price=order_request.price,
+                    params=ccxt_params
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported order type: {order_request.order_type}")
+        
+        except Exception as ccxt_error:
+            # Handle CCXT errors gracefully to prevent 500 errors
+            error_msg = str(ccxt_error)
+            logger.error(f"❌ CCXT order creation failed for {exchange_symbol} on {exchange}: {error_msg}")
+            
+            # Ensure we never return empty error messages
+            if not error_msg or error_msg.strip() == "":
+                error_msg = f"Unknown error placing {order_request.order_type} {order_request.side} order for {exchange_symbol}"
+            
+            # Check if it's a minimum amount error
+            if 'minimum' in error_msg.lower() or 'min' in error_msg.lower():
+                raise HTTPException(status_code=422, detail=f"MINIMUM_AMOUNT_ERROR: {error_msg}")
+            elif 'insufficient' in error_msg.lower() or 'balance' in error_msg.lower():
+                raise HTTPException(status_code=422, detail=f"INSUFFICIENT_BALANCE: {error_msg}")
+            elif 'precision' in error_msg.lower() or 'decimal' in error_msg.lower():
+                raise HTTPException(status_code=422, detail=f"PRECISION_ERROR: {error_msg}")
+            else:
+                raise HTTPException(status_code=422, detail=f"ORDER_ERROR: {error_msg}")
+        
         response_time = time.time() - start_time
         
         # Update health
-        exchanges[exchange_name]['health']['status'] = 'healthy'
-        exchanges[exchange_name]['health']['response_time'] = response_time
-        exchanges[exchange_name]['health']['last_check'] = datetime.utcnow()
+        exchanges[exchange]['health']['status'] = 'healthy'
+        exchanges[exchange]['health']['response_time'] = response_time
+        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
         
-        return {
-            "exchange": exchange_name,
-            "info": info,
-            "config": exchanges[exchange_name]['config'],
-            "health": exchanges[exchange_name]['health']
-        }
+        # Register WebSocket callback for order updates if available
+        if 'id' in order:
+            handler = websocket_manager.get_handler(exchange)
+            if handler and handler.is_connected:
+                def order_callback(status, data):
+                    logger.info(f"Order {order['id']} on {exchange} updated to {status}")
+                
+                handler.register_order_callback(order['id'], order_callback)
         
+        return {"order": order, "exchange": exchange, "symbol": exchange_symbol}
+        
+    except HTTPException:
+        # Re-raise HTTPExceptions (like 422 for dust amounts) without modification
+        raise
     except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange_name, e, "get_exchange_info")
+        await exchange_manager._handle_exchange_error(exchange, e, f"place_order({order_request.symbol})")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Simulation Mode Endpoints
-@app.post("/api/v1/simulation/order")
-async def create_simulation_order(order: Order):
-    """Create a simulation order (no real execution)"""
-    # In simulation mode, we just return a mock order response
-    mock_order = {
-        "id": f"sim_{int(time.time())}",
-        "symbol": order.symbol,
-        "type": order.order_type,
-        "side": order.side,
-        "amount": order.amount,
-        "price": order.price or 0,
-        "status": "closed",
-        "filled": order.amount,
-        "remaining": 0,
-        "cost": (order.price or 0) * order.amount,
-        "timestamp": datetime.utcnow().isoformat(),
-        "datetime": datetime.utcnow().isoformat(),
-        "fee": None,
-        "trades": [],
-        "info": {"simulation": True}
-    }
+@app.delete("/api/v1/trading/order/{exchange}/{order_id}")
+async def cancel_order(exchange: str, order_id: str, symbol: str = None):
+    """Cancel a trading order - COMPLETE ORDER MANAGEMENT"""
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
-    return mock_order
+    # Check if exchange has credentials
+    exchange_info = exchanges[exchange]
+    config = exchange_info.get('config', {})
+    if not config.get('api_key') or not config.get('api_secret'):
+        raise HTTPException(status_code=403, detail=f"Exchange {exchange} missing API credentials for trading operations")
+    
+    try:
+        await exchange_manager._rate_limit(exchange)
+        
+        # Get the actual CCXT instance
+        exchange_instance = exchanges[exchange]['instance']
+        
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'cancel_order'):
+            raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing cancel_order method")
+        
+        start_time = time.time()
+        
+        # Cancel the order using CCXT with improved error handling
+        try:
+            if symbol:
+                # Some exchanges require symbol for cancellation
+                result = await exchange_instance.cancel_order(order_id, symbol)
+            else:
+                result = await exchange_instance.cancel_order(order_id)
+            
+            response_time = time.time() - start_time
+            
+            # Update health
+            exchanges[exchange]['health']['status'] = 'healthy'
+            exchanges[exchange]['health']['response_time'] = response_time
+            exchanges[exchange]['health']['last_check'] = datetime.utcnow()
+            
+            # Unregister WebSocket callback if it was registered
+            handler = websocket_manager.get_handler(exchange)
+            if handler:
+                handler.unregister_order_callback(order_id)
+            
+            return {"result": result, "exchange": exchange, "order_id": order_id, "status": "cancelled"}
+            
+        except Exception as cancel_error:
+            # Handle common cancellation errors gracefully
+            error_message = str(cancel_error).lower()
+            
+            if any(phrase in error_message for phrase in ['order not found', 'does not exist', 'invalid order', 'already filled', 'already executed']):
+                # Order was likely filled or already cancelled
+                logger.warning(f"Order {order_id} on {exchange} cannot be cancelled - likely filled or expired: {cancel_error}")
+                return {"result": None, "exchange": exchange, "order_id": order_id, "status": "already_processed", "message": "Order likely filled or expired"}
+            else:
+                # Re-raise other errors
+                raise cancel_error
+        
+    except Exception as e:
+        await exchange_manager._handle_exchange_error(exchange, e, f"cancel_order({order_id})")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/simulation/balance/{exchange}")
-async def get_simulation_balance(exchange: str):
-    """Get simulation balance for an exchange"""
-    # Return a mock balance for simulation
-    mock_balance = {
-        "info": {},
-        "free": {"USDC": 10000.0},
-        "used": {"USDC": 0.0},
-        "total": {"USDC": 10000.0},
-        "timestamp": datetime.utcnow().isoformat(),
-        "datetime": datetime.utcnow().isoformat(),
-        "simulation": True
-    }
+# OHLCV Data Endpoints
+@app.get("/api/v1/market/ohlcv/{exchange}/{symbol:path}")
+async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: int = 100):
+    """Get OHLCV (candlestick) data for a symbol - REQUIRED FOR STRATEGY SERVICE"""
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     
-    return mock_balance
+    try:
+        # Convert symbol format for different exchanges
+        exchange_symbol = symbol
+        if exchange == 'cryptocom':
+            # Crypto.com needs symbols with slashes, convert from CROUSD to CRO/USD
+            if '/' not in symbol:
+                if len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(symbol) >= 7 and symbol.endswith('USDC'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
+            # Add :USD or :USDC suffix when needed without introducing double slashes
+            if ':' not in exchange_symbol:
+                if exchange_symbol.endswith('/USD'):
+                    exchange_symbol = exchange_symbol.replace('/USD', '/USD:USD')
+                elif exchange_symbol.endswith('/USDC'):
+                    exchange_symbol = exchange_symbol.replace('/USDC', '/USDC:USDC')
+        elif exchange in ['binance', 'bybit']:
+            # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD
+            if '/' not in symbol:
+                if len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(symbol) >= 7 and symbol.endswith('USDC'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
+        
+        await exchange_manager._rate_limit(exchange)
+        
+        # CRITICAL: Get the actual CCXT instance
+        exchange_instance = exchanges[exchange]['instance']
+        
+        # Verify the instance has the required methods
+        if not hasattr(exchange_instance, 'fetch_ohlcv'):
+            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_ohlcv method")
+        
+        start_time = time.time()
+        # Fetch OHLCV data using CCXT
+        ohlcv = await exchange_instance.fetch_ohlcv(exchange_symbol, timeframe=timeframe, limit=limit)
+        response_time = time.time() - start_time
+        
+        # Update health
+        exchanges[exchange]['health']['status'] = 'healthy'
+        exchanges[exchange]['health']['response_time'] = response_time
+        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
+        
+        # Convert to DataFrame format expected by strategies
+        if ohlcv:
+            df_data = {
+                'timestamp': [candle[0] for candle in ohlcv],
+                'open': [candle[1] for candle in ohlcv],
+                'high': [candle[2] for candle in ohlcv],
+                'low': [candle[3] for candle in ohlcv],
+                'close': [candle[4] for candle in ohlcv],
+                'volume': [candle[5] for candle in ohlcv]
+            }
+            return {"data": df_data, "symbol": exchange_symbol, "timeframe": timeframe}
+        else:
+            return {"data": None, "error": "No data available"}
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        # Handle symbol not found errors with 404 instead of 500
+        if any(phrase in error_msg for phrase in ['does not have market symbol', 'symbol not found', 'invalid symbol', 'market not found']):
+            logger.warning(f"Symbol {exchange_symbol} not found on {exchange}: {e}")
+            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found on {exchange}")
+        
+        await exchange_manager._handle_exchange_error(exchange, e, f"get_ohlcv({symbol}, {timeframe})")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Orders/Trades history endpoints for reconciliation
+@app.get("/api/v1/trading/order/{exchange}/{order_id}")
+async def get_order_by_id(exchange: str, order_id: str, symbol: Optional[str] = None):
+    """Fetch a specific order by ID (optionally provide symbol for exchanges that require it)."""
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
+    try:
+        await exchange_manager._rate_limit(exchange)
+        exchange_instance = exchanges[exchange]['instance']
+        if not hasattr(exchange_instance, 'fetch_order'):
+            raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing fetch_order method")
+        # Some exchanges require symbol; try without first, then with symbol if provided
+        try:
+            order = await exchange_instance.fetch_order(id=order_id, symbol=symbol) if symbol else await exchange_instance.fetch_order(id=order_id)
+        except Exception as e:
+            if symbol:
+                raise e
+            else:
+                raise HTTPException(status_code=400, detail=f"Symbol may be required to fetch order on {exchange}: {str(e)}")
+        return {"order": order}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await exchange_manager._handle_exchange_error(exchange, e, f"get_order_by_id({order_id})")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/trading/orders/history/{exchange}")
+async def get_orders_history(exchange: str, symbol: Optional[str] = None, since: Optional[int] = None, limit: Optional[int] = 100):
+    """Fetch historical orders (closed/filled) for reconciliation."""
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
+    try:
+        await exchange_manager._rate_limit(exchange)
+        exchange_instance = exchanges[exchange]['instance']
+        if not hasattr(exchange_instance, 'fetch_orders'):
+            raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing fetch_orders method")
+        orders = await exchange_instance.fetch_orders(symbol=symbol, since=since, limit=limit)
+        return {"orders": orders}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await exchange_manager._handle_exchange_error(exchange, e, "get_orders_history")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/trading/mytrades/{exchange}")
+async def get_my_trades(exchange: str, symbol: Optional[str] = None, since: Optional[int] = None, limit: Optional[int] = 100):
+    """Fetch trade fills (executions) for reconciliation."""
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
+    try:
+        await exchange_manager._rate_limit(exchange)
+        exchange_instance = exchanges[exchange]['instance']
+        if not hasattr(exchange_instance, 'fetch_my_trades'):
+            raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing fetch_my_trades method")
+        # Normalize/convert inputs per exchange quirks
+        normalized_symbol = symbol
+        if exchange.lower() == 'cryptocom':
+            # Crypto.com rejects some limits; cap safely to 100
+            try:
+                if limit is None or limit <= 0:
+                    limit = 100
+                elif limit > 100:
+                    limit = 100
+            except Exception:
+                limit = 100
+            # Ensure symbol has slash format if provided without one
+            if normalized_symbol and '/' not in normalized_symbol:
+                if normalized_symbol.endswith('USD') and len(normalized_symbol) >= 6:
+                    base = normalized_symbol[:-3]
+                    normalized_symbol = f"{base}/USD"
+                elif normalized_symbol.endswith('USDC') and len(normalized_symbol) >= 7:
+                    base = normalized_symbol[:-4]
+                    normalized_symbol = f"{base}/USDC"
+        # Primary fetch
+        try:
+            trades = await exchange_instance.fetch_my_trades(symbol=normalized_symbol, since=since, limit=limit)
+        except Exception as e:
+            # Retry without limit if Crypto.com complains about invalid limit
+            if exchange.lower() == 'cryptocom' and 'invalid limit' in str(e).lower():
+                trades = await exchange_instance.fetch_my_trades(symbol=normalized_symbol, since=since)
+            else:
+                raise
+        return {"trades": trades}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await exchange_manager._handle_exchange_error(exchange, e, "get_my_trades")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# WebSocket status endpoints
+@app.get("/api/v1/websocket/{exchange}/status")
+async def get_websocket_status(exchange: str):
+    """Get WebSocket connection status for an exchange"""
+    handler = websocket_manager.get_handler(exchange)
+    if not handler:
+        return {"connected": False, "reason": "Handler not found"}
+    
+    return {
+        "connected": handler.is_connected,
+        "last_update": handler.last_update,
+        "registered_callbacks": len(handler.order_callbacks)
+    }
+
+@app.post("/api/v1/websocket/{exchange}/subscribe")
+async def subscribe_symbols(exchange: str, payload: Dict[str, Any]):
+    """Subscribe to live tickers for given symbols (symbol format without slash, e.g., BTCUSD)."""
+    handler = websocket_manager.get_handler(exchange)
+    if not handler or not handler.is_connected:
+        raise HTTPException(status_code=503, detail="WebSocket not connected")
+    symbols = payload.get('symbols') or []
+    if not isinstance(symbols, list) or not symbols:
+        raise HTTPException(status_code=400, detail="symbols must be a non-empty list")
+    await handler.subscribe(symbols)
+    return {"subscribed": symbols}
+
+@app.post("/api/v1/websocket/{exchange}/unsubscribe")
+async def unsubscribe_symbols(exchange: str, payload: Dict[str, Any]):
+    handler = websocket_manager.get_handler(exchange)
+    if not handler or not handler.is_connected:
+        raise HTTPException(status_code=503, detail="WebSocket not connected")
+    symbols = payload.get('symbols') or []
+    if not isinstance(symbols, list) or not symbols:
+        raise HTTPException(status_code=400, detail="symbols must be a non-empty list")
+    await handler.unsubscribe(symbols)
+    return {"unsubscribed": symbols}
 
 # Startup and shutdown events
 @app.on_event("startup")
@@ -705,19 +1344,16 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    global exchanges
-    for exchange_name, exchange_data in exchanges.items():
+    await websocket_manager.shutdown_all()
+    
+    # Close all CCXT async exchange instances
+    for exchange_name, exchange_info in exchanges.items():
         try:
-            await exchange_data['instance'].close()
-            logger.info(f"Closed connection to {exchange_name}")
+            if 'instance' in exchange_info and hasattr(exchange_info['instance'], 'close'):
+                await exchange_info['instance'].close()
+                logger.info(f"Closed {exchange_name} exchange instance")
         except Exception as e:
-            logger.error(f"Error closing {exchange_name}: {e}")
+            logger.warning(f"Error closing {exchange_name} exchange: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8003,
-        reload=True,
-        log_level="info"
-    ) 
+    uvicorn.run(app, host="0.0.0.0", port=8003)

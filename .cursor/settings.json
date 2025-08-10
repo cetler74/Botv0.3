@@ -1,0 +1,21 @@
+{
+  "mcp": {
+    "enabled": true,
+    "servers": {
+      "perplexity": {
+        "command": "node",
+        "args": ["mcp-perplexity-server.js"],
+        "env": {
+          "PERPLEXITY_API_KEY": "${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}"
+        }
+      }
+    }
+  },
+  "experimental": {
+    "mcp": true
+  },
+  "ai": {
+    "enableWebSearch": true,
+    "enableRealTimeData": true
+  }
+} 

@@ -9,11 +9,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY services/orchestrator-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
+COPY services/orchestrator-service/main.py .
+# Copy core module needed for pair selection
+COPY core ./core
 
 # Expose port
 EXPOSE 8005

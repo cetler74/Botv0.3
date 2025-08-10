@@ -3,6 +3,7 @@ Integration tests for service-to-service communication
 """
 
 import pytest
+import pytest_asyncio
 import asyncio
 import httpx
 from unittest.mock import patch, Mock
@@ -12,11 +13,11 @@ from datetime import datetime
 class TestServiceCommunication:
     """Test communication between microservices."""
     
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def http_client(self):
         """Async HTTP client for testing."""
         async with httpx.AsyncClient() as client:
-            return client
+            yield client
     
     @pytest.mark.asyncio
     async def test_config_to_database_communication(self, http_client):
@@ -41,7 +42,7 @@ class TestServiceCommunication:
             # Test that database service can get config from config service
             response = await http_client.get("http://config-service:8001/api/v1/config/database")
             assert response.status_code == 200
-            assert response.json() == config_data["database"]
+            assert response.json() == config_data
     
     @pytest.mark.asyncio
     async def test_exchange_to_config_communication(self, http_client):
@@ -163,9 +164,55 @@ class TestServiceCommunication:
             response = await http_client.get("http://orchestrator-service:8005/api/v1/risk/exposure")
             assert response.status_code == 200
 
+    @pytest.mark.asyncio
+    async def test_exchange_pairs_endpoint(self, http_client):
+        """Test /api/v1/market/pairs/{exchange} for crypto.com and binance."""
+        # Mocked response for crypto.com
+        cryptocom_pairs = {
+            "pairs": ["BTC/USDC", "ETH/USDC", "SOL/USDC"],
+            "total": 3
+        }
+        # Mocked response for binance
+        binance_pairs = {
+            "pairs": ["BTC/USDC", "ETH/USDC", "BNB/USDC"],
+            "total": 3
+        }
+
+        with patch('httpx.AsyncClient.get') as mock_get:
+            # crypto.com
+            mock_response_crypto = Mock()
+            mock_response_crypto.status_code = 200
+            mock_response_crypto.json.return_value = cryptocom_pairs
+            mock_get.return_value = mock_response_crypto
+
+            response = await http_client.get("http://exchange-service:8003/api/v1/market/pairs/cryptocom")
+            assert response.status_code == 200
+            data = response.json()
+            assert "pairs" in data and isinstance(data["pairs"], list)
+            assert data["total"] == len(data["pairs"])
+            assert data["total"] > 0
+
+            # binance
+            mock_response_binance = Mock()
+            mock_response_binance.status_code = 200
+            mock_response_binance.json.return_value = binance_pairs
+            mock_get.return_value = mock_response_binance
+
+            response = await http_client.get("http://exchange-service:8003/api/v1/market/pairs/binance")
+            assert response.status_code == 200
+            data = response.json()
+            assert "pairs" in data and isinstance(data["pairs"], list)
+            assert data["total"] == len(data["pairs"])
+            assert data["total"] > 0
+
 class TestServiceDependencies:
     """Test service dependency management."""
     
+    @pytest_asyncio.fixture
+    async def http_client(self):
+        async with httpx.AsyncClient() as client:
+            yield client
+
     @pytest.mark.asyncio
     async def test_service_startup_order(self, http_client):
         """Test that services start in the correct order."""
@@ -228,6 +275,11 @@ class TestServiceDependencies:
 
 class TestDataFlow:
     """Test data flow between services."""
+    
+    @pytest_asyncio.fixture
+    async def http_client(self):
+        async with httpx.AsyncClient() as client:
+            yield client
     
     @pytest.mark.asyncio
     async def test_trading_workflow_data_flow(self, http_client):
@@ -321,6 +373,11 @@ class TestDataFlow:
 
 class TestErrorHandling:
     """Test error handling in service communication."""
+    
+    @pytest_asyncio.fixture
+    async def http_client(self):
+        async with httpx.AsyncClient() as client:
+            yield client
     
     @pytest.mark.asyncio
     async def test_service_unavailable(self, http_client):

@@ -190,10 +190,12 @@ class Dashboard {
     }
     
     async updatePortfolio() {
+        console.log('updatePortfolio() called');
         try {
             const response = await fetch('/api/portfolio');
             if (response.ok) {
                 const data = await response.json();
+                console.log('Portfolio data received:', data);
                 this.updatePortfolioUI(data);
             }
         } catch (error) {
@@ -203,26 +205,71 @@ class Dashboard {
     
     updatePortfolioUI(data) {
         const totalBalanceElement = document.getElementById('total-balance');
+        const availableBalanceElement = document.getElementById('available-balance');
         const totalPnlElement = document.getElementById('total-pnl');
         const dailyPnlElement = document.getElementById('daily-pnl');
+        const openTradesElement = document.getElementById('open-trades');
+        const totalUnrealizedPnlElement = document.getElementById('total-unrealized-pnl');
         const winRateElement = document.getElementById('win-rate');
-        
         // Update total balance
         totalBalanceElement.textContent = this.formatCurrency(data.total_balance || 0);
         
+        // Calculate and update available balance (sum of all exchanges)
+        let availableSum = 0;
+        if (data.exchanges) {
+            for (const ex of Object.values(data.exchanges)) {
+                availableSum += (typeof ex.available !== 'undefined' ? ex.available : (ex.available_balance || 0));
+            }
+        }
+        availableBalanceElement.textContent = this.formatCurrency(availableSum);
+        
+        // Generate and set tooltips with per-exchange breakdown
+        if (data.exchanges) {
+            const totalBalanceTooltip = this.generateBalanceTooltip(data.exchanges, 'balance');
+            const availableBalanceTooltip = this.generateBalanceTooltip(data.exchanges, 'available_balance');
+            
+            totalBalanceElement.setAttribute('title', totalBalanceTooltip);
+            availableBalanceElement.setAttribute('title', availableBalanceTooltip);
+        }
         // Update total PnL
         const totalPnl = data.total_pnl || 0;
         totalPnlElement.textContent = this.formatCurrency(totalPnl);
         totalPnlElement.className = `h4 ${this.getPnlClass(totalPnl)}`;
         
+        // Generate PnL tooltip
+        if (data.exchanges) {
+            const pnlTooltip = this.generatePnLTooltip(data.exchanges);
+            totalPnlElement.setAttribute('title', pnlTooltip);
+        }
         // Update daily PnL
         const dailyPnl = data.daily_pnl || 0;
         dailyPnlElement.textContent = this.formatCurrency(dailyPnl);
         dailyPnlElement.className = `h4 ${this.getPnlClass(dailyPnl)}`;
-        
+        // Update open trades count
+        const activeTrades = data.active_trades || 0;
+        openTradesElement.textContent = activeTrades;
+        // Update total unrealized PnL
+        const totalUnrealizedPnl = data.total_unrealized_pnl || 0;
+        totalUnrealizedPnlElement.textContent = this.formatCurrency(totalUnrealizedPnl);
+        totalUnrealizedPnlElement.className = `h4 ${this.getPnlClass(totalUnrealizedPnl)}`;
         // Update win rate
         const winRate = data.win_rate || 0;
         winRateElement.textContent = `${(winRate * 100).toFixed(1)}%`;
+        // Update per-exchange breakdown table
+        if (data.exchanges) {
+            console.log('Exchange data received:', data.exchanges);
+            const exchangeRows = Object.entries(data.exchanges).map(([exchange, ex]) => ({
+                exchange,
+                total_balance: ex.balance,
+                available_balance: ex.available_balance || ex.available,
+                total_pnl: ex.total_pnl,
+                timestamp: ex.timestamp
+            }));
+            console.log('Mapped exchange rows:', exchangeRows);
+            updateExchangeBreakdownTable(exchangeRows);
+        } else {
+            console.log('No exchange data in response:', data);
+        }
     }
     
     async updateRiskExposure() {
@@ -264,7 +311,7 @@ class Dashboard {
     
     async updateRecentTrades() {
         try {
-            const response = await fetch('/api/trades?limit=10');
+            const response = await fetch('/api/trades?limit=50');
             if (response.ok) {
                 const data = await response.json();
                 this.updateRecentTradesUI(data.trades || []);
@@ -275,22 +322,38 @@ class Dashboard {
     }
     
     updateRecentTradesUI(trades) {
-        const tbody = document.getElementById('recent-trades');
-        
+        const tbody = document.getElementById('recent-trades') || document.getElementById('trades-table-body');
+        if (!tbody) return;
         if (trades.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center">No recent trades</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="15" class="text-center">No recent trades</td></tr>';
             return;
         }
-        
         tbody.innerHTML = trades.map(trade => `
             <tr>
-                <td>${this.formatDateTime(trade.entry_time)}</td>
-                <td>${trade.pair}</td>
-                <td>${trade.exchange}</td>
-                <td>${trade.position_size > 0 ? 'BUY' : 'SELL'}</td>
-                <td>${Math.abs(trade.position_size).toFixed(4)}</td>
-                <td>${this.formatCurrency(trade.entry_price)}</td>
-                <td><span class="trade-status-${trade.status.toLowerCase()}">${trade.status}</span></td>
+                <td class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle" title="${trade.trade_id || 'N/A'}">${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exchange || 'N/A'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm font-semibold ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${(trade.unrealized_pnl || 0).toFixed(2)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm align-middle">
+                    <span class="badge ${trade.status === 'OPEN' ? 'bg-success' : trade.status === 'CLOSED' ? 'bg-secondary' : 'bg-warning'}">${trade.status || 'N/A'}</span>
+                </td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden" title="${trade.entry_reason || 'N/A'}">${this.truncateText(trade.entry_reason || 'N/A', 30)}</td>
+                <td class="profit-trigger-col align-middle">
+                  ${trade.profit_protection || 'inactive'}
+                  <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
+                </td>
+                <td class="trailing-stop-col align-middle">
+                  ${trade.trail_stop || 'inactive'}
+                  <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
+                </td>
+                <td class="highest-price-col text-right align-middle">
+                  ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
+                </td>
             </tr>
         `).join('');
     }
@@ -327,8 +390,14 @@ class Dashboard {
     }
     
     startPeriodicUpdates() {
+        console.log('startPeriodicUpdates() called');
+        // Initial load
+        this.updateTradingStatus();
+        this.updatePortfolio();
+        this.updateRiskExposure();
         // Update data every 30 seconds
         this.updateInterval = setInterval(() => {
+            console.log('Periodic update triggered');
             this.updateTradingStatus();
             this.updatePortfolio();
             this.updateRiskExposure();
@@ -413,9 +482,157 @@ class Dashboard {
                 return 'bg-info text-white';
         }
     }
+    
+    truncateText(text, maxLength) {
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...';
+    }
+    
+    generateBalanceTooltip(exchanges, balanceType) {
+        const title = balanceType === 'balance' ? 'Total Balance by Exchange:' : 'Available Balance by Exchange:';
+        let tooltip = title + '\n';
+        
+        Object.entries(exchanges).forEach(([exchangeName, data]) => {
+            const value = balanceType === 'balance' ? data.balance : (data.available_balance || data.available);
+            const exchangeDisplayName = exchangeName.charAt(0).toUpperCase() + exchangeName.slice(1);
+            tooltip += `${exchangeDisplayName}: $${value?.toFixed(2) || '0.00'}\n`;
+        });
+        
+        return tooltip.trim();
+    }
+    
+    generatePnLTooltip(exchanges) {
+        let tooltip = 'Total PnL by Exchange:\n';
+        
+        Object.entries(exchanges).forEach(([exchangeName, data]) => {
+            const value = data.total_pnl || 0;
+            const exchangeDisplayName = exchangeName.charAt(0).toUpperCase() + exchangeName.slice(1);
+            tooltip += `${exchangeDisplayName}: $${value.toFixed(2)}\n`;
+        });
+        
+        return tooltip.trim();
+    }
+}
+
+function updateExchangeBreakdownTable(exchangeData) {
+    console.log('updateExchangeBreakdownTable called with:', exchangeData);
+    const tbody = document.getElementById('exchange-breakdown-table-body');
+    console.log('Table body element:', tbody);
+    tbody.innerHTML = '';
+    if (!exchangeData || exchangeData.length === 0) {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td colspan="5" class="px-4 py-8 text-center text-gray-500">
+                No per-exchange balance data available
+            </td>
+        `;
+        tbody.appendChild(row);
+        return;
+    }
+    exchangeData.forEach(exchange => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${exchange.exchange || 'N/A'}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.total_balance || 0).toFixed(2)}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.available_balance || 0).toFixed(2)}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.total_pnl || 0).toFixed(2)}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${exchange.timestamp ? new Date(exchange.timestamp).toLocaleString() : 'N/A'}</td>
+        `;
+        tbody.appendChild(row);
+    });
+}
+
+// Add this function for trade history rendering (similar to updateRecentTradesUI)
+function updateTradeHistoryUI(trades) {
+    const tbody = document.getElementById('trade-history-table-body');
+    if (!tbody) return;
+    if (!trades || trades.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="15" class="text-center">No trade history</td></tr>';
+        return;
+    }
+    tbody.innerHTML = trades.map(trade => `
+        <tr>
+            <td class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle" title="${trade.trade_id || 'N/A'}">${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle">${trade.exchange || 'N/A'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle">${Dashboard.prototype.formatDateTime(trade.entry_time)}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle">${trade.exit_time ? Dashboard.prototype.formatDateTime(trade.exit_time) : 'N/A'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.exit_price ? Dashboard.prototype.formatCurrency(trade.exit_price) : 'N/A'}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle" title="${trade.entry_reason || 'N/A'}">${Dashboard.prototype.truncateText(trade.entry_reason || 'N/A', 30)}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle" title="${trade.exit_reason || 'N/A'}">${Dashboard.prototype.truncateText(trade.exit_reason || 'N/A', 30)}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm font-medium ${Dashboard.prototype.getPnlClass(trade.realized_pnl)} text-right align-middle">${Dashboard.prototype.formatCurrency(trade.realized_pnl || 0)}</td>
+            <td class="px-2 sm:px-4 py-3 text-sm font-medium ${Dashboard.prototype.getPnlClass(trade.realized_pnl_pct)} text-right align-middle">${trade.realized_pnl_pct !== undefined ? trade.realized_pnl_pct.toFixed(2) + '%' : 'N/A'}</td>
+            <td class="profit-trigger-col align-middle">
+              ${trade.profit_protection || 'inactive'}
+              <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
+            </td>
+            <td class="trailing-stop-col align-middle">
+              ${trade.trail_stop || 'inactive'}
+              <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
+            </td>
+            <td class="highest-price-col text-right align-middle">
+              ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
+            </td>
+        </tr>
+    `).join('');
+}
+
+// Patch the dashboard to call updateTradeHistoryUI after fetching trade history
+// (Assume the function that fetches trade history is called updateTradeHistory)
+const origUpdateTradeHistory = Dashboard.prototype.updateTradeHistory;
+Dashboard.prototype.updateTradeHistory = async function() {
+    try {
+        const response = await fetch('/api/trades/closed/history?limit=20');
+        if (response.ok) {
+            const data = await response.json();
+            updateTradeHistoryUI(data.trades || []);
+        }
+    } catch (error) {
+        console.error('Error updating trade history:', error);
+    }
+};
+
+function updateExchangeStatus(exchanges) {
+    console.log('updateExchangeStatus called with:', exchanges);
+    const exchangeStatus = document.getElementById('exchange-status');
+    if (!exchangeStatus) {
+        console.error('exchange-status element not found');
+        return;
+    }
+    exchangeStatus.innerHTML = '';
+    Object.entries(exchanges).forEach(([name, info]) => {
+        console.log(`Processing exchange ${name}:`, info);
+        const exchangeDiv = document.createElement('div');
+        // Use status string from API
+        const isHealthy = info.status && info.status.toLowerCase() === 'healthy';
+        console.log(`Exchange ${name} status: ${info.status}, isHealthy: ${isHealthy}`);
+        const statusClass = isHealthy ? 'status-online' : 'status-offline';
+        const statusText = isHealthy ? 'Online' : 'Offline';
+        exchangeDiv.className = 'flex items-center p-4 border rounded-lg';
+        exchangeDiv.innerHTML = `
+            <div class="flex items-center">
+                <span class="status-indicator ${statusClass}"></span>
+                <div>
+                    <h4 class="font-medium text-gray-900">${name.toUpperCase()}</h4>
+                    <p class="text-sm text-gray-500">${statusText}</p>
+                </div>
+            </div>
+        `;
+        exchangeStatus.appendChild(exchangeDiv);
+    });
 }
 
 // Initialize dashboard when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
     new Dashboard();
+    document.querySelectorAll('.toggle-col').forEach(checkbox => {
+      checkbox.addEventListener('change', function() {
+        const colClass = this.dataset.col + '-col';
+        document.querySelectorAll('.' + colClass).forEach(cell => {
+          cell.style.display = this.checked ? '' : 'none';
+        });
+      });
+    });
 }); 

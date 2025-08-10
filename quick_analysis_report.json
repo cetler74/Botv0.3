@@ -1,0 +1,66 @@
+{
+  "summary": {
+    "cycle_count": 48,
+    "total_trades": 4,
+    "open_trades": 2,
+    "closed_trades": 2,
+    "trades_per_cycle": 0.08333333333333333,
+    "total_pnl": 1.18406162,
+    "win_rate": 1.0,
+    "balance_utilization": 0.0,
+    "trade_saturation": 0.03333333333333333
+  },
+  "current_parameters": {
+    "max_trades_per_exchange": 20,
+    "min_exchange_balance": 100.0,
+    "min_order_size_usd": 100.0,
+    "position_size_percentage": 0.08
+  },
+  "balances": {
+    "binance": {
+      "total": 621.58554984,
+      "available": 621.58554984,
+      "used": 0
+    },
+    "bybit": {
+      "total": 102.65929767,
+      "available": 102.64534721,
+      "used": 0
+    },
+    "cryptocom": {
+      "total": 534.3097342870051,
+      "available": 534.3097342870051,
+      "used": 0.0
+    }
+  },
+  "recommendations": [
+    {
+      "category": "Trade Generation",
+      "issue": "Very low trade generation rate",
+      "current_value": "0.083 trades/cycle",
+      "recommendation": "Consider relaxing strategy parameters (ADX threshold, volume requirements, RSI thresholds)",
+      "priority": "high"
+    },
+    {
+      "category": "Balance Utilization",
+      "issue": "Low balance utilization",
+      "current_value": "0.0%",
+      "recommendation": "Consider increasing position_size_percentage or reducing min_order_size_usd",
+      "priority": "medium"
+    },
+    {
+      "category": "Trade Saturation",
+      "issue": "Low trade saturation",
+      "current_value": "3.3%",
+      "recommendation": "Consider reducing max_trades_per_exchange or increasing position size",
+      "priority": "medium"
+    },
+    {
+      "category": "Order Size",
+      "issue": "High minimum order size",
+      "current_value": "$100.0",
+      "recommendation": "Consider reducing min_order_size_usd to allow smaller trades",
+      "priority": "medium"
+    }
+  ]
+}

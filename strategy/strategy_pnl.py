@@ -14,6 +14,7 @@ def calculate_atr(ohlcv_data, period=14):
     Returns:
         ATR value
     """
+    logger = logging.getLogger(__name__)
     if len(ohlcv_data) < period:
         return None
 
@@ -54,10 +55,12 @@ def calculate_atr(ohlcv_data, period=14):
             if float_value != float_value:  # NaN check
                 return None
             return float_value
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[ATR] Could not convert last_value '{last_value}' to float: {e}")
             return None
             
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[ATR] Exception in calculate_atr: {e}")
         return None
 
 def calculate_volatility_adjustment(atr_value, current_price):
@@ -163,8 +166,15 @@ def calculate_unrealized_pnl(position, current_price, trade_id=None):
         
     # Ensure values are numbers
     try:
-        entry_price = float(position.entry_price)
-        position_size = float(position.position_size)
+        entry_price = position.entry_price
+        position_size = position.position_size
+        current_price = float(current_price)
+        
+        if entry_price is None or position_size is None or current_price is None:
+            raise ValueError("entry_price, position_size, or current_price is None")
+
+        entry_price = float(entry_price)
+        position_size = float(position_size)
         current_price = float(current_price)
         
         if trade_id:

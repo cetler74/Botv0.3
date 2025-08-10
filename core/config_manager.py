@@ -246,7 +246,9 @@ class ConfigManager:
             
     def get_database_config(self) -> Dict[str, Any]:
         """Get database configuration"""
-        return self.config_data.get('database', {})
+        db_config = self.config_data.get('database', {})
+        logger.info(f"get_database_config() returning: {db_config}")
+        return db_config
         
     def get_redis_config(self) -> Dict[str, Any]:
         """Get Redis configuration"""

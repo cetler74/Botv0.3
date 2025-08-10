@@ -119,7 +119,7 @@ class DatabaseManager:
     async def get_balance(self, exchange: str) -> Optional[Dict[str, Any]]:
         """Get balance for specific exchange"""
         query = """
-            SELECT * FROM balance 
+            SELECT * FROM trading.balance 
             WHERE exchange = %s 
             ORDER BY timestamp DESC 
             LIMIT 1
@@ -154,7 +154,7 @@ class DatabaseManager:
         query = """
             SELECT DISTINCT ON (exchange) 
                 exchange, balance, available_balance, total_pnl, daily_pnl, timestamp
-            FROM balance 
+            FROM trading.balance 
             ORDER BY exchange, timestamp DESC
         """
         return await self.execute_query(query)
@@ -472,8 +472,30 @@ class DatabaseManager:
             balances = await self.get_all_balances()
             total_balance = sum(float(b['balance']) for b in balances)
             total_available = sum(float(b['available_balance']) for b in balances)
-            total_pnl = sum(float(b['total_pnl']) for b in balances)
-            daily_pnl = sum(float(b['daily_pnl']) for b in balances)
+            
+            # Calculate realized PnL from closed trades
+            query = """
+                SELECT COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+                       COALESCE(SUM(CASE 
+                           WHEN exit_time >= CURRENT_DATE 
+                           THEN realized_pnl 
+                           ELSE 0 
+                       END), 0) as daily_realized_pnl
+                FROM trades 
+                WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL
+            """
+            pnl_result = await self.execute_single_query(query)
+            total_realized_pnl = float(pnl_result['total_realized_pnl']) if pnl_result else 0.0
+            daily_realized_pnl = float(pnl_result['daily_realized_pnl']) if pnl_result else 0.0
+            
+            # Calculate unrealized PnL from open trades
+            open_trades_query = """
+                SELECT COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl
+                FROM trades 
+                WHERE status = 'OPEN' AND unrealized_pnl IS NOT NULL
+            """
+            unrealized_result = await self.execute_single_query(open_trades_query)
+            total_unrealized_pnl = float(unrealized_result['total_unrealized_pnl']) if unrealized_result else 0.0
             
             # Get open trades count
             open_trades = await self.get_open_trades()
@@ -484,8 +506,9 @@ class DatabaseManager:
             return {
                 'total_balance': total_balance,
                 'total_available_balance': total_available,
-                'total_pnl': total_pnl,
-                'daily_pnl': daily_pnl,
+                'total_pnl': total_realized_pnl,
+                'daily_pnl': daily_realized_pnl,
+                'total_unrealized_pnl': total_unrealized_pnl,
                 'open_trades_count': len(open_trades),
                 'unresolved_alerts_count': len(recent_alerts),
                 'exchanges': [b['exchange'] for b in balances],

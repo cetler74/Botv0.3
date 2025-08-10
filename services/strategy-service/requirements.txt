@@ -4,4 +4,8 @@ pydantic==2.5.0
 pandas==2.1.4
 numpy==1.24.3
 httpx==0.25.2
-python-multipart==0.0.6 
+python-multipart==0.0.6
+pandas-ta==0.3.14b
+prometheus_client==0.19.0
+psycopg2-binary==2.9.7
+aioredis==2.0.1 

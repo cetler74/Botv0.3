@@ -9,13 +9,13 @@ confirmations before entering positions.
 
 import pandas as pd
 import numpy as np
-import talib
+import pandas_ta as ta
 from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Optional, Tuple, Any, Union
 
-from .base_strategy import BaseStrategy
-from .strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced
+from strategy.base_strategy import BaseStrategy
+from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced
 from strategy.condition_logger import ConditionLogger
 
 logger = logging.getLogger(__name__)
@@ -35,17 +35,20 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
     - VWAP for fair value reference
     """
     
-    def __init__(self, config: Any, exchange=None, database=None, redis_client=None):
+    def __init__(self, config: Any, exchange=None, database=None, redis_client=None, exchange_name=None):
         """Initialize the Multi-Timeframe Confluence Strategy. Uses ConditionLogger for validation and condition checks."""
         super().__init__(config, exchange, database, redis_client)
         self.name = "multi_timeframe_confluence"
         self.description = "Multi-Timeframe Confluence Strategy for Sideways Markets"
-        self.condition_logger = ConditionLogger()
+        # Don't override the condition logger from base class - it's already initialized with proper strategy name
+        self.logger = logging.getLogger(__name__)
+        self.exchange_name = exchange_name
         
         # Strategy parameters based on research - UPDATED for current market conditions
-        self.adx_threshold = self._get_config_param('adx_threshold', 35)  # Increased from 30 to 35 for current volatility
+        self.adx_threshold = self._get_config_param('adx_threshold', 15)  # CRITICAL FIX: Use 15 as fallback to match config
         self.rsi_oversold = self._get_config_param('rsi_oversold', 30)
         self.rsi_overbought = self._get_config_param('rsi_overbought', 70)
+        self.trending_adx_threshold = self._get_config_param('trending_adx_threshold', 25)  # NEW: Trending market threshold
         self.bb_period = self._get_config_param('bb_period', 20)
         self.bb_std = self._get_config_param('bb_std', 2)
         self.vwap_period = self._get_config_param('vwap_period', 20)
@@ -55,7 +58,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         # Timeframes for analysis
         self.daily_timeframe = self._get_config_param('daily_timeframe', '1d')
         self.hourly_timeframe = self._get_config_param('hourly_timeframe', '1h')
-        self.min_confluence = self._get_config_param('min_confluence', 2)  # Minimum confirmations needed
+        self.min_confluence = self._get_config_param('min_confluence', 1)  # Minimum confirmations needed - reduced for more trades
         
         # UPDATED: More realistic sideways market criteria
         self.max_price_range_pct = self._get_config_param('max_price_range_pct', 15.0)  # Increased from 5% to 15%
@@ -66,7 +69,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         self.daily_data = None
         self.hourly_data = None
         
-        logger.info(f"MultiTimeframeConfluenceStrategy initialized with UPDATED parameters: "
+        self.logger.info(f"MultiTimeframeConfluenceStrategy initialized with UPDATED parameters: "
                    f"ADX threshold={self.adx_threshold}, max price range={self.max_price_range_pct}%, "
                    f"max volume ratio={self.max_volume_ratio}, min periods={self.min_sideways_periods}")
     
@@ -83,7 +86,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
     
     async def initialize(self, pair: str) -> None:
         """Initialize the strategy for a specific trading pair."""
-        logger.info(f"Initializing MultiTimeframeConfluenceStrategy for pair {pair}")
+        self.logger.info(f"Initializing MultiTimeframeConfluenceStrategy for pair {pair}")
         self.state.pair = pair
         
         # Initialize strategy-specific state
@@ -132,56 +135,25 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                 self.state.indicators['daily_adx'] = daily_latest.get('adx')
                     
         except Exception as e:
-            logger.error(f"Error updating MultiTimeframeConfluenceStrategy: {str(e)}")
+            self.logger.error(f"Error updating MultiTimeframeConfluenceStrategy: {str(e)}")
     
     async def _fetch_daily_data(self) -> Optional[pd.DataFrame]:
         """Fetch daily data for trend analysis."""
         try:
-            # Use database to get daily data (this is the correct pattern)
-            if hasattr(self, 'database') and self.database:
-                # Convert pair format from BTC/USDC to BTCUSDC for database query
-                symbol = self.state.pair.replace('/', '')
-                
-                # Get base currency from configuration
-                base_currency = 'USDC'  # Default for EU compliance
-                if hasattr(self.config, 'trading') and hasattr(self.config.trading, 'base_currency'):
-                    base_currency = self.config.trading.base_currency
-                
-                # Get balance for the configured base currency
-                base_balance = 0
-                if hasattr(self.exchange, 'get_balance'):
-                    try:
-                        balance_data = await self.exchange.get_balance(base_currency)
-                        # If currency is specified, get_balance returns a Balance object
-                        if hasattr(balance_data, 'free'):
-                            base_balance = balance_data.free
-                        else:
-                            base_balance = 0
-                    except Exception as e:
-                        logger.warning(f"Could not get balance for {base_currency}: {e}")
-                        base_balance = 0
-                
-                daily_df = await self.database.get_ohlcv(symbol, self.daily_timeframe, limit=100)
-                if not daily_df.empty:
+            # Use exchange manager to get daily data
+            if hasattr(self, 'exchange') and self.exchange:
+                # Use the correct symbol format (e.g., ORDI/USDC)
+                symbol = self.state.pair
+                exchange_name = self.exchange_name if hasattr(self, 'exchange_name') else None
+                daily_df = await self.exchange.get_ohlcv(exchange_name, symbol, self.daily_timeframe, limit=100)
+                if daily_df is not None and not daily_df.empty:
                     return daily_df
                 else:
-                    logger.warning(f"No daily data found in database for {symbol} ({self.state.pair})")
+                    self.logger.warning(f"No daily data found from exchange for {symbol} ({self.state.pair})")
             else:
-                logger.debug(f"Database not available for fetching daily data")
-                
-            # Fallback: For now, we'll use the hourly data if available for basic analysis
-            if self.hourly_data is not None and len(self.hourly_data) > 0:
-                # Create a mock daily data by resampling hourly data
-                daily_resampled = self.hourly_data.resample('1D').agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum'
-                }).dropna()
-                return daily_resampled
+                self.logger.debug(f"Exchange manager not available for fetching daily data")
         except Exception as e:
-            logger.error(f"Error fetching daily data: {str(e)}")
+            self.logger.error(f"Error fetching daily data: {str(e)}")
         return None
     
     def _calculate_daily_indicators(self, df: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None) -> pd.DataFrame:
@@ -190,19 +162,24 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         if indicators_cache is not None and pair:
             cache_key = f"DAILY_ADX_{pair}_{self.daily_timeframe}"
             if cache_key in indicators_cache:
-                logger.debug(f"[CACHE HIT] Daily ADX for {pair} {self.daily_timeframe}")
-                df['adx'] = indicators_cache[cache_key]
+                self.logger.debug(f"[CACHE HIT] Daily ADX for {pair} {self.daily_timeframe}")
+                cached_adx = indicators_cache[cache_key]
+                # Handle both old DataFrame format and new Series format from cache
+                if hasattr(cached_adx, 'columns') and 'ADX_14' in cached_adx.columns:
+                    df['adx'] = cached_adx['ADX_14']
+                else:
+                    df['adx'] = cached_adx
                 return df
         if len(df) < 20:
             return df
-        close = df['close'].values.astype(float)
-        high = df['high'].values.astype(float)
-        low = df['low'].values.astype(float)
-        adx = talib.ADX(high, low, close, timeperiod=14)
-        df['adx'] = adx
+        adx_result = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx_result is not None and 'ADX_14' in adx_result.columns:
+            df['adx'] = adx_result['ADX_14']
+        else:
+            df['adx'] = None
         if indicators_cache is not None and cache_key:
-            indicators_cache[cache_key] = adx
-            logger.debug(f"[CACHE STORE] Daily ADX for {pair} {self.daily_timeframe}")
+            indicators_cache[cache_key] = df['adx']
+            self.logger.debug(f"[CACHE STORE] Daily ADX for {pair} {self.daily_timeframe}")
         return df
     
     def _calculate_hourly_indicators(self, df: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None) -> pd.DataFrame:
@@ -216,21 +193,24 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         }
         # RSI
         if indicators_cache is not None and cache_keys['rsi'] in indicators_cache:
-            logger.debug(f"[CACHE HIT] Hourly RSI for {pair} {self.hourly_timeframe}")
+            self.logger.debug(f"[CACHE HIT] Hourly RSI for {pair} {self.hourly_timeframe}")
             df['rsi'] = indicators_cache[cache_keys['rsi']]
         else:
-            df['rsi'] = talib.RSI(df['close'].values.astype(float), timeperiod=14)
+            df['rsi'] = ta.rsi(df['close'], length=14)
             if indicators_cache is not None:
                 indicators_cache[cache_keys['rsi']] = df['rsi']
-                logger.debug(f"[CACHE STORE] Hourly RSI for {pair} {self.hourly_timeframe}")
+                self.logger.debug(f"[CACHE STORE] Hourly RSI for {pair} {self.hourly_timeframe}")
         # BB
         if indicators_cache is not None and cache_keys['bb_upper'] in indicators_cache:
-            logger.debug(f"[CACHE HIT] Hourly BB for {pair} {self.hourly_timeframe}")
+            self.logger.debug(f"[CACHE HIT] Hourly BB for {pair} {self.hourly_timeframe}")
             df['bb_upper'] = indicators_cache[cache_keys['bb_upper']]
             df['bb_middle'] = indicators_cache[cache_keys['bb_middle']]
             df['bb_lower'] = indicators_cache[cache_keys['bb_lower']]
         else:
-            upper, middle, lower = talib.BBANDS(df['close'].values.astype(float), timeperiod=20, nbdevup=2, nbdevdn=2)
+            bb = ta.bbands(df['close'], length=20, std=2)
+            upper = bb['BBU_20_2.0']
+            middle = bb['BBM_20_2.0']
+            lower = bb['BBL_20_2.0']
             df['bb_upper'] = upper
             df['bb_middle'] = middle
             df['bb_lower'] = lower
@@ -238,16 +218,16 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                 indicators_cache[cache_keys['bb_upper']] = upper
                 indicators_cache[cache_keys['bb_middle']] = middle
                 indicators_cache[cache_keys['bb_lower']] = lower
-                logger.debug(f"[CACHE STORE] Hourly BB for {pair} {self.hourly_timeframe}")
+                self.logger.debug(f"[CACHE STORE] Hourly BB for {pair} {self.hourly_timeframe}")
         # VWAP
         if indicators_cache is not None and cache_keys['vwap'] in indicators_cache:
-            logger.debug(f"[CACHE HIT] Hourly VWAP for {pair} {self.hourly_timeframe}")
+            self.logger.debug(f"[CACHE HIT] Hourly VWAP for {pair} {self.hourly_timeframe}")
             df['vwap'] = indicators_cache[cache_keys['vwap']]
         else:
             df['vwap'] = self._calculate_vwap(df)
             if indicators_cache is not None:
                 indicators_cache[cache_keys['vwap']] = df['vwap']
-                logger.debug(f"[CACHE STORE] Hourly VWAP for {pair} {self.hourly_timeframe}")
+                self.logger.debug(f"[CACHE STORE] Hourly VWAP for {pair} {self.hourly_timeframe}")
         return df
     
     def _calculate_vwap(self, df: pd.DataFrame) -> pd.Series:
@@ -259,38 +239,66 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
     
     def _detect_sideways_market(self) -> Tuple[bool, str]:
         """
-        Detect sideways market conditions on daily timeframe.
+        Detect sideways market conditions using hourly data instead of daily.
         
         UPDATED Criteria for current market conditions:
         - ADX below threshold (increased from 30 to 35)
         - Price trading within 15% range (increased from 5%) for at least 7 periods (reduced from 10)
         - Volume within 150% of recent average (increased from 120%)
         """
-        if self.daily_data is None or len(self.daily_data) < 20:
-            return False, "Insufficient daily data"
+        # Use hourly data instead of daily data since daily data is not available
+        if self.hourly_data is None or len(self.hourly_data) < 20:
+            return False, "Insufficient hourly data"
             
-        current_adx = self.daily_data['adx'].iloc[-1]
+        # Calculate ADX on hourly data
+        if 'adx' not in self.hourly_data.columns:
+            # Calculate ADX directly on hourly data
+            if len(self.hourly_data) >= 20:
+                try:
+                    adx_result = ta.adx(self.hourly_data['high'], self.hourly_data['low'], self.hourly_data['close'], length=14)
+                    if adx_result is not None and 'ADX_14' in adx_result.columns:
+                        self.hourly_data['adx'] = adx_result['ADX_14']
+                        adx_value = adx_result['ADX_14'].iloc[-1] if not pd.isna(adx_result['ADX_14'].iloc[-1]) else 'NaN'
+                        self.logger.info(f"ADX calculation successful: {adx_value}")
+                    else:
+                        self.logger.warning("ADX calculation returned None or invalid data")
+                        self.hourly_data['adx'] = None
+                except Exception as e:
+                    self.logger.error(f"ADX calculation failed: {str(e)}")
+                    self.hourly_data['adx'] = None
+            else:
+                self.logger.warning(f"Insufficient data for ADX calculation: {len(self.hourly_data)} < 20")
+                self.hourly_data['adx'] = None
+            
+        # Handle case where ADX calculation failed
+        adx_column = self.hourly_data['adx']
+        if adx_column is None:
+            current_adx = None
+        else:
+            current_adx = adx_column.iloc[-1] if hasattr(adx_column, 'iloc') else None
         
         # Check if ADX indicates sideways market (UPDATED threshold)
         if pd.isna(current_adx) or current_adx > self.adx_threshold:
-            return False, f"ADX indicates trending market ({current_adx:.2f} > {self.adx_threshold})"
+            adx_value = f"{current_adx:.2f}" if current_adx is not None and not pd.isna(current_adx) else "None"
+            return False, f"ADX indicates trending market ({adx_value} > {self.adx_threshold})"
         
         # Check price range over last N periods (UPDATED: reduced periods, increased range)
-        recent_high = self.daily_data['high'].tail(self.min_sideways_periods).max()
-        recent_low = self.daily_data['low'].tail(self.min_sideways_periods).min()
+        recent_high = self.hourly_data['high'].tail(self.min_sideways_periods).max()
+        recent_low = self.hourly_data['low'].tail(self.min_sideways_periods).min()
         price_range = (recent_high - recent_low) / recent_low
         
         if price_range > (self.max_price_range_pct / 100):  # Convert percentage to decimal
             return False, f"Price range too wide for sideways market ({price_range:.2%} > {self.max_price_range_pct}%)"
         
         # Check volume condition (UPDATED: more lenient)
-        recent_volume = self.daily_data['volume'].tail(5).mean()
-        historical_volume = self.daily_data['volume'].tail(25).mean()
+        recent_volume = self.hourly_data['volume'].tail(5).mean()
+        historical_volume = self.hourly_data['volume'].tail(25).mean()
         
         if recent_volume > historical_volume * self.max_volume_ratio:
             return False, f"Volume too high for consolidation ({recent_volume:.0f} > {historical_volume * self.max_volume_ratio:.0f})"
         
-        return True, f"Sideways market detected (ADX: {current_adx:.2f}, Range: {price_range:.2%}, Volume ratio: {recent_volume/historical_volume:.2f})"
+        adx_value = f"{current_adx:.2f}" if current_adx is not None and not pd.isna(current_adx) else "None"
+        return True, f"Sideways market detected (ADX: {adx_value}, Range: {price_range:.2%}, Volume ratio: {recent_volume/historical_volume:.2f})"
     
     def _generate_confluence_signals(self) -> Tuple[int, int, List[str]]:
         """
@@ -352,76 +360,97 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         
         return buy_confluence, sell_confluence, signal_details
     
-    async def generate_signal(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> Tuple[str, float, float]:
+    async def generate_signal(self, market_data, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None, exchange_adapter=None) -> Tuple[str, float, float]:
         """Generate trading signal, using indicator cache if provided."""
-        # Use the cache for indicator calculations
+        # Use exchange_adapter if provided to override self.exchange
+        if exchange_adapter is not None:
+            self.exchange = exchange_adapter
+        
+        # Handle both DataFrame and dict market_data formats
+        if isinstance(market_data, dict):
+            # If market_data is a dict with timeframes, use the primary timeframe
+            if timeframe and timeframe in market_data:
+                ohlcv = market_data[timeframe]
+            elif '1h' in market_data:
+                ohlcv = market_data['1h']
+            else:
+                # Use the first available timeframe
+                first_tf = list(market_data.keys())[0]
+                ohlcv = market_data[first_tf]
+        else:
+            # If market_data is already a DataFrame
+            ohlcv = market_data
+            
         hourly_data = self._calculate_hourly_indicators(ohlcv, indicators_cache, pair)
+        # Set the hourly data for sideways market detection
+        self.hourly_data = hourly_data
         try:
-            # Check for sideways market on daily timeframe
             is_sideways, market_condition = self._detect_sideways_market()
-            if not is_sideways:
-                await self.condition_logger.log_condition(
-                    "sideways_market_check", 
+            # CRITICAL FIX: Allow both sideways AND trending markets to increase trade frequency
+            market_suitable = is_sideways
+            
+            # If not sideways, check if it's a suitable trending market
+            if not is_sideways and self.hourly_data is not None and len(self.hourly_data) >= 20:
+                # Check if ADX indicates trending market strength
+                adx_column = self.hourly_data.get('adx')
+                if adx_column is not None:
+                    current_adx = adx_column.iloc[-1] if hasattr(adx_column, 'iloc') else None
+                    # Allow trending markets with strong momentum (ADX > trending_adx_threshold)
+                    if not pd.isna(current_adx) and current_adx > self.trending_adx_threshold:
+                        market_suitable = True
+                        market_condition = f"Strong trending market (ADX: {current_adx:.2f})"
+            
+            if not market_suitable:
+                await self._condition_logger.log_condition(
+                    "market_condition_check", 
                     False, 
-                    f"Daily timeframe market condition: {market_condition}",
+                    f"Market not suitable for trading: {market_condition}",
                     False,
                     context={'market_condition': market_condition}
                 )
-                return 'none', 0.0, 0.0
-            # Generate confluence signals
+                return 'hold', 0.0, 0.0
             buy_confluence, sell_confluence, signal_details = self._generate_confluence_signals()
-            # Update state with confluence information
             self.state.indicators['confluence_count'] = max(buy_confluence, sell_confluence)
             self.state.indicators['signal_details'] = signal_details
             if self.hourly_data is not None and len(self.hourly_data) > 0:
                 current_price = self.hourly_data['close'].iloc[-1]
             else:
-                return 'none', 0.0, 0.0
-            # Generate signal if we have sufficient confluence
+                return 'hold', 0.0, 0.0
             if buy_confluence >= self.min_confluence and buy_confluence > sell_confluence:
-                # Calculate stop loss and take profit
                 stop_loss = current_price * (1 - self.stop_loss_pct)
                 take_profit = current_price * (1 + self.take_profit_pct)
-                await self.condition_logger.log_condition(
+                await self._condition_logger.log_condition(
                     "buy_confluence_signal",
                     buy_confluence,
                     f"Buy signal with {buy_confluence} confluences: {', '.join(signal_details)}",
                     True,
                     context={'confluences': buy_confluence, 'details': signal_details}
                 )
-                # Calculate ADX using TA-Lib
-                try:
-                    import talib
-                    high = ohlcv['high'].values.astype(float)
-                    low = ohlcv['low'].values.astype(float)
-                    close = ohlcv['close'].values.astype(float)
-                    adx = talib.ADX(high, low, close, timeperiod=14)
-                    self.logger.info(f"[DEBUG] ADX values for {pair} ({timeframe}): {adx[-5:].tolist() if len(adx) >= 5 else adx.tolist()}")
-                except Exception as e:
-                    self.logger.error(f"Failed to calculate ADX for {pair} ({timeframe}): {e}")
-                return 'buy', stop_loss, take_profit
+                reason = f"buy_confluence:{buy_confluence}|details:{'+'.join(signal_details)}"
+                confidence = min(buy_confluence / 5.0, 1.0)  # Normalize confidence based on confluence count
+                strength = min(buy_confluence / 5.0, 1.0)   # Use same value for strength
+                return 'buy', confidence, strength
             elif sell_confluence >= self.min_confluence and sell_confluence > buy_confluence:
-                # For spot trading, we don't execute sell signals, but we can use them for exits
-                await self.condition_logger.log_condition(
+                await self._condition_logger.log_condition(
                     "sell_confluence_signal",
                     sell_confluence,
                     f"Sell signal detected with {sell_confluence} confluences (spot trading - no action)",
                     False,
                     context={'confluences': sell_confluence, 'details': signal_details}
                 )
-                return 'none', 0.0, 0.0
+                return 'hold', 0.0, 0.0
             else:
-                await self.condition_logger.log_condition(
+                await self._condition_logger.log_condition(
                     "insufficient_confluence",
                     max(buy_confluence, sell_confluence),
                     f"Insufficient confluence (Buy: {buy_confluence}, Sell: {sell_confluence}, min required: {self.min_confluence})",
                     False,
                     context={'buy_confluence': buy_confluence, 'sell_confluence': sell_confluence}
                 )
-                return 'none', 0.0, 0.0
+                return 'hold', 0.0, 0.0
         except Exception as e:
-            logger.error(f"Error generating signal: {str(e)}")
-            return 'none', 0.0, 0.0
+            self.logger.error(f"Error generating signal: {str(e)}")
+            return 'hold', 0.0, 0.0
     
     async def calculate_position_size(self, signal_type: str) -> float:
         """Calculate position size based on risk management rules."""
@@ -457,49 +486,43 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             
             if current_price > 0:
                 position_size = position_value / current_price
-                logger.info(f"Calculated position size: {position_size:.6f} for {self.state.pair}")
+                self.logger.info(f"Calculated position size: {position_size:.6f} for {self.state.pair}")
                 return position_size
             
             return 0.0
             
         except Exception as e:
-            logger.error(f"Error calculating position size: {str(e)}")
+            self.logger.error(f"Error calculating position size: {str(e)}")
             return 0.0
     
-    async def should_exit(self) -> bool:
-        """Check if current position should be closed."""
+    async def should_exit(self) -> Tuple[bool, Optional[str]]:
+        """Check if current position should be closed. Returns (should_exit, reason)."""
         try:
             if self.state.position != 'long' or self.state.entry_price <= 0:
-                return False
-            
+                return False, None
             # Get current price
             current_price = self.hourly_data['close'].iloc[-1] if self.hourly_data is not None else 0
             if current_price <= 0:
-                return False
-            
+                return False, None
             # NOTE: Profit protection is now handled centrally in the orchestrator
             # This prevents duplicate calls and ensures consistent logging and behavior
-            
             # Check for sell confluence as additional exit signal
             if self.state.position == 'long':
                 buy_confluence, sell_confluence, signal_details = self._generate_confluence_signals()
-                
                 # Exit if strong sell confluence is detected
                 if sell_confluence >= self.min_confluence:
-                    await self.condition_logger.log_condition(
+                    await self._condition_logger.log_condition(
                         "confluence_exit_signal",
                         sell_confluence,
                         f"Exit signal with {sell_confluence} sell confluences: {', '.join(signal_details)}",
                         True,
                         context={'confluences': sell_confluence, 'details': signal_details}
                     )
-                    return True
-            
-            return False
-            
+                    return True, 'sell_confluence'
+            return False, None
         except Exception as e:
-            logger.error(f"Error checking exit conditions: {str(e)}")
-            return False
+            self.logger.error(f"Error checking exit conditions: {str(e)}")
+            return False, None
     
     async def get_strategy_info(self) -> Dict[str, Any]:
         """Get current strategy information and state."""
@@ -522,3 +545,46 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                 'take_profit_pct': self.take_profit_pct
             }
         } 
+
+    async def analyze_pair(self, pair, min_candles=None, exchange_name: Optional[str] = None):
+        timeframes = ['1h', '15m']
+        results = {}
+        for timeframe in timeframes:
+            self.logger.info(f"[MultiTimeframeConfluence] Analyzing {pair} on {timeframe}")
+            df = await self.exchange.get_ohlcv(exchange_name, pair, timeframe, limit=min_candles or 50)
+            if df is None or len(df) < (min_candles or 50):
+                self.logger.warning(f"Not enough data for {pair} on {timeframe}")
+                results[timeframe] = ('hold', 0, {})
+                continue
+            # Example indicator calculation and checks
+            indicators = {}
+            try:
+                adx_result = ta.adx(df['high'], df['low'], df['close'], length=14)
+                rsi = ta.rsi(df['close'], length=14)
+                indicators = {
+                    'adx': adx_result['ADX_14'].iloc[-1] if adx_result is not None and 'ADX_14' in adx_result.columns else None,
+                    'rsi': rsi[-1],
+                }
+            except Exception as e:
+                self.logger.error(f"[MultiTimeframeConfluence] Indicator calculation error for {pair} on {timeframe}: {e}")
+                results[timeframe] = ('hold', 0, {})
+                continue
+            self.logger.info(f"[MultiTimeframeConfluence] {pair} {timeframe} indicators: {indicators}")
+            for name, value in indicators.items():
+                if pd.isna(value):
+                    self.logger.warning(f"[MultiTimeframeConfluence] Indicator {name} is NaN for {pair} on {timeframe}, holding.")
+                    results[timeframe] = ('hold', 0, indicators)
+                    break
+            else:
+                adx_pass = indicators['adx'] > self.adx_threshold
+                self.logger.info(f"[MultiTimeframeConfluence] ADX check: current={indicators['adx']}, target>{self.adx_threshold}, result={'PASS' if adx_pass else 'FAIL'}")
+                rsi_pass = indicators['rsi'] > 50
+                self.logger.info(f"[MultiTimeframeConfluence] RSI check: current={indicators['rsi']}, target>50, result={'PASS' if rsi_pass else 'FAIL'}")
+                checks = [adx_pass, rsi_pass]
+                if all(checks):
+                    self.logger.info(f"[MultiTimeframeConfluence] Signal for {pair} on {timeframe}: BUY (all conditions met)")
+                    results[timeframe] = ('buy', 1, indicators)
+                else:
+                    self.logger.info(f"[MultiTimeframeConfluence] Signal for {pair} on {timeframe}: HOLD (not all conditions met)")
+                    results[timeframe] = ('hold', 0, indicators)
+        return results 

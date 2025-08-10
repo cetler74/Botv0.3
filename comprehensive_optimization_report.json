@@ -1,0 +1,210 @@
+{
+  "timestamp": "2025-08-04T21:25:28.111826",
+  "performance_baseline": {
+    "health_score": 55,
+    "win_rate": 1.0,
+    "profit_factor": 1.18406162,
+    "total_pnl": 1.18406162,
+    "trades_per_cycle": 2.0,
+    "max_drawdown": 0,
+    "sharpe_ratio": 0.59203081,
+    "balance_utilization": 0.0,
+    "exchange_stats": {
+      "cryptocom": {
+        "trades": [
+          {
+            "id": 2099,
+            "trade_id": "396691e2-e3e8-4e89-b0ba-1eedcd3531c2",
+            "pair": "AAVE/USD",
+            "entry_price": 263.484,
+            "exit_price": 265.464,
+            "status": "CLOSED",
+            "entry_id": "6530219582640167301",
+            "exit_id": "6530219582641475077",
+            "entry_time": "2025-08-04T14:55:20.965581+00:00",
+            "exit_time": "2025-08-04T15:16:46.713847+00:00",
+            "unrealized_pnl": 0.4971622,
+            "realized_pnl": 0.4971622,
+            "highest_price": 265.464,
+            "profit_protection": "trailing",
+            "profit_protection_trigger": null,
+            "trail_stop": "active",
+            "trail_stop_trigger": 264.1367,
+            "exchange": "cryptocom",
+            "entry_reason": "heikin_ashi strategy signal: buy (confidence: 1.00, strength: 1.00)",
+            "exit_reason": "stop_loss_264.1%",
+            "position_size": 0.25109202,
+            "fees": 0.0,
+            "strategy": "heikin_ashi",
+            "created_at": "2025-08-04T14:55:20.985258+00:00",
+            "updated_at": "2025-08-04T15:16:46.730608+00:00",
+            "current_price": 265.464
+          },
+          {
+            "id": 2098,
+            "trade_id": "3013ca98-f08f-4a4b-86b1-33699bc32551",
+            "pair": "AAVE/USD",
+            "entry_price": 263.834,
+            "exit_price": 266.3,
+            "status": "CLOSED",
+            "entry_id": "6530219582640041547",
+            "exit_id": "6530219582645004499",
+            "entry_time": "2025-08-04T14:53:37.209773+00:00",
+            "exit_time": "2025-08-04T16:07:58.489794+00:00",
+            "unrealized_pnl": 0.55431056,
+            "realized_pnl": 0.68689942,
+            "highest_price": 265.832,
+            "profit_protection": "trailing",
+            "profit_protection_trigger": null,
+            "trail_stop": "active",
+            "trail_stop_trigger": 264.5028,
+            "exchange": "cryptocom",
+            "entry_reason": "heikin_ashi strategy signal: buy (confidence: 1.00, strength: 1.00)",
+            "exit_reason": "stop_loss_264.5%",
+            "position_size": 0.27854802,
+            "fees": 0.0,
+            "strategy": "heikin_ashi",
+            "created_at": "2025-08-04T14:53:37.234768+00:00",
+            "updated_at": "2025-08-04T16:07:58.509339+00:00",
+            "current_price": 265.824
+          }
+        ],
+        "pnl": 1.18406162,
+        "wins": 2,
+        "losses": 0,
+        "win_rate": 1.0,
+        "total_trades": 2
+      }
+    },
+    "strategy_stats": {
+      "heikin_ashi": {
+        "trades": [
+          {
+            "id": 2099,
+            "trade_id": "396691e2-e3e8-4e89-b0ba-1eedcd3531c2",
+            "pair": "AAVE/USD",
+            "entry_price": 263.484,
+            "exit_price": 265.464,
+            "status": "CLOSED",
+            "entry_id": "6530219582640167301",
+            "exit_id": "6530219582641475077",
+            "entry_time": "2025-08-04T14:55:20.965581+00:00",
+            "exit_time": "2025-08-04T15:16:46.713847+00:00",
+            "unrealized_pnl": 0.4971622,
+            "realized_pnl": 0.4971622,
+            "highest_price": 265.464,
+            "profit_protection": "trailing",
+            "profit_protection_trigger": null,
+            "trail_stop": "active",
+            "trail_stop_trigger": 264.1367,
+            "exchange": "cryptocom",
+            "entry_reason": "heikin_ashi strategy signal: buy (confidence: 1.00, strength: 1.00)",
+            "exit_reason": "stop_loss_264.1%",
+            "position_size": 0.25109202,
+            "fees": 0.0,
+            "strategy": "heikin_ashi",
+            "created_at": "2025-08-04T14:55:20.985258+00:00",
+            "updated_at": "2025-08-04T15:16:46.730608+00:00",
+            "current_price": 265.464
+          },
+          {
+            "id": 2098,
+            "trade_id": "3013ca98-f08f-4a4b-86b1-33699bc32551",
+            "pair": "AAVE/USD",
+            "entry_price": 263.834,
+            "exit_price": 266.3,
+            "status": "CLOSED",
+            "entry_id": "6530219582640041547",
+            "exit_id": "6530219582645004499",
+            "entry_time": "2025-08-04T14:53:37.209773+00:00",
+            "exit_time": "2025-08-04T16:07:58.489794+00:00",
+            "unrealized_pnl": 0.55431056,
+            "realized_pnl": 0.68689942,
+            "highest_price": 265.832,
+            "profit_protection": "trailing",
+            "profit_protection_trigger": null,
+            "trail_stop": "active",
+            "trail_stop_trigger": 264.5028,
+            "exchange": "cryptocom",
+            "entry_reason": "heikin_ashi strategy signal: buy (confidence: 1.00, strength: 1.00)",
+            "exit_reason": "stop_loss_264.5%",
+            "position_size": 0.27854802,
+            "fees": 0.0,
+            "strategy": "heikin_ashi",
+            "created_at": "2025-08-04T14:53:37.234768+00:00",
+            "updated_at": "2025-08-04T16:07:58.509339+00:00",
+            "current_price": 265.824
+          }
+        ],
+        "pnl": 1.18406162,
+        "wins": 2,
+        "losses": 0,
+        "win_rate": 1.0,
+        "total_trades": 2
+      }
+    },
+    "pnl_timeline": [
+      {
+        "date": "2025-08-04",
+        "cumulative_pnl": 0.4971622
+      },
+      {
+        "date": "2025-08-04",
+        "cumulative_pnl": 1.18406162
+      }
+    ],
+    "recommendations": [
+      {
+        "category": "Profit Factor",
+        "target": "Risk Management",
+        "issue": "Low profit factor: 1.18",
+        "recommendation": "Improve risk/reward by increasing position size: trading.position_size_percentage from 0.12 to 0.15",
+        "config_change": "trading.position_size_percentage: 0.15",
+        "priority": "high"
+      },
+      {
+        "category": "Balance Utilization",
+        "target": "Trading Parameters",
+        "issue": "Very low balance utilization: 0.0%",
+        "recommendation": "Reduce minimum order size: trading.min_order_size_usd from 25.0 to 15.0",
+        "config_change": "trading.min_order_size_usd: 15.0",
+        "priority": "high"
+      }
+    ]
+  },
+  "optimizations": [
+    {
+      "category": "Profit Factor",
+      "target": "Position Size",
+      "current_value": 0.08,
+      "recommended_value": 0.15,
+      "config_path": "trading.position_size_percentage",
+      "priority": "high",
+      "expected_impact": "Improve risk/reward ratio",
+      "confidence": 0.8
+    },
+    {
+      "category": "Balance Utilization",
+      "target": "Minimum Order Size",
+      "current_value": 100.0,
+      "recommended_value": 15.0,
+      "config_path": "trading.min_order_size_usd",
+      "priority": "high",
+      "expected_impact": "Enable smaller trades",
+      "confidence": 0.9
+    }
+  ],
+  "test_results": [],
+  "summary": {
+    "total_optimizations": 2,
+    "high_priority": 2,
+    "medium_priority": 0,
+    "low_priority": 0,
+    "expected_improvements": {
+      "Win Rate": "0%",
+      "Profit Factor": "+20-30%",
+      "Trading Frequency": "0%",
+      "Balance Utilization": "+50-100%"
+    }
+  }
+}

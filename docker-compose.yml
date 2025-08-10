@@ -43,6 +43,13 @@ services:
     environment:
       - CONFIG_PATH=/app/config/config.yaml
       - DOCKER_ENV=true
+      # Exchange API Credentials
+      - EXCHANGE_BINANCE_API_KEY=${EXCHANGE_BINANCE_API_KEY}
+      - EXCHANGE_BINANCE_API_SECRET=${EXCHANGE_BINANCE_API_SECRET}
+      - EXCHANGE_BYBIT_API_KEY=${EXCHANGE_BYBIT_API_KEY}
+      - EXCHANGE_BYBIT_API_SECRET=${EXCHANGE_BYBIT_API_SECRET}
+      - EXCHANGE_CRYPTOCOM_API_KEY=${EXCHANGE_CRYPTOCOM_API_KEY}
+      - EXCHANGE_CRYPTOCOM_API_SECRET=${EXCHANGE_CRYPTOCOM_API_SECRET}
     volumes:
       - ./config:/app/config
     networks:
@@ -71,6 +78,8 @@ services:
       - DB_USER=carloslarramba
       - DB_PASSWORD=mypassword
       - DB_POOL_SIZE=10
+    volumes:
+      - ./services/database-service/main.py:/app/main.py
     networks:
       - trading-bot-network
     depends_on:
@@ -94,6 +103,15 @@ services:
     environment:
       - CONFIG_SERVICE_URL=http://config-service:8001
       - DATABASE_SERVICE_URL=http://database-service:8002
+      - EXCHANGE_BINANCE_API_KEY=${EXCHANGE_BINANCE_API_KEY}
+      - EXCHANGE_BINANCE_API_SECRET=${EXCHANGE_BINANCE_API_SECRET}
+      - EXCHANGE_BYBIT_API_KEY=${EXCHANGE_BYBIT_API_KEY}
+      - EXCHANGE_BYBIT_API_SECRET=${EXCHANGE_BYBIT_API_SECRET}
+      - EXCHANGE_CRYPTOCOM_API_KEY=${EXCHANGE_CRYPTOCOM_API_KEY}
+      - EXCHANGE_CRYPTOCOM_API_SECRET=${EXCHANGE_CRYPTOCOM_API_SECRET}
+    volumes:
+      - ./services/exchange-service/main.py:/app/main.py
+      - ./scripts:/app/scripts
     networks:
       - trading-bot-network
     depends_on:
@@ -110,7 +128,9 @@ services:
 
   # Strategy Service
   strategy-service:
-    build: ./services/strategy-service
+    build:
+      context: .
+      dockerfile: services/strategy-service/Dockerfile
     container_name: trading-bot-strategy
     ports:
       - "8004:8004"
@@ -119,7 +139,8 @@ services:
       - EXCHANGE_SERVICE_URL=http://exchange-service:8003
       - DATABASE_SERVICE_URL=http://database-service:8002
     volumes:
-      - ./:/app/strategies
+      - ./services/strategy-service/main.py:/app/main.py
+      - ./strategy:/app/strategy
     networks:
       - trading-bot-network
     depends_on:
@@ -138,7 +159,9 @@ services:
 
   # Orchestrator Service
   orchestrator-service:
-    build: ./services/orchestrator-service
+    build:
+      context: .
+      dockerfile: services/orchestrator-service/Dockerfile
     container_name: trading-bot-orchestrator
     ports:
       - "8005:8005"
@@ -147,6 +170,9 @@ services:
       - DATABASE_SERVICE_URL=http://database-service:8002
       - EXCHANGE_SERVICE_URL=http://exchange-service:8003
       - STRATEGY_SERVICE_URL=http://strategy-service:8004
+    volumes:
+      - ./services/orchestrator-service/main.py:/app/main.py
+      - ./core:/app/core
     networks:
       - trading-bot-network
     depends_on:
@@ -165,6 +191,106 @@ services:
       retries: 3
       start_period: 10s
 
+  # MCP Service
+  mcp-service:
+    build: ./services/mcp-service
+    container_name: trading-bot-mcp
+    ports:
+      - "8010:8001"
+    environment:
+      - CONFIG_SERVICE_URL=http://config-service:8001
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./config:/app/config
+    networks:
+      - trading-bot-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      config-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Order Sync Service
+  order-sync-service:
+    build: ./services/order-sync-service
+    container_name: trading-bot-order-sync
+    ports:
+      - "8008:8008"
+    environment:
+      - DATABASE_SERVICE_URL=http://database-service:8002
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8005
+    networks:
+      - trading-bot-network
+    depends_on:
+      database-service:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+      orchestrator-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Position Sync Service
+  position-sync-service:
+    build: ./services/position-sync-service
+    container_name: trading-bot-position-sync
+    ports:
+      - "8009:8009"
+    environment:
+      - DATABASE_SERVICE_URL=http://database-service:8002
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+    networks:
+      - trading-bot-network
+    depends_on:
+      database-service:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Price Feed Service
+  price-feed-service:
+    build: ./services/price-feed-service
+    container_name: trading-bot-price-feed
+    ports:
+      - "8007:8007"
+    environment:
+      - DATABASE_URL=postgresql://carloslarramba:mypassword@postgres:5432/trading_bot_futures
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - CONFIG_SERVICE_URL=http://config-service:8001
+    networks:
+      - trading-bot-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
   # Web Dashboard Service
   web-dashboard-service:
     build: ./services/web-dashboard-service
@@ -177,9 +303,12 @@ services:
       - EXCHANGE_SERVICE_URL=http://exchange-service:8003
       - STRATEGY_SERVICE_URL=http://strategy-service:8004
       - ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8005
+      - ORDER_SYNC_SERVICE_URL=http://order-sync-service:8008
+      - POSITION_SYNC_SERVICE_URL=http://position-sync-service:8009
     volumes:
-      - ./web/static:/app/static
-      - ./web/templates:/app/templates
+      - ./services/web-dashboard-service/main.py:/app/main.py
+      - ./services/web-dashboard-service/static:/app/static
+      - ./services/web-dashboard-service/templates:/app/templates
     networks:
       - trading-bot-network
     depends_on:
@@ -208,6 +337,7 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml
     networks:
       - trading-bot-network
     command:

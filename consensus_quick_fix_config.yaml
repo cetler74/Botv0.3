@@ -1,0 +1,45 @@
+# CONSENSUS & MARKET REGIME QUICK FIX
+# Generated: 2025-08-05T23:21:17.978121
+# PURPOSE: Fix market regime over-restriction causing low trade frequency
+
+# CRITICAL FIX 1: Relax Multi-Timeframe Confluence Strategy
+strategies:
+  multi_timeframe_confluence:
+    enabled: true
+    parameters:
+      # CRITICAL: Reduce timeframe agreement requirement
+      required_timeframe_agreement: 2  # Changed from 3 to 2 (allows 2/3 timeframes)
+      min_confidence: 0.25              # Reduced from 0.4+
+      adx_entry_threshold: 15           # Reduced from 25
+      
+      # Additional relaxations
+      trend_strength_threshold: 0.3     # Reduced from 0.5+
+      volume_confirmation_required: false  # Disable volume confirmation
+      
+  # CRITICAL FIX 2: Enable more strategies for low volatility
+  heikin_ashi:
+    enabled: true
+    parameters:
+      adx_entry_threshold: 12           # Very low for low volatility markets
+      min_confidence: 0.25
+      
+  vwma_hull:
+    enabled: true  
+    parameters:
+      adx_entry_threshold: 12           # Very low for low volatility markets
+      min_confidence: 0.25
+      volume_threshold: 1.0             # Minimal volume requirement
+
+# NOTE: These changes target the ROOT CAUSE identified:
+# 1. Most pairs classified as low_volatility  
+# 2. Only multi_timeframe_confluence runs on these pairs
+# 3. Multi_timeframe_confluence is too restrictive (generates mostly HOLD)
+#
+# EXPECTED RESULT: 5-10x increase in trading frequency
+# TEST: Monitor "CONSENSUS RESULT" logs - should see more BUY signals
+
+# MARKET REGIME DETECTOR CHANGES NEEDED (in code):
+# File: strategy/market_regime_detector.py
+# 1. Line ~350: Change LOW_VOLATILITY mapping to include more strategies
+# 2. Line ~280: Relax low volatility thresholds (atr_pct < 0.01 instead of 0.015)
+# 3. Line ~290: Relax bollinger band width threshold

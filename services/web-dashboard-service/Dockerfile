@@ -14,6 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code and templates
 COPY main.py .
+COPY strategy_optimizer.py .
+COPY enhanced_strategy_optimizer.py .
+COPY test_connections.py .
+COPY test_endpoints.py .
 COPY templates/ templates/
 COPY static/ static/
 
