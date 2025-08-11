@@ -37,7 +37,8 @@ class StrategyManager:
             'heikin_ashi': 'HeikinAshiStrategy', 
             'multi_timeframe_confluence': 'MultiTimeframeConfluenceStrategy',
             'engulfing_multi_tf': 'EngulfingMultiTimeframeStrategy',
-            'strategy_pnl_enhanced': 'StrategyPnLEnhanced'
+            'strategy_pnl_enhanced': 'StrategyPnLEnhanced',
+            'fibonacci': 'FibonacciStrategy'
         }
         
         # Explicit module mapping to match actual filenames
@@ -46,6 +47,7 @@ class StrategyManager:
             'heikin_ashi': 'strategy.heikin_ashi_strategy',
             'multi_timeframe_confluence': 'strategy.multi_timeframe_confluence_strategy',
             'engulfing_multi_tf': 'strategy.engulfing_multi_tf',
+            'fibonacci': 'strategy.fibonacci_strategy',
         }
         for strategy_name, strategy_config in strategies_config.items():
             if not strategy_config.get('enabled', False):

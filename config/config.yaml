@@ -252,6 +252,25 @@ strategies:
     target_timeframes:
     - 1h
     - 15m
+  fibonacci:
+    enabled: true
+    parameters:
+      min_candles: 25
+      swing_lookback: 20
+      fib_tolerance: 0.005  # 0.5% tolerance for Fibonacci levels
+      trend_detection_period: 10
+      trend_slope_threshold: 0.001
+      exit_candles_required: 3
+      atr_period: 14
+      atr_multiplier_sl: 1.5
+      atr_multiplier_tp: 2.0
+      max_hold_time_hours: 24
+      risk_per_trade: 0.01
+      min_volume_threshold: 1.2
+      volume_lookback: 10
+    target_timeframes:
+    - 1h
+    - 15m
 strategy_manager:
   analysis_timeout: 30
   max_concurrent_analyses: 10

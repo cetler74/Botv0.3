@@ -244,6 +244,10 @@ class StrategyManager:
             'engulfing_multi_tf': {
                 'module': 'engulfing_multi_tf',
                 'class': 'EngulfingMultiTimeframeStrategy'
+            },
+            'fibonacci': {
+                'module': 'fibonacci_strategy',
+                'class': 'FibonacciStrategy'
             }
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
