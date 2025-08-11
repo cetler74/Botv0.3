@@ -545,6 +545,62 @@ class StrategyManager:
                 'participating_strategies': 0
             }
             
+    async def check_fibonacci_exit_signals(self, exchange_name: str, pair: str, trade_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Check for Fibonacci-specific exit signals (three consecutive bearish candles with lower lows)"""
+        try:
+            # Only check if Fibonacci strategy is enabled
+            if 'fibonacci' not in strategies or not strategies['fibonacci']['enabled']:
+                logger.debug("Fibonacci strategy not enabled, skipping Fibonacci exit check")
+                return []
+                
+            fibonacci_strategy = strategies['fibonacci']['instance']
+            
+            # Get market data for Fibonacci exit analysis
+            market_data = await self._get_market_data_for_strategy(
+                exchange_name, pair, ['1h', '15m', '5m']  # Use all Fibonacci timeframes
+            )
+            if not market_data:
+                logger.warning(f"No market data available for Fibonacci exit analysis on {pair}")
+                return []
+                
+            # Update Fibonacci strategy with market data (use primary timeframe)
+            primary_timeframe = '1h'
+            if primary_timeframe in market_data:
+                await fibonacci_strategy.update(market_data[primary_timeframe])
+                
+            # Check for Fibonacci-specific exit conditions
+            should_exit = await fibonacci_strategy.should_exit()
+            
+            if should_exit:
+                # Get detailed exit reason from the strategy
+                exit_reason = "Three consecutive bearish candles with lower lows detected"
+                
+                # Check if we can get more specific reason from the strategy state
+                if hasattr(fibonacci_strategy, 'state') and hasattr(fibonacci_strategy.state, 'last_signal'):
+                    if fibonacci_strategy.state.last_signal == 'exit':
+                        exit_reason = "Fibonacci exit signal triggered"
+                
+                logger.info(f"Fibonacci exit signal detected for {pair} on {exchange_name}: {exit_reason}")
+                
+                return [{
+                    'pair': pair,
+                    'signal': 'exit',
+                    'strategy': 'fibonacci',
+                    'exchange': exchange_name,
+                    'reason': exit_reason,
+                    'details': {
+                        'strategy_name': 'fibonacci',
+                        'market_regime': getattr(fibonacci_strategy.state, 'market_regime', 'unknown'),
+                        'exit_type': 'fibonacci_specific'
+                    }
+                }]
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error checking Fibonacci exit signals for {pair} on {exchange_name}: {e}")
+            return []
+            
     async def _get_market_data_for_strategy(self, exchange_name: str, symbol: str, 
                                            timeframes: List[str] = ['1h', '15m', '5m']) -> Dict[str, pd.DataFrame]:
         """Get market data for strategy analysis"""

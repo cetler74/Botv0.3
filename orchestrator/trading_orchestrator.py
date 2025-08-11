@@ -320,27 +320,54 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.error(f"Trade {trade_id} invalid entry_price or position_size: {e}. Skipping.")
                 return
-            # Check profit protection
-            logger.info(f"[RiskMgmt] Checking profit protection for trade {trade_id}: entry={entry_price}, current={current_price}, pnl_pct={((current_price-entry_price)/entry_price)*100:.2f}%")
-            should_exit, reason = await self.strategy_manager.apply_profit_protection(trade, current_price)
-            if should_exit:
-                logger.info(f"[RiskMgmt] Profit protection triggered for trade {trade_id} (reason: {reason})")
-                await self._execute_trade_exit(trade, current_price, reason)
-                return
-            # Check trailing stop
-            logger.info(f"[RiskMgmt] Checking trailing stop for trade {trade_id}: entry={entry_price}, current={current_price}, pnl_pct={((current_price-entry_price)/entry_price)*100:.2f}%")
-            should_exit, reason = await self.strategy_manager.apply_trailing_stop(trade, current_price)
-            if should_exit:
-                logger.info(f"[RiskMgmt] Trailing stop triggered for trade {trade_id} (reason: {reason})")
-                await self._execute_trade_exit(trade, current_price, reason)
-                return
-            # Check strategy exit signals
-            exit_signals = await self.strategy_manager.check_exit_signals(exchange_name, pair, trade)
-            if exit_signals:
-                # Use the first exit signal's reason if available
-                reason = exit_signals[0].get('reason', 'strategy_exit')
-                await self._execute_trade_exit(trade, current_price, reason)
-                return
+            # Get the strategy that was used for entry
+            entry_strategy = trade.get('strategy', 'consensus')
+            logger.info(f"[ExitLogic] Trade {trade_id} was entered using strategy: {entry_strategy}")
+            
+            # Apply different exit logic based on entry strategy
+            if entry_strategy == 'fibonacci':
+                # For Fibonacci strategy trades, check Fibonacci-specific exit conditions first
+                logger.info(f"[ExitLogic] Checking Fibonacci-specific exit conditions for trade {trade_id}")
+                fibonacci_exit_signals = await self.strategy_manager.check_fibonacci_exit_signals(exchange_name, pair, trade)
+                if fibonacci_exit_signals:
+                    reason = fibonacci_exit_signals[0].get('reason', 'fibonacci_exit')
+                    logger.info(f"[ExitLogic] Fibonacci exit signal triggered for trade {trade_id} (reason: {reason})")
+                    await self._execute_trade_exit(trade, current_price, reason)
+                    return
+                    
+                # If no Fibonacci exit signal, fall back to profit protection and trailing stop
+                logger.info(f"[ExitLogic] No Fibonacci exit signal, checking profit protection for trade {trade_id}")
+                should_exit, reason = await self.strategy_manager.apply_profit_protection(trade, current_price)
+                if should_exit:
+                    logger.info(f"[RiskMgmt] Profit protection triggered for trade {trade_id} (reason: {reason})")
+                    await self._execute_trade_exit(trade, current_price, reason)
+                    return
+                    
+                logger.info(f"[ExitLogic] Checking trailing stop for trade {trade_id}")
+                should_exit, reason = await self.strategy_manager.apply_trailing_stop(trade, current_price)
+                if should_exit:
+                    logger.info(f"[RiskMgmt] Trailing stop triggered for trade {trade_id} (reason: {reason})")
+                    await self._execute_trade_exit(trade, current_price, reason)
+                    return
+            else:
+                # For all other strategies, use the standard profit protection and trailing stop logic
+                logger.info(f"[ExitLogic] Using standard exit logic for {entry_strategy} strategy trade {trade_id}")
+                
+                # Check profit protection
+                logger.info(f"[RiskMgmt] Checking profit protection for trade {trade_id}: entry={entry_price}, current={current_price}, pnl_pct={((current_price-entry_price)/entry_price)*100:.2f}%")
+                should_exit, reason = await self.strategy_manager.apply_profit_protection(trade, current_price)
+                if should_exit:
+                    logger.info(f"[RiskMgmt] Profit protection triggered for trade {trade_id} (reason: {reason})")
+                    await self._execute_trade_exit(trade, current_price, reason)
+                    return
+                    
+                # Check trailing stop
+                logger.info(f"[RiskMgmt] Checking trailing stop for trade {trade_id}: entry={entry_price}, current={current_price}, pnl_pct={((current_price-entry_price)/entry_price)*100:.2f}%")
+                should_exit, reason = await self.strategy_manager.apply_trailing_stop(trade, current_price)
+                if should_exit:
+                    logger.info(f"[RiskMgmt] Trailing stop triggered for trade {trade_id} (reason: {reason})")
+                    await self._execute_trade_exit(trade, current_price, reason)
+                    return
             # Update unrealized PnL
             if entry_price > 0 and position_size > 0:
                 unrealized_pnl = (current_price - entry_price) * position_size
