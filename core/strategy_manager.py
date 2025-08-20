@@ -11,6 +11,7 @@ import pandas as pd
 import importlib
 import sys
 import os
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,17 @@ class StrategyManager:
                           timeframes: List[str] = ['1h', '15m', '5m']) -> Dict[str, Any]:
         """Analyze a trading pair using all enabled strategies"""
         try:
+            # CRITICAL FIX: Check market regime protection before analysis
+            market_regime_ok = await self._check_market_regime_protection(exchange_name, pair)
+            if not market_regime_ok:
+                return {
+                    'pair': pair,
+                    'exchange': exchange_name,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'strategies': {},
+                    'consensus': {'signal': 'hold', 'reason': 'Market regime protection active'}
+                }
+            
             # Get market data for all timeframes
             market_data = await self.exchange_manager.get_market_data_for_strategy(
                 exchange_name, pair, timeframes
@@ -332,7 +344,7 @@ class StrategyManager:
     async def apply_profit_protection(self, trade_data: Dict[str, Any], current_price: float) -> Tuple[bool, Optional[str]]:
         """Apply profit protection logic using existing strategy_pnl module"""
         try:
-            from strategy.strategy_pnl import check_profit_protection_enhanced
+            from strategy.strategy_pnl import check_profit_protection_enhanced, restore_profit_protection_state
             class ProfitProtectionState:
                 def __init__(self):
                     self.profit_protection_active = False
@@ -340,7 +352,10 @@ class StrategyManager:
                     self.consecutive_decreases = 0
                     self.last_unrealized_pnl = 0.0
                     self.profit_protection_activated_at = None
-            state = ProfitProtectionState()
+                    self.position = 'long'  # Default position side
+            
+            # CRITICAL FIX: Load existing state from database instead of creating fresh state
+            state = await self._load_protection_state(trade_data.get('trade_id'), ProfitProtectionState())
             entry_price = trade_data.get('entry_price')
             position_size = trade_data.get('position_size')
             if entry_price is None or position_size is None:
@@ -374,6 +389,8 @@ class StrategyManager:
                         'highest_price': max(current_price, float(trade_data.get('highest_price', 0) or 0))
                     }
                 )
+            # CRITICAL FIX: Save state back to database
+            await self._save_protection_state(trade_data.get('trade_id'), state, risk_data)
             return should_exit, reason
         except Exception as e:
             logger.error(f"Error applying profit protection: {e}")
@@ -388,8 +405,11 @@ class StrategyManager:
                     self.trailing_stop_active = False
                     self.trailing_stop_level = 0.0
                     self.highest_price_seen = 0.0
+                    self.lowest_price_seen = float('inf')
                     self.position = 'long'
-            state = TrailingStopState()
+            
+            # CRITICAL FIX: Load existing trailing stop state from database
+            state = await self._load_trailing_stop_state(trade_data.get('trade_id'), TrailingStopState())
             exchange_name = trade_data.get('exchange')
             pair = trade_data.get('pair')
             entry_price = trade_data.get('entry_price')
@@ -434,10 +454,214 @@ class StrategyManager:
                         'highest_price': state.highest_price_seen
                     }
                 )
+            # CRITICAL FIX: Save trailing stop state back to database
+            await self._save_trailing_stop_state(trade_data.get('trade_id'), state, risk_data)
             return should_exit, reason
         except Exception as e:
             logger.error(f"Error applying trailing stop: {e}")
             return False, None
+    
+    async def _load_protection_state(self, trade_id: str, default_state):
+        """Load profit protection state from database"""
+        try:
+            if hasattr(self, 'database_manager') and self.database_manager:
+                # Load from trailing_stops table if it exists
+                query = """
+                    SELECT profit_protection_enabled, profit_protection_active, 
+                           profit_lock_percentage, highest_price_seen, recovery_data
+                    FROM trading.trailing_stops 
+                    WHERE trade_id = %s
+                """
+                result = await self.database_manager.execute_single_query(query, (trade_id,))
+                if result:
+                    # Parse recovery_data JSON for detailed state
+                    recovery_data = result.get('recovery_data', {})
+                    if isinstance(recovery_data, str):
+                        import json
+                        recovery_data = json.loads(recovery_data) if recovery_data else {}
+                    
+                    default_state.profit_protection_active = result.get('profit_protection_active', False)
+                    default_state.peak_unrealized_pnl = float(recovery_data.get('peak_unrealized_pnl', 0.0))
+                    default_state.consecutive_decreases = int(recovery_data.get('consecutive_decreases', 0))
+                    default_state.last_unrealized_pnl = float(recovery_data.get('last_unrealized_pnl', 0.0))
+                    default_state.profit_protection_activated_at = recovery_data.get('profit_protection_activated_at')
+                    default_state.position = 'long'  # Assume long positions for now
+                    logger.info(f"[StateRestore] Loaded protection state for {trade_id}: active={default_state.profit_protection_active}, peak={default_state.peak_unrealized_pnl}")
+                else:
+                    logger.debug(f"[StateRestore] No existing protection state found for {trade_id}, using defaults")
+        except Exception as e:
+            logger.error(f"Error loading protection state for {trade_id}: {e}")
+        return default_state
+    
+    async def _save_protection_state(self, trade_id: str, state, risk_data: dict):
+        """Save profit protection state to database"""
+        try:
+            if hasattr(self, 'database_manager') and self.database_manager:
+                # Prepare recovery data with detailed state
+                recovery_data = {
+                    'peak_unrealized_pnl': state.peak_unrealized_pnl,
+                    'consecutive_decreases': state.consecutive_decreases,
+                    'last_unrealized_pnl': state.last_unrealized_pnl,
+                    'profit_protection_activated_at': state.profit_protection_activated_at.isoformat() if state.profit_protection_activated_at else None
+                }
+                
+                # Update or insert trailing_stops record
+                upsert_query = """
+                    INSERT INTO trading.trailing_stops 
+                    (trade_id, profit_protection_enabled, profit_protection_active, recovery_data, created_at, updated_at)
+                    VALUES (%s, true, %s, %s, NOW(), NOW())
+                    ON CONFLICT (trade_id) DO UPDATE SET
+                        profit_protection_active = EXCLUDED.profit_protection_active,
+                        recovery_data = EXCLUDED.recovery_data,
+                        updated_at = NOW()
+                """
+                await self.database_manager.execute_query(
+                    upsert_query, 
+                    (trade_id, state.profit_protection_active, json.dumps(recovery_data))
+                )
+                logger.debug(f"[StateSave] Saved protection state for {trade_id}: active={state.profit_protection_active}")
+        except Exception as e:
+            logger.error(f"Error saving protection state for {trade_id}: {e}")
+    
+    async def _load_trailing_stop_state(self, trade_id: str, default_state):
+        """Load trailing stop state from database"""
+        try:
+            if hasattr(self, 'database_manager') and self.database_manager:
+                # Load from trailing_stops table
+                query = """
+                    SELECT trailing_enabled, is_active, current_stop_price, 
+                           highest_price_seen, lowest_price_seen, recovery_data
+                    FROM trading.trailing_stops 
+                    WHERE trade_id = %s
+                """
+                result = await self.database_manager.execute_single_query(query, (trade_id,))
+                if result:
+                    # Parse recovery_data JSON for detailed state
+                    recovery_data = result.get('recovery_data', {})
+                    if isinstance(recovery_data, str):
+                        import json
+                        recovery_data = json.loads(recovery_data) if recovery_data else {}
+                    
+                    default_state.trailing_stop_active = result.get('is_active', False)
+                    default_state.trailing_stop_level = float(result.get('current_stop_price', 0.0))
+                    default_state.highest_price_seen = float(result.get('highest_price_seen', 0.0))
+                    default_state.lowest_price_seen = float(result.get('lowest_price_seen', float('inf')))
+                    default_state.position = 'long'  # Assume long positions
+                    logger.info(f"[StateRestore] Loaded trailing state for {trade_id}: active={default_state.trailing_stop_active}, level={default_state.trailing_stop_level}")
+                else:
+                    logger.debug(f"[StateRestore] No existing trailing stop state found for {trade_id}, using defaults")
+        except Exception as e:
+            logger.error(f"Error loading trailing stop state for {trade_id}: {e}")
+        return default_state
+    
+    async def _save_trailing_stop_state(self, trade_id: str, state, risk_data: dict):
+        """Save trailing stop state to database"""
+        try:
+            if hasattr(self, 'database_manager') and self.database_manager:
+                # Get trade details for insertion
+                trade_data = await self.database_manager.get_trade_by_id(trade_id)
+                if not trade_data:
+                    logger.error(f"Trade {trade_id} not found, cannot save trailing stop state")
+                    return
+                
+                # Prepare recovery data with detailed state 
+                recovery_data = {
+                    'trailing_stop_active': state.trailing_stop_active,
+                    'trailing_stop_level': state.trailing_stop_level,
+                    'highest_price_seen': state.highest_price_seen,
+                    'lowest_price_seen': state.lowest_price_seen if state.lowest_price_seen != float('inf') else None,
+                    'last_update': datetime.utcnow().isoformat()
+                }
+                
+                # Update or insert trailing_stops record with all required fields
+                upsert_query = """
+                    INSERT INTO trading.trailing_stops 
+                    (trade_id, exchange, pair, trailing_enabled, is_active, current_stop_price, 
+                     highest_price_seen, lowest_price_seen, entry_price, current_price, 
+                     position_side, recovery_data, created_at, updated_at)
+                    VALUES (%s, %s, %s, true, %s, %s, %s, %s, %s, %s, 'long', %s, NOW(), NOW())
+                    ON CONFLICT (trade_id) DO UPDATE SET
+                        is_active = EXCLUDED.is_active,
+                        current_stop_price = EXCLUDED.current_stop_price,
+                        highest_price_seen = EXCLUDED.highest_price_seen,
+                        lowest_price_seen = EXCLUDED.lowest_price_seen,
+                        current_price = EXCLUDED.current_price,
+                        recovery_data = EXCLUDED.recovery_data,
+                        updated_at = NOW()
+                """
+                
+                await self.database_manager.execute_query(
+                    upsert_query, 
+                    (
+                        trade_id, 
+                        trade_data.get('exchange'), 
+                        trade_data.get('pair'),
+                        state.trailing_stop_active,
+                        state.trailing_stop_level,
+                        state.highest_price_seen,
+                        state.lowest_price_seen if state.lowest_price_seen != float('inf') else None,
+                        trade_data.get('entry_price'),
+                        trade_data.get('current_price'),
+                        json.dumps(recovery_data)
+                    )
+                )
+                logger.debug(f"[StateSave] Saved trailing stop state for {trade_id}: active={state.trailing_stop_active}")
+        except Exception as e:
+            logger.error(f"Error saving trailing stop state for {trade_id}: {e}")
+    
+    async def _check_market_regime_protection(self, exchange_name: str, pair: str) -> bool:
+        """Check if market regime allows new positions (BTC/ETH correlation protection)"""
+        try:
+            # Skip protection for BTC and ETH themselves
+            if pair.upper().startswith(('BTC', 'ETH')):
+                return True
+            
+            # Get BTC data for correlation analysis
+            btc_data = await self.exchange_manager.get_ohlcv(exchange_name, 'BTC/USDC', '1h', limit=24)
+            if btc_data is None or len(btc_data) < 24:
+                logger.warning("[MarketRegime] Cannot get BTC data, allowing trades")
+                return True
+            
+            # Calculate BTC 4-hour price change
+            current_btc = btc_data['close'].iloc[-1]
+            btc_4h_ago = btc_data['close'].iloc[-4] if len(btc_data) >= 4 else btc_data['close'].iloc[0]
+            btc_4h_change = (current_btc - btc_4h_ago) / btc_4h_ago
+            
+            # Block new positions if BTC down >3% in 4 hours
+            if btc_4h_change < -0.03:
+                logger.warning(f"[MarketRegime] BTC down {btc_4h_change:.2%} in 4h, blocking new {pair} positions")
+                return False
+            
+            # Additional check: BTC 1-hour momentum
+            btc_1h_ago = btc_data['close'].iloc[-2] if len(btc_data) >= 2 else current_btc
+            btc_1h_change = (current_btc - btc_1h_ago) / btc_1h_ago
+            
+            # Block if BTC down >2% in 1 hour (flash crash protection)
+            if btc_1h_change < -0.02:
+                logger.warning(f"[MarketRegime] BTC down {btc_1h_change:.2%} in 1h, blocking new {pair} positions")
+                return False
+            
+            # Try to get ETH data for additional confirmation
+            try:
+                eth_data = await self.exchange_manager.get_ohlcv(exchange_name, 'ETH/USDC', '1h', limit=4)
+                if eth_data is not None and len(eth_data) >= 4:
+                    current_eth = eth_data['close'].iloc[-1]
+                    eth_4h_ago = eth_data['close'].iloc[-4]
+                    eth_4h_change = (current_eth - eth_4h_ago) / eth_4h_ago
+                    
+                    # If both BTC and ETH down >2% in 4h, block trades
+                    if btc_4h_change < -0.02 and eth_4h_change < -0.02:
+                        logger.warning(f"[MarketRegime] Both BTC ({btc_4h_change:.2%}) and ETH ({eth_4h_change:.2%}) down, blocking {pair}")
+                        return False
+            except Exception as e:
+                logger.debug(f"Could not get ETH data for regime check: {e}")
+            
+            logger.debug(f"[MarketRegime] BTC 4h: {btc_4h_change:.2%}, 1h: {btc_1h_change:.2%} - allowing {pair} trades")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in market regime protection: {e}")
+            return True  # Allow trades if check fails
             
     async def get_strategy_performance(self, strategy_name: str, exchange: str = "unknown", pair: str = "unknown") -> Dict[str, Any]:
         """Get performance metrics for a specific strategy"""

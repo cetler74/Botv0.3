@@ -64,10 +64,12 @@ body {
 
 .badge.bg-success {
     background-color: #28a745 !important;
+    color: white !important;
 }
 
 .badge.bg-danger {
-    background-color: #dc3545 !important;
+    background-color: #6b7280 !important;
+    color: white !important;
 }
 
 .badge.bg-warning {
@@ -77,6 +79,40 @@ body {
 
 .badge.bg-secondary {
     background-color: #6c757d !important;
+    color: white !important;
+}
+
+/* Enhanced badge styling */
+.enhanced-badge {
+    font-size: 0.8rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    display: inline-block;
+    text-align: center;
+    min-width: 80px;
+}
+
+.enhanced-badge.badge-success {
+    background-color: #28a745 !important;
+    color: white !important;
+}
+
+.enhanced-badge.badge-danger {
+    background-color: #6b7280 !important;
+    color: white !important;
+}
+
+.enhanced-badge.badge-warning {
+    background-color: #ffc107 !important;
+    color: #212529;
+}
+
+.enhanced-badge.badge-secondary {
+    background-color: #6c757d !important;
+    color: white !important;
 }
 
 /* Progress bar */
@@ -223,17 +259,17 @@ body {
 
 /* PnL colors */
 .pnl-positive {
-    color: #16a34a !important;
+    color: #28a745;
     font-weight: 600;
 }
 
 .pnl-negative {
-    color: #dc2626 !important;
+    color: #dc3545;
     font-weight: 600;
 }
 
 .pnl-neutral {
-    color: #6b7280 !important;
+    color: #6c757d;
     font-weight: 600;
 }
 

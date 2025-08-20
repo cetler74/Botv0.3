@@ -44,11 +44,11 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         self.logger = logging.getLogger(__name__)
         self.exchange_name = exchange_name
         
-        # Strategy parameters based on research - UPDATED for current market conditions
-        self.adx_threshold = self._get_config_param('adx_threshold', 15)  # CRITICAL FIX: Use 15 as fallback to match config
+        # Strategy parameters from config - NO hardcoded defaults
+        self.adx_threshold = self._get_config_param('adx_threshold', 20)  # From config, fallback for compatibility
         self.rsi_oversold = self._get_config_param('rsi_oversold', 30)
         self.rsi_overbought = self._get_config_param('rsi_overbought', 70)
-        self.trending_adx_threshold = self._get_config_param('trending_adx_threshold', 25)  # NEW: Trending market threshold
+        self.trending_adx_threshold = self._get_config_param('trending_adx_threshold', 30)  # From config
         self.bb_period = self._get_config_param('bb_period', 20)
         self.bb_std = self._get_config_param('bb_std', 2)
         self.vwap_period = self._get_config_param('vwap_period', 20)
@@ -58,20 +58,23 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         # Timeframes for analysis
         self.daily_timeframe = self._get_config_param('daily_timeframe', '1d')
         self.hourly_timeframe = self._get_config_param('hourly_timeframe', '1h')
-        self.min_confluence = self._get_config_param('min_confluence', 1)  # Minimum confirmations needed - reduced for more trades
+        self.min_confluence = self._get_config_param('min_confluence', 3)  # Minimum confirmations needed - ENHANCED from config
         
         # UPDATED: More realistic sideways market criteria
         self.max_price_range_pct = self._get_config_param('max_price_range_pct', 15.0)  # Increased from 5% to 15%
+        self.max_daily_volatility_pct = self._get_config_param('max_daily_volatility_pct', 5.0)  # NEW: Skip extreme volatility
         self.max_volume_ratio = self._get_config_param('max_volume_ratio', 1.5)  # Increased from 1.2 to 1.5
         self.min_sideways_periods = self._get_config_param('min_sideways_periods', 7)  # Reduced from 10 to 7
+        self.atr_stop_loss_multiplier = self._get_config_param('atr_stop_loss_multiplier', 1.5)  # NEW: ATR-based stop loss
         
         # Data storage for multi-timeframe analysis
         self.daily_data = None
         self.hourly_data = None
         
-        self.logger.info(f"MultiTimeframeConfluenceStrategy initialized with UPDATED parameters: "
-                   f"ADX threshold={self.adx_threshold}, max price range={self.max_price_range_pct}%, "
-                   f"max volume ratio={self.max_volume_ratio}, min periods={self.min_sideways_periods}")
+        self.logger.info(f"MultiTimeframeConfluenceStrategy initialized with ENHANCED parameters: "
+                   f"ADX threshold={self.adx_threshold}, trending ADX={self.trending_adx_threshold}, "
+                   f"min confluence={self.min_confluence}, max daily volatility={self.max_daily_volatility_pct}%, "
+                   f"stop loss={self.stop_loss_pct:.1%}, ATR multiplier={self.atr_stop_loss_multiplier}")
     
     def _get_config_param(self, param_name: str, default_value: Any) -> Any:
         """Get a parameter from the config."""
@@ -189,7 +192,9 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             'bb_upper': f"HOURLY_BB_UPPER_{pair}_{self.hourly_timeframe}",
             'bb_middle': f"HOURLY_BB_MIDDLE_{pair}_{self.hourly_timeframe}",
             'bb_lower': f"HOURLY_BB_LOWER_{pair}_{self.hourly_timeframe}",
-            'vwap': f"HOURLY_VWAP_{pair}_{self.hourly_timeframe}"
+            'vwap': f"HOURLY_VWAP_{pair}_{self.hourly_timeframe}",
+            'ema_9': f"HOURLY_EMA9_{pair}_{self.hourly_timeframe}",
+            'ema_21': f"HOURLY_EMA21_{pair}_{self.hourly_timeframe}"
         }
         # RSI
         if indicators_cache is not None and cache_keys['rsi'] in indicators_cache:
@@ -228,6 +233,34 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             if indicators_cache is not None:
                 indicators_cache[cache_keys['vwap']] = df['vwap']
                 self.logger.debug(f"[CACHE STORE] Hourly VWAP for {pair} {self.hourly_timeframe}")
+        
+        # CRITICAL FIX: Add EMA calculations for trend direction filter
+        # EMA 9 - Fast moving average
+        if indicators_cache is not None and cache_keys['ema_9'] in indicators_cache:
+            self.logger.debug(f"[CACHE HIT] Hourly EMA9 for {pair} {self.hourly_timeframe}")
+            df['ema_9'] = indicators_cache[cache_keys['ema_9']]
+        else:
+            if len(df) >= 9:
+                df['ema_9'] = ta.ema(df['close'], length=9)
+                if indicators_cache is not None:
+                    indicators_cache[cache_keys['ema_9']] = df['ema_9']
+                    self.logger.debug(f"[CACHE STORE] Hourly EMA9 for {pair} {self.hourly_timeframe}")
+            else:
+                df['ema_9'] = None
+        
+        # EMA 21 - Slow moving average
+        if indicators_cache is not None and cache_keys['ema_21'] in indicators_cache:
+            self.logger.debug(f"[CACHE HIT] Hourly EMA21 for {pair} {self.hourly_timeframe}")
+            df['ema_21'] = indicators_cache[cache_keys['ema_21']]
+        else:
+            if len(df) >= 21:
+                df['ema_21'] = ta.ema(df['close'], length=21)
+                if indicators_cache is not None:
+                    indicators_cache[cache_keys['ema_21']] = df['ema_21']
+                    self.logger.debug(f"[CACHE STORE] Hourly EMA21 for {pair} {self.hourly_timeframe}")
+            else:
+                df['ema_21'] = None
+        
         return df
     
     def _calculate_vwap(self, df: pd.DataFrame) -> pd.Series:
@@ -237,18 +270,65 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                df['volume'].rolling(window=self.vwap_period).sum()
         return vwap
     
+    def _calculate_atr_stop_loss(self, current_price: float) -> float:
+        """Calculate ATR-based stop loss for more dynamic risk management"""
+        try:
+            if self.hourly_data is None or len(self.hourly_data) < 14:
+                # Fallback to percentage-based stop loss
+                return current_price * (1 - self.stop_loss_pct)
+            
+            # Calculate ATR using pandas_ta
+            import pandas_ta as ta
+            atr = ta.atr(self.hourly_data['high'], self.hourly_data['low'], self.hourly_data['close'], length=14)
+            
+            if atr is None or pd.isna(atr.iloc[-1]):
+                # Fallback to percentage-based stop loss
+                return current_price * (1 - self.stop_loss_pct)
+            
+            atr_value = atr.iloc[-1]
+            atr_stop_loss = current_price - (atr_value * self.atr_stop_loss_multiplier)
+            
+            # Ensure ATR stop loss is not more aggressive than percentage stop loss
+            percentage_stop_loss = current_price * (1 - self.stop_loss_pct)
+            final_stop_loss = max(atr_stop_loss, percentage_stop_loss)
+            
+            self.logger.info(f"ATR stop loss calculation: current_price={current_price:.4f}, "
+                           f"atr={atr_value:.4f}, atr_stop={atr_stop_loss:.4f}, "
+                           f"pct_stop={percentage_stop_loss:.4f}, final={final_stop_loss:.4f}")
+            
+            return final_stop_loss
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating ATR stop loss: {e}")
+            # Fallback to percentage-based stop loss
+            return current_price * (1 - self.stop_loss_pct)
+    
     def _detect_sideways_market(self) -> Tuple[bool, str]:
         """
-        Detect sideways market conditions using hourly data instead of daily.
+        Detect sideways market conditions using hourly data with enhanced filters.
         
-        UPDATED Criteria for current market conditions:
-        - ADX below threshold (increased from 30 to 35)
-        - Price trading within 15% range (increased from 5%) for at least 7 periods (reduced from 10)
-        - Volume within 150% of recent average (increased from 120%)
+        ENHANCED Criteria for improved reliability:
+        - ADX below 15 for sideways markets (stricter)
+        - Price trading within configured range for at least 7 periods
+        - Volume within 150% of recent average
+        - Daily volatility filter to skip extreme conditions
         """
         # Use hourly data instead of daily data since daily data is not available
         if self.hourly_data is None or len(self.hourly_data) < 20:
             return False, "Insufficient hourly data"
+            
+        # ENHANCED: Check daily volatility filter first
+        try:
+            if len(self.hourly_data) >= 24:  # Need at least 24 hours of data
+                recent_24h = self.hourly_data.tail(24)
+                daily_high = recent_24h['high'].max()
+                daily_low = recent_24h['low'].min()
+                daily_volatility = (daily_high - daily_low) / daily_low * 100
+                
+                if daily_volatility > self.max_daily_volatility_pct:
+                    return False, f"Daily volatility too high: {daily_volatility:.2f}% > {self.max_daily_volatility_pct}%"
+        except Exception as e:
+            self.logger.warning(f"Error calculating daily volatility: {e}")
             
         # Calculate ADX on hourly data
         if 'adx' not in self.hourly_data.columns:
@@ -313,24 +393,67 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         # Get current hourly data
         current_hour = self.hourly_data.iloc[-1]
         
+        # CRITICAL FIX: Check trend direction first - block buy signals in downtrends
+        if 'ema_9' in self.hourly_data.columns and 'ema_21' in self.hourly_data.columns:
+            ema_9_current = current_hour.get('ema_9')
+            ema_21_current = current_hour.get('ema_21')
+            
+            if not pd.isna(ema_9_current) and not pd.isna(ema_21_current):
+                is_uptrend = ema_9_current > ema_21_current
+                trend_strength = abs(ema_9_current - ema_21_current) / ema_21_current
+                
+                # Strong downtrend - block all buy signals
+                if not is_uptrend and trend_strength > 0.01:  # >1% separation in downtrend
+                    self.logger.info(f"[TrendFilter] Strong downtrend detected: EMA9({ema_9_current:.4f}) < EMA21({ema_21_current:.4f}), blocking buy signals")
+                    # Only allow sell signals in strong downtrends
+                    return 0, self._calculate_sell_confluences_only(current_hour), ["Downtrend: buy signals blocked"]
+        
         # Initialize confluence counters
         buy_confluence = 0
         sell_confluence = 0
         signal_details = []
         
-        # Confluence 1: Bollinger Bands
+        # Confluence 1: Bollinger Bands - CRITICAL FIX: Make trend-aware
+        # Check trend direction first
+        is_uptrend = True  # Default to uptrend if EMAs not available
+        if 'ema_9' in self.hourly_data.columns and 'ema_21' in self.hourly_data.columns:
+            ema_9_current = current_hour.get('ema_9')
+            ema_21_current = current_hour.get('ema_21')
+            if not pd.isna(ema_9_current) and not pd.isna(ema_21_current):
+                is_uptrend = ema_9_current > ema_21_current
+        
         if not pd.isna(current_hour['bb_lower']) and current_hour['close'] <= current_hour['bb_lower']:
-            buy_confluence += 1
-            signal_details.append("Price at BB lower band (buy signal)")
+            if is_uptrend:
+                # BB lower in uptrend = buy signal
+                buy_confluence += 1
+                signal_details.append("Price at BB lower band in uptrend (buy signal)")
+            else:
+                # BB lower in downtrend = potential continuation
+                sell_confluence += 1
+                signal_details.append("Price at BB lower band in downtrend (breakdown)")
         elif not pd.isna(current_hour['bb_upper']) and current_hour['close'] >= current_hour['bb_upper']:
             sell_confluence += 1
             signal_details.append("Price at BB upper band (sell signal)")
         
-        # Confluence 2: RSI
+        # Confluence 2: RSI - CRITICAL FIX: Make trend-aware
         if not pd.isna(current_hour['rsi']):
+            # Check trend direction for RSI interpretation
+            is_uptrend = True  # Default to uptrend if EMAs not available
+            if 'ema_9' in self.hourly_data.columns and 'ema_21' in self.hourly_data.columns:
+                ema_9_current = current_hour.get('ema_9')
+                ema_21_current = current_hour.get('ema_21')
+                if not pd.isna(ema_9_current) and not pd.isna(ema_21_current):
+                    is_uptrend = ema_9_current > ema_21_current
+            
             if current_hour['rsi'] <= self.rsi_oversold:
-                buy_confluence += 1
-                signal_details.append(f"RSI oversold: {current_hour['rsi']:.2f}")
+                if is_uptrend:
+                    # RSI oversold in uptrend = buy signal
+                    buy_confluence += 1
+                    signal_details.append(f"RSI oversold in uptrend: {current_hour['rsi']:.2f}")
+                else:
+                    # RSI oversold in downtrend = continuation signal (sell)
+                    sell_confluence += 1
+                    signal_details.append(f"RSI oversold in downtrend (continuation): {current_hour['rsi']:.2f}")
             elif current_hour['rsi'] >= self.rsi_overbought:
                 sell_confluence += 1
                 signal_details.append(f"RSI overbought: {current_hour['rsi']:.2f}")
@@ -359,6 +482,24 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                     signal_details.append("Volume spike supports sell signal")
         
         return buy_confluence, sell_confluence, signal_details
+    
+    def _calculate_sell_confluences_only(self, current_hour) -> int:
+        """Calculate only sell confluences for downtrend conditions"""
+        sell_confluence = 0
+        
+        # Only check sell signals in downtrend
+        if not pd.isna(current_hour.get('bb_upper', None)) and current_hour['close'] >= current_hour['bb_upper']:
+            sell_confluence += 1
+        
+        if not pd.isna(current_hour.get('rsi', None)) and current_hour['rsi'] >= self.rsi_overbought:
+            sell_confluence += 1
+        
+        if not pd.isna(current_hour.get('vwap', None)):
+            vwap_deviation = (current_hour['close'] - current_hour['vwap']) / current_hour['vwap']
+            if vwap_deviation > 0.02:  # 2% above VWAP
+                sell_confluence += 1
+        
+        return sell_confluence
     
     async def generate_signal(self, market_data, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None, exchange_adapter=None) -> Tuple[str, float, float]:
         """Generate trading signal, using indicator cache if provided."""
@@ -417,7 +558,8 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             else:
                 return 'hold', 0.0, 0.0
             if buy_confluence >= self.min_confluence and buy_confluence > sell_confluence:
-                stop_loss = current_price * (1 - self.stop_loss_pct)
+                # Use ATR-based stop loss for better risk management
+                stop_loss = self._calculate_atr_stop_loss(current_price)
                 take_profit = current_price * (1 + self.take_profit_pct)
                 await self._condition_logger.log_condition(
                     "buy_confluence_signal",

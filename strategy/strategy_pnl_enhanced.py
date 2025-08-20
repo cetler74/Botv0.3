@@ -318,13 +318,8 @@ def check_profit_protection_enhanced(state, unrealized_pnl, entry_price, positio
         if atr_value and current_price > 0:
             adjusted_config = get_dynamic_config(atr_value, current_price, config)
     
-    # Get configuration settings
+    # Get configuration settings from config file (no hardcoded defaults)
     try:
-        threshold = 0.01
-        max_drawdown = 0.30
-        consecutive_threshold = 8
-        significant_decrease_multiplier = 0.002
-        
         # FIX: Use type check for dict vs object for trading_config
         if isinstance(adjusted_config, dict):
             trading_config = adjusted_config.get('trading', adjusted_config)
@@ -332,15 +327,24 @@ def check_profit_protection_enhanced(state, unrealized_pnl, entry_price, positio
             trading_config = getattr(adjusted_config, 'trading', adjusted_config)
         
         if isinstance(trading_config, dict):
-            threshold = float(trading_config.get('profit_protection_threshold', threshold))
-            max_drawdown = float(trading_config.get('profit_protection_max_drawdown', max_drawdown))
-            consecutive_threshold = int(trading_config.get('profit_protection_consecutive_threshold', consecutive_threshold))
-            significant_decrease_multiplier = float(trading_config.get('significant_decrease_multiplier', significant_decrease_multiplier))
+            profit_protection_config = trading_config.get('profit_protection', {})
+            threshold = float(profit_protection_config.get('activation_threshold', 0.01))
+            max_drawdown = float(profit_protection_config.get('max_drawdown', 0.30))
+            consecutive_threshold = int(profit_protection_config.get('consecutive_threshold', 8))
+            significant_decrease_multiplier = float(profit_protection_config.get('significant_decrease_multiplier', 0.002))
         else:
-            threshold = float(getattr(trading_config, 'profit_protection_threshold', threshold))
-            max_drawdown = float(getattr(trading_config, 'profit_protection_max_drawdown', max_drawdown))
-            consecutive_threshold = int(getattr(trading_config, 'profit_protection_consecutive_threshold', consecutive_threshold))
-            significant_decrease_multiplier = float(getattr(trading_config, 'significant_decrease_multiplier', significant_decrease_multiplier))
+            profit_protection_config = getattr(trading_config, 'profit_protection', None)
+            if profit_protection_config and hasattr(profit_protection_config, '__dict__'):
+                threshold = float(getattr(profit_protection_config, 'activation_threshold', 0.01))
+                max_drawdown = float(getattr(profit_protection_config, 'max_drawdown', 0.30))
+                consecutive_threshold = int(getattr(profit_protection_config, 'consecutive_threshold', 8))
+                significant_decrease_multiplier = float(getattr(profit_protection_config, 'significant_decrease_multiplier', 0.002))
+            else:
+                # Fallback if structure is different
+                threshold = 0.01
+                max_drawdown = 0.30
+                consecutive_threshold = 8
+                significant_decrease_multiplier = 0.002
         
         logger.info(f"[Trade {trade_id}] [ProfitProtection] Config loaded - threshold={threshold:.3f}, max_drawdown={max_drawdown:.3f}")
             
@@ -538,9 +542,7 @@ def manage_trailing_stop_enhanced(state, current_price, entry_price, position_si
             adjusted_config = get_dynamic_config(atr_value, current_price, config)
     
     try:
-        activation_threshold_pct = 0.03
-        base_trailing_distance_pct = 0.15
-        
+        # Get configuration settings from config file (no hardcoded defaults)
         # FIX: Use type check for dict vs object for trading_config
         if isinstance(adjusted_config, dict):
             trading_config = adjusted_config.get('trading', adjusted_config)
@@ -548,11 +550,18 @@ def manage_trailing_stop_enhanced(state, current_price, entry_price, position_si
             trading_config = getattr(adjusted_config, 'trading', adjusted_config)
         
         if isinstance(trading_config, dict):
-            activation_threshold_pct = float(trading_config.get('trailing_stop_activation', activation_threshold_pct))
-            base_trailing_distance_pct = float(trading_config.get('trailing_stop_distance', base_trailing_distance_pct))
+            trailing_stop_config = trading_config.get('trailing_stop', {})
+            activation_threshold_pct = float(trailing_stop_config.get('activation_threshold', 0.03))
+            base_trailing_distance_pct = float(trailing_stop_config.get('base_trailing_distance', 0.15))
         else:
-            activation_threshold_pct = float(getattr(trading_config, 'trailing_stop_activation', activation_threshold_pct))
-            base_trailing_distance_pct = float(getattr(trading_config, 'trailing_stop_distance', base_trailing_distance_pct))
+            trailing_stop_config = getattr(trading_config, 'trailing_stop', None)
+            if trailing_stop_config and hasattr(trailing_stop_config, '__dict__'):
+                activation_threshold_pct = float(getattr(trailing_stop_config, 'activation_threshold', 0.03))
+                base_trailing_distance_pct = float(getattr(trailing_stop_config, 'base_trailing_distance', 0.15))
+            else:
+                # Fallback if structure is different
+                activation_threshold_pct = 0.03
+                base_trailing_distance_pct = 0.15
         
         logger.info(f"[Trade {trade_id}] [TrailingStop] Config loaded - activation={activation_threshold_pct:.3f}")
         

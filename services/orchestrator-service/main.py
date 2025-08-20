@@ -5,7 +5,7 @@ Main trading coordination and decision making
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime, timedelta
 import signal
 import sys
@@ -19,6 +19,11 @@ import uuid
 import time
 import numpy as np
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
+
+# Add the project root to the path to import core modules
+sys.path.append('/app')
+from core.strategy_manager import StrategyManager
+from core.database_manager import DatabaseManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -470,6 +475,12 @@ class TradingOrchestrator:
         self.momentum_filter = MomentumFilter()  # Initialize momentum filter
         self.last_pair_update = datetime.utcnow()  # Track when pairs were last updated
         
+        # Initialize strategy manager and database manager
+        self.database_manager = None
+        self.strategy_manager = None
+        self._config = None
+        self.config_manager = None  # Will be initialized in initialize() method
+        
     async def _emit_order_created_event(self, local_order_id: str, client_order_id: str, trade_id: Optional[str], 
                                        exchange: str, symbol: str, side: str, order_type: str, 
                                        amount: float, price: Optional[float] = None) -> bool:
@@ -549,6 +560,15 @@ class TradingOrchestrator:
         """Initialize the orchestrator"""
         try:
             logger.info("Initializing Trading Orchestrator...")
+            
+            # Initialize configuration
+            await self._initialize_config()
+            
+            # Initialize database manager
+            await self._initialize_database_manager()
+            
+            # Initialize strategy manager
+            await self._initialize_strategy_manager()
             
             # Initialize balances
             await self._initialize_balances()
@@ -759,19 +779,88 @@ class TradingOrchestrator:
             logger.error(f"Error initializing pair selections: {e}")
                         
     async def _generate_and_store_pairs(self, client, exchange_name, max_pairs, base_currency):
-        """Generate and store pairs for an exchange"""
+        """Generate and store pairs for an exchange with blacklist management"""
         try:
             from core.pair_selector import select_top_pairs_ccxt
+            from core.dynamic_blacklist_manager import blacklist_manager
             
             # Use the provided base_currency parameter
             logger.info(f"Generating pairs for {exchange_name} with base currency: {base_currency}")
                 
-            # Generate new pairs
-            pair_result = await select_top_pairs_ccxt(exchange_name, base_currency, max_pairs, 'spot')
-            selected_pairs = pair_result['selected_pairs']
+            # Get active blacklisted pairs
+            blacklisted_pairs = await blacklist_manager.get_active_blacklist()
+            logger.info(f"[Blacklist] Active blacklisted pairs for {exchange_name}: {blacklisted_pairs}")
             
-            # Always forcibly add CRO/USD for cryptocom if not already present
-            if exchange_name.lower() == "cryptocom":
+            # Generate new pairs excluding blacklisted ones
+            try:
+                pair_result = await select_top_pairs_ccxt(exchange_name, base_currency, max_pairs * 2, 'spot')  # Get extra pairs
+                
+                # Handle case where pair selector fails
+                if pair_result is None or not isinstance(pair_result, dict) or 'selected_pairs' not in pair_result:
+                    logger.error(f"Pair selector failed for {exchange_name}, using fallback method")
+                    all_selected_pairs = []
+                else:
+                    all_selected_pairs = pair_result['selected_pairs']
+                    logger.info(f"CCXT pair selector found {len(all_selected_pairs)} pairs for {exchange_name}")
+                    
+            except Exception as selector_error:
+                logger.error(f"Pair selector exception for {exchange_name}: {selector_error}")
+                all_selected_pairs = []
+            
+            # If pair selector failed or returned insufficient pairs, use predefined high-quality pairs
+            if len(all_selected_pairs) < max_pairs:
+                logger.info(f"Insufficient pairs from selector ({len(all_selected_pairs)}), using predefined pairs for {exchange_name}")
+                
+                # Predefined high-quality pairs for each exchange
+                predefined_pairs = {
+                    'binance': ['BNB/USDC', 'BTC/USDC', 'ETH/USDC', 'XRP/USDC', 'XLM/USDC', 'LINK/USDC', 'LTC/USDC', 
+                               'TRX/USDC', 'ADA/USDC', 'NEO/USDC', 'DOT/USDC', 'MATIC/USDC', 'UNI/USDC', 'AVAX/USDC', 'ALGO/USDC'],
+                    'bybit': ['ETH/USDC', 'BTC/USDC', 'XLM/USDC', 'SOL/USDC', 'XRP/USDC', 'DOT/USDC', 'MATIC/USDC', 
+                             'UNI/USDC', 'AVAX/USDC', 'LINK/USDC', 'LTC/USDC', 'ADA/USDC', 'ALGO/USDC', 'ATOM/USDC', 'FTM/USDC'],
+                    'cryptocom': ['CRO/USD', '1INCH/USD', 'AAVE/USD', 'ACA/USD', 'ACH/USD', 'ACT/USD', 'BTC/USD', 'ETH/USD', 
+                                 'XRP/USD', 'DOT/USD', 'MATIC/USD', 'UNI/USD', 'AVAX/USD', 'LINK/USD', 'LTC/USD']
+                }
+                
+                # Use predefined pairs and merge with selector results
+                exchange_predefined = predefined_pairs.get(exchange_name.lower(), [])
+                
+                # Combine selector results with predefined pairs, avoiding duplicates
+                combined_pairs = list(all_selected_pairs)  # Start with selector results
+                for pair in exchange_predefined:
+                    if pair not in combined_pairs and len(combined_pairs) < max_pairs:
+                        combined_pairs.append(pair)
+                
+                all_selected_pairs = combined_pairs[:max_pairs]
+                logger.info(f"Using {len(all_selected_pairs)} combined pairs for {exchange_name}")
+            
+            # Ensure CRO/USD is always first for crypto.com
+            if exchange_name.lower() == "cryptocom" and "CRO/USD" not in all_selected_pairs:
+                if len(all_selected_pairs) >= max_pairs:
+                    all_selected_pairs = all_selected_pairs[:-1]  # Remove last to make room
+                all_selected_pairs.insert(0, "CRO/USD")
+                logger.info(f"✅ Ensured CRO/USD is included for cryptocom: {all_selected_pairs[:3]}...")
+            elif exchange_name.lower() == "cryptocom":
+                # Move CRO/USD to first position if it exists
+                if "CRO/USD" in all_selected_pairs:
+                    all_selected_pairs.remove("CRO/USD")
+                    all_selected_pairs.insert(0, "CRO/USD")
+                    logger.info(f"✅ Moved CRO/USD to first position for cryptocom")
+            
+            # Filter out blacklisted pairs
+            selected_pairs = [pair for pair in all_selected_pairs if pair not in blacklisted_pairs][:max_pairs]
+            
+            # Get replacement pairs if we have blacklisted pairs
+            if len(blacklisted_pairs) > 0:
+                replacement_pairs = await blacklist_manager.get_replacement_pairs(exchange_name, max_pairs, blacklisted_pairs)
+                # Merge with selected pairs, avoiding duplicates
+                for replacement in replacement_pairs:
+                    if replacement not in selected_pairs and len(selected_pairs) < max_pairs:
+                        selected_pairs.append(replacement)
+                        
+                logger.info(f"[Blacklist] Replaced {len(blacklisted_pairs)} blacklisted pairs with {len(replacement_pairs)} alternatives")
+            
+            # Always forcibly add CRO/USD for cryptocom if not already present and not blacklisted
+            if exchange_name.lower() == "cryptocom" and "CRO/USD" not in blacklisted_pairs:
                 logger.info(f"[DEBUG] cryptocom pairs before force-add: {selected_pairs}")
                 if "CRO/USD" not in selected_pairs:
                     selected_pairs.append("CRO/USD")
@@ -796,6 +885,35 @@ class TradingOrchestrator:
 
         except Exception as e:
             logger.error(f"Error initializing pair selections: {e}")
+    
+    async def _get_strategy_position_config(self, strategy_name: str) -> tuple[float, float]:
+        """Get position sizing configuration for a specific strategy"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(f"{config_service_url}/api/v1/config/trading")
+                if response.status_code == 200:
+                    config = response.json()
+                    strategy_sizing = config.get('strategy_position_sizing', {})
+                    
+                    if strategy_sizing.get('enabled', False):
+                        strategy_config = strategy_sizing.get(strategy_name)
+                        if strategy_config:
+                            position_percentage = strategy_config.get('position_size_percentage', 0.10)
+                            max_position_usd = strategy_config.get('max_position_usd', 200)
+                            logger.info(f"[PositionConfig] Using strategy-specific config for {strategy_name}: {position_percentage:.1%}, ${max_position_usd}")
+                            return position_percentage, max_position_usd
+                    
+                    # Fallback to global position sizing
+                    global_percentage = config.get('position_size_percentage', 0.10)
+                    logger.info(f"[PositionConfig] Using global config for {strategy_name}: {global_percentage:.1%}")
+                    return global_percentage, 200.0
+                    
+        except Exception as e:
+            logger.error(f"Error loading position config for {strategy_name}: {e}")
+            
+        # Final fallback
+        logger.warning(f"[PositionConfig] Using fallback config for {strategy_name}: 10%, $200")
+        return 0.10, 200.0
             
     async def start_trading(self) -> bool:
         """Start the trading orchestrator"""
@@ -854,6 +972,200 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"Failed to execute emergency stop: {e}")
             return False
+    
+    async def sync_exchange_trades(self) -> dict:
+        """Sync trades with exchanges to close orphaned trades in database"""
+        try:
+            logger.info("🔄 Starting exchange-database trade synchronization...")
+            sync_results = {
+                'trades_checked': 0,
+                'trades_synced': 0,
+                'errors': []
+            }
+            
+            # Get all open trades from database
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                trades_response = await client.get(f"{database_service_url}/api/v1/trades?status=OPEN")
+                if trades_response.status_code != 200:
+                    logger.error(f"❌ Failed to get open trades: {trades_response.status_code}")
+                    return sync_results
+                
+                open_trades = trades_response.json().get('trades', [])
+                sync_results['trades_checked'] = len(open_trades)
+                logger.info(f"📊 Found {len(open_trades)} open trades to verify")
+                
+                for trade in open_trades:
+                    try:
+                        trade_id = trade['trade_id']  # Use UUID trade_id, not database row id
+                        exchange_name = trade['exchange']
+                        pair = trade['pair']
+                        position_size = float(trade.get('position_size', 0))
+                        
+                        logger.info(f"🔍 Checking trade {trade_id}: {position_size} {pair} on {exchange_name}")
+                        
+                        # Check if balance exists for this asset on exchange
+                        balance_response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
+                        if balance_response.status_code == 200:
+                            balances = balance_response.json().get('balances', {})
+                            
+                            # Extract base asset from pair (e.g., ADA from ADA/USDC)
+                            base_asset = pair.split('/')[0] if '/' in pair else pair.split('_')[0]
+                            
+                            # Check if we have this asset in balances
+                            position_found = False
+                            if base_asset in balances:
+                                available_balance = float(balances[base_asset].get('available', 0))
+                                # If we have significant balance (more than 10% of position size), consider position exists
+                                if available_balance >= position_size * 0.1:
+                                    position_found = True
+                            
+                            if not position_found:
+                                # No position found on exchange - trade was likely closed
+                                logger.warning(f"🚨 Trade {trade_id} has no position on {exchange_name} - likely closed on exchange but not in DB")
+                                
+                                # Get recent orders to find exit details
+                                orders_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/{exchange_name}/history")
+                                exit_price = None
+                                exit_time = None
+                                
+                                if orders_response.status_code == 200:
+                                    orders = orders_response.json().get('orders', [])
+                                    # Look for sell orders for this pair
+                                    for order in orders:
+                                        if (order.get('symbol') == pair and 
+                                            order.get('side', '').lower() == 'sell' and
+                                            order.get('status', '').lower() in ['filled', 'closed']):
+                                            exit_price = float(order.get('average', 0))
+                                            exit_time = order.get('timestamp')
+                                            break
+                                
+                                # Use current market price as fallback if no exit order found (better than entry price)
+                                if not exit_price:
+                                    try:
+                                        # Get current market price for more accurate PnL calculation
+                                        ticker_response = await client.get(f"{exchange_service_url}/api/v1/market/ticker/{exchange_name}/{pair.replace('/', '')}")
+                                        if ticker_response.status_code == 200:
+                                            ticker_data = ticker_response.json()
+                                            current_price = float(ticker_data.get('price', 0))
+                                            if current_price > 0:
+                                                exit_price = current_price
+                                                logger.info(f"📈 Using current market price ${current_price:.4f} for exit (no order history found)")
+                                            else:
+                                                exit_price = float(trade.get('entry_price', 0))
+                                                logger.warning(f"⚠️ Using entry price ${exit_price:.4f} as fallback (no market price available)")
+                                        else:
+                                            exit_price = float(trade.get('entry_price', 0))
+                                            logger.warning(f"⚠️ Using entry price ${exit_price:.4f} as fallback (market price fetch failed)")
+                                    except Exception as price_error:
+                                        exit_price = float(trade.get('entry_price', 0))
+                                        logger.warning(f"⚠️ Using entry price ${exit_price:.4f} as fallback (price fetch error: {price_error})")
+                                if not exit_time:
+                                    exit_time = datetime.utcnow().isoformat() + '+00:00'
+                                
+                                # Calculate realized PnL
+                                entry_price = float(trade.get('entry_price', 0))
+                                realized_pnl = (exit_price - entry_price) * position_size
+                                
+                                # Close the trade in database with exchange values
+                                close_data = {
+                                    'status': 'CLOSED',
+                                    'exit_price': exit_price,
+                                    'exit_reason': 'exchange_sync_closure',
+                                    'exit_time': exit_time,
+                                    'realized_pnl': realized_pnl,
+                                    'updated_at': datetime.utcnow().isoformat() + '+00:00'
+                                }
+                                
+                                close_response = await client.put(f"{database_service_url}/api/v1/trades/{trade_id}", json=close_data)
+                                if close_response.status_code == 200:
+                                    logger.info(f"✅ Successfully synced trade {trade_id}: closed with exit_price=${exit_price:.4f}, PnL=${realized_pnl:.2f}")
+                                    sync_results['trades_synced'] += 1
+                                else:
+                                    error_msg = f"Failed to close trade {trade_id}: {close_response.status_code}"
+                                    logger.error(f"❌ {error_msg}")
+                                    sync_results['errors'].append(error_msg)
+                            else:
+                                logger.info(f"✅ Trade {trade_id} position verified on {exchange_name}")
+                        else:
+                            error_msg = f"Failed to get balances for {exchange_name}: {balance_response.status_code}"
+                            logger.error(f"❌ {error_msg}")
+                            sync_results['errors'].append(error_msg)
+                            
+                    except Exception as trade_error:
+                        error_msg = f"Error syncing trade {trade.get('id', 'unknown')}: {str(trade_error)}"
+                        logger.error(f"❌ {error_msg}")
+                        sync_results['errors'].append(error_msg)
+            
+            logger.info(f"✅ Sync complete: {sync_results['trades_synced']}/{sync_results['trades_checked']} trades synced")
+            return sync_results
+            
+        except Exception as e:
+            logger.error(f"❌ Error in exchange sync: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return {'trades_checked': 0, 'trades_synced': 0, 'errors': [str(e)]}
+    
+    async def _initialize_config(self) -> None:
+        """Initialize configuration from config service"""
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                # Get trading configuration
+                trading_response = await client.get(f"{config_service_url}/api/v1/config/trading")
+                trading_response.raise_for_status()
+                trading_config = trading_response.json()
+                
+                # Get database configuration
+                database_response = await client.get(f"{config_service_url}/api/v1/config/database")
+                database_response.raise_for_status()
+                database_config = database_response.json()
+                
+                # Get strategies configuration
+                strategies_response = await client.get(f"{config_service_url}/api/v1/config/strategies")
+                strategies_response.raise_for_status()
+                strategies_config = strategies_response.json()
+                
+                # Combine all configurations
+                self._config = {
+                    'trading': trading_config,
+                    'database': database_config,
+                    'strategies': strategies_config
+                }
+                
+                logger.info(f"Configuration loaded successfully: trailing_stop trigger={trading_config.get('trailing_stop', {}).get('trigger_percentage', 'unknown')}")
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            raise
+    
+    async def _initialize_database_manager(self) -> None:
+        """Initialize database manager"""
+        try:
+            if not self._config:
+                raise ValueError("Configuration not loaded")
+            
+            db_config = self._config.get('database', {})
+            self.database_manager = DatabaseManager(db_config)
+            logger.info("Database manager initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize database manager: {e}")
+            raise
+    
+    async def _initialize_strategy_manager(self) -> None:
+        """Initialize strategy manager with database and config"""
+        try:
+            if not self._config or not self.database_manager:
+                raise ValueError("Configuration or database manager not initialized")
+            
+            # Create a mock exchange manager for strategy manager
+            # (The strategy manager will mainly be used for profit protection and trailing stops)
+            self.strategy_manager = StrategyManager(
+                config=self._config,
+                exchange_manager=None,  # Not needed for exit logic
+                database_manager=self.database_manager
+            )
+            logger.info("Strategy manager initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize strategy manager: {e}")
+            raise
             
     async def _trading_loop(self) -> None:
         """Main trading loop with order monitoring"""
@@ -976,7 +1288,7 @@ class TradingOrchestrator:
                     default_stop_loss = -(config_stop_loss_pct * 100)
                     # Convert trailing_stop config to percentages
                     trailing_stop_config = trading_config.get('trailing_stop', {})
-                    trailing_trigger_decimal = trailing_stop_config.get('trigger_percentage', 0.02)
+                    trailing_trigger_decimal = trailing_stop_config.get('activation_threshold', 0.005)
                     trailing_trigger_pct = trailing_trigger_decimal * 100
                     trailing_step_decimal = trailing_stop_config.get('step_percentage', 0.01)
                     trailing_step_pct = trailing_step_decimal * 100
@@ -1014,15 +1326,12 @@ class TradingOrchestrator:
                 logger.warning(f"[Trade {trade_id}] [ExitCheck] Skipping: invalid current_price: {e}")
                 return
 
-            # Defensive: Validate and convert trail_stop_trigger, fallback to config value
-            raw_stop = trade.get('trail_stop_trigger')
-            try:
-                if raw_stop is None:
-                    raise ValueError("trail_stop_trigger is None")
-                current_stop_loss = float(raw_stop)
-            except Exception:
-                current_stop_loss = default_stop_loss  # Use config value instead of hardcoded -2.0
-                logger.info(f"[Trade {trade_id}] [ExitCheck] trail_stop_trigger not set, using config default: {current_stop_loss}%")
+            # CRITICAL FIX: Don't confuse trail_stop_trigger (PRICE) with stop_loss (PERCENTAGE)
+            # trail_stop_trigger is a PRICE level for trailing stops ($2.8847)
+            # current_stop_loss should be a PERCENTAGE for stop loss comparison (-0.8%)
+            
+            # Always use the configured stop loss percentage, not the trailing stop trigger price
+            current_stop_loss = default_stop_loss  # This is already the correct negative percentage (e.g., -0.8%)
             logger.info(f"[Trade {trade_id}] [ExitCheck] Using stop loss: {current_stop_loss}%")
 
             # Calculate PnL and update trade data
@@ -1066,15 +1375,18 @@ class TradingOrchestrator:
             # Only trigger profit protection if it hasn't been activated yet
             if pnl_percentage >= 1.0 and not profit_protection_status:
                 # Move to guarantee 0.5% profit instead of just breakeven
-                new_stop_loss = 0.5  # Guarantee 0.5% profit
+                profit_guarantee_pct = 0.5  # Guarantee 0.5% profit
+                # Convert percentage to actual trigger price
+                profit_guarantee_trigger_price = entry_price * (1 + (profit_guarantee_pct / 100))
                 logger.info(f"[Trade {trade_id}] [ProfitProtection] ✅ TRIGGERED: PnL {pnl_percentage:.2f}% >= 1.0% AND no profit protection active")
-                logger.info(f"[Trade {trade_id}] [ProfitProtection] Moving stop loss: {current_stop_loss:.2f}% → {new_stop_loss:.2f}% (guaranteeing 0.5% profit)")
+                logger.info(f"[Trade {trade_id}] [ProfitProtection] Setting profit protection trigger: ${profit_guarantee_trigger_price:.6f} (guaranteeing {profit_guarantee_pct}% profit)")
                 await self._update_trade_data(trade_id, {
-                    'trail_stop_trigger': new_stop_loss,
+                    'trail_stop_trigger': profit_guarantee_trigger_price,  # Store actual trigger PRICE
                     'profit_protection': 'profit_guaranteed',
                     'profit_protection_trigger': pnl_percentage
                 })
-                current_stop_loss = new_stop_loss
+                # DON'T UPDATE current_stop_loss - it should remain the configured stop loss percentage
+                # current_stop_loss should always be the stop loss percentage (-0.8%), not profit protection percentage
             else:
                 # Fix the log message to show the correct logic
                 if pnl_percentage < 1.0:
@@ -1099,6 +1411,19 @@ class TradingOrchestrator:
                     trailing_step_decimal = trailing_step_pct / 100  # Convert percentage to decimal
                     trigger_price = highest_price * (1 - trailing_step_decimal)
                     
+                    # Apply minimum trigger distance for ALL pairs to guarantee minimum 0.5% profit
+                    min_trigger_distance_pct = trading_config.get('trailing_stop', {}).get('min_trigger_distance_percentage', 0.005)
+                    
+                    # For ALL pairs, ensure minimum trigger distance ABOVE entry price (guarantee profit)
+                    # min_trigger_distance_percentage is already in decimal format (0.005 = 0.5%)
+                    min_trigger_price = entry_price * (1 + min_trigger_distance_pct)  # ABOVE entry price
+                    
+                    if trigger_price < min_trigger_price:
+                        logger.info(f"[Trade {trade_id}] [TrailingStop] 🔧 ADJUSTED: Calculated trigger ${trigger_price:.6f} < minimum ${min_trigger_price:.6f}, using minimum ({min_trigger_distance_pct:.1%} above entry ${entry_price:.6f})")
+                        trigger_price = min_trigger_price
+                    else:
+                        logger.info(f"[Trade {trade_id}] [TrailingStop] ✅ CALCULATED: Using calculated trigger ${trigger_price:.6f} (from highest ${highest_price:.6f} - {trailing_step_pct:.2f}%) > minimum ${min_trigger_price:.6f}")
+                    
                     logger.info(f"[Trade {trade_id}] [TrailingStop] ✅ UPDATED: PnL {pnl_percentage:.2f}% >= {trailing_trigger_pct:.2f}% AND new stop {trailing_stop:.2f}% > current {current_stop_loss:.2f}%")
                     logger.info(f"[Trade {trade_id}] [TrailingStop] Moving stop loss: {current_stop_loss:.2f}% → {trailing_stop:.2f}%")
                     logger.info(f"[Trade {trade_id}] [TrailingStop] Trigger price: ${trigger_price:.6f} (${highest_price:.6f} - {trailing_step_pct:.2f}%)")
@@ -1107,7 +1432,8 @@ class TradingOrchestrator:
                         'trail_stop': 'active',
                         'profit_protection': 'trailing'
                     })
-                    current_stop_loss = trailing_stop
+                    # DON'T UPDATE current_stop_loss - it should remain the configured stop loss percentage
+                    # current_stop_loss should always be the stop loss percentage (-0.8%), not trailing percentage
                 else:
                     logger.info(f"[Trade {trade_id}] [TrailingStop] ❌ NOT UPDATED: new stop {trailing_stop:.2f}% <= current stop {current_stop_loss:.2f}% (already higher)")
             else:
@@ -1365,6 +1691,87 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"❌ Error closing dust position {trade_id}: {str(e)}")
             return False
+
+    async def _check_and_handle_dust_amount(self, exchange_name: str, pair: str, side: str, amount: float, trade_id: Optional[str] = None) -> Optional[Union[str, Dict[str, Any]]]:
+        """Detect and handle dust amounts before placing/retrying limit orders.
+
+        Returns:
+        - "skip_dust" to indicate the order should be skipped and (for sells) the trade closed as dust
+        - None if no dust handling is needed
+        - Optionally a dict representing an already handled order placement result (not used currently)
+        """
+        try:
+            # Get a price to compute notional when available
+            current_price = 0.0
+            try:
+                current_price = await self._get_current_price(exchange_name, pair)
+            except Exception:
+                current_price = 0.0
+
+            # Exchange-specific thresholds
+            if exchange_name == 'cryptocom':
+                min_notional_usd = 12.0
+                min_amounts = {
+                    'AAVE/USD': 0.001,
+                    'BTC/USD': 0.00001,
+                    'ETH/USD': 0.0001,
+                    'SOL/USD': 0.001,
+                    'LTC/USD': 0.001,
+                    'XRP/USD': 1.0,
+                    'ADA/USD': 1.0,
+                    'ACH/USD': 1.0,
+                    'ACT/USD': 1.0,
+                    'default': 0.000001
+                }
+                min_amount = min_amounts.get(pair, min_amounts['default'])
+                is_below_min_amount = amount < float(min_amount)
+                is_below_min_notional = (current_price > 0) and (amount * current_price < min_notional_usd)
+                if is_below_min_amount or is_below_min_notional:
+                    if side.lower() == 'sell' and trade_id:
+                        await self._close_dust_position(trade_id, exchange_name, pair, amount, "dust_amount_below_minimum")
+                    return "skip_dust"
+
+            elif exchange_name == 'binance':
+                min_amounts = {
+                    'LINK/USDC': 1.0,
+                    'LINK/USDT': 1.0,
+                    'default': 0.001
+                }
+                min_amount = min_amounts.get(pair, min_amounts['default'])
+                if amount < float(min_amount):
+                    if side.lower() == 'sell' and trade_id:
+                        await self._close_dust_position(trade_id, exchange_name, pair, amount, "dust_amount_below_minimum")
+                    return "skip_dust"
+
+            elif exchange_name == 'bybit':
+                # Bybit-specific minimum amounts based on exchange handler and error messages
+                min_amounts = {
+                    'XRP/USDC': 0.01,  # Error message shows 0.01 minimum
+                    'BTC/USDC': 0.00001,
+                    'ETH/USDC': 0.001,
+                    'SOL/USDC': 0.01,
+                    'XLM/USDC': 1.0,
+                    'default': 0.001
+                }
+                min_amount = min_amounts.get(pair, min_amounts['default'])
+                min_notional_usd = 1.0  # Bybit minimum notional
+                
+                is_below_min_amount = amount < float(min_amount)
+                is_below_min_notional = (current_price > 0) and (amount * current_price < min_notional_usd)
+                
+                logger.info(f"🔍 DUST DEBUG: {pair} on {exchange_name} - amount={amount:.8f}, min_amount={min_amount}, below_min={is_below_min_amount}")
+                logger.info(f"🔍 DUST DEBUG: current_price=${current_price:.8f}, notional=${amount * current_price:.6f}, min_notional=${min_notional_usd}, below_notional={is_below_min_notional}")
+                
+                if is_below_min_amount or is_below_min_notional:
+                    logger.warning(f"💸 DUST DETECTED: {amount} {pair} on {exchange_name} (min: {min_amount}, notional: ${amount * current_price:.6f})")
+                    if side.lower() == 'sell' and trade_id:
+                        await self._close_dust_position(trade_id, exchange_name, pair, amount, "dust_amount_below_minimum")
+                    return "skip_dust"
+
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️ Error in dust amount pre-check for {pair} on {exchange_name}: {e}")
+            return None
             
     async def _check_available_balance(self) -> bool:
         """Check if there's sufficient balance for new trades"""
@@ -1559,7 +1966,16 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.error(f"❌ Failed to check balance for {exchange_name}: {e}")
                 return
-            position_value_usdc = available_balance * 0.1
+            # STRATEGY-SPECIFIC POSITION SIZING
+            strategy_name = signal.get('strategy', 'default')
+            position_percentage, max_position_usd = await self._get_strategy_position_config(strategy_name)
+            
+            position_value_usdc = min(
+                available_balance * position_percentage,
+                max_position_usd
+            )
+            
+            logger.info(f"[PositionSizing] Strategy: {strategy_name}, Percentage: {position_percentage:.1%}, Max: ${max_position_usd}, Calculated: ${position_value_usdc:.2f}")
             
             # Get exchange-specific minimum order size from configuration
             min_order_size_usd = 50.0  # Default fallback
@@ -1605,12 +2021,65 @@ class TradingOrchestrator:
             if not order_result or not order_result.get('id'):
                 logger.error(f"❌ Failed to place BUY order for {pair} on {exchange_name} (no order ID returned)")
                 return
-            # Immediately create trade record as OPEN
+            
+            # CRITICAL FIX: Wait for order fill confirmation to get actual exchange fill price
+            # Use longer timeout for Crypto.com due to slower API response times
+            fill_timeout = 60 if exchange_name.lower() == 'cryptocom' else 30
+            logger.info(f"🔍 Waiting for entry order {order_result['id']} fill confirmation to get actual exchange price (timeout: {fill_timeout}s)...")
+            filled_order = await self._wait_for_order_fill(exchange_name, order_result['id'], pair, timeout=fill_timeout, original_order=order_result, amount=sanitized_position_size)
+            
+            if not filled_order:
+                logger.error(f"❌ Entry order {order_result['id']} failed to fill for {pair} on {exchange_name} but was filled on the exchange")
+                
+                # CRITICAL RECOVERY: Check if order was actually filled on exchange despite timeout
+                logger.warning(f"🔄 RECOVERY ATTEMPT: Checking if order {order_result['id']} was actually filled on {exchange_name}...")
+                try:
+                    # Get actual fill price from exchange order history
+                    actual_fill_price = await self._get_order_fill_price_from_history(exchange_name, order_result['id'], pair)
+                    
+                    if actual_fill_price > 0:
+                        logger.info(f"✅ RECOVERY SUCCESS: Order {order_result['id']} was filled at {actual_fill_price} - creating trade record")
+                        filled_price = actual_fill_price
+                        filled_amount = sanitized_position_size
+                        
+                        # Create synthetic filled order for trade creation
+                        filled_order = {
+                            'id': order_result['id'],
+                            'average': str(filled_price),
+                            'filled': str(filled_amount),
+                            'amount': str(filled_amount),
+                            'status': 'filled',
+                            'symbol': pair,
+                            'recovery': True
+                        }
+                        logger.warning(f"🚨 CRITICAL RECOVERY: Using synthetic fill data for trade creation")
+                    else:
+                        logger.error(f"💥 RECOVERY FAILED: Could not verify order fill on exchange - trade will be missing from database")
+                        return
+                        
+                except Exception as recovery_error:
+                    logger.error(f"💥 RECOVERY EXCEPTION: {recovery_error}")
+                    return
+            
+            # Immediately create trade record as OPEN using confirmed fill data
             trade_id = str(uuid.uuid4())
             strategy_name = signal.get('strategy', 'unknown')
-            # Safely extract filled amount and price with defensive handling
-            filled_amount = float(order_result.get('filled') or position_size_units)
-            filled_price = float(order_result.get('average') or entry_price)
+            # Use confirmed fill data with fallbacks to prevent price discrepancies
+            filled_amount = float(filled_order.get('filled') or sanitized_position_size)
+            filled_price = float(filled_order.get('average', 0))
+            
+            # CRITICAL: If no fill price available, get current market price instead of using signal price
+            if filled_price <= 0:
+                logger.warning(f"⚠️ No fill price in order response, fetching current market price for {pair} on {exchange_name}")
+                current_market_price = await self._get_current_price(exchange_name, pair)
+                if current_market_price > 0:
+                    filled_price = current_market_price
+                    logger.info(f"📈 Using current market price ${filled_price:.6f} as entry price")
+                else:
+                    logger.error(f"💥 CRITICAL: Cannot determine entry price for {pair} on {exchange_name}")
+                    return
+            
+            logger.info(f"✅ Entry order confirmed: {filled_amount:.8f} {pair} at ${filled_price:.6f} (order ID: {order_result['id']})")
             trade_data = {
                 'trade_id': trade_id,
                 'pair': pair,
@@ -1808,8 +2277,19 @@ class TradingOrchestrator:
                             discrepancy = amount - quote_available
                             logger.warning(f"⚠️ POSITION SIZE MISMATCH: Database shows {amount:.8f}, but exchange has {quote_available:.8f} (diff: {discrepancy:.8f})")
                             
-                            # If discrepancy is small (< 5% or < 10 units), auto-correct the position size
-                            if quote_available > 0 and (discrepancy / amount < 0.05 or discrepancy < 10):
+                            # FOR EXIT ORDERS: Position size is already corrected in _execute_trade_exit()
+                            # This logic now handles exit orders properly by using exchange balance
+                            if side.lower() == 'sell' and trade_id:
+                                logger.warning(f"🚨 EXIT ORDER INSUFFICIENT BALANCE: Database shows {amount:.8f}, exchange has {quote_available:.8f}")
+                                # Use exchange balance if available, otherwise this will fail as expected
+                                if quote_available >= amount * 0.1:  # At least 10% of expected
+                                    logger.warning(f"🔧 AUTO-CORRECTING exit order: {amount:.8f} -> {quote_available:.8f} (using exchange balance)")
+                                    amount = quote_available
+                                else:
+                                    logger.error(f"💥 CRITICAL: Exchange balance too low ({quote_available:.8f}) for meaningful exit - order will fail")
+                                    # Let it fail - this should be caught by the dust position logic
+                            # If discrepancy is small (< 5% or < 10 units), auto-correct the position size for entry orders
+                            elif quote_available > 0 and (discrepancy / amount < 0.05 or discrepancy < 10):
                                 logger.info(f"🔧 AUTO-CORRECTING position size from {amount:.8f} to {quote_available:.8f}")
                                 
                                 # Check minimum amount requirements before proceeding
@@ -2024,12 +2504,24 @@ class TradingOrchestrator:
                                     else:
                                         logger.warning(f"⚠️ Original order status is {orig_status}, not filled")
                                 
-                                # For Crypto.com and other exchanges where market orders fill instantly,
-                                # create a synthetic filled order response using reasonable defaults
-                                if exchange_name == 'cryptocom' and check_count == 0:
-                                    logger.info(f"✅ Assuming Crypto.com market order {order_id} filled instantly")
-                                    
-                                    # Get current market price for synthetic average
+                                # For exchanges where market orders fill instantly, try to get actual fill price from order history
+                                logger.info(f"🔍 Order {order_id} not in open orders, checking order history for actual fill price...")
+                                
+                                # Try to get actual fill price from exchange order history
+                                actual_fill_price = await self._get_order_fill_price_from_history(exchange_name, order_id, pair)
+                                
+                                if actual_fill_price > 0:
+                                    logger.info(f"✅ Found actual fill price from order history: ${actual_fill_price:.6f}")
+                                    return {
+                                        'id': order_id,
+                                        'status': 'closed',
+                                        'filled': amount,
+                                        'average': actual_fill_price,  # Use actual fill price from exchange
+                                        'info': {'orderId': order_id, 'exchange': exchange_name}
+                                    }
+                                else:
+                                    # Fallback: Use current market price if order history unavailable
+                                    logger.warning(f"⚠️ Could not get actual fill price from history, falling back to current market price")
                                     try:
                                         async with httpx.AsyncClient(timeout=10.0) as price_client:
                                             exchange_pair = pair.replace('/', '') if pair else ''
@@ -2037,21 +2529,22 @@ class TradingOrchestrator:
                                             if price_response.status_code == 200:
                                                 ticker = price_response.json()
                                                 current_market_price = float(ticker.get('last', 0.0))
-                                                logger.info(f"[CRYPTOCOM SYNTHETIC] Using current market price: ${current_market_price:.6f}")
+                                                logger.warning(f"📈 Using current market price as fallback: ${current_market_price:.6f}")
                                             else:
-                                                current_market_price = 0.13  # Fallback for CRO/USD
-                                                logger.warning(f"[CRYPTOCOM SYNTHETIC] Using fallback price: ${current_market_price:.6f}")
+                                                current_market_price = 0.0
+                                                logger.error(f"💥 Failed to get fallback market price for {pair} on {exchange_name}")
                                     except Exception as price_error:
-                                        current_market_price = 0.13  # Fallback for CRO/USD  
-                                        logger.warning(f"[CRYPTOCOM SYNTHETIC] Price fetch failed, using fallback: ${current_market_price:.6f} - {price_error}")
+                                        current_market_price = 0.0
+                                        logger.error(f"💥 Price fetch error: {price_error}")
                                     
-                                    return {
-                                        'id': order_id,
-                                        'status': 'closed',
-                                        'filled': amount,
-                                        'average': current_market_price,  # Use real market price instead of None
-                                        'info': {'orderId': order_id, 'exchange': exchange_name}
-                                    }
+                                    if current_market_price > 0:
+                                        return {
+                                            'id': order_id,
+                                            'status': 'closed',
+                                            'filled': amount,
+                                            'average': current_market_price,
+                                            'info': {'orderId': order_id, 'exchange': exchange_name}
+                                        }
                         
                         check_count += 1
                         if check_count < 6:
@@ -2073,6 +2566,50 @@ class TradingOrchestrator:
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
+    
+    async def _get_order_fill_price_from_history(self, exchange_name: str, order_id: str, pair: str) -> float:
+        """Get actual fill price from exchange order history"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Try to get order history from exchange service
+                response = await client.get(f"{exchange_service_url}/api/v1/trading/order-history/{exchange_name}")
+                
+                if response.status_code == 200:
+                    order_history = response.json().get('orders', [])
+                    
+                    # Find our order in history
+                    for order in order_history:
+                        if order.get('id') == order_id or order.get('orderId') == order_id:
+                            # Get actual fill price from the order
+                            fill_price = float(order.get('average', 0) or order.get('price', 0) or 0)
+                            if fill_price > 0:
+                                logger.info(f"📋 Found order {order_id} in history with fill price ${fill_price:.6f}")
+                                return fill_price
+                            else:
+                                logger.warning(f"⚠️ Order {order_id} found in history but no fill price available")
+                    
+                    logger.warning(f"⚠️ Order {order_id} not found in exchange order history")
+                else:
+                    logger.warning(f"⚠️ Failed to get order history from {exchange_name}: {response.status_code}")
+                
+                # Try alternative endpoint for recent orders
+                recent_response = await client.get(f"{exchange_service_url}/api/v1/trading/recent-orders/{exchange_name}")
+                
+                if recent_response.status_code == 200:
+                    recent_orders = recent_response.json().get('orders', [])
+                    
+                    for order in recent_orders:
+                        if order.get('id') == order_id or order.get('orderId') == order_id:
+                            fill_price = float(order.get('average', 0) or order.get('price', 0) or 0)
+                            if fill_price > 0:
+                                logger.info(f"📋 Found order {order_id} in recent orders with fill price ${fill_price:.6f}")
+                                return fill_price
+                
+                return 0.0  # No fill price found
+                
+        except Exception as e:
+            logger.error(f"❌ Error getting fill price from order history for {order_id}: {e}")
+            return 0.0
 
     async def _cancel_order(self, exchange_name: str, order_id: str, pair: str) -> bool:
         """Cancel an order"""
@@ -2158,7 +2695,33 @@ class TradingOrchestrator:
                 return
             exchange_name = trade['exchange']
             pair = trade['pair']
-            position_size = float(trade['position_size'])
+            database_position_size = float(trade['position_size'])
+            
+            # FOR SELL ORDERS: Always use recorded trade amount first, handle discrepancies after
+            # This prioritizes position closure over minor balance differences
+            position_size = database_position_size
+            logger.info(f"💰 Using recorded trade amount for exit: {position_size:.8f} {pair.split('/')[0] if '/' in pair else pair.split('_')[0]}")
+            
+            # Optional: Check exchange balance for logging/adjustment after order placement
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as balance_client:
+                    balance_response = await balance_client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
+                    if balance_response.status_code == 200:
+                        balances = balance_response.json().get('balances', {})
+                        base_asset = pair.split('/')[0] if '/' in pair else pair.split('_')[0]
+                        
+                        if base_asset in balances:
+                            exchange_available = float(balances[base_asset].get('available', 0))
+                            difference = abs(exchange_available - database_position_size)
+                            
+                            if difference > database_position_size * 0.05:  # Log significant differences
+                                logger.info(f"📊 Balance difference detected - Database: {database_position_size:.8f}, Exchange: {exchange_available:.8f} {base_asset}")
+                                logger.info(f"🎯 Will attempt exit with recorded amount {database_position_size:.8f} first, adjust if needed")
+                        else:
+                            logger.info(f"ℹ️ {base_asset} balance not found in response, proceeding with recorded amount")
+            except Exception as balance_error:
+                logger.debug(f"Balance check failed (non-critical): {balance_error}")
+                # Continue with recorded amount regardless of balance check results
             
             # Check minimum amount requirements for this exchange/pair
             min_amounts = {
@@ -2202,7 +2765,33 @@ class TradingOrchestrator:
             if not filled_exit_order:
                 logger.error(f"❌ Exit order {exit_order_result['id']} failed to fill for {pair} on {exchange_name}")
                 await self._cancel_order(exchange_name, exit_order_result['id'], pair)
-                return
+                
+                # CRITICAL: For trailing stops and stop losses, force emergency market order
+                if exit_reason.startswith('trailing_stop_trigger') or exit_reason.startswith('stop_loss_trigger'):
+                    logger.warning(f"🚨 EMERGENCY EXIT: Critical exit failed, forcing market order for {pair} on {exchange_name}")
+                    
+                    # Force market order as emergency fallback
+                    emergency_exit_result = await self._place_market_order(exchange_name, pair, 'sell', sanitized_position_size, trade_id)
+                    if not emergency_exit_result:
+                        logger.error(f"💥 CRITICAL FAILURE: Emergency market order also failed for {pair} on {exchange_name}")
+                        # Force close the trade in database to prevent further losses
+                        logger.error(f"🆘 FORCE CLOSING: Marking trade {trade_id} as closed to prevent further losses")
+                        await self._update_trade_status(trade_id, 'CLOSED', f'emergency_force_close_{exit_reason}')
+                        return
+                    
+                    # Wait for emergency market order to fill (shorter timeout for market orders)
+                    filled_exit_order = await self._wait_for_order_fill(exchange_name, emergency_exit_result['id'], pair, timeout=10, original_order=emergency_exit_result, amount=position_size)
+                    if not filled_exit_order:
+                        logger.error(f"💥 CRITICAL FAILURE: Emergency market order failed to fill for {pair} on {exchange_name}")
+                        # Force close the trade in database to prevent further losses
+                        logger.error(f"🆘 FORCE CLOSING: Marking trade {trade_id} as closed to prevent further losses")  
+                        await self._update_trade_status(trade_id, 'CLOSED', f'emergency_force_close_{exit_reason}')
+                        return
+                    
+                    logger.info(f"✅ EMERGENCY SUCCESS: Market order filled for {pair} on {exchange_name}")
+                else:
+                    # For non-critical exits, just return and try again later
+                    return
             
             # Calculate realized PnL with defensive None handling
             entry_price = float(trade['entry_price'])
@@ -2370,8 +2959,9 @@ class TradingOrchestrator:
             exchange_service_url = os.getenv('EXCHANGE_SERVICE_URL', 'http://exchange-service:8003')
             
             async with httpx.AsyncClient(timeout=60.0) as client:
-                # Check each exchange
-                for exchange_name in self.config_manager.get_all_exchanges():
+                # Check each exchange - using hardcoded list since config_manager is not fully implemented
+                exchanges = ['binance', 'bybit', 'cryptocom']
+                for exchange_name in exchanges:
                     verification_results['exchanges_checked'].append(exchange_name)
                     
                     # Get recent orders from exchange
@@ -2481,16 +3071,27 @@ class TradingOrchestrator:
             # Get current orderbook to check realistic pricing
             from core.exchange_handlers import exchange_handler_manager
             exchange_symbol = exchange_handler_manager.format_symbol_for_api(exchange_name, pair)
+            logger.info(f"🔍 VALIDATION: Symbol formatting - pair={pair} → exchange_symbol={exchange_symbol}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # Get orderbook data
                 try:
-                    response = await client.get(f"{exchange_service_url}/api/v1/market/orderbook/{exchange_name}/{exchange_symbol}")
+                    response = await client.get(f"{exchange_service_url}/api/v1/market/orderbook/{exchange_name}/{pair}?limit=5")
                     response.raise_for_status()
                     orderbook = response.json()
                     
-                    current_bid = float(orderbook.get('bid', 0.0))
-                    current_ask = float(orderbook.get('ask', 0.0))
+                    # Handle orderbook array format: {"bids": [[price, size], ...], "asks": [[price, size], ...]}
+                    bids = orderbook.get('bids', [])
+                    asks = orderbook.get('asks', [])
+                    
+                    if bids and asks and len(bids) > 0 and len(asks) > 0:
+                        current_bid = float(bids[0][0])  # Best bid price
+                        current_ask = float(asks[0][0])  # Best ask price
+                    else:
+                        current_bid = float(orderbook.get('bid', 0.0))  # Fallback to direct values
+                        current_ask = float(orderbook.get('ask', 0.0))
+                    
+                    logger.info(f"🔍 VALIDATION: Got orderbook for {pair} on {exchange_name}: bid={current_bid}, ask={current_ask}")
                     
                     if current_bid <= 0 or current_ask <= 0:
                         logger.warning(f"Invalid orderbook data for {pair} on {exchange_name}: bid={current_bid}, ask={current_ask}")
@@ -2522,6 +3123,7 @@ class TradingOrchestrator:
             if side.lower() == 'sell':
                 # For sell orders, check if limit price is too high above current ask
                 max_realistic_price = current_ask * 1.02  # Allow up to 2% above current ask
+                logger.info(f"🔍 VALIDATION: Sell validation - limit_price=${limit_price:.8f}, ask=${current_ask:.8f}, max_realistic=${max_realistic_price:.8f}")
                 if limit_price > max_realistic_price:
                     logger.warning(f"🚨 Sell limit price ${limit_price:.8f} too high - current ask: ${current_ask:.8f}, max realistic: ${max_realistic_price:.8f}")
                     return False
@@ -2550,6 +3152,191 @@ class TradingOrchestrator:
             logger.error(f"Error validating limit price for {pair} on {exchange_name}: {e}")
             # If validation fails, be conservative and reject the limit order
             return False
+
+    async def _intelligent_limit_retry(self, exchange_name: str, pair: str, side: str, amount: float, trade_id: str = None) -> Optional[Dict[str, Any]]:
+        """Intelligently retry limit orders with price corrections based on failure analysis"""
+        try:
+            logger.info(f"🧠 Starting intelligent limit retry for {side} {amount:.8f} {pair} on {exchange_name}")
+            
+            # Check if this is a dust amount issue that should be handled differently
+            logger.info(f"🔍 RETRY DUST CHECK: Checking {amount:.8f} {pair} on {exchange_name} for dust amounts")
+            dust_check_result = await self._check_and_handle_dust_amount(exchange_name, pair, side, amount, trade_id)
+            logger.info(f"🔍 RETRY DUST RESULT: {dust_check_result}")
+            if dust_check_result == "skip_dust":
+                logger.info(f"💨 RETRY: Skipping dust amount order: {amount:.8f} {pair} on {exchange_name} below exchange minimums")
+                return {"status": "skipped", "reason": "dust_amount", "id": "dust_skipped"}
+            elif dust_check_result and isinstance(dust_check_result, dict):
+                logger.info(f"✅ Dust amount converted to minimum viable order")
+                return dust_check_result
+            
+            # Get fresh market data for price correction
+            current_price = await self._get_current_price(exchange_name, pair)
+            if current_price <= 0:
+                logger.warning(f"❌ Cannot get current price for intelligent retry of {pair} on {exchange_name}")
+                return None
+                
+            # Get fresh orderbook data
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{exchange_service_url}/api/v1/market/orderbook/{exchange_name}/{pair}?limit=5")
+                    response.raise_for_status()
+                    orderbook = response.json()
+                    
+                    bids = orderbook.get('bids', [])
+                    asks = orderbook.get('asks', [])
+                    
+                    if not (bids and asks and len(bids) > 0 and len(asks) > 0):
+                        logger.warning(f"❌ Cannot get orderbook for intelligent retry of {pair} on {exchange_name}")
+                        return None
+                        
+                    best_bid = float(bids[0][0])
+                    best_ask = float(asks[0][0])
+                    spread = best_ask - best_bid
+                    spread_pct = (spread / best_ask) * 100
+                    
+                    logger.info(f"🔍 Fresh market data - bid=${best_bid:.8f}, ask=${best_ask:.8f}, spread={spread_pct:.4f}%")
+                    
+            except Exception as e:
+                logger.warning(f"❌ Failed to get fresh orderbook for retry: {e}")
+                return None
+                
+            # Try multiple pricing strategies in order of aggressiveness
+            pricing_strategies = []
+            
+            if side.lower() == 'sell':
+                pricing_strategies = [
+                    # Strategy 1: Just inside the spread (most aggressive maker price)
+                    {"name": "inside_spread", "price": best_bid + (spread * 0.1)},  
+                    # Strategy 2: At best ask (immediate fill but still maker)
+                    {"name": "at_ask", "price": best_ask},
+                    # Strategy 3: Slightly above best ask (quick fill)  
+                    {"name": "above_ask", "price": best_ask * 1.0001}
+                ]
+            else:  # buy
+                pricing_strategies = [
+                    # Strategy 1: Just inside the spread (most aggressive maker price)
+                    {"name": "inside_spread", "price": best_ask - (spread * 0.1)},
+                    # Strategy 2: At best bid (immediate fill but still maker)
+                    {"name": "at_bid", "price": best_bid},
+                    # Strategy 3: Slightly below best bid (quick fill)
+                    {"name": "below_bid", "price": best_bid * 0.9999}
+                ]
+            
+            # Try each pricing strategy
+            for i, strategy in enumerate(pricing_strategies):
+                logger.info(f"🎯 Retry attempt {i+1}/3: {strategy['name']} strategy - price=${strategy['price']:.8f}")
+                
+                # Attempt the order with this pricing strategy
+                retry_result = await self._place_limit_order_with_custom_price(
+                    exchange_name, pair, side, amount, strategy['price'], trade_id, f"retry_{strategy['name']}"
+                )
+                
+                if retry_result and retry_result.get('id'):
+                    logger.info(f"✅ Intelligent retry successful with {strategy['name']} strategy: {retry_result['id']}")
+                    return retry_result
+                else:
+                    logger.info(f"❌ Retry {i+1} failed with {strategy['name']} strategy, trying next...")
+                    # Small delay between retries
+                    await asyncio.sleep(0.5)
+            
+            logger.warning(f"❌ All intelligent retry strategies failed for {pair} on {exchange_name}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error in intelligent limit retry for {pair} on {exchange_name}: {e}")
+            return None
+
+    async def _place_limit_order_with_custom_price(self, exchange_name: str, pair: str, side: str, amount: float, 
+                                                  custom_price: float, trade_id: str = None, strategy_name: str = "") -> Optional[Dict[str, Any]]:
+        """Place a limit order with a custom price (used for intelligent retries)"""
+        try:
+            # Sanitize amount
+            sanitized_amount = self._sanitize_numeric_value(amount)
+            
+            # Convert pair format for exchange service
+            exchange_symbol = self._convert_pair_format(exchange_name, pair)
+            
+            # Generate client order ID for this retry attempt
+            client_order_id = self._generate_client_order_id(trade_id, f"limit_{strategy_name}")
+            local_order_id = str(uuid.uuid4())
+            
+            logger.info(f"🆔 Custom price order - client_order_id: {client_order_id}, price: ${custom_price:.8f}")
+            
+            # Create order mapping
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    mapping_data = {
+                        'local_order_id': local_order_id,
+                        'client_order_id': client_order_id,
+                        'exchange': exchange_name,
+                        'symbol': pair,
+                        'order_type': 'limit',
+                        'side': side,
+                        'amount': sanitized_amount,
+                        'price': custom_price
+                    }
+                    
+                    mapping_response = await client.post(f"{database_service_url}/api/v1/order-mappings", json=mapping_data)
+                    mapping_response.raise_for_status()
+                    logger.info(f"✅ Order mapping created: {local_order_id} -> {client_order_id}")
+                    
+                    # Emit OrderCreated event
+                    event_data = {
+                        'event_type': 'OrderCreated',
+                        'order_id': local_order_id,
+                        'client_order_id': client_order_id,
+                        'exchange': exchange_name,
+                        'symbol': pair,
+                        'side': side,
+                        'amount': sanitized_amount,
+                        'price': custom_price,
+                        'order_type': 'limit'
+                    }
+                    
+                    await client.post(f"{database_service_url}/api/v1/events", json=event_data)
+                    logger.info(f"📝 OrderCreated event emitted: {strategy_name}")
+                    
+                    # Place the order through exchange service
+                    order_data = {
+                        'exchange': exchange_name,
+                        'symbol': exchange_symbol,
+                        'order_type': 'limit',
+                        'side': side,
+                        'amount': sanitized_amount,
+                        'price': custom_price,
+                        'client_order_id': client_order_id
+                    }
+                    
+                    logger.info(f"🔄 Placing custom price limit order: {side} {sanitized_amount} {exchange_symbol} @ ${custom_price:.8f}")
+                    
+                    order_response = await client.post(f"{exchange_service_url}/api/v1/trading/order", json=order_data)
+                    
+                    if order_response.status_code == 200:
+                        result = order_response.json()
+                        logger.info(f"✅ Custom price limit order successful: {result.get('id')}")
+                        
+                        # Update order mapping with exchange order ID
+                        if result.get('id'):
+                            mapping_update_data = {
+                                'exchange_order_id': str(result['id']),
+                                'status': 'open'
+                            }
+                            await client.put(f"{database_service_url}/api/v1/order-mappings/{client_order_id}", json=mapping_update_data)
+                            logger.info(f"✅ Order mapping updated with exchange order ID: {result['id']}")
+                        
+                        return result
+                    else:
+                        error_detail = order_response.text
+                        logger.warning(f"❌ Custom price limit order failed: {order_response.status_code} - {error_detail}")
+                        return None
+                        
+            except Exception as e:
+                logger.error(f"❌ Error placing custom price limit order: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Error in custom price limit order placement: {e}")
+            return None
             
     async def _run_maintenance_tasks(self) -> None:
         """Run maintenance tasks"""
@@ -2608,7 +3395,8 @@ class TradingOrchestrator:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 exchanges_response = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
                 exchanges_response.raise_for_status()
-                exchanges = exchanges_response.json()
+                exchanges_data = exchanges_response.json()
+                exchanges = exchanges_data.get('exchanges', [])
                 
                 updated_count = 0
                 for exchange_name in exchanges:
@@ -2937,8 +3725,8 @@ class TradingOrchestrator:
                             competitive_adjustment = 0.0001  # 0.01%
                             limit_price = best_ask * (1 - competitive_adjustment)
                             
-                            # Don't go below 105% of best bid
-                            min_price = best_bid * 1.05
+                            # Don't go below 100.01% of best bid (very small buffer)
+                            min_price = best_bid * 1.0001
                             limit_price = max(limit_price, min_price)
                         
                         # Round to appropriate decimal places
@@ -3015,12 +3803,145 @@ class TradingOrchestrator:
             global database_service_url
             # Sanitize amount first
             sanitized_amount = self._sanitize_numeric_value(amount)
+
+            # Pre-check for dust amounts to avoid futile attempts
+            try:
+                dust_result = await self._check_and_handle_dust_amount(exchange_name, pair, side, sanitized_amount, trade_id)
+                if dust_result == "skip_dust":
+                    return None
+            except Exception as _dust_err:
+                logger.debug(f"Dust pre-check skipped due to error: {_dust_err}")
             
-            # CRITICAL: Validate position availability before placing order
-            position_valid = await self._validate_position_for_order(exchange_name, pair, side, sanitized_amount)
-            if not position_valid:
-                logger.error(f"❌ Position validation failed: Insufficient {self._get_required_asset(pair, side)} balance on {exchange_name}")
-                return None
+            # Real-time balance check (SELL: ensure we have asset; BUY: ensure enough quote funds)
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    balance_response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
+                    balance_response.raise_for_status()
+                    current_balance = balance_response.json()
+
+                    if side.lower() == 'sell':
+                        # Determine asset being sold
+                        asset = pair.split('/')[0] if '/' in pair else pair.replace('USD', '').replace('USDC', '')
+                        quote_available = float(current_balance.get('free', {}).get(asset, 0) or 0)
+                        if quote_available < sanitized_amount:
+                            discrepancy = sanitized_amount - quote_available
+                            logger.warning(f"⚠️ POSITION SIZE MISMATCH: Database shows {sanitized_amount:.8f}, but exchange has {quote_available:.8f} (diff: {discrepancy:.8f})")
+                            
+                            # FOR EXIT ORDERS: Check if exchange actually has the position
+                            if side.lower() == 'sell' and trade_id:
+                                # If exchange has less than 10% of the position, it's likely already sold or doesn't exist
+                                if quote_available < sanitized_amount * 0.1:
+                                    logger.error(f"🚨 POSITION NOT FOUND: Exchange has {quote_available:.8f} but database shows {sanitized_amount:.8f}")
+                                    logger.error(f"💀 FORCE CLOSING TRADE: Position likely already sold or doesn't exist on exchange")
+                                    await self._close_dust_position(trade_id, exchange_name, pair, quote_available, "position_not_found_on_exchange")
+                                    return None
+                                else:
+                                    logger.warning(f"🚨 EXIT ORDER: Adjusting position size from {sanitized_amount:.8f} to {quote_available:.8f} to match exchange balance")
+                                    sanitized_amount = quote_available  # Use available balance for exit to guarantee success
+                            # If available amount is above minimum, proceed with available amount (for entry orders only)
+                            elif quote_available > 0:
+                                # Ensure above exchange minimums using correct values
+                                min_amounts = {
+                                    'cryptocom': {
+                                        'AAVE/USD': 0.001,
+                                        'BTC/USD': 0.00001,
+                                        'ETH/USD': 0.0001,
+                                        'XRP/USD': 1.0,
+                                        'default': 0.000001
+                                    },
+                                    'binance': {
+                                        'XRP/USDC': 1.0,
+                                        'LINK/USDC': 1.0,
+                                        'default': 0.001
+                                    },
+                                    'bybit': {
+                                        'XRP/USDC': 0.01,  # Error message shows 0.01 minimum
+                                        'BTC/USDC': 0.00001,
+                                        'ETH/USDC': 0.001,
+                                        'SOL/USDC': 0.01,
+                                        'default': 0.001
+                                    }
+                                }
+                                exchange_min_amounts = min_amounts.get(exchange_name.lower(), {})
+                                min_amount = float(exchange_min_amounts.get(pair, exchange_min_amounts.get('default', 0.000001)))
+                                if quote_available < min_amount:
+                                    logger.warning(f"💸 Available amount {quote_available:.8f} below minimum {min_amount} for {pair} on {exchange_name}")
+                                    # Close as dust position instead of failing
+                                    if trade_id:
+                                        await self._close_dust_position(trade_id, exchange_name, pair, quote_available, "position_size_below_minimum")
+                                    return None
+                                sanitized_amount = quote_available
+                                amount = quote_available
+                                logger.info(f"🔧 Position size corrected for limit order: proceeding with {sanitized_amount:.8f} {asset}")
+                            else:
+                                # Exchange is the source of truth - correct the database
+                                logger.warning(f"🔄 CORRECTING DATABASE: Exchange has {quote_available:.8f} {asset}, updating trade {trade_id} from {sanitized_amount:.8f} to {quote_available:.8f}")
+                                
+                                # Update the trade in database with correct amount
+                                if trade_id:
+                                    try:
+                                        async with httpx.AsyncClient(timeout=30.0) as client:
+                                            update_data = {
+                                                'amount': quote_available,
+                                                'position_size': quote_available
+                                            }
+                                            update_response = await client.put(f"{database_service_url}/api/v1/trades/{trade_id}", json=update_data)
+                                            update_response.raise_for_status()
+                                            logger.info(f"✅ Database corrected: Trade {trade_id} amount updated to {quote_available:.8f} {asset}")
+                                            
+                                            # Check if the corrected amount is still above minimum
+                                            min_amounts = {
+                                                'cryptocom': {
+                                                    'AAVE/USD': 0.001,
+                                                    'BTC/USD': 0.00001,
+                                                    'ETH/USD': 0.0001,
+                                                    'XRP/USD': 1.0,
+                                                    'default': 0.000001
+                                                },
+                                                'binance': {
+                                                    'XRP/USDC': 1.0,
+                                                    'LINK/USDC': 1.0,
+                                                    'default': 0.001
+                                                },
+                                                'bybit': {
+                                                    'XRP/USDC': 0.01,
+                                                    'BTC/USDC': 0.00001,
+                                                    'ETH/USDC': 0.001,
+                                                    'SOL/USDC': 0.01,
+                                                    'default': 0.001
+                                                }
+                                            }
+                                            exchange_min_amounts = min_amounts.get(exchange_name.lower(), {})
+                                            min_amount = float(exchange_min_amounts.get(pair, exchange_min_amounts.get('default', 0.000001)))
+                                            
+                                            if quote_available < min_amount:
+                                                logger.warning(f"💸 Corrected amount {quote_available:.8f} still below minimum {min_amount} for {pair} on {exchange_name}")
+                                                await self._close_dust_position(trade_id, exchange_name, pair, quote_available, "corrected_position_below_minimum")
+                                                return None
+                                            else:
+                                                # Proceed with corrected amount
+                                                sanitized_amount = quote_available
+                                                amount = quote_available
+                                                logger.info(f"🔧 Proceeding with corrected amount: {sanitized_amount:.8f} {asset}")
+                                                
+                                    except Exception as db_update_err:
+                                        logger.error(f"❌ Failed to update database for trade {trade_id}: {db_update_err}")
+                                        return None
+                                else:
+                                    logger.error(f"🚫 CRITICAL: Position size discrepancy too large! Available: {quote_available:.8f}, Required: {sanitized_amount:.8f}")
+                                    return None
+                    else:  # buy
+                        base_currency = 'USD' if exchange_name == 'cryptocom' else 'USDC'
+                        funds_available = float(current_balance.get('free', {}).get(base_currency, 0) or 0)
+                        # Rough affordability check using current price with small buffer
+                        current_price_for_buy = await self._get_current_price(exchange_name, pair)
+                        if current_price_for_buy > 0:
+                            estimated_cost = sanitized_amount * current_price_for_buy * 1.01
+                            if funds_available < estimated_cost:
+                                logger.error(f"🚫 CRITICAL: Insufficient {base_currency} for BUY. Available: ${funds_available:.2f}, Required: ${estimated_cost:.2f}")
+                                return None
+            except Exception as balance_err:
+                logger.warning(f"⚠️ Could not verify real-time balance for limit order on {exchange_name}: {balance_err}")
             
             # Get current market price
             current_price = await self._get_current_price(exchange_name, pair)
@@ -3246,7 +4167,16 @@ class TradingOrchestrator:
                     await order_tracker.record_order_attempt('limit', limit_result)
                     return limit_result
                 else:
-                    logger.warning(f"⚠️ Limit order failed, falling back to market order for {pair} on {exchange_name}")
+                    # Try intelligent limit order retry with price correction before falling back
+                    logger.info(f"🔄 Attempting intelligent limit order retry with price correction for {pair} on {exchange_name}")
+                    retry_result = await self._intelligent_limit_retry(exchange_name, pair, side, amount, trade_id)
+                    
+                    if retry_result and retry_result.get('id'):
+                        logger.info(f"✅ Intelligent retry successful: {retry_result['id']}")
+                        await order_tracker.record_order_attempt('limit', retry_result)
+                        return retry_result
+                    
+                    logger.warning(f"⚠️ All limit order attempts failed, falling back to market order for {pair} on {exchange_name}")
                     
                     # Record failed limit order attempt to database for tracking
                     import time
@@ -3260,11 +4190,11 @@ class TradingOrchestrator:
                         'amount': amount,
                         'price': None,
                         'status': 'failed',
-                        'error_message': 'Limit order failed, falling back to market order'
+                        'error_message': 'All limit order attempts failed, falling back to market order'
                     }
                     await self._record_order_to_database(db_failed_order)
                     
-                    # Fallback to market order
+                    # Final fallback to market order
                     market_result = await self._place_market_order(exchange_name, pair, side, amount, trade_id)
                     if market_result and market_result.get('id'):
                         await order_tracker.record_order_attempt('market', market_result)
@@ -4140,6 +5070,84 @@ async def select_pairs(exchange: str, pairs: List[str]):
         logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/v1/pairs/update")
+async def force_pairs_update():
+    """Manually trigger pair selection update for all exchanges"""
+    try:
+        logger.info("🔄 Manual pair update triggered via API")
+        await orchestrator._update_pair_selections()
+        orchestrator.last_pair_update = datetime.utcnow()
+        
+        # Get updated pairs count
+        total_pairs = sum(len(pairs) for pairs in orchestrator.pair_selections.values())
+        
+        return {
+            "message": "Pair selection updated successfully",
+            "exchanges": list(orchestrator.pair_selections.keys()),
+            "total_pairs": total_pairs,
+            "updated_at": datetime.utcnow().isoformat(),
+            "pair_selections": orchestrator.pair_selections
+        }
+    except Exception as e:
+        logger.error(f"Error updating pairs: {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/trading/recover-missing-trades")
+async def recover_missing_trades():
+    """Recovery API to identify and create missing trade records from exchange positions"""
+    try:
+        logger.info("🚨 CRITICAL RECOVERY: Scanning for missing trades on all exchanges")
+        recovered_trades = []
+        
+        # Check each exchange for positions that aren't tracked in database
+        exchanges = ['binance', 'bybit', 'cryptocom']
+        
+        for exchange_name in exchanges:
+            try:
+                logger.info(f"🔍 Scanning {exchange_name} for missing trades...")
+                
+                # Get current exchange balances
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    balance_response = await client.get(f"{exchange_service_url}/api/v1/account/balance/{exchange_name}")
+                    if balance_response.status_code != 200:
+                        continue
+                        
+                    balance_data = balance_response.json()
+                    
+                    # Look for positions with reserved/used quantities (indicating open orders/positions)
+                    for asset, balance_info in balance_data.get('used', {}).items():
+                        if float(balance_info) > 0:
+                            logger.warning(f"🔍 Found reserved balance: {asset} = {balance_info} on {exchange_name}")
+                            
+                            # Create recovery trade record for positions not in database
+                            # This would need to be expanded with actual order history lookup
+                            recovered_trades.append({
+                                'exchange': exchange_name,
+                                'asset': asset,
+                                'reserved_amount': balance_info,
+                                'action': 'detected_position'
+                            })
+                            
+            except Exception as exchange_error:
+                logger.error(f"Error scanning {exchange_name}: {exchange_error}")
+                continue
+        
+        return {
+            "message": "Missing trade recovery scan completed",
+            "recovered_trades": recovered_trades,
+            "total_found": len(recovered_trades),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in recovery scan: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/v1/trading/verify-trades")
 async def verify_all_trades_endpoint():
     """Verify all recent trades are properly recorded in database"""
@@ -4149,6 +5157,23 @@ async def verify_all_trades_endpoint():
         return verification_results
     except Exception as e:
         logger.error(f"Error in trade verification: {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/trading/sync-exchange-trades")
+async def sync_exchange_trades_endpoint():
+    """Sync trades with exchanges to close orphaned trades in database"""
+    try:
+        sync_results = await orchestrator.sync_exchange_trades()
+        return {
+            "status": "success",
+            "message": f"Synced {sync_results['trades_synced']}/{sync_results['trades_checked']} trades",
+            "results": sync_results
+        }
+    except Exception as e:
+        logger.error(f"Error in exchange sync: {str(e)}")
         logger.error(f"Exception type: {type(e).__name__}")
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")

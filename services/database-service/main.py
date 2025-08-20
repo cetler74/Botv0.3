@@ -1021,7 +1021,7 @@ async def get_trades(
         # Build base query with calculated fields
         base_query = """
             SELECT *,
-                   (entry_price * position_size) as notional_value,
+                   (COALESCE(current_price, entry_price, 0) * COALESCE(position_size, 0)) as notional_value,
                    profit_protection_trigger as profit_trigger,
                    trail_stop_trigger as trailing_stop,
                    CASE 
@@ -1113,7 +1113,7 @@ async def update_trade(trade_id: str, update_data: Dict[str, Any]):
             if key in ['exit_price', 'exit_id', 'exit_time', 'unrealized_pnl', 
                       'realized_pnl', 'highest_price', 'current_price', 'profit_protection', 
                       'profit_protection_trigger', 'trail_stop', 'trail_stop_trigger',
-                      'exit_reason', 'fees', 'status', 'entry_id', 'position_size']:
+                      'exit_reason', 'fees', 'status', 'entry_id', 'position_size', 'entry_price']:
                 # Normalize status values for consistency
                 if key == 'status':
                     value = normalize_status(value, "trade")
@@ -1167,7 +1167,8 @@ async def get_trade_history(
     min_pnl: Optional[float] = None,
     max_pnl: Optional[float] = None,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    exclude_exit_reason: Optional[str] = None
 ):
     """Get trade history with pagination and filtering"""
     if not db_manager:
@@ -1229,6 +1230,11 @@ async def get_trade_history(
             base_query += " AND entry_time <= %s"
             params.append(end_date)
             
+        # Add exclude exit reason filter (for filtering out dust trades)
+        if exclude_exit_reason:
+            base_query += " AND (exit_reason IS NULL OR exit_reason != %s)"
+            params.append(exclude_exit_reason)
+            
         # Get total count for pagination
         count_query = f"SELECT COUNT(*) as total FROM ({base_query}) as subquery"
         count_result = await db_manager.execute_single_query(count_query, tuple(params))
@@ -1254,6 +1260,67 @@ async def get_trade_history(
         
     except Exception as e:
         logger.error(f"Error getting trade history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/trades/update-prices")
+async def update_current_prices(update_data: Dict[str, Any]):
+    """Update current prices for open trades"""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+        
+    try:
+        pair = update_data.get('pair')
+        exchange = update_data.get('exchange') 
+        current_price = update_data.get('current_price')
+        
+        if not all([pair, exchange, current_price]):
+            raise HTTPException(status_code=400, detail="Missing required fields: pair, exchange, current_price")
+            
+        # Update current price and recalculate unrealized PnL for open trades
+        update_query = """
+            UPDATE trading.trades 
+            SET 
+                current_price = %s,
+                last_price_update = NOW(),
+                price_updates_count = COALESCE(price_updates_count, 0) + 1,
+                unrealized_pnl = CASE 
+                    WHEN status = 'OPEN' THEN 
+                        (%s - entry_price) * position_size 
+                    ELSE unrealized_pnl 
+                END,
+                highest_price = CASE 
+                    WHEN %s > COALESCE(highest_price, entry_price) THEN %s
+                    ELSE highest_price
+                END,
+                updated_at = NOW()
+            WHERE 
+                pair = %s 
+                AND exchange = %s 
+                AND status = 'OPEN'
+        """
+        
+        result = await db_manager.execute_query(
+            update_query, 
+            (current_price, current_price, current_price, current_price, pair, exchange)
+        )
+        
+        # Get count of updated trades
+        count_query = "SELECT COUNT(*) as count FROM trading.trades WHERE pair = %s AND exchange = %s AND status = 'OPEN'"
+        count_result = await db_manager.execute_single_query(count_query, (pair, exchange))
+        updated_count = count_result.get('count', 0) if count_result else 0
+        
+        logger.info(f"Updated current price for {updated_count} open {pair} trades on {exchange} to {current_price}")
+        
+        return {
+            "message": "Prices updated successfully",
+            "updated_trades": updated_count,
+            "pair": pair,
+            "exchange": exchange,
+            "current_price": current_price
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating prices: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/trades/sync-orders")

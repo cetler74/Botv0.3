@@ -164,10 +164,15 @@ class PriceFeedManager:
         
         while not self.shutdown_event.is_set():
             try:
-                # Prefer WS live price if enabled; else use REST fetch loop
-                await self._update_prices_from_ws_if_available()
-                # Fallback/refresh via REST
-                await self._fetch_all_prices()
+                # Track which pairs got WebSocket updates to avoid REST API override
+                ws_updated_pairs = set()
+                
+                # Prefer WS live price if enabled
+                if self.config.get('enable_websocket_prices'):
+                    ws_updated_pairs = await self._update_prices_from_ws_if_available()
+                
+                # Fallback/refresh via REST only for pairs that didn't get WebSocket data
+                await self._fetch_all_prices(exclude_pairs=ws_updated_pairs)
                 
                 # Update trailing stops based on new prices
                 await self._process_trailing_stop_updates()
@@ -179,13 +184,19 @@ class PriceFeedManager:
                 logger.error(f"❌ Error in price monitoring loop: {e}")
                 await asyncio.sleep(5.0)  # Longer sleep on errors
     
-    async def _fetch_all_prices(self):
-        """Fetch current prices for all active trading pairs"""
+    async def _fetch_all_prices(self, exclude_pairs=None):
+        """Fetch current prices for all active trading pairs, excluding specified pairs"""
+        if exclude_pairs is None:
+            exclude_pairs = set()
+            
         tasks = []
         
         for exchange_name, pairs in self.active_pairs.items():
             for pair in pairs:
-                tasks.append(self._fetch_price(exchange_name, pair))
+                pair_key = f"{exchange_name}:{pair}"
+                # Skip pairs that were successfully updated via WebSocket
+                if pair_key not in exclude_pairs:
+                    tasks.append(self._fetch_price(exchange_name, pair))
         
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -200,14 +211,21 @@ class PriceFeedManager:
             logger.warning(f"Realtime config not available, using defaults: {e}")
 
     async def _update_prices_from_ws_if_available(self):
+        """Update prices from WebSocket and return set of pairs that were successfully updated"""
+        updated_pairs = set()
         if not self.config.get('enable_websocket_prices'):
-            return
+            return updated_pairs
+            
         try:
             stale = self.config.get('stale_price_threshold_seconds', 30)
             async with httpx.AsyncClient(timeout=3.0) as client:
                 for exchange_name, pairs in self.active_pairs.items():
                     for pair in pairs:
-                        symbol = pair.replace('/', '')
+                        # Use correct symbol format for each exchange
+                        if exchange_name == 'cryptocom':
+                            symbol = pair  # Keep slash format for Crypto.com: ACH/USD
+                        else:
+                            symbol = pair.replace('/', '')  # Remove slash for others: ETHUSDC
                         url = f"{EXCHANGE_SERVICE_URL}/api/v1/market/ticker-live/{exchange_name}/{symbol}"
                         r = await client.get(url, params={'stale_threshold_seconds': stale})
                         if r.status_code == 200:
@@ -224,16 +242,23 @@ class PriceFeedManager:
                                     'timestamp': datetime.utcnow(),
                                     'source': 'websocket'
                                 }
+                                # Track this pair as successfully updated via WebSocket
+                                updated_pairs.add(f"{exchange_name}:{pair}")
         except Exception as e:
             logger.debug(f"WS price update skipped: {e}")
+            
+        return updated_pairs
     
     async def _fetch_price(self, exchange_name: str, pair: str):
         """Fetch price for a specific exchange/pair"""
         try:
             # Try to get price from exchange service
             async with httpx.AsyncClient(timeout=5.0) as client:
-                # Convert pair format if needed
-                symbol = pair.replace('/', '')  # Simple conversion for now
+                # Use correct symbol format for each exchange
+                if exchange_name == 'cryptocom':
+                    symbol = pair  # Keep slash format for Crypto.com: ACH/USD
+                else:
+                    symbol = pair.replace('/', '')  # Remove slash for others: ETHUSDC
                 
                 response = await client.get(
                     f"{EXCHANGE_SERVICE_URL}/api/v1/market/ticker/{exchange_name}/{symbol}"
@@ -415,7 +440,11 @@ class PriceFeedManager:
             max_per_ex = self.config.get('ws', {}).get('max_concurrent_subscriptions_per_exchange', 50)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 for exchange_name, pairs in self.active_pairs.items():
-                    symbols = [p.replace('/', '') for p in list(pairs)][:max_per_ex]
+                    # Use correct symbol format for each exchange
+                    if exchange_name == 'cryptocom':
+                        symbols = list(pairs)[:max_per_ex]  # Keep slash format for Crypto.com
+                    else:
+                        symbols = [p.replace('/', '') for p in list(pairs)][:max_per_ex]  # Remove slash for others
                     if not symbols:
                         continue
                     try:
@@ -594,12 +623,21 @@ async def get_active_trailing_stops():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/price/{exchange}/{pair}")
+@app.get("/api/v1/price/{exchange}/{pair:path}")
 async def get_current_price(exchange: str, pair: str):
     """Get current price for a specific exchange/pair from cache"""
     try:
+        # URL decode the pair parameter to handle encoded slashes
+        from urllib.parse import unquote
+        decoded_pair = unquote(pair)
+        
         # Try different cache key formats to match what's actually stored
         possible_keys = [
+            f"{exchange}:{decoded_pair}",
+            f"{exchange.lower()}:{decoded_pair.upper()}",
+            f"{exchange.upper()}:{decoded_pair.lower()}",
+            f"{exchange.upper()}:{decoded_pair.upper()}",
+            # Also try original pair format in case it wasn't encoded
             f"{exchange}:{pair}",
             f"{exchange.lower()}:{pair.upper()}",
             f"{exchange.upper()}:{pair.lower()}",

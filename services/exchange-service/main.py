@@ -38,6 +38,10 @@ class WebSocketExchangeHandler:
         self.last_update = None
         self.order_callbacks = {}  # order_id -> callback function
         self.subscribed_symbols: Set[str] = set()
+        # Task lifecycle management
+        self.listener_task = None
+        self.reconnect_task = None
+        self.should_stop = False
         
     async def connect(self) -> bool:
         """Establish WebSocket connection to exchange"""
@@ -51,8 +55,17 @@ class WebSocketExchangeHandler:
             self.is_connected = True
             self.last_update = datetime.utcnow().isoformat()
             
-            # Start listening for messages
-            asyncio.create_task(self._listen_for_messages())
+            # Start listening for messages with proper task management
+            if self.listener_task:
+                self.listener_task.cancel()
+            self.listener_task = asyncio.create_task(self._listen_for_messages())
+            
+            # Start automatic reconnection monitoring
+            if self.reconnect_task:
+                self.reconnect_task.cancel()
+            self.reconnect_task = asyncio.create_task(self._monitor_connection())
+            
+            logger.info(f"✅ {self.exchange_name} WebSocket connected with listener task")
             return True
             
         except Exception as e:
@@ -61,7 +74,27 @@ class WebSocketExchangeHandler:
             return False
     
     async def disconnect(self):
-        """Close WebSocket connection"""
+        """Close WebSocket connection and cleanup tasks"""
+        self.should_stop = True
+        
+        # Cancel tasks
+        if self.listener_task:
+            self.listener_task.cancel()
+            try:
+                await self.listener_task
+            except asyncio.CancelledError:
+                pass
+            self.listener_task = None
+            
+        if self.reconnect_task:
+            self.reconnect_task.cancel()
+            try:
+                await self.reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self.reconnect_task = None
+        
+        # Close connection
         if self.connection:
             try:
                 await self.connection.close()
@@ -70,12 +103,17 @@ class WebSocketExchangeHandler:
             finally:
                 self.connection = None
                 self.is_connected = False
-                logger.info(f"Disconnected from {self.exchange_name} WebSocket")
+                logger.info(f"🔌 Disconnected from {self.exchange_name} WebSocket")
     
     async def _listen_for_messages(self):
-        """Listen for incoming WebSocket messages"""
+        """Listen for incoming WebSocket messages with proper lifecycle management"""
+        logger.info(f"🎧 Starting message listener for {self.exchange_name}")
         try:
             async for message in self.connection:
+                if self.should_stop:
+                    logger.info(f"🛑 Message listener stopped for {self.exchange_name}")
+                    break
+                    
                 try:
                     data = json.loads(message)
                     # Try to parse ticker updates first; if not, handle as order update
@@ -86,12 +124,89 @@ class WebSocketExchangeHandler:
                     logger.warning(f"Invalid JSON message from {self.exchange_name}: {message}")
                 except Exception as e:
                     logger.error(f"Error processing message from {self.exchange_name}: {e}")
+                    
         except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"WebSocket connection closed for {self.exchange_name}")
+            if not self.should_stop:
+                logger.warning(f"⚠️ WebSocket connection closed unexpectedly for {self.exchange_name}")
             self.is_connected = False
+        except asyncio.CancelledError:
+            logger.info(f"🔄 Message listener cancelled for {self.exchange_name}")
+            raise
         except Exception as e:
-            logger.error(f"Error in WebSocket listener for {self.exchange_name}: {e}")
+            logger.error(f"❌ Error in WebSocket listener for {self.exchange_name}: {e}")
             self.is_connected = False
+        finally:
+            logger.info(f"🔚 Message listener ended for {self.exchange_name}")
+    
+    async def _monitor_connection(self):
+        """Monitor connection health and auto-reconnect if needed"""
+        logger.info(f"📡 Starting connection monitor for {self.exchange_name}")
+        
+        while not self.should_stop:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                if not self.is_connected and not self.should_stop:
+                    logger.warning(f"🔄 Connection lost for {self.exchange_name}, attempting reconnect...")
+                    
+                    # Attempt reconnection
+                    try:
+                        if self.connection:
+                            try:
+                                await self.connection.close()
+                            except:
+                                pass
+                                
+                        # Wait a bit before reconnecting
+                        await asyncio.sleep(5)
+                        
+                        # Reconnect
+                        logger.info(f"🔄 Reconnecting to {self.exchange_name} WebSocket...")
+                        self.connection = await websockets.connect(self.websocket_url)
+                        self.is_connected = True
+                        self.last_update = datetime.utcnow().isoformat()
+                        
+                        # Restart message listener
+                        if self.listener_task:
+                            self.listener_task.cancel()
+                        self.listener_task = asyncio.create_task(self._listen_for_messages())
+                        
+                        logger.info(f"✅ Reconnected to {self.exchange_name} WebSocket")
+                        
+                        # Re-subscribe to symbols if any
+                        if self.subscribed_symbols:
+                            logger.info(f"🔄 Re-subscribing to {len(self.subscribed_symbols)} symbols for {self.exchange_name}")
+                            await self._resubscribe_symbols()
+                        
+                    except Exception as reconnect_error:
+                        logger.error(f"❌ Reconnection failed for {self.exchange_name}: {reconnect_error}")
+                        await asyncio.sleep(30)  # Wait longer before next attempt
+                        
+            except asyncio.CancelledError:
+                logger.info(f"🛑 Connection monitor cancelled for {self.exchange_name}")
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in connection monitor for {self.exchange_name}: {e}")
+                await asyncio.sleep(60)
+    
+    async def _resubscribe_symbols(self):
+        """Re-subscribe to all previously subscribed symbols after reconnection"""
+        if not self.subscribed_symbols:
+            return
+            
+        try:
+            symbols_list = list(self.subscribed_symbols)
+            logger.info(f"🔄 Re-subscribing to symbols for {self.exchange_name}: {symbols_list}")
+            
+            # Clear and re-subscribe to ensure clean state
+            temp_symbols = self.subscribed_symbols.copy()
+            self.subscribed_symbols.clear()
+            await self.subscribe(symbols_list)
+            
+            logger.info(f"✅ Successfully re-subscribed to {len(symbols_list)} symbols for {self.exchange_name}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to re-subscribe symbols for {self.exchange_name}: {e}")
     
     async def _handle_order_update(self, data: dict):
         """Handle order update from WebSocket - FIXED VERSION"""
@@ -148,18 +263,76 @@ class WebSocketExchangeHandler:
                     self.last_update = datetime.utcnow().isoformat()
                     return True
 
-            # Crypto.com public ticker
+            # Crypto.com public ticker - handle both subscription responses and ticker data
             if self.exchange_name.lower() == 'cryptocom':
+                # Handle subscription confirmations - also process initial ticker data
+                if isinstance(data, dict) and data.get('method') == 'subscribe' and data.get('code') == 0:
+                    result = data.get('result', {})
+                    logger.info(f"Crypto.com subscription confirmed: {result.get('subscription', 'unknown')}")
+                    
+                    # Process initial ticker data from subscription response
+                    initial_data = result.get('data', [])
+                    if isinstance(initial_data, list) and initial_data:
+                        for ticker_item in initial_data:
+                            if isinstance(ticker_item, dict) and ticker_item.get('i'):
+                                instrument = ticker_item.get('i')
+                                last_price = ticker_item.get('a')
+                                bid_price = ticker_item.get('b')
+                                ask_price = ticker_item.get('k')
+                                
+                                if instrument and last_price:
+                                    _update_ticker_cache(self.exchange_name, instrument, last_price, bid_price, ask_price)
+                                    logger.info(f"🎯 Crypto.com initial ticker: {instrument} = ${last_price} (bid: ${bid_price}, ask: ${ask_price})")
+                    
+                    self.last_update = datetime.utcnow().isoformat()
+                    return True
+                
+                # Handle direct ticker data format from current API (simple format)
+                if isinstance(data, dict) and data.get('i'):  # 'i' = instrument name
+                    instrument = data.get('i')
+                    last_price = data.get('a')  # 'a' = latest trade price
+                    bid_price = data.get('b')   # 'b' = best bid price  
+                    ask_price = data.get('k')   # 'k' = best ask price
+                    
+                    if instrument and last_price:
+                        # Store with the instrument format that matches our cache keys
+                        _update_ticker_cache(self.exchange_name, instrument, last_price, bid_price, ask_price)
+                        logger.info(f"🎯 Crypto.com ticker update: {instrument} = ${last_price} (bid: ${bid_price}, ask: ${ask_price})")
+                        self.last_update = datetime.utcnow().isoformat()
+                        return True
+                
+                # Handle legacy subscription format (method=subscription with params)
+                if isinstance(data, dict) and data.get('method') == 'subscription':
+                    params = data.get('params', {})
+                    channel = params.get('channel', '')
+                    if channel.startswith('ticker.'):
+                        ticker_data = params.get('data', {})
+                        if ticker_data:
+                            # Extract instrument name from channel (e.g., ticker.AAVE_USD -> AAVE_USD)
+                            instrument = channel.replace('ticker.', '')
+                            last = ticker_data.get('a')  # last price
+                            bid = ticker_data.get('b')   # bid price  
+                            ask = ticker_data.get('k')   # ask price
+                            
+                            if instrument and last:
+                                # Store with the instrument format that matches our cache keys (AAVE_USD)
+                                _update_ticker_cache(self.exchange_name, instrument, last, bid, ask)
+                                logger.info(f"🎯 Crypto.com legacy ticker update: {instrument} = ${last} (bid: ${bid}, ask: ${ask})")
+                            
+                        self.last_update = datetime.utcnow().isoformat()
+                        return True
+                
+                # Fallback: Handle old format for compatibility
                 if isinstance(data, dict) and data.get('result') and isinstance(data['result'], dict):
                     items = data['result'].get('data') or []
                     if isinstance(items, dict):
                         items = [items]
                     for item in items:
-                        # instrument name could be like BTC_USD; normalize by removing non-alnum
                         instr = item.get('i') or item.get('instrument_name') or item.get('s')
                         if not instr:
                             continue
-                        symbol = ''.join(ch for ch in str(instr) if ch.isalnum())
+                        # Keep underscore format for cache key consistency
+                        symbol = instr.replace('/', '_') if '/' in instr else instr
                         last = item.get('a') or item.get('c') or item.get('last')
                         bid = item.get('b')
                         ask = item.get('k') or item.get('a')
@@ -186,16 +359,26 @@ class WebSocketExchangeHandler:
                 await self.connection.send(json.dumps(msg))
             # Crypto.com subscribe
             if self.exchange_name.lower() == 'cryptocom' and self.connection:
-                # Crypto.com expects instrument_name like BTC_USD; try to infer by inserting underscore before USD/USDC
-                args = []
+                # Crypto.com expects ticker channels in format: ticker.INSTRUMENT_NAME (e.g., ticker.AAVE_USD)
+                channels = []
                 for s in new_syms:
-                    if s.endswith('USD'):
-                        args.append({"instrument_name": f"{s[:-3]}_USD"})
+                    # Convert symbol format: AAVE/USD -> ticker.AAVE_USD, BTCUSDC -> ticker.BTC_USDC
+                    if '/' in s:
+                        # Symbol already has slash: AAVE/USD -> AAVE_USD
+                        instrument = s.replace('/', '_')
+                    elif s.endswith('USD'):
+                        # Symbol like AAVEUSD -> AAVE_USD
+                        instrument = f"{s[:-3]}_USD"
                     elif s.endswith('USDC'):
-                        args.append({"instrument_name": f"{s[:-4]}_USDC"})
-                if args:
-                    msg = {"id": int(time.time()), "method": "subscribe", "params": {"channels": ["ticker"]}, "nonce": int(time.time()*1000)}
-                    # Some implementations require channels with instrument_name; keep simple here
+                        # Symbol like BTCUSDC -> BTC_USDC  
+                        instrument = f"{s[:-4]}_USDC"
+                    else:
+                        instrument = s
+                    
+                    channels.append(f"ticker.{instrument}")
+                
+                if channels:
+                    msg = {"id": int(time.time()), "method": "subscribe", "params": {"channels": channels}, "nonce": int(time.time()*1000)}
                     await self.connection.send(json.dumps(msg))
         except Exception as e:
             logger.warning(f"Subscription error for {self.exchange_name}: {e}")
@@ -210,9 +393,22 @@ class WebSocketExchangeHandler:
                 msg = {"op": "unsubscribe", "args": topics}
                 await self.connection.send(json.dumps(msg))
             if self.exchange_name.lower() == 'cryptocom' and self.connection:
-                # Send generic unsubscribe
-                msg = {"id": int(time.time()), "method": "unsubscribe", "params": {"channels": ["ticker"]}, "nonce": int(time.time()*1000)}
-                await self.connection.send(json.dumps(msg))
+                # Unsubscribe from specific ticker channels
+                channels = []
+                for s in remove_syms:
+                    if '/' in s:
+                        instrument = s.replace('/', '_')
+                    elif s.endswith('USD'):
+                        instrument = f"{s[:-3]}_USD"
+                    elif s.endswith('USDC'):
+                        instrument = f"{s[:-4]}_USDC"
+                    else:
+                        instrument = s
+                    channels.append(f"ticker.{instrument}")
+                
+                if channels:
+                    msg = {"id": int(time.time()), "method": "unsubscribe", "params": {"channels": channels}, "nonce": int(time.time()*1000)}
+                    await self.connection.send(json.dumps(msg))
         except Exception as e:
             logger.warning(f"Unsubscribe error for {self.exchange_name}: {e}")
     
@@ -355,8 +551,17 @@ websocket_manager = WebSocketManager()
 ticker_cache: Dict[str, Dict[str, Any]] = {}
 
 def _normalize_symbol_key(exchange: str, symbol: str) -> str:
-    # Symbol expected without slash by most callers (e.g., BTCUSD, BTCUSDC)
-    normalized = ''.join(ch for ch in str(symbol) if ch.isalnum())
+    # Handle symbol normalization per exchange requirements
+    if exchange.lower() == 'cryptocom':
+        # For Crypto.com, keep underscore format for consistency with WebSocket data
+        if '/' in symbol:
+            normalized = symbol.replace('/', '_')
+        else:
+            normalized = symbol
+    else:
+        # For other exchanges, strip non-alphanumeric characters
+        normalized = ''.join(ch for ch in str(symbol) if ch.isalnum())
+    
     return f"{exchange}:{normalized}"
 
 def _update_ticker_cache(exchange: str, symbol: str, last: Any, bid: Any, ask: Any) -> None:
@@ -1309,8 +1514,149 @@ async def get_websocket_status(exchange: str):
     return {
         "connected": handler.is_connected,
         "last_update": handler.last_update,
-        "registered_callbacks": len(handler.order_callbacks)
+        "registered_callbacks": len(handler.order_callbacks),
+        "listener_task_running": handler.listener_task is not None and not handler.listener_task.done() if handler.listener_task else False,
+        "reconnect_task_running": handler.reconnect_task is not None and not handler.reconnect_task.done() if handler.reconnect_task else False,
+        "subscribed_symbols": len(handler.subscribed_symbols),
+        "subscribed_symbols_list": list(handler.subscribed_symbols),
+        "websocket_url": handler.websocket_url
     }
+
+@app.get("/api/v1/websocket/monitor/all")
+async def get_all_websocket_status():
+    """Get comprehensive WebSocket status for all exchanges with ticker data"""
+    from datetime import datetime, timedelta
+    
+    result = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "exchanges": {},
+        "summary": {
+            "total_exchanges": 0,
+            "connected_exchanges": 0,
+            "active_listeners": 0,
+            "total_subscribed_symbols": 0,
+            "total_ticker_cache_entries": 0
+        }
+    }
+    
+    for exchange_name, handler in websocket_manager.handlers.items():
+        # Calculate time since last update
+        last_update_age = None
+        if handler.last_update:
+            try:
+                last_update_dt = datetime.fromisoformat(handler.last_update)
+                last_update_age = (datetime.utcnow() - last_update_dt).total_seconds()
+            except:
+                last_update_age = None
+        
+        # Get ticker cache entries for this exchange
+        exchange_tickers = {}
+        ticker_count = 0
+        for cache_key, cache_data in ticker_cache.items():
+            if cache_key.startswith(f"{exchange_name}:"):
+                symbol = cache_key.split(':', 1)[1]
+                ticker_age = None
+                if cache_data.get('timestamp'):
+                    try:
+                        ticker_dt = datetime.fromisoformat(cache_data['timestamp'])
+                        ticker_age = (datetime.utcnow() - ticker_dt).total_seconds()
+                    except:
+                        ticker_age = None
+                
+                exchange_tickers[symbol] = {
+                    "last_price": cache_data.get('last'),
+                    "bid": cache_data.get('bid'),
+                    "ask": cache_data.get('ask'),
+                    "timestamp": cache_data.get('timestamp'),
+                    "age_seconds": ticker_age
+                }
+                ticker_count += 1
+        
+        exchange_info = {
+            "connected": handler.is_connected,
+            "websocket_url": handler.websocket_url,
+            "last_update": handler.last_update,
+            "last_update_age_seconds": last_update_age,
+            "listener_task_running": handler.listener_task is not None and not handler.listener_task.done() if handler.listener_task else False,
+            "reconnect_task_running": handler.reconnect_task is not None and not handler.reconnect_task.done() if handler.reconnect_task else False,
+            "subscribed_symbols": list(handler.subscribed_symbols),
+            "subscribed_count": len(handler.subscribed_symbols),
+            "registered_callbacks": len(handler.order_callbacks),
+            "ticker_cache_entries": ticker_count,
+            "cached_tickers": exchange_tickers
+        }
+        
+        result["exchanges"][exchange_name] = exchange_info
+        
+        # Update summary
+        result["summary"]["total_exchanges"] += 1
+        if handler.is_connected:
+            result["summary"]["connected_exchanges"] += 1
+        if handler.listener_task and not handler.listener_task.done():
+            result["summary"]["active_listeners"] += 1
+        result["summary"]["total_subscribed_symbols"] += len(handler.subscribed_symbols)
+        result["summary"]["total_ticker_cache_entries"] += ticker_count
+    
+    return result
+
+@app.get("/api/v1/websocket/monitor/ticker-cache")
+async def get_ticker_cache_status():
+    """Get detailed ticker cache information across all exchanges"""
+    from datetime import datetime
+    
+    result = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "total_entries": len(ticker_cache),
+        "exchanges": {},
+        "recent_updates": []
+    }
+    
+    # Group by exchange
+    for cache_key, cache_data in ticker_cache.items():
+        if ':' not in cache_key:
+            continue
+            
+        exchange_name, symbol = cache_key.split(':', 1)
+        
+        if exchange_name not in result["exchanges"]:
+            result["exchanges"][exchange_name] = {
+                "ticker_count": 0,
+                "tickers": {}
+            }
+        
+        # Calculate age
+        ticker_age = None
+        if cache_data.get('timestamp'):
+            try:
+                ticker_dt = datetime.fromisoformat(cache_data['timestamp'])
+                ticker_age = (datetime.utcnow() - ticker_dt).total_seconds()
+            except:
+                ticker_age = None
+        
+        ticker_info = {
+            "last_price": cache_data.get('last'),
+            "bid": cache_data.get('bid'),
+            "ask": cache_data.get('ask'),
+            "timestamp": cache_data.get('timestamp'),
+            "age_seconds": ticker_age
+        }
+        
+        result["exchanges"][exchange_name]["tickers"][symbol] = ticker_info
+        result["exchanges"][exchange_name]["ticker_count"] += 1
+        
+        # Track recent updates (less than 60 seconds old)
+        if ticker_age and ticker_age < 60:
+            result["recent_updates"].append({
+                "exchange": exchange_name,
+                "symbol": symbol,
+                "age_seconds": ticker_age,
+                "last_price": cache_data.get('last')
+            })
+    
+    # Sort recent updates by age
+    result["recent_updates"].sort(key=lambda x: x["age_seconds"] or 9999)
+    
+    return result
 
 @app.post("/api/v1/websocket/{exchange}/subscribe")
 async def subscribe_symbols(exchange: str, payload: Dict[str, Any]):

@@ -7,8 +7,9 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Trading Bot Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css?v=20240723" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css?v=20240723" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20240723" rel="stylesheet">
 
     <style>
         .gradient-bg {
@@ -30,6 +31,21 @@
         .status-online { background-color: #10b981; }
         .status-offline { background-color: #ef4444; }
         .status-warning { background-color: #f59e0b; }
+        /* Custom badge styles for fallback */
+        .badge {
+          display: inline-block;
+          padding: 0.25em 0.6em;
+          font-size: 75%;
+          font-weight: 700;
+          line-height: 1;
+          color: #fff;
+          text-align: center;
+          white-space: nowrap;
+          vertical-align: baseline;
+          border-radius: 0.25rem;
+        }
+        .bg-success { background-color: #10b981 !important; }
+        .bg-secondary { background-color: #6b7280 !important; }
         
         /* Mobile-specific styles */
         @media (max-width: 768px) {
@@ -79,25 +95,6 @@
             -webkit-overflow-scrolling: touch;
         }
         
-        /* Sortable table headers */
-        .sortable {
-            cursor: pointer;
-            user-select: none;
-            transition: background-color 0.2s;
-        }
-        
-        .sortable:hover {
-            background-color: #f3f4f6;
-        }
-        
-        .sortable.sort-asc i:before {
-            content: "\f0de";
-        }
-        
-        .sortable.sort-desc i:before {
-            content: "\f0dd";
-        }
-        
         /* Mobile navigation improvements */
         .mobile-nav-toggle {
             display: none;
@@ -129,7 +126,7 @@
 <body class="bg-gray-100">
     <!-- Navigation -->
     <nav class="gradient-bg text-white shadow-lg relative">
-        <div class="w-full px-4 sm:px-6 lg:px-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex justify-between h-16">
                 <div class="flex items-center">
                     <i class="fas fa-chart-line text-2xl mr-3"></i>
@@ -158,7 +155,19 @@
     </nav>
 
     <!-- Main Content -->
-    <div class="w-full px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8">
+    <div class="w-full px-2 sm:px-4 py-4 sm:py-6 lg:py-8">
+        <!-- Add missing control buttons and status indicators for dashboard.js compatibility -->
+        <div class="flex space-x-2 mb-4">
+          <button id="start-btn" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg text-sm font-medium text-white">Start</button>
+          <button id="stop-btn" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded-lg text-sm font-medium text-white">Stop</button>
+          <button id="emergency-btn" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm font-medium text-white">Emergency</button>
+          <span id="status-indicator" class="badge bg-secondary ml-4">Status</span>
+        </div>
+        <div class="flex space-x-4 mb-4">
+          <div><span class="font-medium">Trading Status:</span> <span id="bot-trading-status" class="font-mono"></span></div>
+          <div><span class="font-medium">Cycle Count:</span> <span id="bot-cycle-count" class="font-mono"></span></div>
+          <div><span class="font-medium">Uptime:</span> <span id="bot-uptime" class="font-mono"></span></div>
+        </div>
         <!-- Bot/System Status Section -->
         <div id="bot-status-section" class="mb-8">
             <div class="bg-white rounded-lg shadow-md p-6 flex flex-col md:flex-row md:items-center md:justify-between">
@@ -170,23 +179,6 @@
                     <div><span class="font-medium">Trading Status:</span> <span id="bot-trading-status" class="font-mono"></span></div>
                     <div><span class="font-medium">Cycle Count:</span> <span id="bot-cycle-count" class="font-mono"></span></div>
                     <div><span class="font-medium">Uptime:</span> <span id="bot-uptime" class="font-mono"></span></div>
-                    <div class="mt-2 flex gap-2">
-                        <a href="/profitability" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors touch-target inline-flex items-center">
-                            <i class="fas fa-chart-line mr-2"></i>
-                            <span class="mobile-hidden">Profitability Analysis</span>
-                            <span class="md:hidden">Analysis</span>
-                        </a>
-                        <a href="/analytics" class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors touch-target inline-flex items-center">
-                            <i class="fas fa-chart-area mr-2"></i>
-                            <span class="mobile-hidden">Trading Analytics</span>
-                            <span class="md:hidden">Analytics</span>
-                        </a>
-                        <a href="/orders" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors touch-target inline-flex items-center">
-                            <i class="fas fa-list mr-2"></i>
-                            <span class="mobile-hidden">Orders Status</span>
-                            <span class="md:hidden">Orders</span>
-                        </a>
-                    </div>
                 </div>
             </div>
         </div>
@@ -240,8 +232,8 @@
         </script>
         <!-- End Bot/System Status Section -->
         <!-- Portfolio Overview -->
-        <div class="grid mobile-grid-1 tablet-grid-2 laptop-grid-3 desktop-grid-3 gap-4 sm:gap-6 mb-6 sm:mb-8">
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 sm:gap-6 mb-6 sm:mb-8 w-full">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-blue-100 text-blue-600">
                         <i class="fas fa-wallet text-xl"></i>
@@ -252,7 +244,7 @@
                     </div>
                 </div>
             </div>
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-cyan-100 text-cyan-600">
                         <i class="fas fa-coins text-xl"></i>
@@ -264,7 +256,7 @@
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-green-100 text-green-600">
                         <i class="fas fa-chart-line text-xl"></i>
@@ -276,7 +268,7 @@
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-yellow-100 text-yellow-600">
                         <i class="fas fa-calendar-day text-xl"></i>
@@ -288,7 +280,7 @@
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-purple-100 text-purple-600">
                         <i class="fas fa-exchange-alt text-xl"></i>
@@ -300,7 +292,7 @@
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-indigo-100 text-indigo-600">
                         <i class="fas fa-chart-area text-xl"></i>
@@ -312,7 +304,7 @@
                 </div>
             </div>
 
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-emerald-100 text-emerald-600">
                         <i class="fas fa-trophy text-xl"></i>
@@ -321,68 +313,6 @@
                         <p class="text-sm font-medium text-gray-600 mobile-text-xs">Win Rate</p>
                         <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="win-rate">0%</p>
                     </div>
-                </div>
-            </div>
-
-            <!-- Shadow PnL Card (Realized + Unrealized) -->
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover">
-                <div class="flex items-start justify-between">
-                    <div class="flex items-center">
-                        <div class="p-3 rounded-full bg-pink-100 text-pink-600">
-                            <i class="fas fa-dollar-sign text-xl"></i>
-                        </div>
-                        <div class="ml-4">
-                            <p class="text-sm font-medium text-gray-600 mobile-text-xs">Shadow PnL</p>
-                            <p class="text-xs text-gray-500">Computed from fills (FIFO)</p>
-                        </div>
-                    </div>
-                    <div class="flex flex-col space-y-2">
-                        <div class="flex space-x-2">
-                            <select id="pnl-exchange" class="border border-gray-300 rounded px-2 py-1 text-xs">
-                                <option value="cryptocom" selected>cryptocom</option>
-                                <option value="binance">binance</option>
-                                <option value="bybit">bybit</option>
-                            </select>
-                            <input id="pnl-symbol" type="text" value="A2Z/USD" class="border border-gray-300 rounded px-2 py-1 text-xs w-28" title="Symbol (e.g., BTC/USD)" />
-                            <select id="pnl-period" class="border border-gray-300 rounded px-2 py-1 text-xs">
-                                <option value="today">Today</option>
-                                <option value="7d" selected>7d</option>
-                                <option value="30d">30d</option>
-                                <option value="all">All</option>
-                            </select>
-                        </div>
-                    </div>
-                </div>
-                <div class="grid grid-cols-2 gap-4 mt-4">
-                    <div>
-                        <p class="text-xs text-gray-500">Realized (excl. fees)</p>
-                        <p id="pnl-realized" class="text-lg font-semibold text-gray-900">$0.00</p>
-                    </div>
-                    <div>
-                        <p class="text-xs text-gray-500">Fees (USD)</p>
-                        <p id="pnl-fees" class="text-lg font-semibold text-gray-900">$0.00</p>
-                    </div>
-                    <div>
-                        <p class="text-xs text-gray-500">Realized (incl. fees)</p>
-                        <p id="pnl-realized-incl" class="text-lg font-semibold text-gray-900">$0.00</p>
-                    </div>
-                    <div>
-                        <p class="text-xs text-gray-500">Unrealized</p>
-                        <p id="pnl-unrealized" class="text-lg font-semibold text-gray-900">$0.00</p>
-                    </div>
-                    <div>
-                        <p class="text-xs text-gray-500">Inventory Notional</p>
-                        <p id="pnl-notional" class="text-lg font-semibold text-gray-900">$0.00</p>
-                    </div>
-                    <div>
-                        <p class="text-xs text-gray-500">Current Price</p>
-                        <p id="pnl-current-price" class="text-lg font-semibold text-gray-900">$0.0000</p>
-                    </div>
-                </div>
-                <div class="mt-3">
-                    <button id="pnl-refresh" class="text-blue-600 hover:text-blue-800 text-sm">
-                        <i class="fas fa-sync-alt mr-1"></i>Refresh PnL
-                    </button>
                 </div>
             </div>
         </div>
@@ -416,7 +346,7 @@
 
 
         <!-- Recent Trades -->
-        <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6">
+        <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
             <div class="flex mobile-flex-col justify-between items-center mobile-space-y-2 mb-4">
                 <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm">Recent Trades</h3>
                 <div class="flex mobile-flex-col space-x-2 mobile-space-x-0 mobile-space-y-2">
@@ -426,12 +356,6 @@
                         <option value="OPEN">Open Only</option>
                         <option value="CLOSED">Closed Only</option>
                         <option value="PENDING_EXIT">Pending Exit</option>
-                    </select>
-                    <select id="trades-page-size" class="border border-gray-300 rounded px-3 py-1 text-sm mobile-full-width">
-                        <option value="20">Show 20</option>
-                        <option value="50" selected>Show 50</option>
-                        <option value="100">Show 100</option>
-                        <option value="all">Show All</option>
                     </select>
                     <button id="refresh-trades" class="text-blue-600 hover:text-blue-800 touch-target">
                         <i class="fas fa-sync-alt"></i>
@@ -443,42 +367,24 @@
               <label><input type="checkbox" class="toggle-col" data-col="trailing-stop" checked> Trailing Stop</label>
               <label><input type="checkbox" class="toggle-col" data-col="highest-price" checked> Highest Price</label>
             </div>
-            <div class="responsive-table">
-                <table class="min-w-full divide-y divide-gray-200">
+            <div class="responsive-table w-full">
+                <table class="min-w-full w-full divide-y divide-gray-200">
                     <thead class="bg-gray-50">
                         <tr>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="trade_id">
-                                Trade ID <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="pair">
-                                Pair <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden sortable" data-sort="exchange">
-                                Exchange <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden sortable" data-sort="entry_time">
-                                Entry Time <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="entry_price">
-                                Entry Price <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="current_price">
-                                Current Price <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="position_size">
-                                Amount (units) <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="notional_value">Notional Value ($) <i class="fas fa-sort ml-1"></i></th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="unrealized_pnl">
-                                Unrealized PnL <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="status">
-                                Status <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden sortable" data-sort="entry_reason">Entry Reason <i class="fas fa-sort ml-1"></i></th>
-                            <th class="profit-trigger-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider sortable" data-sort="profit_trigger">Profit Trigger <i class="fas fa-sort ml-1"></i></th>
-                            <th class="trailing-stop-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider sortable" data-sort="trailing_stop">Trailing Stop <i class="fas fa-sort ml-1"></i></th>
-                            <th class="highest-price-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider sortable" data-sort="highest_price">Highest Price <i class="fas fa-sort ml-1"></i></th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Trade ID</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Pair</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden">Exchange</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden">Entry Time</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Current Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Amount (units)</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Notional Value ($)</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Unrealized PnL</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Status</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs mobile-hidden">Entry Reason</th>
+                            <th class="profit-trigger-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Profit Trigger</th>
+                            <th class="trailing-stop-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Trailing Stop</th>
+                            <th class="highest-price-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Highest Price</th>
                         </tr>
                     </thead>
                     <tbody id="trades-table-body" class="bg-white divide-y divide-gray-200">
@@ -486,29 +392,18 @@
                     </tbody>
                 </table>
             </div>
-            <div class="mt-4 flex justify-between items-center">
-                <div class="text-sm text-gray-500">
-                    <span id="trades-summary">Showing 0 trades</span>
-                </div>
-                <div class="flex space-x-2" id="trades-pagination">
-                    <button id="trades-prev-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">Previous</button>
-                    <span id="trades-page-info" class="px-3 py-1 text-sm text-gray-600">Page 1</span>
-                    <button id="trades-next-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">Next</button>
-                </div>
-            </div>
         </div>
 
         <!-- Exchange Status -->
-        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6">
+        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
             <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm mb-4">Exchange Status</h3>
-            <div id="exchange-debug" class="text-sm text-gray-600 mb-2">Debug: Loading exchange status...</div>
             <div id="exchange-status" class="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <!-- Exchange status will be populated here -->
             </div>
         </div>
 
         <!-- Strategy Performance -->
-        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6">
+        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
             <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm mb-4">Strategy Performance</h3>
             <div id="strategy-performance" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <!-- Strategy performance will be populated here -->
@@ -516,7 +411,7 @@
         </div>
 
         <!-- Trade History -->
-        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6">
+        <div class="mt-6 sm:mt-8 bg-white rounded-lg shadow-md mobile-p-3 p-6 w-full">
             <div class="flex mobile-flex-col justify-between items-center mobile-space-y-2 mb-4">
                 <h3 class="text-lg font-semibold text-gray-900 mobile-text-sm">Trade History</h3>
                 <div class="flex mobile-flex-col space-x-2 mobile-space-x-0 mobile-space-y-2">
@@ -538,43 +433,25 @@
               <label><input type="checkbox" class="toggle-col" data-col="trailing-stop" checked> Trailing Stop</label>
               <label><input type="checkbox" class="toggle-col" data-col="highest-price" checked> Highest Price</label>
             </div>
-            <div class="responsive-table">
-                <table class="min-w-full divide-y divide-gray-200">
+            <div class="responsive-table w-full">
+                <table class="min-w-full w-full divide-y divide-gray-200">
                     <thead class="bg-gray-50">
                         <tr>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="trade_id">
-                                Trade ID <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="pair">
-                                Pair <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="exchange">
-                                Exchange <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="entry_time">
-                                Entry Time <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="entry_price">
-                                Entry Price <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="position_size">
-                                Amount <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="exit_time">
-                                Exit Time <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="exit_price">
-                                Exit Price <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="entry_reason">Entry Reason <i class="fas fa-sort ml-1"></i></th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="exit_reason">Exit Reason <i class="fas fa-sort ml-1"></i></th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="realized_pnl">
-                                Realized PnL <i class="fas fa-sort ml-1"></i>
-                            </th>
-                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs sortable" data-sort="realized_pnl_pct">PnL % <i class="fas fa-sort ml-1"></i></th>
-                            <th class="profit-trigger-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider sortable" data-sort="profit_trigger">Profit Trigger <i class="fas fa-sort ml-1"></i></th>
-                            <th class="trailing-stop-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider sortable" data-sort="trailing_stop">Trailing Stop <i class="fas fa-sort ml-1"></i></th>
-                            <th class="highest-price-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider sortable" data-sort="highest_price">Highest Price <i class="fas fa-sort ml-1"></i></th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Trade ID</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Pair</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exchange</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Time</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Amount</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Time</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Reason</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Reason</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Realized PnL</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">PnL %</th>
+                            <th class="profit-trigger-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Profit Trigger</th>
+                            <th class="trailing-stop-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Trailing Stop</th>
+                            <th class="highest-price-col px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Highest Price</th>
                         </tr>
                     </thead>
                     <tbody id="trade-history-table-body" class="bg-white divide-y divide-gray-200">
@@ -680,7 +557,6 @@
                 
 
             }
-            // Shadow PnL auto-refresh hook could go here if desired
         }
 
         // Generate tooltip content for balance breakdown
@@ -716,66 +592,16 @@
                 const response = await fetch('/api/portfolio');
                 const data = await response.json();
                 updateDashboard({ portfolio: data });
-                
-                // Update per-exchange breakdown table
-                if (data.exchanges) {
-                    console.log('Exchange data received:', data.exchanges);
-                    const exchangeRows = Object.entries(data.exchanges).map(([exchange, ex]) => ({
-                        exchange,
-                        total_balance: ex.balance,
-                        available_balance: ex.available_balance || ex.available,
-                        total_pnl: ex.total_pnl,
-                        timestamp: ex.timestamp
-                    }));
-                    console.log('Mapped exchange rows:', exchangeRows);
-                    updateExchangeBreakdownTable(exchangeRows);
-                } else {
-                    console.log('No exchange data in response:', data);
-                }
             } catch (error) {
                 console.error('Error fetching portfolio:', error);
             }
         }
 
-        async function fetchTrades(page = 1, sortBy = null, sortOrder = null) {
+        async function fetchTrades() {
             try {
-                console.log('fetchTrades called with:', { page, sortBy, sortOrder });
-                const pageSize = document.getElementById('trades-page-size').value;
-                const limit = pageSize === 'all' ? 1000 : parseInt(pageSize);
-                
-                // Update current page and sorting
-                currentTradesPage = page;
-                if (sortBy) currentTradesSortBy = sortBy;
-                if (sortOrder) currentTradesSortOrder = sortOrder;
-                
-                console.log('Current trade state:', { currentTradesPage, currentTradesSortBy, currentTradesSortOrder, limit });
-                
-                const params = new URLSearchParams({
-                    page: currentTradesPage,
-                    limit: limit,
-                    sort_by: currentTradesSortBy,
-                    sort_order: currentTradesSortOrder
-                });
-                
-                const response = await fetch(`/api/trades?${params}`);
+                const response = await fetch('/api/trades');
                 const data = await response.json();
-                
-                // Store all trades for filtering
-                allTrades = data.trades || [];
-                
-                // Update pagination info
-                if (data.pagination) {
-                    totalTradesPages = data.pagination.total_pages;
-                    updateTradesPagination(data.pagination);
-                }
-                
-                // Apply current filters
-                applyTradesFilter();
-                
-                // Update summary with total count
-                const totalCount = data.pagination ? data.pagination.total : allTrades.length;
-                updateTradesSummary(totalCount);
-                
+                updateTradesTable(data.trades);
             } catch (error) {
                 console.error('Error fetching trades:', error);
             }
@@ -785,23 +611,11 @@
 
         async function fetchExchanges() {
             try {
-                console.log('fetchExchanges called');
-                const debugElement = document.getElementById('exchange-debug');
-                if (debugElement) debugElement.textContent = 'Debug: fetchExchanges called...';
-                
                 const response = await fetch('/api/exchanges');
-                console.log('fetchExchanges response status:', response.status);
-                if (debugElement) debugElement.textContent = `Debug: Response status: ${response.status}`;
-                
                 const data = await response.json();
-                console.log('fetchExchanges data received:', data);
-                if (debugElement) debugElement.textContent = `Debug: Data received: ${JSON.stringify(data)}`;
-                
                 updateExchangeStatus(data);
             } catch (error) {
                 console.error('Error fetching exchanges:', error);
-                const debugElement = document.getElementById('exchange-debug');
-                if (debugElement) debugElement.textContent = `Debug: Error: ${error.message}`;
             }
         }
 
@@ -825,51 +639,15 @@
         let currentPage = 1;
         let totalPages = 1;
         let currentFilter = 'all';
-        let currentHistorySortBy = 'exit_time';
-        let currentHistorySortOrder = 'desc';
         const itemsPerPage = 20;
-        
-        // Trades table variables
-        let currentTradesPage = 1;
-        let totalTradesPages = 1;
-        let currentTradesSortBy = 'entry_time';
-        let currentTradesSortOrder = 'desc';
 
-        async function fetchTradeHistory(page = 1, filter = 'all', sortBy = null, sortOrder = null) {
+        async function fetchTradeHistory(page = 1, filter = 'all') {
             try {
-                // Update current sorting if provided
-                if (sortBy) currentHistorySortBy = sortBy;
-                if (sortOrder) currentHistorySortOrder = sortOrder;
-                
-                const params = new URLSearchParams({
-                    page: page,
-                    limit: itemsPerPage,
-                    filter: filter,
-                    sort_by: currentHistorySortBy,
-                    sort_order: currentHistorySortOrder
-                });
-                
-                const response = await fetch(`/api/trade-history?${params}`);
+                const response = await fetch(`/api/trade-history?page=${page}&filter=${filter}&limit=${itemsPerPage}`);
                 const data = await response.json();
-                
-                // Update the table
-                updateTradeHistoryTable(data.trades || []);
-                
-                // Update pagination if available
-                if (data.pagination) {
-                    updatePagination(data.pagination.total, data.pagination.page, data.pagination.total_pages);
-                    updateHistorySummary(data.pagination.total, data.trades ? data.trades.length : 0);
-                } else {
-                    // Fallback if no pagination data
-                    const trades = data.trades || [];
-                    updatePagination(trades.length, page, 1);
-                    updateHistorySummary(trades.length, trades.length);
-                }
-                
-                // Update current values
-                currentPage = page;
-                currentFilter = filter;
-                
+                updateTradeHistoryTable(data.trades);
+                updatePagination(data.total, data.page, data.total_pages);
+                updateHistorySummary(data.total, data.trades.length);
             } catch (error) {
                 console.error('Error fetching trade history:', error);
             }
@@ -885,12 +663,6 @@
         function updateTradesTable(trades) {
             allTrades = trades || [];
             applyTradesFilter();
-        }
-
-        function updateTradesSummary(totalCount) {
-            const summary = document.getElementById('trades-summary');
-            const showing = filteredTrades.length;
-            summary.textContent = `Showing ${showing} of ${totalCount} trades`;
         }
 
         function applyTradesFilter() {
@@ -926,7 +698,7 @@
             filtered.forEach(trade => {
                 const row = document.createElement('tr');
                 const pnl = trade.unrealized_pnl || 0;
-                const pnlClass = pnl > 0 ? 'text-green-600 font-semibold' : pnl < 0 ? 'text-red-600 font-semibold' : 'text-gray-600';
+                const pnlClass = pnl >= 0 ? 'text-green-600' : 'text-red-600';
                 const entryTime = trade.entry_time ? new Date(trade.entry_time).toLocaleString() : 'N/A';
                 const entryReason = trade.entry_reason || 'N/A';
                 const truncatedReason = entryReason.length > 30 ? entryReason.substring(0, 30) + '...' : entryReason;
@@ -942,69 +714,45 @@
                 // Determine status badge class
                 let statusClass = 'bg-gray-100 text-gray-800';
                 if (trade.status === 'OPEN') {
-                    statusClass = 'bg-green-100 text-green-800';
+                    statusClass = 'bg-green-600 text-white';
                 } else if (trade.status === 'CLOSED') {
-                    statusClass = 'bg-red-100 text-red-800';
+                    statusClass = 'bg-gray-600 text-white';
                 } else if (trade.status === 'PENDING_EXIT') {
                     statusClass = 'bg-yellow-100 text-yellow-800';
                 }
                 
                 row.innerHTML = `
-                    <td class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle mobile-hidden" title="${trade.trade_id || 'N/A'}">${shortTradeId}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exchange || 'N/A'}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${entryTime}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm ${pnlClass} text-right align-middle">$${pnl.toFixed(2)}</td>
-                    <td class="px-2 sm:px-4 py-3 text-sm align-middle">
-                        <span class="badge ${statusClass}">${trade.status || 'N/A'}</span>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-mono text-gray-900" title="${trade.trade_id || 'N/A'}">${shortTradeId}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${trade.pair || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.exchange || 'N/A'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${entryTime}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.position_size?.toFixed(6) || '0.000000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm ${pnlClass}">$${pnl.toFixed(2)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${statusClass}">
+                            ${trade.status || 'N/A'}
+                        </span>
                     </td>
-                    <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden" title="${entryReason}">${truncatedReason}</td>
-                    <td class="profit-trigger-col align-middle">
-                      ${trade.profit_protection || 'inactive'}
-                      <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
-                    </td>
-                    <td class="trailing-stop-col align-middle">
-                      ${trade.trail_stop || 'inactive'}
-                      <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
-                    </td>
-                    <td class="highest-price-col text-right align-middle">
-                      ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
-                    </td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" title="${entryReason}">${truncatedReason}</td>
                 `;
                 tbody.appendChild(row);
             });
-            
-            updateTradesSummary(allTrades.length);
         }
 
 
 
         function updateExchangeStatus(exchanges) {
-            console.log('updateExchangeStatus called with:', exchanges);
             const exchangeStatus = document.getElementById('exchange-status');
-            const debugElement = document.getElementById('exchange-debug');
-            
-            if (!exchangeStatus) {
-                console.error('exchange-status element not found');
-                if (debugElement) debugElement.textContent = 'Debug: exchange-status element not found';
-                return;
-            }
-            
-            if (debugElement) debugElement.textContent = `Debug: updateExchangeStatus called with ${Object.keys(exchanges).length} exchanges`;
-            
             exchangeStatus.innerHTML = '';
+            
             Object.entries(exchanges).forEach(([name, info]) => {
-                console.log(`Processing exchange ${name}:`, info);
                 const exchangeDiv = document.createElement('div');
-                // Use status string from API
-                const isHealthy = info.status && info.status.toLowerCase() === 'healthy';
-                console.log(`Exchange ${name} status: ${info.status}, isHealthy: ${isHealthy}`);
-                const statusClass = isHealthy ? 'status-online' : 'status-offline';
-                const statusText = isHealthy ? 'Online' : 'Offline';
+                const statusClass = info.healthy ? 'status-online' : 'status-offline';
+                const statusText = info.healthy ? 'Online' : 'Offline';
+                
                 exchangeDiv.className = 'flex items-center p-4 border rounded-lg';
                 exchangeDiv.innerHTML = `
                     <div class="flex items-center">
@@ -1090,24 +838,14 @@
         }
 
         function updatePagination(total, currentPage, totalPages) {
-            // Update global variables
-            window.totalPages = totalPages;
-            window.currentPage = currentPage;
-            
             const prevButton = document.getElementById('prev-page');
             const nextButton = document.getElementById('next-page');
             const pageInfo = document.getElementById('page-info');
             
-            if (prevButton && nextButton && pageInfo) {
-                prevButton.disabled = currentPage <= 1;
-                nextButton.disabled = currentPage >= totalPages;
-                
-                pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
-                
-                // Update button opacity
-                prevButton.style.opacity = currentPage > 1 ? '1' : '0.5';
-                nextButton.style.opacity = currentPage < totalPages ? '1' : '0.5';
-            }
+            prevButton.disabled = currentPage <= 1;
+            nextButton.disabled = currentPage >= totalPages;
+            
+            pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
         }
 
         function updateHistorySummary(total, currentCount) {
@@ -1143,87 +881,75 @@
             });
         }
 
-        function updateTradesPagination(pagination) {
-            const prevButton = document.getElementById('trades-prev-page');
-            const nextButton = document.getElementById('trades-next-page');
-            const pageInfo = document.getElementById('trades-page-info');
-            
-            if (prevButton && nextButton && pageInfo) {
-                prevButton.disabled = !pagination.has_prev;
-                nextButton.disabled = !pagination.has_next;
-                pageInfo.textContent = `Page ${pagination.page} of ${pagination.total_pages}`;
-                
-                // Update button opacity
-                prevButton.style.opacity = pagination.has_prev ? '1' : '0.5';
-                nextButton.style.opacity = pagination.has_next ? '1' : '0.5';
+
+
+        // Event listeners
+        document.getElementById('refresh-trades').addEventListener('click', fetchTrades);
+        
+        // Trades filtering and search event listeners
+        document.getElementById('trades-filter').addEventListener('change', (e) => {
+            currentTradesFilter = e.target.value;
+            applyTradesFilter();
+        });
+        
+        document.getElementById('trade-search').addEventListener('input', (e) => {
+            currentTradesSearch = e.target.value;
+            applyTradesFilter();
+        });
+        
+        // Trade History event listeners
+        document.getElementById('refresh-history').addEventListener('click', () => {
+            fetchTradeHistory(currentPage, currentFilter);
+        });
+        
+        document.getElementById('history-filter').addEventListener('change', (e) => {
+            currentFilter = e.target.value;
+            currentPage = 1;
+            fetchTradeHistory(currentPage, currentFilter);
+        });
+        
+        document.getElementById('prev-page').addEventListener('click', () => {
+            if (currentPage > 1) {
+                currentPage--;
+                fetchTradeHistory(currentPage, currentFilter);
             }
-        }
-
-        function handleColumnSort(sortField) {
-            // Determine which table the sort field belongs to
-            const tradeHistoryFields = ['entry_reason', 'exit_reason', 'realized_pnl_pct', 'profit_trigger', 'trailing_stop', 'highest_price'];
-            const isTradeHistoryField = tradeHistoryFields.includes(sortField);
-            
-            if (isTradeHistoryField) {
-                // Handle Trade History sorting
-                if (currentHistorySortBy === sortField) {
-                    currentHistorySortOrder = currentHistorySortOrder === 'asc' ? 'desc' : 'asc';
-                } else {
-                    currentHistorySortBy = sortField;
-                    currentHistorySortOrder = 'desc'; // Default to descending for new columns
-                }
-                
-                // Update visual indicators for Trade History
-                updateHistorySortIndicators();
-                
-                // Fetch new Trade History data
-                fetchTradeHistory(1, currentFilter, currentHistorySortBy, currentHistorySortOrder);
-            } else {
-                // Handle Recent Trades sorting
-                if (currentTradesSortBy === sortField) {
-                    currentTradesSortOrder = currentTradesSortOrder === 'asc' ? 'desc' : 'asc';
-                } else {
-                    currentTradesSortBy = sortField;
-                    currentTradesSortOrder = 'desc'; // Default to descending for new columns
-                }
-                
-                // Update visual indicators for Recent Trades
-                updateSortIndicators();
-                
-                // Fetch new Recent Trades data
-                fetchTrades(1, currentTradesSortBy, currentTradesSortOrder);
+        });
+        
+        document.getElementById('next-page').addEventListener('click', () => {
+            if (currentPage < totalPages) {
+                currentPage++;
+                fetchTradeHistory(currentPage, currentFilter);
             }
-        }
-
-        function updateSortIndicators() {
-            // Clear all existing sort indicators
-            document.querySelectorAll('.sortable').forEach(header => {
-                header.classList.remove('sort-asc', 'sort-desc');
-            });
-            
-            // Add indicator to current sort column
-            const currentHeader = document.querySelector(`[data-sort="${currentTradesSortBy}"]`);
-            if (currentHeader) {
-                currentHeader.classList.add(currentTradesSortOrder === 'asc' ? 'sort-asc' : 'sort-desc');
+        });
+        
+        document.getElementById('emergency-stop').addEventListener('click', function() {
+            document.getElementById('emergency-modal').classList.remove('hidden');
+        });
+        
+        document.getElementById('cancel-emergency-stop').addEventListener('click', function() {
+            document.getElementById('emergency-modal').classList.add('hidden');
+        });
+        
+        document.getElementById('confirm-emergency-stop').addEventListener('click', async function() {
+            try {
+                const response = await fetch('/api/control/emergency-stop', { method: 'POST' });
+                const data = await response.json();
+                alert(data.message);
+                document.getElementById('emergency-modal').classList.add('hidden');
+                fetchTrades(); // Refresh trades
+            } catch (error) {
+                console.error('Error executing emergency stop:', error);
+                alert('Error executing emergency stop');
             }
-        }
+        });
 
-        function updateHistorySortIndicators() {
-            // Clear all existing sort indicators in Trade History table
-            document.querySelectorAll('#trade-history-table-body').closest('table').querySelectorAll('.sortable').forEach(header => {
-                header.classList.remove('sort-asc', 'sort-desc');
-            });
-            
-            // Add indicator to current sort column in Trade History table
-            const currentHeader = document.querySelector(`[data-sort="${currentHistorySortBy}"]`);
-            if (currentHeader) {
-                currentHeader.classList.add(currentHistorySortOrder === 'asc' ? 'sort-asc' : 'sort-desc');
-            }
-        }
-
-
-
-        // All event listeners now properly handled in setupEventListeners() function
+        // Toggle exchange breakdown
+        document.getElementById('toggle-exchange-breakdown').addEventListener('click', function() {
+            const breakdownSection = document.getElementById('exchange-breakdown-section');
+            const button = document.getElementById('toggle-exchange-breakdown');
+            breakdownSection.style.display = breakdownSection.style.display === 'none' ? 'block' : 'none';
+            button.textContent = breakdownSection.style.display === 'none' ? 'Show per-exchange breakdown' : 'Hide per-exchange breakdown';
+        });
 
         // User agent detection and responsive behavior
         function detectDeviceType() {
@@ -1235,7 +961,20 @@
             // Add device-specific classes to body
             document.body.classList.add(isMobile ? 'mobile-device' : isTablet ? 'tablet-device' : 'desktop-device');
             
-
+            // Adjust chart options based on device
+            if (isMobile) {
+                // Mobile-specific chart configurations
+                if (pnlChart) {
+                    pnlChart.options.plugins.legend.display = false;
+                    pnlChart.options.scales.x.ticks.font.size = 10;
+                    pnlChart.options.scales.y.ticks.font.size = 10;
+                    pnlChart.update();
+                }
+                if (exchangeChart) {
+                    exchangeChart.options.plugins.legend.display = false;
+                    exchangeChart.update();
+                }
+            }
             
             console.log(`Device detected: ${isMobile ? 'Mobile' : isTablet ? 'Tablet' : 'Desktop'}`);
             return { isMobile, isTablet, isLaptop };
@@ -1298,9 +1037,6 @@
             initializeResponsiveTables();
             initializeTouchInteractions();
             
-            // Add all event listeners
-            setupEventListeners();
-            
             // Initialize data
             connectWebSocket();
             fetchPortfolio();
@@ -1313,8 +1049,6 @@
             setInterval(() => {
                 fetchPortfolio();
                 fetchTrades();
-                // Periodically refresh PnL
-                refreshShadowPnl();
             }, 30000);
             
             // Handle window resize for responsive behavior
@@ -1323,235 +1057,8 @@
                 initializeResponsiveTables();
             });
         });
-
-        // Setup all event listeners
-        function setupEventListeners() {
-            console.log('Setting up event listeners...');
-            
-            // Trades table event listeners
-            const refreshTradesBtn = document.getElementById('refresh-trades');
-            if (refreshTradesBtn) {
-                console.log('✅ Found refresh-trades button');
-                refreshTradesBtn.addEventListener('click', () => fetchTrades());
-            } else {
-                console.log('❌ refresh-trades button not found');
-            }
-            // Shadow PnL controls
-            const pnlRefresh = document.getElementById('pnl-refresh');
-            if (pnlRefresh) {
-                pnlRefresh.addEventListener('click', refreshShadowPnl);
-            }
-            ['pnl-exchange','pnl-symbol','pnl-period'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.addEventListener('change', refreshShadowPnl);
-            });
-            
-            const tradesFilter = document.getElementById('trades-filter');
-            if (tradesFilter) {
-                tradesFilter.addEventListener('change', (e) => {
-                    currentTradesFilter = e.target.value;
-                    applyTradesFilter();
-                });
-            }
-            
-            const tradeSearch = document.getElementById('trade-search');
-            if (tradeSearch) {
-                tradeSearch.addEventListener('input', (e) => {
-                    currentTradesSearch = e.target.value;
-                    applyTradesFilter();
-                });
-            }
-            
-            const tradesPageSize = document.getElementById('trades-page-size');
-            if (tradesPageSize) {
-                tradesPageSize.addEventListener('change', () => {
-                    fetchTrades(1); // Reset to page 1 when changing page size
-                });
-            }
-            
-            // Trades pagination event listeners
-            const tradesPrevPage = document.getElementById('trades-prev-page');
-            if (tradesPrevPage) {
-                console.log('✅ Found trades-prev-page button');
-                tradesPrevPage.addEventListener('click', () => {
-                    console.log('Previous page clicked, current page:', currentTradesPage);
-                    if (currentTradesPage > 1) {
-                        fetchTrades(currentTradesPage - 1);
-                    }
-                });
-            } else {
-                console.log('❌ trades-prev-page button not found');
-            }
-            
-            const tradesNextPage = document.getElementById('trades-next-page');
-            if (tradesNextPage) {
-                console.log('✅ Found trades-next-page button');
-                tradesNextPage.addEventListener('click', () => {
-                    console.log('Next page clicked, current page:', currentTradesPage, 'total pages:', totalTradesPages);
-                    if (currentTradesPage < totalTradesPages) {
-                        fetchTrades(currentTradesPage + 1);
-                    }
-                });
-            } else {
-                console.log('❌ trades-next-page button not found');
-            }
-            
-            // Sortable column headers event listeners
-            console.log('✅ Setting up sortable column click listeners');
-            document.addEventListener('click', (e) => {
-                if (e.target.closest('.sortable')) {
-                    const sortField = e.target.closest('.sortable').getAttribute('data-sort');
-                    console.log('Sort column clicked:', sortField);
-                    if (sortField) {
-                        handleColumnSort(sortField);
-                    }
-                }
-            });
-            
-            // Trade History event listeners
-            const refreshHistoryBtn = document.getElementById('refresh-history');
-            if (refreshHistoryBtn) {
-                refreshHistoryBtn.addEventListener('click', () => {
-                    fetchTradeHistory(currentPage, currentFilter);
-                });
-            }
-            
-            const historyFilter = document.getElementById('history-filter');
-            if (historyFilter) {
-                historyFilter.addEventListener('change', (e) => {
-                    currentFilter = e.target.value;
-                    currentPage = 1;
-                    fetchTradeHistory(currentPage, currentFilter);
-                });
-            }
-            
-            const prevPageBtn = document.getElementById('prev-page');
-            if (prevPageBtn) {
-                prevPageBtn.addEventListener('click', () => {
-                    if (window.currentPage > 1) {
-                        window.currentPage--;
-                        fetchTradeHistory(window.currentPage, currentFilter);
-                    }
-                });
-            }
-            
-            const nextPageBtn = document.getElementById('next-page');
-            if (nextPageBtn) {
-                nextPageBtn.addEventListener('click', () => {
-                    if (window.currentPage < window.totalPages) {
-                        window.currentPage++;
-                        fetchTradeHistory(window.currentPage, currentFilter);
-                    }
-                });
-            }
-            
-            // Emergency stop event listeners
-            const emergencyStopBtn = document.getElementById('emergency-stop');
-            if (emergencyStopBtn) {
-                emergencyStopBtn.addEventListener('click', function() {
-                    const modal = document.getElementById('emergency-modal');
-                    if (modal) modal.classList.remove('hidden');
-                });
-            }
-            
-            const cancelEmergencyBtn = document.getElementById('cancel-emergency-stop');
-            if (cancelEmergencyBtn) {
-                cancelEmergencyBtn.addEventListener('click', function() {
-                    const modal = document.getElementById('emergency-modal');
-                    if (modal) modal.classList.add('hidden');
-                });
-            }
-            
-            const confirmEmergencyBtn = document.getElementById('confirm-emergency-stop');
-            if (confirmEmergencyBtn) {
-                confirmEmergencyBtn.addEventListener('click', async function() {
-                    try {
-                        const response = await fetch('/api/control/emergency-stop', { method: 'POST' });
-                        const data = await response.json();
-                        alert('Emergency stop triggered: ' + data.message);
-                        const modal = document.getElementById('emergency-modal');
-                        if (modal) modal.classList.add('hidden');
-                    } catch (error) {
-                        alert('Error triggering emergency stop: ' + error.message);
-                    }
-                });
-            }
-            
-            // Column toggle functionality for tables
-            document.querySelectorAll('.toggle-col').forEach(checkbox => {
-                checkbox.addEventListener('change', function() {
-                    const column = this.dataset.col;
-                    const isChecked = this.checked;
-                    const columns = document.querySelectorAll(`.${column}-col`);
-                    
-                    columns.forEach(col => {
-                        col.style.display = isChecked ? '' : 'none';
-                    });
-                });
-            });
-            
-            // Toggle exchange breakdown
-            const toggleBreakdownBtn = document.getElementById('toggle-exchange-breakdown');
-            if (toggleBreakdownBtn) {
-                toggleBreakdownBtn.addEventListener('click', function() {
-                    const breakdownSection = document.getElementById('exchange-breakdown-section');
-                    if (breakdownSection) {
-                        breakdownSection.style.display = breakdownSection.style.display === 'none' ? 'block' : 'none';
-                        this.textContent = breakdownSection.style.display === 'none' ? 'Show per-exchange breakdown' : 'Hide per-exchange breakdown';
-                    }
-                });
-            }
-        }
-
-        // --- Shadow PnL fetcher ---
-        function computePeriodRange(key) {
-            const now = new Date();
-            const end = now.toISOString();
-            if (key === 'today') {
-                const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-                return { start: startDate.toISOString(), end };
-            } else if (key === '7d') {
-                const startDate = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
-                return { start: startDate.toISOString(), end };
-            } else if (key === '30d') {
-                const startDate = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
-                return { start: startDate.toISOString(), end };
-            }
-            return { start: null, end: null };
-        }
-
-        async function refreshShadowPnl() {
-            try {
-                const ex = document.getElementById('pnl-exchange')?.value || 'cryptocom';
-                const sym = document.getElementById('pnl-symbol')?.value || 'A2Z/USD';
-                const period = document.getElementById('pnl-period')?.value || '7d';
-                const range = computePeriodRange(period);
-
-                // Realized PnL
-                const params = new URLSearchParams({ exchange: ex, symbol: sym });
-                if (range.start) params.append('start', range.start);
-                if (range.end) params.append('end', range.end);
-                const realizedResp = await fetch(`/api/pnl/realized?${params.toString()}`);
-                const realized = realizedResp.ok ? await realizedResp.json() : null;
-                if (realized) {
-                    document.getElementById('pnl-realized').textContent = `$${(realized.realized_pnl_excl_fees || 0).toFixed(2)}`;
-                    document.getElementById('pnl-fees').textContent = `$${(realized.fees_usd || 0).toFixed(2)}`;
-                    document.getElementById('pnl-realized-incl').textContent = `$${(realized.realized_pnl_incl_fees || 0).toFixed(2)}`;
-                }
-
-                // Unrealized PnL
-                const unrealParams = new URLSearchParams({ exchange: ex, symbol: sym });
-                const unrealResp = await fetch(`/api/pnl/unrealized?${unrealParams.toString()}`);
-                const unreal = unrealResp.ok ? await unrealResp.json() : null;
-                if (unreal) {
-                    document.getElementById('pnl-unrealized').textContent = `$${(unreal.unrealized_pnl || 0).toFixed(2)}`;
-                    document.getElementById('pnl-notional').textContent = `$${(unreal.notional_value || 0).toFixed(2)}`;
-                    document.getElementById('pnl-current-price').textContent = `$${(unreal.current_price || 0).toFixed(4)}`;
-                }
-            } catch (e) {
-                console.error('Error refreshing PnL:', e);
-            }
-        }
     </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js?v=20240723"></script>
+    <script src="/static/js/dashboard.js?v=20240723"></script>
 </body>
 </html> 

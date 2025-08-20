@@ -190,10 +190,12 @@ class Dashboard {
     }
     
     async updatePortfolio() {
+        console.log('updatePortfolio() called');
         try {
             const response = await fetch('/api/portfolio');
             if (response.ok) {
                 const data = await response.json();
+                console.log('Portfolio data received:', data);
                 this.updatePortfolioUI(data);
             }
         } catch (error) {
@@ -252,17 +254,21 @@ class Dashboard {
         totalUnrealizedPnlElement.className = `h4 ${this.getPnlClass(totalUnrealizedPnl)}`;
         // Update win rate
         const winRate = data.win_rate || 0;
-        winRateElement.textContent = `${winRate.toFixed(1)}%`;
+        winRateElement.textContent = `${(winRate * 100).toFixed(1)}%`;
         // Update per-exchange breakdown table
         if (data.exchanges) {
+            console.log('Exchange data received:', data.exchanges);
             const exchangeRows = Object.entries(data.exchanges).map(([exchange, ex]) => ({
                 exchange,
                 total_balance: ex.balance,
-                available_balance: ex.available,
+                available_balance: ex.available_balance || ex.available,
                 total_pnl: ex.total_pnl,
                 timestamp: ex.timestamp
             }));
+            console.log('Mapped exchange rows:', exchangeRows);
             updateExchangeBreakdownTable(exchangeRows);
+        } else {
+            console.log('No exchange data in response:', data);
         }
     }
     
@@ -305,7 +311,7 @@ class Dashboard {
     
     async updateRecentTrades() {
         try {
-            const response = await fetch('/api/trades?limit=10');
+            const response = await fetch('/api/trades?limit=50');
             if (response.ok) {
                 const data = await response.json();
                 this.updateRecentTradesUI(data.trades || []);
@@ -331,19 +337,19 @@ class Dashboard {
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${(trade.unrealized_pnl || 0).toFixed(2)}${this.calculatePnlPercentage(trade)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle" id="notional-value-${trade.trade_id || 'N/A'}">$${(trade.notional_value || ((trade.current_price || trade.entry_price || 0) * (trade.position_size || 0))).toFixed(2)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm font-semibold ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${this.formatPnL(trade.unrealized_pnl || 0)}${this.calculatePnlPercentage(trade)}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm align-middle">
                     <span class="badge ${trade.status === 'OPEN' ? 'bg-success' : trade.status === 'CLOSED' ? 'bg-secondary' : 'bg-warning'}">${trade.status || 'N/A'}</span>
                 </td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden" title="${trade.entry_reason || 'N/A'}">${this.truncateText(trade.entry_reason || 'N/A', 30)}</td>
                 <td class="profit-trigger-col align-middle">
                   ${trade.profit_protection || 'inactive'}
-                  <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}${this.calculatePnlPercentage(trade)}` : 'None'}</div>
+                  <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
                 </td>
                 <td class="trailing-stop-col align-middle">
                   ${trade.trail_stop || 'inactive'}
-                  <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}${this.calculatePnlPercentage(trade)}` : 'None'}</div>
+                  <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
                 </td>
                 <td class="highest-price-col text-right align-middle">
                   ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
@@ -384,21 +390,192 @@ class Dashboard {
     }
     
     startPeriodicUpdates() {
-        // Update data every 30 seconds
-        this.updateInterval = setInterval(() => {
-            this.updateTradingStatus();
-            this.updatePortfolio();
-            this.updateRiskExposure();
-            this.updateRecentTrades();
-            this.updateRecentAlerts();
-        }, 30000);
-        
-        // Initial update
+        console.log('startPeriodicUpdates() called');
+        // Initial load - call all update methods immediately
         this.updateTradingStatus();
         this.updatePortfolio();
         this.updateRiskExposure();
         this.updateRecentTrades();
         this.updateRecentAlerts();
+        this.updateMarketSentiment();
+        this.updateDailyPnL();
+        
+        // Update data every 30 seconds
+        this.updateInterval = setInterval(() => {
+            console.log('Periodic update triggered');
+            this.updateTradingStatus();
+            this.updatePortfolio();
+            this.updateRiskExposure();
+            this.updateRecentTrades();
+            this.updateRecentAlerts();
+            this.updateMarketSentiment();
+            this.updateDailyPnL();
+        }, 30000);
+    }
+    
+    async updateMarketSentiment() {
+        console.log('🔄 Starting market sentiment update...');
+        try {
+            const response = await fetch('/api/v1/market/sentiment');
+            if (response.ok) {
+                const data = await response.json();
+                console.log('📥 Market sentiment data received:', data);
+                
+                // Update overall sentiment
+                const sentimentEl = document.getElementById('overall-sentiment');
+                console.log('🎯 Found sentiment element:', !!sentimentEl);
+                const strengthEl = document.getElementById('sentiment-strength');
+                const iconEl = document.getElementById('sentiment-icon');
+                
+                if (sentimentEl && strengthEl && iconEl) {
+                    sentimentEl.textContent = this.capitalize(data.overall_trend || 'Unknown');
+                    strengthEl.textContent = `Strength: ${data.trend_strength || 0}/3`;
+                    
+                    // Update sentiment styling and icon
+                    sentimentEl.className = sentimentEl.className.replace(/text-(red|green|gray)-\d+/, '');
+                    iconEl.className = iconEl.className.replace(/text-(red|green|gray)-\d+/, '');
+                    
+                    if (data.overall_trend === 'bullish') {
+                        sentimentEl.classList.add('text-green-600');
+                        iconEl.className = 'fas fa-arrow-trend-up text-green-600 text-xl';
+                    } else if (data.overall_trend === 'bearish') {
+                        sentimentEl.classList.add('text-red-600');
+                        iconEl.className = 'fas fa-arrow-trend-down text-red-600 text-xl';
+                    } else {
+                        sentimentEl.classList.add('text-gray-600');
+                        iconEl.className = 'fas fa-minus text-gray-600 text-xl';
+                    }
+                }
+                
+                // Update BTC trend
+                const btcTrendEl = document.getElementById('btc-trend');
+                const btcChangeEl = document.getElementById('btc-change');
+                
+                if (btcTrendEl && btcChangeEl && data.btc_trend) {
+                    btcTrendEl.textContent = this.capitalize(data.btc_trend.direction || 'Unknown');
+                    btcChangeEl.textContent = `24h: ${data.btc_trend.change_24h?.toFixed(2) || '0.00'}%`;
+                    
+                    // Update BTC trend styling
+                    btcTrendEl.className = btcTrendEl.className.replace(/text-(red|green|gray)-\d+/, '');
+                    btcChangeEl.className = btcChangeEl.className.replace(/text-(red|green|gray)-\d+/, '');
+                    
+                    if (data.btc_trend.direction === 'bullish') {
+                        btcTrendEl.classList.add('text-green-600');
+                        btcChangeEl.classList.add('text-green-600');
+                    } else if (data.btc_trend.direction === 'bearish') {
+                        btcTrendEl.classList.add('text-red-600');
+                        btcChangeEl.classList.add('text-red-600');
+                    } else {
+                        btcTrendEl.classList.add('text-gray-600');
+                        btcChangeEl.classList.add('text-gray-500');
+                    }
+                }
+                
+                // Update ETH trend
+                const ethTrendEl = document.getElementById('eth-trend');
+                const ethChangeEl = document.getElementById('eth-change');
+                
+                if (ethTrendEl && ethChangeEl && data.eth_trend) {
+                    ethTrendEl.textContent = this.capitalize(data.eth_trend.direction || 'Unknown');
+                    ethChangeEl.textContent = `24h: ${data.eth_trend.change_24h?.toFixed(2) || '0.00'}%`;
+                    
+                    // Update ETH trend styling
+                    ethTrendEl.className = ethTrendEl.className.replace(/text-(red|green|gray)-\d+/, '');
+                    ethChangeEl.className = ethChangeEl.className.replace(/text-(red|green|gray)-\d+/, '');
+                    
+                    if (data.eth_trend.direction === 'bullish') {
+                        ethTrendEl.classList.add('text-green-600');
+                        ethChangeEl.classList.add('text-green-600');
+                    } else if (data.eth_trend.direction === 'bearish') {
+                        ethTrendEl.classList.add('text-red-600');
+                        ethChangeEl.classList.add('text-red-600');
+                    } else {
+                        ethTrendEl.classList.add('text-gray-600');
+                        ethChangeEl.classList.add('text-gray-500');
+                    }
+                }
+                
+                // Update portfolio sentiment
+                const bullishEl = document.getElementById('bullish-trades');
+                const bearishEl = document.getElementById('bearish-trades');
+                const totalSentimentEl = document.getElementById('total-trades-sentiment');
+                
+                if (bullishEl && bearishEl && totalSentimentEl && data.active_trades_sentiment) {
+                    bullishEl.textContent = data.active_trades_sentiment.bullish || 0;
+                    bearishEl.textContent = data.active_trades_sentiment.bearish || 0;
+                    totalSentimentEl.textContent = data.active_trades_sentiment.total || 0;
+                }
+                
+            } else {
+                console.error('❌ Failed to fetch market sentiment:', response.status, response.statusText);
+            }
+        } catch (error) {
+            console.error('💥 Error updating market sentiment:', error);
+        }
+    }
+    
+    async updateDailyPnL() {
+        console.log('📊 Starting daily PnL update...');
+        try {
+            const response = await fetch('/api/v1/pnl/daily');
+            if (response.ok) {
+                const data = await response.json();
+                
+                // Update summary cards
+                if (data.summary) {
+                    const totalPnlEl = document.getElementById('summary-total-pnl');
+                    const profitableDaysEl = document.getElementById('summary-profitable-days');
+                    const losingDaysEl = document.getElementById('summary-losing-days');
+                    const totalTradesEl = document.getElementById('summary-total-trades');
+                    
+                    if (totalPnlEl) {
+                        totalPnlEl.textContent = `$${this.formatPnL(data.summary.total_pnl || 0)}`;
+                        totalPnlEl.className = totalPnlEl.className.replace(/text-(red|green)-\d+/, '');
+                        if (data.summary.total_pnl > 0) {
+                            totalPnlEl.classList.add('text-green-600');
+                        } else if (data.summary.total_pnl < 0) {
+                            totalPnlEl.classList.add('text-red-600');
+                        }
+                    }
+                    
+                    if (profitableDaysEl) profitableDaysEl.textContent = data.summary.profitable_days || 0;
+                    if (losingDaysEl) losingDaysEl.textContent = data.summary.losing_days || 0;
+                    if (totalTradesEl) totalTradesEl.textContent = data.summary.total_trades || 0;
+                }
+                
+                // Update table
+                const tableBody = document.getElementById('daily-pnl-table');
+                if (tableBody && data.daily_pnl) {
+                    let tableHTML = '';
+                    
+                    data.daily_pnl.forEach(day => {
+                        const pnlClass = day.realized_pnl > 0 ? 'text-green-600' : day.realized_pnl < 0 ? 'text-red-600' : 'text-gray-600';
+                        const cumulativeClass = day.cumulative_pnl > 0 ? 'text-green-600' : day.cumulative_pnl < 0 ? 'text-red-600' : 'text-gray-600';
+                        const trendIcon = day.realized_pnl > 0 ? 'fa-arrow-up text-green-500' : day.realized_pnl < 0 ? 'fa-arrow-down text-red-500' : 'fa-minus text-gray-400';
+                        
+                        tableHTML += `
+                            <tr class="hover:bg-gray-50">
+                                <td class="px-4 py-3 text-sm text-gray-900">${this.formatDate(day.date)}</td>
+                                <td class="px-4 py-3 text-sm font-medium ${pnlClass}">$${this.formatPnL(day.realized_pnl)}</td>
+                                <td class="px-4 py-3 text-sm font-medium ${cumulativeClass}">$${this.formatPnL(day.cumulative_pnl)}</td>
+                                <td class="px-4 py-3 text-sm text-gray-600">${day.trade_count}</td>
+                                <td class="px-4 py-3 text-sm text-gray-600">${day.win_rate.toFixed(1)}%</td>
+                                <td class="px-4 py-3 text-sm">
+                                    <i class="fas ${trendIcon}"></i>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                    
+                    tableBody.innerHTML = tableHTML;
+                }
+                
+            } else {
+                console.error('Failed to fetch daily PnL:', response.statusText);
+            }
+        } catch (error) {
+            console.error('Error updating daily PnL:', error);
+        }
     }
     
     showNotification(message, type = 'info') {
@@ -413,6 +590,20 @@ class Dashboard {
     }
     
     // Utility functions
+    capitalize(str) {
+        if (!str) return str;
+        return str.charAt(0).toUpperCase() + str.slice(1);
+    }
+    
+    formatDate(dateString) {
+        const date = new Date(dateString);
+        return date.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric'
+        });
+    }
+    
     formatCurrency(amount) {
         return new Intl.NumberFormat('en-US', {
             style: 'currency',
@@ -422,21 +613,26 @@ class Dashboard {
         }).format(amount);
     }
     
-    formatDateTime(dateString) {
-        const date = new Date(dateString);
-        return date.toLocaleString();
-    }
-    
-    formatUptime(uptimeString) {
-        // Parse uptime string (e.g., "1 day, 2:30:45")
-        const match = uptimeString.match(/(\d+):(\d+):(\d+)/);
-        if (match) {
-            const hours = parseInt(match[1]);
-            const minutes = parseInt(match[2]);
-            const seconds = parseInt(match[3]);
-            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    formatPnL(amount) {
+        // Format PnL with appropriate precision for crypto values
+        const absAmount = Math.abs(amount);
+        
+        if (absAmount >= 10) {
+            // Large amounts: show 2 decimal places ($12.34)
+            return amount.toFixed(2);
+        } else if (absAmount >= 1) {
+            // Medium amounts: show 3 decimal places ($1.234)
+            return amount.toFixed(3);
+        } else if (absAmount >= 0.01) {
+            // Small amounts: show 4 decimal places ($0.1234)
+            return amount.toFixed(4);
+        } else if (absAmount >= 0.001) {
+            // Very small amounts: show 5 decimal places ($0.01234)
+            return amount.toFixed(5);
+        } else {
+            // Tiny amounts: show 6 decimal places ($0.001234)
+            return amount.toFixed(6);
         }
-        return uptimeString;
     }
     
     calculatePnlPercentage(trade) {
@@ -456,7 +652,7 @@ class Dashboard {
                 const positionSize = parseFloat(trade.position_size);
                 const unrealizedPnl = parseFloat(trade.unrealized_pnl);
                 if (entryPrice > 0 && positionSize > 0) {
-                    const pnlPercentage = (unrealizedPnl / (entryPrice * position_size)) * 100;
+                    const pnlPercentage = (unrealizedPnl / (entryPrice * positionSize)) * 100;
                     return ` (${pnlPercentage >= 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%)`;
                 }
             }
@@ -467,6 +663,23 @@ class Dashboard {
             return ` (${pnlPercentage >= 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%)`;
         }
         return '';
+    }
+    
+    formatDateTime(dateString) {
+        const date = new Date(dateString);
+        return date.toLocaleString();
+    }
+    
+    formatUptime(uptimeString) {
+        // Parse uptime string (e.g., "1 day, 2:30:45")
+        const match = uptimeString.match(/(\d+):(\d+):(\d+)/);
+        if (match) {
+            const hours = parseInt(match[1]);
+            const minutes = parseInt(match[2]);
+            const seconds = parseInt(match[3]);
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+        return uptimeString;
     }
     
     getStatusBadgeClass(status) {
@@ -533,7 +746,9 @@ class Dashboard {
 }
 
 function updateExchangeBreakdownTable(exchangeData) {
+    console.log('updateExchangeBreakdownTable called with:', exchangeData);
     const tbody = document.getElementById('exchange-breakdown-table-body');
+    console.log('Table body element:', tbody);
     tbody.innerHTML = '';
     if (!exchangeData || exchangeData.length === 0) {
         const row = document.createElement('tr');
@@ -582,11 +797,11 @@ function updateTradeHistoryUI(trades) {
             <td class="px-2 sm:px-4 py-3 text-sm font-medium ${Dashboard.prototype.getPnlClass(trade.realized_pnl_pct)} text-right align-middle">${trade.realized_pnl_pct !== undefined ? trade.realized_pnl_pct.toFixed(2) + '%' : 'N/A'}</td>
             <td class="profit-trigger-col align-middle">
               ${trade.profit_protection || 'inactive'}
-              <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}${Dashboard.prototype.calculatePnlPercentage(trade)}` : 'None'}</div>
+              <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
             </td>
             <td class="trailing-stop-col align-middle">
               ${trade.trail_stop || 'inactive'}
-              <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}${Dashboard.prototype.calculatePnlPercentage(trade)}` : 'None'}</div>
+              <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
             </td>
             <td class="highest-price-col text-right align-middle">
               ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
@@ -598,9 +813,9 @@ function updateTradeHistoryUI(trades) {
 // Patch the dashboard to call updateTradeHistoryUI after fetching trade history
 // (Assume the function that fetches trade history is called updateTradeHistory)
 const origUpdateTradeHistory = Dashboard.prototype.updateTradeHistory;
-Dashboard.prototype.updateTradeHistory = async function() {
+Dashboard.prototype.updateTradeHistory = async function(filter = 'all') {
     try {
-        const response = await fetch('/api/trades/closed/history?limit=20');
+        const response = await fetch(`/api/trade-history?filter=${filter}&limit=20`);
         if (response.ok) {
             const data = await response.json();
             updateTradeHistoryUI(data.trades || []);
@@ -611,12 +826,19 @@ Dashboard.prototype.updateTradeHistory = async function() {
 };
 
 function updateExchangeStatus(exchanges) {
+    console.log('updateExchangeStatus called with:', exchanges);
     const exchangeStatus = document.getElementById('exchange-status');
+    if (!exchangeStatus) {
+        console.error('exchange-status element not found');
+        return;
+    }
     exchangeStatus.innerHTML = '';
     Object.entries(exchanges).forEach(([name, info]) => {
+        console.log(`Processing exchange ${name}:`, info);
         const exchangeDiv = document.createElement('div');
         // Use status string from API
         const isHealthy = info.status && info.status.toLowerCase() === 'healthy';
+        console.log(`Exchange ${name} status: ${info.status}, isHealthy: ${isHealthy}`);
         const statusClass = isHealthy ? 'status-online' : 'status-offline';
         const statusText = isHealthy ? 'Online' : 'Offline';
         exchangeDiv.className = 'flex items-center p-4 border rounded-lg';
@@ -633,15 +855,75 @@ function updateExchangeStatus(exchanges) {
     });
 }
 
-// Initialize dashboard when DOM is loaded
-document.addEventListener('DOMContentLoaded', () => {
-    new Dashboard();
-    document.querySelectorAll('.toggle-col').forEach(checkbox => {
-      checkbox.addEventListener('change', function() {
-        const colClass = this.dataset.col + '-col';
-        document.querySelectorAll('.' + colClass).forEach(cell => {
-          cell.style.display = this.checked ? '' : 'none';
-        });
-      });
+// Initialize dashboard immediately since script is at end of body
+document.querySelectorAll('.toggle-col').forEach(checkbox => {
+  checkbox.addEventListener('change', function() {
+    const colClass = this.dataset.col + '-col';
+    document.querySelectorAll('.' + colClass).forEach(cell => {
+      cell.style.display = this.checked ? '' : 'none';
     });
-}); 
+  });
+});
+
+// Add event listener for trade history filter
+const historyFilter = document.getElementById('history-filter');
+if (historyFilter) {
+    historyFilter.addEventListener('change', function() {
+        const filter = this.value;
+        if (typeof window.dashboard !== 'undefined' && window.dashboard.updateTradeHistory) {
+            window.dashboard.updateTradeHistory(filter);
+        }
+    });
+}
+
+// Initialize Dashboard class immediately
+console.log('🚀 Initializing Dashboard...');
+try {
+    window.dashboard = new Dashboard();
+    console.log('✅ Dashboard initialized successfully');
+} catch (error) {
+    console.error('💥 Dashboard initialization failed:', error);
+    
+    // Try manual initialization of just the new features
+    console.log('🔄 Attempting manual feature initialization...');
+    
+    // Manually call the market sentiment API
+    fetch('/api/v1/market/sentiment')
+        .then(response => response.json())
+        .then(data => {
+            console.log('Market sentiment data:', data);
+            const sentimentEl = document.getElementById('overall-sentiment');
+            if (sentimentEl && data.overall_trend) {
+                sentimentEl.textContent = data.overall_trend.charAt(0).toUpperCase() + data.overall_trend.slice(1);
+            }
+            
+            const btcTrendEl = document.getElementById('btc-trend');
+            const btcChangeEl = document.getElementById('btc-change');
+            if (btcTrendEl && data.btc_trend) {
+                btcTrendEl.textContent = data.btc_trend.direction.charAt(0).toUpperCase() + data.btc_trend.direction.slice(1);
+                btcChangeEl.textContent = `24h: ${data.btc_trend.change_24h?.toFixed(2) || '0.00'}%`;
+            }
+            
+            const ethTrendEl = document.getElementById('eth-trend');
+            const ethChangeEl = document.getElementById('eth-change');
+            if (ethTrendEl && data.eth_trend) {
+                ethTrendEl.textContent = data.eth_trend.direction.charAt(0).toUpperCase() + data.eth_trend.direction.slice(1);
+                ethChangeEl.textContent = `24h: ${data.eth_trend.change_24h?.toFixed(2) || '0.00'}%`;
+            }
+        })
+        .catch(err => console.error('Manual sentiment fetch failed:', err));
+    
+    // Manually call the daily PnL API
+    fetch('/api/v1/pnl/daily')
+        .then(response => response.json())
+        .then(data => {
+            console.log('Daily PnL data:', data);
+            if (data.summary) {
+                const totalPnlEl = document.getElementById('summary-total-pnl');
+                if (totalPnlEl) {
+                    totalPnlEl.textContent = `$${data.summary.total_pnl?.toFixed(2) || '0.00'}`;
+                }
+            }
+        })
+        .catch(err => console.error('Manual PnL fetch failed:', err));
+} 

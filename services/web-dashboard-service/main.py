@@ -17,6 +17,9 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import uvicorn
 import os
+import yaml
+import shutil
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -144,8 +147,18 @@ async def liveness_check():
 # Dashboard Pages
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    """Main dashboard page"""
+    """Enhanced main dashboard page"""
+    return templates.TemplateResponse("enhanced-dashboard.html", {"request": request})
+
+@app.get("/dashboard-original", response_class=HTMLResponse)
+async def original_dashboard(request: Request):
+    """Original dashboard page (backup)"""
     return templates.TemplateResponse("dashboard.html", {"request": request})
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_page(request: Request):
+    """Test page to debug JavaScript"""
+    return templates.TemplateResponse("test.html", {"request": request})
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page(request: Request):
@@ -314,6 +327,18 @@ async def get_portfolio():
         logger.error(f"Error getting portfolio: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/pairs/{exchange}")
+async def get_exchange_pairs(exchange: str):
+    """Get trading pairs for a specific exchange"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{database_service_url}/api/v1/pairs/{exchange}")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error getting pairs for {exchange}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Shadow PnL proxy endpoints (read-only)
 @app.get("/api/pnl/realized")
 async def api_pnl_realized(exchange: str, symbol: str, start: Optional[str] = None, end: Optional[str] = None):
@@ -439,6 +464,8 @@ async def get_trade_history(
                 params["min_pnl"] = 0.01  # Positive PnL
             elif filter == "losing":
                 params["max_pnl"] = -0.01  # Negative PnL
+            elif filter == "no_dust":
+                params["exclude_exit_reason"] = "dust_amount_below_minimum"  # Exclude dust trades
             elif filter == "today":
                 today = datetime.utcnow().date()
                 params["start_date"] = today.isoformat()
@@ -450,30 +477,57 @@ async def get_trade_history(
                 month_ago = datetime.utcnow().date() - timedelta(days=30)
                 params["start_date"] = month_ago.isoformat()
             
-            # Try the specific history endpoint first, fall back to general trades endpoint
-            try:
-                response = await client.get(f"{database_service_url}/api/v1/trades/closed/history", params=params)
-                if response.status_code == 404:
-                    # Fallback to general trades endpoint
-                    response = await client.get(f"{database_service_url}/api/v1/trades", params=params)
-            except:
-                # Fallback to general trades endpoint
-                response = await client.get(f"{database_service_url}/api/v1/trades", params=params)
-                
-            response.raise_for_status()
-            data = response.json()
+            # Use the dedicated trade history endpoint which handles pagination properly
+            response = await client.get(f"{database_service_url}/api/v1/trades/closed/history", params=params)
             
-            # If the response doesn't have pagination info, calculate it
-            if 'pagination' not in data:
-                trades = data.get('trades', [])
+            if response.status_code == 200:
+                # The history endpoint returns proper pagination, format it correctly
+                data = response.json()
                 
-                # Get total count for pagination
+                # Ensure proper pagination format
+                if 'total_pages' in data and 'page' in data:
+                    page_num = data['page']
+                    total_pages = data['total_pages']
+                    total_count = data.get('total', 0)
+                    
+                    # Add standard pagination format
+                    data['pagination'] = {
+                        "page": page_num,
+                        "limit": limit,
+                        "total": total_count,
+                        "total_pages": total_pages,
+                        "has_next": page_num < total_pages,
+                        "has_prev": page_num > 1
+                    }
+                    data['sorting'] = {
+                        "sort_by": sort_by,
+                        "sort_order": sort_order
+                    }
+                
+                return data
+            else:
+                # Fallback to general trades endpoint and build pagination
+                logger.warning(f"History endpoint failed ({response.status_code}), using fallback method")
+                
+                # Get all closed trades first to calculate proper total count
                 count_params = params.copy()
-                count_params['limit'] = 10000  # Get all to count
-                count_response = await client.get(f"{database_service_url}/api/v1/trades", params=count_params)
-                total_trades = len(count_response.json().get('trades', [])) if count_response.status_code == 200 else len(trades)
+                count_params.pop('page', None)  # Remove page to get all
+                count_params.pop('limit', None)  # Remove limit to get all
+                count_params['limit'] = 10000  # Large limit to get all trades
                 
-                # Add pagination info
+                count_response = await client.get(f"{database_service_url}/api/v1/trades", params=count_params)
+                all_trades = count_response.json().get('trades', []) if count_response.status_code == 200 else []
+                
+                # Filter closed trades for accurate count
+                closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
+                total_trades = len(closed_trades)
+                
+                # Now get the paginated results
+                fallback_response = await client.get(f"{database_service_url}/api/v1/trades", params=params)
+                fallback_response.raise_for_status()
+                data = fallback_response.json()
+                
+                # Build proper pagination info with accurate totals
                 total_pages = (total_trades + limit - 1) // limit if total_trades > 0 else 1
                 data['pagination'] = {
                     "page": page,
@@ -487,8 +541,8 @@ async def get_trade_history(
                     "sort_by": sort_by,
                     "sort_order": sort_order
                 }
-            
-            return data
+                
+                return data
     except Exception as e:
         logger.error(f"Error getting trade history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -743,6 +797,85 @@ async def get_all_config():
     except Exception as e:
         logger.error(f"Error getting config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/config/trading")
+async def get_trading_config():
+    """Get trading configuration for dashboard display"""
+    try:
+        # First try config service
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{config_service_url}/api/v1/config/all")
+            if response.status_code == 200:
+                full_config = response.json()
+                trading_config = full_config.get('trading', {})
+                profit_protection = trading_config.get('profit_protection', {})
+                trailing_stop = trading_config.get('trailing_stop', {})
+                
+                return {
+                    "profit_protection": {
+                        "trigger_percentage": profit_protection.get('trigger_percentage', 0.01),
+                        "activation_threshold": profit_protection.get('activation_threshold', 0.008)
+                    },
+                    "trailing_stop": {
+                        "trigger_percentage": trailing_stop.get('trigger_percentage', 0.04),
+                        "activation_threshold": trailing_stop.get('activation_threshold', 0.005),
+                        "step_percentage": trailing_stop.get('step_percentage', 0.005)
+                    }
+                }
+        
+        # Fallback to local config file
+        config_paths = [
+            "/app/config/config.yaml",
+            "config/config.yaml", 
+            "../config/config.yaml", 
+            "../../config/config.yaml"
+        ]
+        
+        for config_path in config_paths:
+            try:
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+                    trading_config = config.get('trading', {})
+                    profit_protection = trading_config.get('profit_protection', {})
+                    trailing_stop = trading_config.get('trailing_stop', {})
+                    
+                    return {
+                        "profit_protection": {
+                            "trigger_percentage": profit_protection.get('trigger_percentage', 0.01),
+                            "activation_threshold": profit_protection.get('activation_threshold', 0.008)
+                        },
+                        "trailing_stop": {
+                            "trigger_percentage": trailing_stop.get('trigger_percentage', 0.04),
+                            "activation_threshold": trailing_stop.get('activation_threshold', 0.005)
+                        }
+                    }
+            except FileNotFoundError:
+                continue
+        
+        # Default fallback values
+        return {
+            "profit_protection": {
+                "trigger_percentage": 0.01,
+                "activation_threshold": 0.008
+            },
+            "trailing_stop": {
+                "trigger_percentage": 0.04,
+                "activation_threshold": 0.005
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting trading config: {e}")
+        return {
+            "profit_protection": {
+                "trigger_percentage": 0.01,
+                "activation_threshold": 0.008
+            },
+            "trailing_stop": {
+                "trigger_percentage": 0.04,
+                "activation_threshold": 0.005
+            }
+        }
 
 @app.put("/api/config/update")
 async def update_config(path: str, value: Any):
@@ -2031,6 +2164,1158 @@ async def get_trading_analytics():
     except Exception as e:
         logger.error(f"Error getting trading analytics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/market/sentiment")
+async def get_market_sentiment():
+    """Get overall market sentiment and trend direction"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get BTC/ETH trend data from exchange service
+            btc_response = await client.get(f"{exchange_service_url}/api/v1/market/ticker/binance/BTCUSDC")
+            eth_response = await client.get(f"{exchange_service_url}/api/v1/market/ticker/binance/ETHUSDC")
+            
+            # Get active trades for sentiment analysis from database service
+            trades_response = await client.get(f"{database_service_url}/api/v1/trades?status=OPEN&limit=100")
+            
+            sentiment_data = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "overall_trend": "neutral",
+                "market_sentiment": "neutral", 
+                "trend_strength": 0,
+                "btc_trend": {"direction": "neutral", "change_24h": 0},
+                "eth_trend": {"direction": "neutral", "change_24h": 0},
+                "active_trades_sentiment": {"bullish": 0, "bearish": 0, "total": 0}
+            }
+            
+            # Analyze BTC trend
+            if btc_response.status_code == 200:
+                btc_data = btc_response.json()
+                btc_change = float(btc_data.get("percentage", 0))
+                sentiment_data["btc_trend"]["change_24h"] = btc_change
+                if btc_change > 2:
+                    sentiment_data["btc_trend"]["direction"] = "bullish"
+                elif btc_change < -2:
+                    sentiment_data["btc_trend"]["direction"] = "bearish"
+                else:
+                    sentiment_data["btc_trend"]["direction"] = "neutral"
+            
+            # Analyze ETH trend  
+            if eth_response.status_code == 200:
+                eth_data = eth_response.json()
+                eth_change = float(eth_data.get("percentage", 0))
+                sentiment_data["eth_trend"]["change_24h"] = eth_change
+                if eth_change > 2:
+                    sentiment_data["eth_trend"]["direction"] = "bullish"
+                elif eth_change < -2:
+                    sentiment_data["eth_trend"]["direction"] = "bearish"
+                else:
+                    sentiment_data["eth_trend"]["direction"] = "neutral"
+            
+            # Analyze active trades sentiment
+            if trades_response.status_code == 200:
+                trades_data = trades_response.json()
+                trades = trades_data.get("trades", [])
+                
+                # Count bullish vs bearish trades based on unrealized PnL
+                bullish_trades = sum(1 for trade in trades if float(trade.get("unrealized_pnl", 0)) > 0)
+                bearish_trades = sum(1 for trade in trades if float(trade.get("unrealized_pnl", 0)) < 0)
+                neutral_trades = sum(1 for trade in trades if float(trade.get("unrealized_pnl", 0)) == 0)
+                
+                sentiment_data["active_trades_sentiment"] = {
+                    "bullish": bullish_trades,
+                    "bearish": bearish_trades,
+                    "neutral": neutral_trades,
+                    "total": len(trades)
+                }
+            
+            # Calculate overall sentiment
+            btc_score = 1 if sentiment_data["btc_trend"]["direction"] == "bullish" else -1 if sentiment_data["btc_trend"]["direction"] == "bearish" else 0
+            eth_score = 1 if sentiment_data["eth_trend"]["direction"] == "bullish" else -1 if sentiment_data["eth_trend"]["direction"] == "bearish" else 0
+            
+            trades_total = sentiment_data["active_trades_sentiment"]["total"]
+            trade_score = 0
+            if trades_total > 0:
+                bullish_ratio = sentiment_data["active_trades_sentiment"]["bullish"] / trades_total
+                if bullish_ratio > 0.6:
+                    trade_score = 1
+                elif bullish_ratio < 0.4:
+                    trade_score = -1
+            
+            overall_score = btc_score + eth_score + trade_score
+            sentiment_data["trend_strength"] = abs(overall_score)
+            
+            if overall_score > 1:
+                sentiment_data["overall_trend"] = "bullish"
+                sentiment_data["market_sentiment"] = "bullish"
+            elif overall_score < -1:
+                sentiment_data["overall_trend"] = "bearish" 
+                sentiment_data["market_sentiment"] = "bearish"
+            else:
+                sentiment_data["overall_trend"] = "neutral"
+                sentiment_data["market_sentiment"] = "neutral"
+            
+            return sentiment_data
+            
+    except Exception as e:
+        logger.error(f"Error getting market sentiment: {e}")
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "overall_trend": "unknown",
+            "market_sentiment": "unknown",
+            "trend_strength": 0,
+            "error": str(e)
+        }
+
+@app.get("/api/v1/pnl/daily")
+async def get_daily_pnl():
+    """Get daily PnL for the last 7 days"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Calculate date range for last 7 days
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=7)
+            
+            # Get trades from database
+            params = {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "limit": 1000
+            }
+            
+            response = await client.get(f"{database_service_url}/api/v1/trades", params=params)
+            
+            if response.status_code != 200:
+                return {"error": "Failed to fetch trades", "daily_pnl": []}
+            
+            trades_data = response.json()
+            trades = trades_data.get("trades", [])
+            
+            # Group trades by day and calculate daily PnL
+            daily_pnl = {}
+            
+            for trade in trades:
+                if trade.get("status") == "CLOSED" and trade.get("realized_pnl"):
+                    exit_time = trade.get("exit_time")
+                    if exit_time:
+                        try:
+                            trade_date = datetime.fromisoformat(exit_time.replace('Z', '+00:00')).date()
+                            trade_date_str = trade_date.isoformat()
+                            
+                            if trade_date_str not in daily_pnl:
+                                daily_pnl[trade_date_str] = {
+                                    "date": trade_date_str,
+                                    "realized_pnl": 0.0,
+                                    "trade_count": 0,
+                                    "winning_trades": 0,
+                                    "losing_trades": 0
+                                }
+                            
+                            pnl = float(trade.get("realized_pnl", 0))
+                            daily_pnl[trade_date_str]["realized_pnl"] += pnl
+                            daily_pnl[trade_date_str]["trade_count"] += 1
+                            
+                            if pnl > 0:
+                                daily_pnl[trade_date_str]["winning_trades"] += 1
+                            else:
+                                daily_pnl[trade_date_str]["losing_trades"] += 1
+                                
+                        except Exception as e:
+                            logger.error(f"Error parsing trade date {exit_time}: {e}")
+                            continue
+            
+            # Fill in missing days with zero PnL
+            current_date = start_date.date()
+            while current_date <= end_date.date():
+                date_str = current_date.isoformat()
+                if date_str not in daily_pnl:
+                    daily_pnl[date_str] = {
+                        "date": date_str,
+                        "realized_pnl": 0.0,
+                        "trade_count": 0,
+                        "winning_trades": 0,
+                        "losing_trades": 0
+                    }
+                current_date += timedelta(days=1)
+            
+            # Sort by date and convert to list
+            sorted_daily_pnl = sorted(daily_pnl.values(), key=lambda x: x["date"])
+            
+            # Calculate cumulative PnL and win rate
+            cumulative_pnl = 0
+            for day in sorted_daily_pnl:
+                cumulative_pnl += day["realized_pnl"]
+                day["cumulative_pnl"] = cumulative_pnl
+                day["win_rate"] = (day["winning_trades"] / day["trade_count"] * 100) if day["trade_count"] > 0 else 0
+            
+            return {
+                "daily_pnl": sorted_daily_pnl,
+                "summary": {
+                    "total_pnl": cumulative_pnl,
+                    "total_trades": sum(day["trade_count"] for day in sorted_daily_pnl),
+                    "profitable_days": sum(1 for day in sorted_daily_pnl if day["realized_pnl"] > 0),
+                    "losing_days": sum(1 for day in sorted_daily_pnl if day["realized_pnl"] < 0),
+                    "best_day": max(sorted_daily_pnl, key=lambda x: x["realized_pnl"]) if sorted_daily_pnl else None,
+                    "worst_day": min(sorted_daily_pnl, key=lambda x: x["realized_pnl"]) if sorted_daily_pnl else None
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"Error getting daily PnL: {e}")
+        return {"error": "Failed to fetch daily PnL", "details": str(e), "daily_pnl": []}
+
+@app.get("/api/v1/analytics/actionable")
+async def get_actionable_analytics():
+    """Get actionable analytics with specific parameter recommendations for strategy optimization"""
+    try:
+        # Load current config to compare against actual values
+        config_file_path = "/app/config/config.yaml"
+        with open(config_file_path, 'r') as f:
+            current_config = yaml.safe_load(f)
+        
+        # Get all trades for analysis
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            trades_response = await client.get(f"{database_service_url}/api/v1/trades?limit=10000")
+            trades_response.raise_for_status()
+            all_trades = trades_response.json().get('trades', [])
+        
+        closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
+        recent_trades = [t for t in closed_trades if t.get('exit_time')][-50:]  # Last 50 trades
+        
+        if len(recent_trades) < 10:
+            return {
+                "status": "insufficient_data",
+                "message": "Need at least 10 trades for actionable recommendations",
+                "recommendations": []
+            }
+        
+        # Calculate overall vs recent win rates for comparison
+        overall_win_rate = sum(1 for t in closed_trades if t.get('realized_pnl', 0) > 0) / len(closed_trades) if closed_trades else 0
+        
+        recommendations = []
+        insights = {}
+        
+        # 1. CONFIDENCE CORRELATION ANALYSIS
+        confidence_performance = {}
+        for trade in recent_trades:
+            # Extract confidence from entry_reason string
+            try:
+                entry_reason = trade.get('entry_reason', '')
+                if 'confidence:' in entry_reason:
+                    confidence_str = entry_reason.split('confidence:')[1].split(',')[0].strip()
+                    confidence = float(confidence_str)
+                else:
+                    confidence = 0.6  # Default
+            except:
+                confidence = 0.6  # Default if parsing fails
+            
+            pnl = trade.get('realized_pnl', 0)
+            confidence_bucket = round(confidence * 20) / 20  # Bucket to 0.05 intervals
+            
+            if confidence_bucket not in confidence_performance:
+                confidence_performance[confidence_bucket] = {'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0}
+            
+            confidence_performance[confidence_bucket]['count'] += 1
+            confidence_performance[confidence_bucket]['total_pnl'] += pnl
+            if pnl > 0:
+                confidence_performance[confidence_bucket]['wins'] += 1
+            else:
+                confidence_performance[confidence_bucket]['losses'] += 1
+        
+        # Get current confidence thresholds from config
+        current_confidence_thresholds = {}
+        strategies = current_config.get('strategies', {})
+        for strategy_name, strategy_config in strategies.items():
+            if strategy_config.get('enabled', False):
+                current_confidence_thresholds[strategy_name] = strategy_config.get('parameters', {}).get('min_confidence', 0.65)
+        
+        # Find optimal confidence threshold
+        best_confidence = None
+        best_win_rate = 0
+        for conf, stats in confidence_performance.items():
+            if stats['count'] >= 5:  # Need significant sample size
+                win_rate = stats['wins'] / stats['count']
+                if win_rate > best_win_rate and win_rate > 0.7:
+                    best_win_rate = win_rate
+                    best_confidence = conf
+        
+        # Only recommend if the optimal confidence is higher than what's currently configured
+        current_avg_confidence = sum(current_confidence_thresholds.values()) / len(current_confidence_thresholds) if current_confidence_thresholds else 0.65
+        
+        if best_confidence and best_confidence > current_avg_confidence + 0.05:  # At least 5% improvement
+            recommendations.append({
+                "type": "confidence_threshold",
+                "priority": "high",
+                "current_value": f"{current_avg_confidence:.2f} (current avg)",
+                "recommended_value": f"{best_confidence:.2f}",
+                "impact": f"Win rate improves to {best_win_rate:.1%}",
+                "config_path": "strategies.*.parameters.min_confidence",
+                "reason": f"Trades with {best_confidence:.2f}+ confidence show {best_win_rate:.1%} win rate vs {(sum(p['wins'] for p in confidence_performance.values()) / sum(p['count'] for p in confidence_performance.values())):.1%} overall"
+            })
+        elif current_confidence_thresholds:
+            # Current confidence levels are already optimal
+            overall_win_rate_confidence = (sum(p['wins'] for p in confidence_performance.values()) / sum(p['count'] for p in confidence_performance.values())) if confidence_performance else 0
+            recommendations.append({
+                "type": "confidence_threshold",
+                "priority": "low",
+                "current_value": f"{current_avg_confidence:.2f} (current avg)",
+                "recommended_value": f"{current_avg_confidence:.2f}",
+                "impact": "Current confidence thresholds are optimal",
+                "config_path": "strategies.*.parameters.min_confidence",
+                "reason": f"Current {current_avg_confidence:.2f} confidence threshold is already near-optimal based on recent performance"
+            })
+        
+        # 2. STOP LOSS OPTIMIZATION
+        stop_loss_analysis = {}
+        for trade in recent_trades:
+            if trade.get('exit_reason', '').startswith('stop_loss_'):
+                try:
+                    sl_pct = float(trade.get('exit_reason', '').split('_')[-1].replace('%', '')) / 100
+                    if sl_pct not in stop_loss_analysis:
+                        stop_loss_analysis[sl_pct] = {'count': 0, 'total_loss': 0}
+                    stop_loss_analysis[sl_pct]['count'] += 1
+                    stop_loss_analysis[sl_pct]['total_loss'] += abs(trade.get('realized_pnl', 0))
+                except:
+                    continue
+        
+        if stop_loss_analysis:
+            avg_loss_by_sl = {sl: stats['total_loss']/stats['count'] for sl, stats in stop_loss_analysis.items() if stats['count'] >= 3}
+            if avg_loss_by_sl:
+                optimal_sl = min(avg_loss_by_sl.keys(), key=lambda x: avg_loss_by_sl[x])
+                current_sl = current_config.get('trading', {}).get('stop_loss_percentage', 0.02)
+                if abs(optimal_sl) != current_sl and abs(optimal_sl) > 0:  # Fix negative values
+                    optimal_sl_positive = abs(optimal_sl)
+                    recommendations.append({
+                        "type": "stop_loss",
+                        "priority": "medium",
+                        "current_value": f"{current_sl:.1%}",
+                        "recommended_value": f"{optimal_sl_positive:.1%}",
+                        "impact": f"Optimize stop loss timing",
+                        "config_path": "trading.stop_loss_percentage",
+                        "reason": f"Analysis suggests {optimal_sl_positive:.1%} stop loss shows better risk control"
+                    })
+        
+        # 3. TRAILING STOP ANALYSIS
+        trailing_winners = [t for t in recent_trades if t.get('exit_reason', '').startswith('trailing_stop_trigger') and t.get('realized_pnl', 0) > 0]
+        trailing_trigger_analysis = {}
+        
+        for trade in trailing_winners:
+            entry_price = trade.get('entry_price', 0)
+            trigger_price = trade.get('trail_stop_trigger', 0)
+            if entry_price > 0 and trigger_price > 0:
+                trigger_pct = ((trigger_price - entry_price) / entry_price)
+                bucket = round(trigger_pct * 100) / 100  # Bucket to 1% intervals
+                if bucket not in trailing_trigger_analysis:
+                    trailing_trigger_analysis[bucket] = {'count': 0, 'total_profit': 0}
+                trailing_trigger_analysis[bucket]['count'] += 1
+                trailing_trigger_analysis[bucket]['total_profit'] += trade.get('realized_pnl', 0)
+        
+        if trailing_trigger_analysis:
+            avg_profit_by_trigger = {trigger: stats['total_profit']/stats['count'] for trigger, stats in trailing_trigger_analysis.items() if stats['count'] >= 2}
+            if avg_profit_by_trigger:
+                optimal_trigger = max(avg_profit_by_trigger.keys(), key=lambda x: avg_profit_by_trigger[x])
+                current_trigger = 0.015  # From config
+                if abs(optimal_trigger - current_trigger) > 0.005:
+                    recommendations.append({
+                        "type": "trailing_stop_trigger",
+                        "priority": "medium",
+                        "current_value": f"{current_trigger:.1%}",
+                        "recommended_value": f"{optimal_trigger:.1%}",
+                        "impact": f"Avg profit per winning trade: ${avg_profit_by_trigger[optimal_trigger]:.2f}",
+                        "config_path": "trading.trailing_stop.trigger_percentage",
+                        "reason": f"Trailing stops triggered at {optimal_trigger:.1%} profit show highest average returns"
+                    })
+        
+        # 4. STRATEGY PERFORMANCE RECOMMENDATIONS  
+        strategy_performance = {}
+        for trade in recent_trades:
+            strategy = trade.get('strategy', 'unknown')
+            if strategy not in strategy_performance:
+                strategy_performance[strategy] = {'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0}
+            
+            strategy_performance[strategy]['count'] += 1
+            strategy_performance[strategy]['total_pnl'] += trade.get('realized_pnl', 0)
+            if trade.get('realized_pnl', 0) > 0:
+                strategy_performance[strategy]['wins'] += 1
+            else:
+                strategy_performance[strategy]['losses'] += 1
+        
+        # Find underperforming strategies (only those currently enabled)
+        for strategy, stats in strategy_performance.items():
+            if stats['count'] >= 5:
+                # Check if strategy is currently enabled in config
+                strategy_config = current_config.get('strategies', {}).get(strategy, {})
+                is_currently_enabled = strategy_config.get('enabled', False)
+                
+                if is_currently_enabled:  # Only recommend disabling if currently enabled
+                    win_rate = stats['wins'] / stats['count']
+                    avg_pnl = stats['total_pnl'] / stats['count']
+                    
+                    if win_rate < 0.4 or avg_pnl < -0.5:
+                        recommendations.append({
+                            "type": "strategy_disable",
+                            "priority": "high",
+                            "current_value": "enabled",
+                            "recommended_value": "disabled",
+                            "impact": f"Avoid avg loss of ${abs(avg_pnl):.2f} per trade",
+                            "config_path": f"strategies.{strategy}.enabled",
+                            "reason": f"Strategy shows {win_rate:.1%} win rate and ${avg_pnl:.2f} avg PnL over {stats['count']} trades"
+                        })
+        
+        # 5. PAIR BLACKLIST RECOMMENDATIONS
+        pair_performance = {}
+        for trade in recent_trades:
+            pair = trade.get('pair', 'unknown')
+            if pair not in pair_performance:
+                pair_performance[pair] = {'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0}
+            
+            pair_performance[pair]['count'] += 1
+            pair_performance[pair]['total_pnl'] += trade.get('realized_pnl', 0)
+            if trade.get('realized_pnl', 0) > 0:
+                pair_performance[pair]['wins'] += 1
+            else:
+                pair_performance[pair]['losses'] += 1
+        
+        # Find consistently losing pairs (only those not already blacklisted)
+        current_blacklist = current_config.get('pair_selector', {}).get('blacklisted_pairs', [])
+        
+        for pair, stats in pair_performance.items():
+            if stats['count'] >= 5 and pair not in current_blacklist:  # Skip already blacklisted pairs
+                win_rate = stats['wins'] / stats['count']
+                avg_pnl = stats['total_pnl'] / stats['count']
+                
+                if win_rate < 0.3 and avg_pnl < -1.0:
+                    recommendations.append({
+                        "type": "pair_blacklist",
+                        "priority": "medium",
+                        "current_value": "active",
+                        "recommended_value": pair,  # Pass the actual pair name
+                        "impact": f"Avoid ${abs(stats['total_pnl']):.2f} in losses",
+                        "config_path": f"pair_selector.blacklisted_pairs",
+                        "reason": f"Pair {pair} shows {win_rate:.1%} win rate and ${avg_pnl:.2f} avg PnL over {stats['count']} trades"
+                    })
+        
+        # 6. POSITION SIZE RECOMMENDATIONS
+        position_analysis = {}
+        for trade in recent_trades:
+            position_size = trade.get('position_size', 0) * trade.get('entry_price', 0)  # USD value
+            pnl_pct = trade.get('realized_pnl_pct', 0)
+            
+            if position_size > 0:
+                size_bucket = round(position_size / 25) * 25  # Bucket by $25 intervals
+                if size_bucket not in position_analysis:
+                    position_analysis[size_bucket] = {'trades': 0, 'total_pnl_pct': 0, 'wins': 0}
+                
+                position_analysis[size_bucket]['trades'] += 1
+                position_analysis[size_bucket]['total_pnl_pct'] += pnl_pct
+                if trade.get('realized_pnl', 0) > 0:
+                    position_analysis[size_bucket]['wins'] += 1
+        
+        # Find optimal position size
+        current_min_order_sizes = current_config.get('trading', {}).get('min_order_size_usd', {})
+        current_default_size = current_min_order_sizes.get('default', 50)
+        
+        if position_analysis:
+            best_size = None
+            best_roi = -float('inf')
+            for size, stats in position_analysis.items():
+                if stats['trades'] >= 3:
+                    avg_roi = stats['total_pnl_pct'] / stats['trades']
+                    win_rate = stats['wins'] / stats['trades']
+                    if avg_roi > best_roi and win_rate > 0.5:
+                        best_roi = avg_roi
+                        best_size = size
+            
+            if best_size and abs(best_size - current_default_size) > 10:  # At least $10 difference
+                recommendations.append({
+                    "type": "position_size",
+                    "priority": "low",
+                    "current_value": f"${current_default_size}",
+                    "recommended_value": f"${best_size:.0f}",
+                    "impact": f"Avg ROI improves to {best_roi:.2%}",
+                    "config_path": "trading.min_order_size_usd",
+                    "reason": f"${best_size:.0f} position sizes show best risk-adjusted returns"
+                })
+        
+        # Performance insights summary
+        recent_win_rate = sum(1 for t in recent_trades if t.get('realized_pnl', 0) > 0) / len(recent_trades)
+        recent_avg_pnl = sum(t.get('realized_pnl', 0) for t in recent_trades) / len(recent_trades)
+        
+        # Calculate potential improvement safely
+        potential_improvement = 0
+        for r in recommendations:
+            impact_str = r.get('impact', '')
+            try:
+                if 'per trade' in impact_str and '$' in impact_str:
+                    # Extract dollar amount from impact string
+                    dollar_amount = impact_str.replace('Avg loss reduces by $', '').replace(' per trade', '').split()[0]
+                    potential_improvement += float(dollar_amount)
+            except:
+                continue
+        
+        insights = {
+            "sample_size": len(recent_trades),
+            "total_trades": len(closed_trades),
+            "recent_win_rate": recent_win_rate,
+            "overall_win_rate": overall_win_rate,
+            "win_rate_trend": "declining" if recent_win_rate < overall_win_rate else "improving",
+            "recent_avg_pnl": recent_avg_pnl,
+            "total_recommendations": len(recommendations),
+            "high_priority_count": len([r for r in recommendations if r['priority'] == 'high']),
+            "potential_improvement": potential_improvement,
+        }
+        
+        return {
+            "status": "success",
+            "insights": insights,
+            "recommendations": recommendations,
+            "analysis_timestamp": datetime.utcnow().isoformat(),
+            "confidence_analysis": confidence_performance,
+            "strategy_performance": strategy_performance,
+            "pair_performance": {k: v for k, v in pair_performance.items() if v['count'] >= 3}
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating actionable analytics: {e}")
+        return {"status": "error", "message": str(e), "recommendations": []}
+
+@app.get("/api/v1/analytics/market-conditions")
+async def get_market_condition_analytics():
+    """Analyze performance under different market conditions for strategy selection"""
+    try:
+        # Get recent trades and market data
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            trades_response = await client.get(f"{database_service_url}/api/v1/trades?limit=200")
+            trades_response.raise_for_status()
+            all_trades = trades_response.json().get('trades', [])
+        
+        closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED' and t.get('entry_time')]
+        
+        if len(closed_trades) < 20:
+            return {
+                "status": "insufficient_data",
+                "message": "Need at least 20 trades for market condition analysis"
+            }
+        
+        # Analyze by time of day
+        hourly_performance = {}
+        for trade in closed_trades:
+            try:
+                entry_time = datetime.fromisoformat(trade.get('entry_time', '').replace('Z', '+00:00'))
+                hour = entry_time.hour
+                
+                if hour not in hourly_performance:
+                    hourly_performance[hour] = {'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0}
+                
+                hourly_performance[hour]['count'] += 1
+                hourly_performance[hour]['total_pnl'] += trade.get('realized_pnl', 0)
+                if trade.get('realized_pnl', 0) > 0:
+                    hourly_performance[hour]['wins'] += 1
+                else:
+                    hourly_performance[hour]['losses'] += 1
+            except:
+                continue
+        
+        # Find best trading hours
+        best_hours = []
+        worst_hours = []
+        for hour, stats in hourly_performance.items():
+            if stats['count'] >= 3:
+                win_rate = stats['wins'] / stats['count']
+                avg_pnl = stats['total_pnl'] / stats['count']
+                
+                if win_rate > 0.7 and avg_pnl > 0.5:
+                    best_hours.append({
+                        "hour": hour,
+                        "win_rate": win_rate,
+                        "avg_pnl": avg_pnl,
+                        "trade_count": stats['count']
+                    })
+                elif win_rate < 0.3 or avg_pnl < -1.0:
+                    worst_hours.append({
+                        "hour": hour,
+                        "win_rate": win_rate,
+                        "avg_pnl": avg_pnl,
+                        "trade_count": stats['count']
+                    })
+        
+        # Analyze by day of week
+        daily_performance = {}
+        for trade in closed_trades:
+            try:
+                entry_time = datetime.fromisoformat(trade.get('entry_time', '').replace('Z', '+00:00'))
+                day = entry_time.weekday()  # 0=Monday, 6=Sunday
+                
+                if day not in daily_performance:
+                    daily_performance[day] = {'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0}
+                
+                daily_performance[day]['count'] += 1
+                daily_performance[day]['total_pnl'] += trade.get('realized_pnl', 0)
+                if trade.get('realized_pnl', 0) > 0:
+                    daily_performance[day]['wins'] += 1
+                else:
+                    daily_performance[day]['losses'] += 1
+            except:
+                continue
+        
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        daily_insights = []
+        for day, stats in daily_performance.items():
+            if stats['count'] >= 3:
+                win_rate = stats['wins'] / stats['count']
+                avg_pnl = stats['total_pnl'] / stats['count']
+                daily_insights.append({
+                    "day": day_names[day],
+                    "win_rate": win_rate,
+                    "avg_pnl": avg_pnl,
+                    "trade_count": stats['count']
+                })
+        
+        # Strategy effectiveness by market condition
+        strategy_conditions = {}
+        for trade in closed_trades:
+            strategy = trade.get('strategy', 'unknown')
+            # Determine if it was a volatile day based on price movement
+            highest = trade.get('highest_price', 0)
+            entry = trade.get('entry_price', 0)
+            volatility = ((highest - entry) / entry) if entry > 0 else 0
+            
+            condition = 'high_volatility' if volatility > 0.03 else 'low_volatility'
+            
+            if strategy not in strategy_conditions:
+                strategy_conditions[strategy] = {
+                    'high_volatility': {'wins': 0, 'losses': 0, 'count': 0},
+                    'low_volatility': {'wins': 0, 'losses': 0, 'count': 0}
+                }
+            
+            strategy_conditions[strategy][condition]['count'] += 1
+            if trade.get('realized_pnl', 0) > 0:
+                strategy_conditions[strategy][condition]['wins'] += 1
+            else:
+                strategy_conditions[strategy][condition]['losses'] += 1
+        
+        # Generate condition-based recommendations
+        condition_recommendations = []
+        for strategy, conditions in strategy_conditions.items():
+            for condition, stats in conditions.items():
+                if stats['count'] >= 5:
+                    win_rate = stats['wins'] / stats['count']
+                    if condition == 'high_volatility' and win_rate < 0.4:
+                        condition_recommendations.append({
+                            "strategy": strategy,
+                            "condition": condition,
+                            "recommendation": "disable_during_high_volatility",
+                            "win_rate": win_rate,
+                            "reason": f"Low {win_rate:.1%} win rate during high volatility periods"
+                        })
+                    elif condition == 'low_volatility' and win_rate > 0.7:
+                        condition_recommendations.append({
+                            "strategy": strategy,
+                            "condition": condition,
+                            "recommendation": "increase_position_during_low_volatility",
+                            "win_rate": win_rate,
+                            "reason": f"High {win_rate:.1%} win rate during stable market conditions"
+                        })
+        
+        return {
+            "status": "success",
+            "hourly_performance": hourly_performance,
+            "best_trading_hours": sorted(best_hours, key=lambda x: x['avg_pnl'], reverse=True)[:5],
+            "worst_trading_hours": sorted(worst_hours, key=lambda x: x['avg_pnl'])[:5],
+            "daily_insights": sorted(daily_insights, key=lambda x: x['avg_pnl'], reverse=True),
+            "strategy_by_condition": strategy_conditions,
+            "condition_recommendations": condition_recommendations,
+            "analysis_timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error analyzing market conditions: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/v1/analytics/parameter-optimization")
+async def get_parameter_optimization_suggestions():
+    """Generate specific parameter optimization suggestions based on recent performance"""
+    try:
+        # Load current config to compare against actual values
+        config_file_path = "/app/config/config.yaml"
+        with open(config_file_path, 'r') as f:
+            current_config = yaml.safe_load(f)
+        
+        # Get recent trades for analysis
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            trades_response = await client.get(f"{database_service_url}/api/v1/trades?limit=100")
+            trades_response.raise_for_status()
+            all_trades = trades_response.json().get('trades', [])
+        
+        closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
+        
+        if len(closed_trades) < 15:
+            return {
+                "status": "insufficient_data",
+                "message": "Need at least 15 trades for parameter optimization",
+                "suggestions": []
+            }
+        
+        suggestions = []
+        
+        # Get current config values first
+        current_stop_loss = current_config.get('trading', {}).get('stop_loss_percentage', 0.02)
+        current_take_profit = current_config.get('trading', {}).get('take_profit_percentage', 0.08)
+        current_trigger = current_config.get('trading', {}).get('trailing_stop', {}).get('trigger_percentage', 0.015)
+        
+        # Get current min_confidence from strategies (check all enabled strategies)
+        current_min_confidence = 0.8  # Default fallback
+        strategies = current_config.get('strategies', {})
+        for strategy_name, strategy_config in strategies.items():
+            if strategy_config.get('enabled', False):
+                strategy_min_conf = strategy_config.get('parameters', {}).get('min_confidence')
+                if strategy_min_conf:
+                    current_min_confidence = strategy_min_conf
+                    break
+        
+        # 1. STOP LOSS EFFICIENCY ANALYSIS
+        stop_loss_trades = [t for t in closed_trades if 'stop_loss' in t.get('exit_reason', '')]
+        if len(stop_loss_trades) >= 5:
+            avg_sl_loss = sum(abs(t.get('realized_pnl', 0)) for t in stop_loss_trades) / len(stop_loss_trades)
+            sl_rate = len(stop_loss_trades) / len(closed_trades)
+            
+            if sl_rate > 0.4:  # More than 40% of trades hit stop loss
+                suggested_sl = max(0.015, current_stop_loss - 0.005)  # Suggest 0.5% tighter but not below 1.5%
+                suggestions.append({
+                    "parameter": "stop_loss_percentage",
+                    "current_value": f"{current_stop_loss*100:.1f}%",
+                    "suggested_value": f"{suggested_sl*100:.1f}%",
+                    "priority": "high",
+                    "reason": f"{sl_rate:.1%} of trades hit stop loss, avg loss ${avg_sl_loss:.2f}",
+                    "expected_impact": "Reduce average loss per trade by 25%",
+                    "config_location": "trading.stop_loss_percentage"
+                })
+        
+        # 2. TAKE PROFIT OPTIMIZATION
+        tp_trades = [t for t in closed_trades if 'take_profit' in t.get('exit_reason', '')]
+        manual_exits = [t for t in closed_trades if 'manual' not in t.get('exit_reason', '') and 'take_profit' not in t.get('exit_reason', '') and 'stop_loss' not in t.get('exit_reason', '')]
+        
+        if len(tp_trades) >= 3 and len(manual_exits) >= 3:
+            avg_tp_profit = sum(t.get('realized_pnl', 0) for t in tp_trades) / len(tp_trades)
+            avg_manual_profit = sum(t.get('realized_pnl', 0) for t in manual_exits) / len(manual_exits)
+            
+            if avg_manual_profit > avg_tp_profit * 1.5:
+                suggested_tp = min(0.15, current_take_profit + 0.04)  # Suggest 4% higher but not above 15%
+                suggestions.append({
+                    "parameter": "take_profit_percentage",
+                    "current_value": f"{current_take_profit*100:.1f}%",
+                    "suggested_value": f"{suggested_tp*100:.1f}%",
+                    "priority": "medium",
+                    "reason": f"Manual exits avg ${avg_manual_profit:.2f} vs TP ${avg_tp_profit:.2f}",
+                    "expected_impact": f"Increase profit per trade by ${avg_manual_profit - avg_tp_profit:.2f}",
+                    "config_location": "trading.take_profit_percentage"
+                })
+        
+        # 3. CONFIDENCE THRESHOLD ANALYSIS
+        recent_low_conf = []
+        recent_high_conf = []
+        for t in closed_trades[-30:]:
+            try:
+                entry_reason = t.get('entry_reason', '')
+                if 'confidence:' in entry_reason:
+                    confidence_str = entry_reason.split('confidence:')[1].split(',')[0].strip()
+                    confidence = float(confidence_str)
+                    if confidence < 0.7:
+                        recent_low_conf.append(t)
+                    elif confidence >= 0.8:
+                        recent_high_conf.append(t)
+            except:
+                continue
+        
+        if len(recent_low_conf) >= 5 and len(recent_high_conf) >= 5:
+            low_conf_wr = sum(1 for t in recent_low_conf if t.get('realized_pnl', 0) > 0) / len(recent_low_conf)
+            high_conf_wr = sum(1 for t in recent_high_conf if t.get('realized_pnl', 0) > 0) / len(recent_high_conf)
+            
+            if high_conf_wr > low_conf_wr + 0.2 and current_min_confidence < 0.8:  # 20% better win rate and current is below 0.8
+                suggested_conf = min(0.9, current_min_confidence + 0.1)  # Suggest 0.1 higher but not above 0.9
+                suggestions.append({
+                    "parameter": "min_confidence",
+                    "current_value": f"{current_min_confidence:.2f}",
+                    "suggested_value": f"{suggested_conf:.2f}",
+                    "priority": "high",
+                    "reason": f"High confidence trades: {high_conf_wr:.1%} WR vs low confidence: {low_conf_wr:.1%} WR",
+                    "expected_impact": f"Improve win rate by {(high_conf_wr - low_conf_wr):.1%}",
+                    "config_location": "strategies.*.parameters.min_confidence"
+                })
+            elif current_min_confidence >= 0.8:
+                # Current confidence is already optimal, no recommendation needed
+                pass
+        
+        # 4. TRAILING STOP OPTIMIZATION - HIGHEST PRICE VALIDATION
+        trailing_trades = [t for t in closed_trades if 'trailing_stop' in t.get('exit_reason', '')]
+        if len(trailing_trades) >= 5:
+            proposed_trigger = current_trigger + 0.01  # Try 1% higher
+            
+            # Analyze trades that exited early and validate if they could have reached higher trigger
+            early_exits = []
+            valid_higher_exits = []
+            missed_opportunities = []
+            
+            for trade in trailing_trades:
+                entry_price = trade.get('entry_price', 0)
+                exit_price = trade.get('exit_price', 0)
+                highest_price = trade.get('highest_price', 0)
+                position_size = trade.get('position_size', 0)
+                realized_pnl = trade.get('realized_pnl', 0)
+                
+                if entry_price <= 0 or highest_price <= 0:
+                    continue
+                
+                # Calculate actual profit percentages achieved
+                actual_profit_pct = ((exit_price - entry_price) / entry_price) if exit_price > 0 else 0
+                max_profit_pct = ((highest_price - entry_price) / entry_price)
+                
+                # Check if this was an early exit (less than 2.5% profit)
+                if actual_profit_pct < proposed_trigger:
+                    early_exits.append({
+                        'trade': trade,
+                        'actual_profit_pct': actual_profit_pct,
+                        'max_profit_pct': max_profit_pct,
+                        'actual_profit_usd': realized_pnl,
+                        'could_reach_trigger': max_profit_pct >= proposed_trigger
+                    })
+                    
+                    # Only count as valid if the price actually reached the higher trigger level
+                    if max_profit_pct >= proposed_trigger:
+                        # Calculate what profit would have been at 2.5% trigger
+                        trigger_price = entry_price * (1 + proposed_trigger)
+                        potential_profit = (trigger_price - entry_price) * position_size
+                        
+                        valid_higher_exits.append({
+                            'current_profit': realized_pnl,
+                            'potential_profit': potential_profit,
+                            'additional_profit': potential_profit - realized_pnl
+                        })
+                    else:
+                        # This trade never reached 2.5%, so changing trigger wouldn't help
+                        missed_opportunities.append({
+                            'max_reached': max_profit_pct,
+                            'profit_lost': realized_pnl  # Would lose this profit with higher trigger
+                        })
+            
+            # Calculate the real impact
+            if len(valid_higher_exits) > 0:
+                total_current_profit = sum(v['current_profit'] for v in valid_higher_exits)
+                total_potential_profit = sum(v['potential_profit'] for v in valid_higher_exits)
+                additional_profit = total_potential_profit - total_current_profit
+                
+                # Calculate profit that would be lost from trades that never reached 2.5%
+                lost_profit = sum(m['profit_lost'] for m in missed_opportunities)
+                net_improvement = additional_profit - lost_profit
+                
+                trades_that_could_improve = len(valid_higher_exits)
+                trades_that_would_miss = len(missed_opportunities)
+                
+                if net_improvement > 5.0 and trades_that_could_improve > trades_that_would_miss:
+                    improvement_pct = (net_improvement / abs(total_current_profit + lost_profit)) * 100 if (total_current_profit + lost_profit) != 0 else 0
+                    
+                    suggestions.append({
+                        "parameter": "trailing_stop_trigger",
+                        "current_value": f"{current_trigger*100:.1f}%",
+                        "suggested_value": f"{proposed_trigger*100:.1f}%",
+                        "priority": "medium",
+                        "reason": f"{trades_that_could_improve} trades reached {proposed_trigger*100:.1f}%+ (gain ${additional_profit:.2f}), {trades_that_would_miss} trades didn't (lose ${lost_profit:.2f})",
+                        "expected_impact": f"Net ${net_improvement:.2f} additional profit ({improvement_pct:.1f}% improvement)",
+                        "config_location": "trading.trailing_stop.trigger_percentage"
+                    })
+                else:
+                    # Current trigger is better
+                    suggestions.append({
+                        "parameter": "trailing_stop_trigger",
+                        "current_value": f"{current_trigger*100:.1f}%",
+                        "suggested_value": f"{current_trigger*100:.1f}%",
+                        "priority": "low",
+                        "reason": f"Higher trigger would lose more than it gains: {trades_that_would_miss} trades wouldn't trigger (lose ${lost_profit:.2f}) vs {trades_that_could_improve} that could improve (gain ${additional_profit:.2f})",
+                        "expected_impact": f"Current {current_trigger*100:.1f}% trigger is optimal",
+                        "config_location": "trading.trailing_stop.trigger_percentage"
+                    })
+            
+            elif len(early_exits) > 0:
+                # All early exits never reached the higher trigger
+                total_early_profit = sum(e['actual_profit_usd'] for e in early_exits)
+                suggestions.append({
+                    "parameter": "trailing_stop_trigger",
+                    "current_value": f"{current_trigger*100:.1f}%",
+                    "suggested_value": f"{current_trigger*100:.1f}%",
+                    "priority": "low",
+                    "reason": f"None of {len(early_exits)} early exits reached {proposed_trigger*100:.1f}% (max: {max(e['max_profit_pct'] for e in early_exits)*100:.1f}%)",
+                    "expected_impact": f"Higher trigger would forfeit ${total_early_profit:.2f} in profits",
+                    "config_location": "trading.trailing_stop.trigger_percentage"
+                })
+        
+        # 5. POSITION SIZE ANALYSIS
+        small_positions = [t for t in closed_trades if (t.get('position_size', 0) * t.get('entry_price', 0)) < 60]
+        large_positions = [t for t in closed_trades if (t.get('position_size', 0) * t.get('entry_price', 0)) >= 100]
+        
+        if len(small_positions) >= 5 and len(large_positions) >= 5:
+            small_avg_roi = sum(t.get('realized_pnl_pct', 0) for t in small_positions) / len(small_positions)
+            large_avg_roi = sum(t.get('realized_pnl_pct', 0) for t in large_positions) / len(large_positions)
+            
+            if abs(small_avg_roi - large_avg_roi) < 1.0 and large_avg_roi > 0:
+                suggestions.append({
+                    "parameter": "min_order_size_usd",
+                    "current_value": "50",
+                    "suggested_value": "75",
+                    "priority": "low",
+                    "reason": f"Similar ROI but larger positions: small {small_avg_roi:.1%} vs large {large_avg_roi:.1%}",
+                    "expected_impact": "Increase absolute profit per trade",
+                    "config_location": "trading.min_order_size_usd"
+                })
+        
+        # 6. DAILY TRADING LIMITS
+        daily_trades = {}
+        for trade in closed_trades[-50:]:
+            try:
+                entry_date = datetime.fromisoformat(trade.get('entry_time', '').replace('Z', '+00:00')).date()
+                if entry_date not in daily_trades:
+                    daily_trades[entry_date] = {'count': 0, 'pnl': 0}
+                daily_trades[entry_date]['count'] += 1
+                daily_trades[entry_date]['pnl'] += trade.get('realized_pnl', 0)
+            except:
+                continue
+        
+        high_volume_days = [day for day, stats in daily_trades.items() if stats['count'] >= 8]
+        if len(high_volume_days) >= 3:
+            avg_pnl_high_volume = sum(daily_trades[day]['pnl'] for day in high_volume_days) / len(high_volume_days)
+            if avg_pnl_high_volume < 0:
+                current_max_daily = current_config.get('trading', {}).get('max_daily_trades', 15)
+                suggested_max_daily = max(5, current_max_daily - 5)  # Suggest 5 fewer but not below 5
+                suggestions.append({
+                    "parameter": "max_daily_trades",
+                    "current_value": str(current_max_daily),
+                    "suggested_value": str(suggested_max_daily),
+                    "priority": "medium",
+                    "reason": f"High volume days ({len(high_volume_days)}) show avg loss ${abs(avg_pnl_high_volume):.2f}",
+                    "expected_impact": "Reduce overtrading losses",
+                    "config_location": "trading.max_daily_trades"
+                })
+        
+        # Calculate potential impact summary safely
+        win_rate_improvement = 0
+        loss_reduction = 0
+        profit_increase = 0
+        
+        for s in suggestions:
+            expected_impact = s.get('expected_impact', '')
+            try:
+                if 'win rate' in expected_impact.lower():
+                    if s['parameter'] == 'min_confidence':
+                        win_rate_improvement += 0.15
+                    else:
+                        win_rate_improvement += 0.05
+                elif 'reduce average loss' in expected_impact.lower():
+                    loss_reduction += 25  # Default improvement percentage
+                elif 'profit' in expected_impact.lower():
+                    profit_increase += 1
+            except:
+                continue
+        
+        potential_improvements = {
+            "win_rate_improvement": win_rate_improvement,
+            "loss_reduction": loss_reduction,
+            "profit_increase": profit_increase
+        }
+        
+        return {
+            "status": "success",
+            "suggestions": suggestions,
+            "analysis_summary": {
+                "total_suggestions": len(suggestions),
+                "high_priority": len([s for s in suggestions if s['priority'] == 'high']),
+                "medium_priority": len([s for s in suggestions if s['priority'] == 'medium']),
+                "low_priority": len([s for s in suggestions if s['priority'] == 'low']),
+                "potential_improvements": potential_improvements
+            },
+            "analysis_timestamp": datetime.utcnow().isoformat(),
+            "sample_size": len(closed_trades)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating parameter optimization suggestions: {e}")
+        return {"status": "error", "message": str(e), "suggestions": []}
+
+@app.post("/api/v1/config/apply-recommendation")
+async def apply_recommendation(request: Request):
+    """Apply a configuration recommendation to the config.yaml file"""
+    try:
+        body = await request.json()
+        config_path = body.get('config_path')
+        value = body.get('value')
+        recommendation_type = body.get('type', 'unknown')
+        
+        if not config_path or value is None:
+            return {"status": "error", "message": "Missing config_path or value"}
+        
+        # Path to the config file (mounted volume in Docker)
+        config_file_path = "/app/config/config.yaml"
+        
+        # Create backup first
+        backup_path = f"{config_file_path}.backup.{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        shutil.copy2(config_file_path, backup_path)
+        
+        # Load current config
+        with open(config_file_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Apply the change based on config path
+        if apply_config_change(config, config_path, value, recommendation_type):
+            # Write updated config
+            with open(config_file_path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+            
+            logger.info(f"Applied recommendation: {config_path} = {value}")
+            return {
+                "status": "success", 
+                "message": f"Applied {recommendation_type}: {config_path} = {value}",
+                "backup_created": backup_path
+            }
+        else:
+            return {"status": "error", "message": f"Failed to apply config change: {config_path}"}
+            
+    except Exception as e:
+        logger.error(f"Error applying recommendation: {e}")
+        return {"status": "error", "message": str(e)}
+
+def apply_config_change(config: Dict, config_path: str, value: Any, recommendation_type: str) -> bool:
+    """Apply a configuration change to the config dictionary"""
+    try:
+        # Handle different recommendation types
+        if recommendation_type == "confidence_threshold":
+            # strategies.*.parameters.min_confidence
+            for strategy_name, strategy_config in config.get('strategies', {}).items():
+                if strategy_config.get('enabled', False):
+                    if 'parameters' not in strategy_config:
+                        strategy_config['parameters'] = {}
+                    strategy_config['parameters']['min_confidence'] = float(value)
+            return True
+            
+        elif recommendation_type == "stop_loss":
+            # trading.stop_loss_percentage
+            if 'trading' not in config:
+                config['trading'] = {}
+            config['trading']['stop_loss_percentage'] = abs(float(value))  # Remove negative sign
+            return True
+            
+        elif recommendation_type == "trailing_stop_trigger":
+            # trading.trailing_stop.trigger_percentage
+            if 'trading' not in config:
+                config['trading'] = {}
+            if 'trailing_stop' not in config['trading']:
+                config['trading']['trailing_stop'] = {}
+            config['trading']['trailing_stop']['trigger_percentage'] = float(value)
+            return True
+            
+        elif recommendation_type == "strategy_disable":
+            # strategies.vwma_hull.enabled
+            strategy_name = config_path.split('.')[1]  # Extract strategy name
+            if 'strategies' in config and strategy_name in config['strategies']:
+                config['strategies'][strategy_name]['enabled'] = value.lower() == 'true'
+            return True
+            
+        elif recommendation_type == "pair_blacklist":
+            # pair_selector.blacklisted_pairs
+            if 'pair_selector' not in config:
+                config['pair_selector'] = {}
+            if 'blacklisted_pairs' not in config['pair_selector']:
+                config['pair_selector']['blacklisted_pairs'] = []
+            
+            # Extract pair name from the value or config_path context
+            # This would need to be passed as additional context
+            pair_name = value  # Assuming value contains the pair name
+            if pair_name not in config['pair_selector']['blacklisted_pairs']:
+                config['pair_selector']['blacklisted_pairs'].append(pair_name)
+            return True
+            
+        elif recommendation_type == "position_size":
+            # trading.min_order_size_usd
+            if 'trading' not in config:
+                config['trading'] = {}
+            if 'min_order_size_usd' not in config['trading']:
+                config['trading']['min_order_size_usd'] = {}
+            
+            # Update all exchanges
+            for exchange in ['binance', 'bybit', 'cryptocom', 'default']:
+                config['trading']['min_order_size_usd'][exchange] = float(value.replace('$', ''))
+            return True
+            
+        else:
+            # Generic path-based update
+            return apply_generic_config_change(config, config_path, value)
+            
+    except Exception as e:
+        logger.error(f"Error in apply_config_change: {e}")
+        return False
+
+def apply_generic_config_change(config: Dict, config_path: str, value: Any) -> bool:
+    """Apply a generic configuration change using dot notation path"""
+    try:
+        path_parts = config_path.split('.')
+        current = config
+        
+        # Navigate to the parent of the target key
+        for part in path_parts[:-1]:
+            if part == '*':
+                # Handle wildcard for strategies
+                continue
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+        
+        # Set the final value
+        final_key = path_parts[-1]
+        
+        # Handle type conversion
+        if isinstance(value, str):
+            if value.lower() in ('true', 'false'):
+                value = value.lower() == 'true'
+            elif value.replace('.', '').replace('-', '').isdigit():
+                value = float(value) if '.' in value else int(value)
+            elif value.startswith('$'):
+                value = float(value.replace('$', ''))
+        
+        current[final_key] = value
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in apply_generic_config_change: {e}")
+        return False
+
+@app.get("/api/v1/config/current")
+async def get_current_config():
+    """Get current configuration values for verification"""
+    try:
+        config_file_path = "/app/config/config.yaml"
+        
+        with open(config_file_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Extract key values that are commonly changed
+        current_values = {
+            "confidence_thresholds": {},
+            "stop_loss_percentage": config.get('trading', {}).get('stop_loss_percentage'),
+            "trailing_stop_trigger": config.get('trading', {}).get('trailing_stop', {}).get('trigger_percentage'),
+            "enabled_strategies": {},
+            "blacklisted_pairs": config.get('pair_selector', {}).get('blacklisted_pairs', []),
+            "min_order_sizes": config.get('trading', {}).get('min_order_size_usd', {}),
+        }
+        
+        # Get confidence thresholds for each strategy
+        for strategy_name, strategy_config in config.get('strategies', {}).items():
+            current_values["confidence_thresholds"][strategy_name] = {
+                "enabled": strategy_config.get('enabled', False),
+                "min_confidence": strategy_config.get('parameters', {}).get('min_confidence')
+            }
+            current_values["enabled_strategies"][strategy_name] = strategy_config.get('enabled', False)
+        
+        return {"status": "success", "config": current_values}
+        
+    except Exception as e:
+        logger.error(f"Error getting current config: {e}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run(

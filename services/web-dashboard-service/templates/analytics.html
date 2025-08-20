@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trading Analytics - In-Depth Analysis</title>
+    <title>Unified Trading Analytics</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -30,26 +30,20 @@
         .danger-card {
             border-left-color: #ef4444;
         }
-        .chart-container {
-            position: relative;
-            height: 300px;
-            margin: 1rem 0;
-        }
-        .table-container {
-            max-height: 400px;
-            overflow-y: auto;
-        }
         .priority-high {
             background-color: #fee2e2;
             color: #dc2626;
+            border-left: 4px solid #dc2626;
         }
         .priority-medium {
             background-color: #fef3c7;
             color: #d97706;
+            border-left: 4px solid #d97706;
         }
         .priority-low {
             background-color: #e0f2fe;
             color: #0369a1;
+            border-left: 4px solid #0369a1;
         }
         .loading-spinner {
             border: 4px solid #f3f4f6;
@@ -63,6 +57,24 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin: 1rem 0;
+        }
+        .recommendation-card {
+            transition: all 0.2s ease;
+        }
+        .recommendation-card:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        .action-button {
+            transition: all 0.2s ease;
+        }
+        .action-button:hover {
+            transform: scale(1.05);
+        }
     </style>
 </head>
 <body class="bg-gray-100">
@@ -73,21 +85,15 @@
                 <div class="flex items-center">
                     <a href="/" class="flex items-center">
                         <i class="fas fa-chart-line text-2xl mr-3"></i>
-                        <h1 class="text-xl font-bold">Trading Analytics</h1>
+                        <h1 class="text-xl font-bold">Unified Trading Analytics</h1>
                     </a>
                 </div>
                 <div class="flex items-center space-x-4">
                     <a href="/" class="hover:bg-white hover:bg-opacity-20 px-3 py-2 rounded-md text-sm font-medium transition-colors">
                         <i class="fas fa-home mr-2"></i>Dashboard
                     </a>
-                    <a href="/profitability" class="hover:bg-white hover:bg-opacity-20 px-3 py-2 rounded-md text-sm font-medium transition-colors">
-                        <i class="fas fa-chart-pie mr-2"></i>Profitability
-                    </a>
-                    <a href="/orders" class="hover:bg-white hover:bg-opacity-20 px-3 py-2 rounded-md text-sm font-medium transition-colors">
-                        <i class="fas fa-list mr-2"></i>Orders
-                    </a>
-                    <button id="refresh-analytics" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors">
-                        <i class="fas fa-sync-alt mr-2"></i>Refresh
+                    <button id="refresh-analytics" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors action-button">
+                        <i class="fas fa-sync-alt mr-2"></i>Refresh All
                     </button>
                 </div>
             </div>
@@ -98,562 +104,512 @@
     <div id="loading-state" class="flex items-center justify-center h-64">
         <div class="text-center">
             <div class="loading-spinner mx-auto mb-4"></div>
-            <p class="text-gray-600">Loading trading analytics...</p>
+            <p class="text-gray-600">Loading comprehensive analytics...</p>
         </div>
     </div>
 
     <!-- Main Content -->
     <div id="main-content" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8" style="display: none;">
         
-        <!-- Header Section -->
+        <!-- Executive Summary -->
         <div class="mb-8">
-            <h1 class="text-3xl font-bold text-gray-900 mb-2">In-Depth Trading Analysis Report</h1>
-            <p class="text-gray-600">Comprehensive analysis of your trading performance, win rates, and profitability metrics</p>
-            <div class="mt-4">
-                <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">
-                    <i class="fas fa-circle text-xs mr-2"></i>
-                    Last Updated: <span id="last-updated">Loading...</span>
-                </span>
-            </div>
-        </div>
-
-        <!-- Overall Statistics -->
-        <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-900 mb-4">📊 Overall Statistics</h2>
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div class="metric-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-chart-bar text-2xl text-blue-600 mr-4"></i>
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-dashboard mr-2 text-blue-600"></i>Executive Summary
+            </h2>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                <div class="metric-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
                         <div>
-                            <p class="text-sm font-medium text-gray-600">Total Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="total-trades">0</p>
+                            <p class="text-sm font-medium text-gray-600">Total Recommendations</p>
+                            <p id="total-recommendations" class="text-2xl font-bold text-gray-900">-</p>
                         </div>
+                        <i class="fas fa-lightbulb text-3xl text-yellow-500"></i>
                     </div>
                 </div>
-                <div class="metric-card success-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-check-circle text-2xl text-green-600 mr-4"></i>
+                <div class="metric-card success-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
                         <div>
-                            <p class="text-sm font-medium text-gray-600">Closed Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="closed-trades">0</p>
+                            <p class="text-sm font-medium text-gray-600">High Priority Actions</p>
+                            <p id="high-priority-count" class="text-2xl font-bold text-gray-900">-</p>
                         </div>
+                        <i class="fas fa-exclamation-triangle text-3xl text-red-500"></i>
                     </div>
                 </div>
-                <div class="metric-card warning-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-clock text-2xl text-yellow-600 mr-4"></i>
+                <div class="metric-card warning-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
                         <div>
-                            <p class="text-sm font-medium text-gray-600">Open Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="open-trades">0</p>
+                            <p class="text-sm font-medium text-gray-600">Recent Win Rate (Last 50)</p>
+                            <p id="current-win-rate" class="text-2xl font-bold text-gray-900">-</p>
+                            <p id="win-rate-comparison" class="text-xs text-gray-500 mt-1">vs Overall: -</p>
                         </div>
+                        <i class="fas fa-percentage text-3xl text-green-500"></i>
                     </div>
                 </div>
-                <div class="metric-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-percentage text-2xl text-blue-600 mr-4"></i>
+                <div class="metric-card danger-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
                         <div>
-                            <p class="text-sm font-medium text-gray-600">Win Rate</p>
-                            <p class="text-2xl font-bold text-gray-900" id="win-rate">0%</p>
+                            <p class="text-sm font-medium text-gray-600">Potential Improvement</p>
+                            <p id="potential-improvement" class="text-2xl font-bold text-gray-900">-</p>
                         </div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Additional metrics row -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-                <div class="metric-card success-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-trophy text-2xl text-green-600 mr-4"></i>
-                        <div>
-                            <p class="text-sm font-medium text-gray-600">Winning Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="winners">0</p>
-                        </div>
-                    </div>
-                </div>
-                <div class="metric-card danger-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-times-circle text-2xl text-red-600 mr-4"></i>
-                        <div>
-                            <p class="text-sm font-medium text-gray-600">Losing Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="losers">0</p>
-                        </div>
-                    </div>
-                </div>
-                <div class="metric-card p-6 rounded-lg shadow-md">
-                    <div class="flex items-center">
-                        <i class="fas fa-minus text-2xl text-gray-600 mr-4"></i>
-                        <div>
-                            <p class="text-sm font-medium text-gray-600">Breakeven Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="breakeven">0</p>
-                        </div>
+                        <i class="fas fa-arrow-up text-3xl text-blue-500"></i>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Detailed PnL Analysis -->
+        <!-- Priority Recommendations -->
         <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-900 mb-4">💰 Detailed PnL Analysis</h2>
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Gross Profit</h3>
-                    <p class="text-2xl font-bold text-green-600" id="gross-profit">$0.00</p>
-                </div>
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Gross Loss</h3>
-                    <p class="text-2xl font-bold text-red-600" id="gross-loss">$0.00</p>
-                </div>
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Net Realized PnL</h3>
-                    <p class="text-2xl font-bold" id="net-pnl">$0.00</p>
-                </div>
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Profit Factor</h3>
-                    <p class="text-2xl font-bold text-blue-600" id="profit-factor">0.00</p>
-                </div>
-            </div>
-            
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Average Win</h3>
-                    <p class="text-xl font-bold text-green-600" id="avg-win">$0.00</p>
-                </div>
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Average Loss</h3>
-                    <p class="text-xl font-bold text-red-600" id="avg-loss">$0.00</p>
-                </div>
-                <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h3 class="text-lg font-semibold text-gray-900 mb-2">Avg PnL per Trade</h3>
-                    <p class="text-xl font-bold text-blue-600" id="avg-pnl-trade">$0.00</p>
-                </div>
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-star mr-2 text-yellow-500"></i>Priority Recommendations
+            </h2>
+            <div id="priority-recommendations" class="space-y-4">
+                <!-- Dynamic content will be inserted here -->
             </div>
         </div>
 
-        <!-- Charts Section -->
+        <!-- Actionable Insights Grid -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
-            <!-- Exchange Performance Chart -->
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h3 class="text-xl font-semibold text-gray-900 mb-4">Exchange Performance</h3>
-                <div class="chart-container">
-                    <canvas id="exchangeChart"></canvas>
-                </div>
-            </div>
             
-            <!-- Strategy Performance Chart -->
-            <div class="bg-white p-6 rounded-lg shadow-md">
-                <h3 class="text-xl font-semibold text-gray-900 mb-4">Strategy Performance</h3>
-                <div class="chart-container">
-                    <canvas id="strategyChart"></canvas>
+            <!-- Confidence Analysis -->
+            <div class="bg-white rounded-lg shadow-sm p-6">
+                <h3 class="text-lg font-bold text-gray-900 mb-4">
+                    <i class="fas fa-chart-bar mr-2 text-blue-600"></i>Confidence Correlation Analysis
+                </h3>
+                <div id="confidence-analysis" class="space-y-3">
+                    <!-- Dynamic content -->
                 </div>
+            </div>
+
+            <!-- Strategy Performance -->
+            <div class="bg-white rounded-lg shadow-sm p-6">
+                <h3 class="text-lg font-bold text-gray-900 mb-4">
+                    <i class="fas fa-cogs mr-2 text-green-600"></i>Strategy Performance
+                </h3>
+                <div id="strategy-performance" class="space-y-3">
+                    <!-- Dynamic content -->
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Market Conditions Analysis -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-clock mr-2 text-purple-600"></i>Market Conditions Analysis
+            </h2>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                
+                <!-- Best Trading Hours -->
+                <div class="bg-white rounded-lg shadow-sm p-6">
+                    <h3 class="text-lg font-bold text-gray-900 mb-4">Best Trading Hours</h3>
+                    <div id="best-hours" class="space-y-2">
+                        <!-- Dynamic content -->
+                    </div>
+                </div>
+
+                <!-- Daily Performance -->
+                <div class="bg-white rounded-lg shadow-sm p-6">
+                    <h3 class="text-lg font-bold text-gray-900 mb-4">Day of Week Performance</h3>
+                    <div id="daily-performance" class="space-y-2">
+                        <!-- Dynamic content -->
+                    </div>
+                </div>
+
             </div>
         </div>
 
-        <!-- Exchange Performance Table -->
+        <!-- Parameter Optimization Suggestions -->
         <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-900 mb-4">🏢 Exchange Performance</h2>
-            <div class="bg-white rounded-lg shadow-md overflow-hidden">
-                <div class="table-container">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-sliders-h mr-2 text-orange-600"></i>Parameter Optimization
+            </h2>
+            <div id="parameter-suggestions" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <!-- Dynamic content -->
+            </div>
+        </div>
+
+        <!-- All Recommendations Table -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-list mr-2 text-gray-600"></i>All Recommendations
+            </h2>
+            <div class="bg-white rounded-lg shadow-sm overflow-hidden">
+                <div class="overflow-x-auto">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Exchange</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total Trades</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Open Trades</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Closed Trades</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Winners</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Losers</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Win Rate</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Net PnL</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avg PnL</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Priority</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Current</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Recommended</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Impact</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Config Path</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
                             </tr>
                         </thead>
-                        <tbody id="exchange-table-body" class="bg-white divide-y divide-gray-200">
-                            <!-- Exchange data will be populated here -->
+                        <tbody id="recommendations-table" class="bg-white divide-y divide-gray-200">
+                            <!-- Dynamic content -->
                         </tbody>
                     </table>
                 </div>
-            </div>
-        </div>
-
-        <!-- Strategy Performance Table -->
-        <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-900 mb-4">📈 Strategy Performance</h2>
-            <div class="bg-white rounded-lg shadow-md overflow-hidden">
-                <div class="table-container">
-                    <table class="min-w-full divide-y divide-gray-200">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Strategy</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Closed Trades</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Winners</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Losers</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Win Rate</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Net PnL</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avg PnL</th>
-                            </tr>
-                        </thead>
-                        <tbody id="strategy-table-body" class="bg-white divide-y divide-gray-200">
-                            <!-- Strategy data will be populated here -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- Top Performing Pairs -->
-        <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-900 mb-4">🚀 Top Performing Pairs</h2>
-            <div class="bg-white rounded-lg shadow-md overflow-hidden">
-                <div class="table-container">
-                    <table class="min-w-full divide-y divide-gray-200">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pair</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Closed Trades</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Win Rate</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Net PnL</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avg PnL per Trade</th>
-                            </tr>
-                        </thead>
-                        <tbody id="pairs-table-body" class="bg-white divide-y divide-gray-200">
-                            <!-- Pairs data will be populated here -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- Key Observations and Recommendations -->
-        <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-900 mb-4">📋 Key Observations & Recommendations</h2>
-            <div id="recommendations-container" class="space-y-4">
-                <!-- Recommendations will be populated here -->
             </div>
         </div>
 
     </div>
 
     <script>
-        let exchangeChart = null;
-        let strategyChart = null;
+        let chartInstances = {};
 
-        async function fetchAnalytics() {
+        // Main function to fetch all analytics
+        async function fetchAllAnalytics() {
+            document.getElementById('loading-state').style.display = 'flex';
+            document.getElementById('main-content').style.display = 'none';
+
             try {
-                document.getElementById('loading-state').style.display = 'flex';
-                document.getElementById('main-content').style.display = 'none';
+                // Fetch all analytics endpoints in parallel
+                const [actionableResponse, marketResponse, parameterResponse] = await Promise.all([
+                    fetch('/api/v1/analytics/actionable'),
+                    fetch('/api/v1/analytics/market-conditions'),
+                    fetch('/api/v1/analytics/parameter-optimization')
+                ]);
 
-                const response = await fetch('/api/v1/analytics/trading');
-                if (!response.ok) throw new Error('Failed to fetch analytics');
-                
-                const data = await response.json();
-                updateAnalytics(data);
-                
+                const actionableData = await actionableResponse.json();
+                const marketData = await marketResponse.json();
+                const parameterData = await parameterResponse.json();
+
+                // Update executive summary
+                updateExecutiveSummary(actionableData, marketData, parameterData);
+
+                // Update priority recommendations
+                updatePriorityRecommendations(actionableData, parameterData);
+
+                // Update confidence analysis
+                updateConfidenceAnalysis(actionableData);
+
+                // Update strategy performance
+                updateStrategyPerformance(actionableData);
+
+                // Update market conditions
+                updateMarketConditions(marketData);
+
+                // Update parameter suggestions
+                updateParameterSuggestions(parameterData);
+
+                // Update recommendations table
+                updateRecommendationsTable(actionableData, parameterData);
+
                 document.getElementById('loading-state').style.display = 'none';
                 document.getElementById('main-content').style.display = 'block';
-                
+
             } catch (error) {
                 console.error('Error fetching analytics:', error);
                 document.getElementById('loading-state').innerHTML = `
                     <div class="text-center">
                         <i class="fas fa-exclamation-triangle text-red-500 text-4xl mb-4"></i>
                         <p class="text-red-600">Error loading analytics: ${error.message}</p>
-                        <button onclick="fetchAnalytics()" class="mt-4 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg">
-                            Retry
+                        <button onclick="fetchAllAnalytics()" class="mt-4 bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+                            Try Again
                         </button>
                     </div>
                 `;
             }
         }
 
-        function updateAnalytics(data) {
-            const now = new Date().toLocaleString();
-            document.getElementById('last-updated').textContent = now;
-
-            // Update overall statistics
-            const stats = data.overall_stats || {};
-            document.getElementById('total-trades').textContent = stats.total_trades || 0;
-            document.getElementById('closed-trades').textContent = stats.closed_trades || 0;
-            document.getElementById('open-trades').textContent = stats.open_trades || 0;
-            document.getElementById('win-rate').textContent = `${stats.win_rate_pct || 0}%`;
-            document.getElementById('winners').textContent = stats.winners || 0;
-            document.getElementById('losers').textContent = stats.losers || 0;
-            document.getElementById('breakeven').textContent = stats.breakeven || 0;
-
-            // Update detailed PnL
-            const pnl = data.detailed_pnl || {};
-            document.getElementById('gross-profit').textContent = `$${pnl.gross_profit || 0}`;
-            document.getElementById('gross-loss').textContent = `$${pnl.gross_loss_abs || 0}`;
+        function updateExecutiveSummary(actionableData, marketData, parameterData) {
+            const totalRecs = (actionableData.recommendations?.length || 0) + (parameterData.suggestions?.length || 0);
+            const highPriority = (actionableData.recommendations?.filter(r => r.priority === 'high')?.length || 0) + 
+                               (parameterData.suggestions?.filter(s => s.priority === 'high')?.length || 0);
             
-            const netPnl = pnl.net_realized_pnl || 0;
-            const netPnlElement = document.getElementById('net-pnl');
-            netPnlElement.textContent = `$${netPnl}`;
-            netPnlElement.className = `text-2xl font-bold ${netPnl >= 0 ? 'text-green-600' : 'text-red-600'}`;
+            document.getElementById('total-recommendations').textContent = totalRecs;
+            document.getElementById('high-priority-count').textContent = highPriority;
             
-            document.getElementById('profit-factor').textContent = pnl.profit_factor || '0.00';
-            document.getElementById('avg-win').textContent = `$${pnl.avg_win || 0}`;
-            document.getElementById('avg-loss').textContent = `$${pnl.avg_loss || 0}`;
-            document.getElementById('avg-pnl-trade').textContent = `$${pnl.avg_pnl_per_trade || 0}`;
-
-            // Update tables
-            updateExchangeTable(data.exchange_performance || []);
-            updateStrategyTable(data.strategy_performance || []);
-            updatePairsTable(data.top_pairs || []);
-            updateRecommendations(data.recommendations || []);
-
-            // Update charts
-            updateExchangeChart(data.exchange_performance || []);
-            updateStrategyChart(data.strategy_performance || []);
+            // Update win rate with comparison
+            const recentWinRate = actionableData.insights?.recent_win_rate;
+            const overallWinRate = actionableData.insights?.overall_win_rate;
+            
+            if (recentWinRate !== undefined) {
+                document.getElementById('current-win-rate').textContent = `${(recentWinRate * 100).toFixed(1)}%`;
+                
+                if (overallWinRate !== undefined) {
+                    const trend = recentWinRate < overallWinRate ? '📉' : '📈';
+                    const trendColor = recentWinRate < overallWinRate ? 'text-red-600' : 'text-green-600';
+                    document.getElementById('win-rate-comparison').innerHTML = 
+                        `<span class="${trendColor}">vs Overall: ${(overallWinRate * 100).toFixed(1)}% ${trend}</span>`;
+                }
+            } else {
+                document.getElementById('current-win-rate').textContent = 'N/A';
+            }
+            
+            document.getElementById('potential-improvement').textContent = actionableData.insights?.potential_improvement ? 
+                `$${actionableData.insights.potential_improvement.toFixed(2)}` : 'N/A';
         }
 
-        function updateExchangeTable(exchanges) {
-            const tbody = document.getElementById('exchange-table-body');
-            tbody.innerHTML = '';
+        function updatePriorityRecommendations(actionableData, parameterData) {
+            const container = document.getElementById('priority-recommendations');
+            const allRecs = [
+                ...(actionableData.recommendations || []).map(r => ({...r, source: 'actionable'})),
+                ...(parameterData.suggestions || []).map(s => ({...s, source: 'parameter', type: s.parameter}))
+            ];
 
-            if (exchanges.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="text-center py-8 text-gray-500">No exchange data available</td></tr>';
+            const highPriorityRecs = allRecs.filter(r => r.priority === 'high').slice(0, 3);
+
+            if (highPriorityRecs.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 text-center py-8">No high priority recommendations at this time.</p>';
                 return;
             }
 
-            exchanges.forEach(exchange => {
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${exchange.exchange}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 font-medium">${exchange.total_trades}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-blue-600 font-medium">${exchange.open_trades}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${exchange.closed_trades}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-green-600">${exchange.winners}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-red-600">${exchange.losers}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${exchange.win_rate_pct}%</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${exchange.net_realized_pnl >= 0 ? 'text-green-600' : 'text-red-600'} font-medium">$${exchange.net_realized_pnl}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">$${exchange.avg_pnl}</td>
-                `;
-                tbody.appendChild(row);
-            });
-        }
-
-        function updateStrategyTable(strategies) {
-            const tbody = document.getElementById('strategy-table-body');
-            tbody.innerHTML = '';
-
-            if (strategies.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">No strategy data available</td></tr>';
-                return;
-            }
-
-            strategies.forEach(strategy => {
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${strategy.strategy}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${strategy.closed_trades}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-green-600">${strategy.winners}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-red-600">${strategy.losers}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${strategy.win_rate_pct}%</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${strategy.net_realized_pnl >= 0 ? 'text-green-600' : 'text-red-600'} font-medium">$${strategy.net_realized_pnl}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">$${strategy.avg_pnl}</td>
-                `;
-                tbody.appendChild(row);
-            });
-        }
-
-        function updatePairsTable(pairs) {
-            const tbody = document.getElementById('pairs-table-body');
-            tbody.innerHTML = '';
-
-            if (pairs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-8 text-gray-500">No pairs data available</td></tr>';
-                return;
-            }
-
-            pairs.forEach(pair => {
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${pair.pair}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${pair.closed_trades}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${pair.win_rate_pct}%</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${pair.net_realized_pnl >= 0 ? 'text-green-600' : 'text-red-600'} font-medium">$${pair.net_realized_pnl}</td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">$${pair.avg_pnl_per_trade}</td>
-                `;
-                tbody.appendChild(row);
-            });
-        }
-
-        function updateRecommendations(recommendations) {
-            const container = document.getElementById('recommendations-container');
-            container.innerHTML = '';
-
-            if (recommendations.length === 0) {
-                container.innerHTML = `
-                    <div class="bg-gray-50 border border-gray-200 rounded-lg p-6 text-center">
-                        <i class="fas fa-info-circle text-gray-400 text-3xl mb-3"></i>
-                        <p class="text-gray-600">No specific recommendations available at this time.</p>
-                        <p class="text-sm text-gray-500 mt-2">Keep trading to generate more data for analysis.</p>
-                    </div>
-                `;
-                return;
-            }
-
-            recommendations.forEach(rec => {
-                const priorityClass = rec.priority === 'high' ? 'priority-high' : 
-                                   rec.priority === 'medium' ? 'priority-medium' : 'priority-low';
-                const iconClass = rec.priority === 'high' ? 'fas fa-exclamation-triangle' : 
-                                rec.priority === 'medium' ? 'fas fa-exclamation-circle' : 'fas fa-info-circle';
-
-                const card = document.createElement('div');
-                card.className = 'bg-white border border-gray-200 rounded-lg p-6 shadow-sm';
-                card.innerHTML = `
-                    <div class="flex items-start">
-                        <div class="flex-shrink-0">
-                            <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${priorityClass}">
-                                <i class="${iconClass} text-xs mr-1"></i>
-                                ${rec.priority.toUpperCase()} PRIORITY
-                            </span>
+            container.innerHTML = highPriorityRecs.map(rec => `
+                <div class="recommendation-card priority-${rec.priority} p-4 rounded-lg">
+                    <div class="flex items-start justify-between">
+                        <div class="flex-1">
+                            <h4 class="font-semibold text-lg mb-2">
+                                <i class="fas fa-exclamation-circle mr-2"></i>
+                                ${rec.type.replace(/_/g, ' ').toUpperCase()}
+                            </h4>
+                            <p class="text-sm mb-2">${rec.reason || rec.description || 'No reason provided'}</p>
+                            <div class="flex items-center space-x-4 text-sm">
+                                <span><strong>Current:</strong> ${rec.current_value}</span>
+                                <span><strong>Recommended:</strong> ${rec.recommended_value || rec.suggested_value}</span>
+                                <span><strong>Impact:</strong> ${rec.impact || rec.expected_impact}</span>
+                            </div>
                         </div>
-                        <div class="ml-4 flex-1">
-                            <h4 class="text-lg font-semibold text-gray-900 mb-2">${rec.category}</h4>
-                            <p class="text-gray-700 mb-3">${rec.recommendation}</p>
-                            <p class="text-sm text-gray-600">
-                                <strong>Expected Impact:</strong> ${rec.impact}
-                            </p>
+                        <button onclick="applyRecommendation('${rec.config_path || rec.config_location}', '${rec.recommended_value || rec.suggested_value}', '${rec.type}')" 
+                                class="action-button bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm">
+                            Apply
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateConfidenceAnalysis(actionableData) {
+            const container = document.getElementById('confidence-analysis');
+            const confidenceData = actionableData.confidence_analysis || {};
+
+            if (Object.keys(confidenceData).length === 0) {
+                container.innerHTML = '<p class="text-gray-500">No confidence data available</p>';
+                return;
+            }
+
+            const confidenceEntries = Object.entries(confidenceData)
+                .sort(([a], [b]) => parseFloat(b) - parseFloat(a))
+                .slice(0, 5);
+
+            container.innerHTML = confidenceEntries.map(([confidence, stats]) => {
+                const winRate = stats.wins / stats.count;
+                const avgPnl = stats.total_pnl / stats.count;
+                return `
+                    <div class="flex items-center justify-between p-3 bg-gray-50 rounded">
+                        <div>
+                            <span class="font-semibold">${(parseFloat(confidence) * 100).toFixed(0)}% Confidence</span>
+                            <span class="text-sm text-gray-600 ml-2">(${stats.count} trades)</span>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-sm font-medium ${winRate > 0.6 ? 'text-green-600' : 'text-red-600'}">
+                                ${(winRate * 100).toFixed(1)}% Win Rate
+                            </div>
+                            <div class="text-xs text-gray-500">
+                                Avg: $${avgPnl.toFixed(2)}
+                            </div>
                         </div>
                     </div>
                 `;
-                container.appendChild(card);
-            });
+            }).join('');
         }
 
-        function updateExchangeChart(exchanges) {
-            const ctx = document.getElementById('exchangeChart').getContext('2d');
-            
-            if (exchangeChart) {
-                exchangeChart.destroy();
+        function updateStrategyPerformance(actionableData) {
+            const container = document.getElementById('strategy-performance');
+            const strategyData = actionableData.strategy_performance || {};
+
+            if (Object.keys(strategyData).length === 0) {
+                container.innerHTML = '<p class="text-gray-500">No strategy data available</p>';
+                return;
             }
 
-            const labels = exchanges.map(e => e.exchange);
-            const winRates = exchanges.map(e => e.win_rate_pct);
-            const netPnl = exchanges.map(e => e.net_realized_pnl);
+            const strategies = Object.entries(strategyData)
+                .map(([name, stats]) => ({
+                    name,
+                    winRate: stats.wins / stats.count,
+                    avgPnl: stats.total_pnl / stats.count,
+                    count: stats.count
+                }))
+                .sort((a, b) => b.winRate - a.winRate);
 
-            exchangeChart = new Chart(ctx, {
-                type: 'bar',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'Win Rate (%)',
-                            data: winRates,
-                            backgroundColor: 'rgba(59, 130, 246, 0.6)',
-                            borderColor: 'rgba(59, 130, 246, 1)',
-                            borderWidth: 1,
-                            yAxisID: 'y'
-                        },
-                        {
-                            label: 'Net PnL ($)',
-                            data: netPnl,
-                            type: 'line',
-                            backgroundColor: 'rgba(16, 185, 129, 0.6)',
-                            borderColor: 'rgba(16, 185, 129, 1)',
-                            borderWidth: 2,
-                            fill: false,
-                            yAxisID: 'y1'
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    scales: {
-                        y: {
-                            type: 'linear',
-                            display: true,
-                            position: 'left',
-                            title: {
-                                display: true,
-                                text: 'Win Rate (%)'
-                            }
-                        },
-                        y1: {
-                            type: 'linear',
-                            display: true,
-                            position: 'right',
-                            title: {
-                                display: true,
-                                text: 'Net PnL ($)'
-                            },
-                            grid: {
-                                drawOnChartArea: false,
-                            },
-                        }
+            container.innerHTML = strategies.map(strategy => `
+                <div class="flex items-center justify-between p-3 bg-gray-50 rounded">
+                    <div>
+                        <span class="font-semibold">${strategy.name.replace(/_/g, ' ')}</span>
+                        <span class="text-sm text-gray-600 ml-2">(${strategy.count} trades)</span>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm font-medium ${strategy.winRate > 0.5 ? 'text-green-600' : 'text-red-600'}">
+                            ${(strategy.winRate * 100).toFixed(1)}% Win Rate
+                        </div>
+                        <div class="text-xs text-gray-500">
+                            Avg: $${strategy.avgPnl.toFixed(2)}
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateMarketConditions(marketData) {
+            // Update best hours
+            const bestHoursContainer = document.getElementById('best-hours');
+            const bestHours = marketData.best_trading_hours || [];
+
+            if (bestHours.length === 0) {
+                bestHoursContainer.innerHTML = '<p class="text-gray-500">No optimal hours identified</p>';
+            } else {
+                bestHoursContainer.innerHTML = bestHours.slice(0, 5).map(hour => `
+                    <div class="flex items-center justify-between p-2 bg-green-50 rounded">
+                        <span class="font-medium">${hour.hour}:00 UTC</span>
+                        <div class="text-right text-sm">
+                            <div class="text-green-600 font-medium">${(hour.win_rate * 100).toFixed(1)}%</div>
+                            <div class="text-gray-500">$${hour.avg_pnl.toFixed(2)} avg</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            // Update daily performance
+            const dailyContainer = document.getElementById('daily-performance');
+            const dailyInsights = marketData.daily_insights || [];
+
+            if (dailyInsights.length === 0) {
+                dailyContainer.innerHTML = '<p class="text-gray-500">No daily insights available</p>';
+            } else {
+                dailyContainer.innerHTML = dailyInsights.slice(0, 7).map(day => `
+                    <div class="flex items-center justify-between p-2 bg-gray-50 rounded">
+                        <span class="font-medium">${day.day}</span>
+                        <div class="text-right text-sm">
+                            <div class="${day.win_rate > 0.5 ? 'text-green-600' : 'text-red-600'} font-medium">
+                                ${(day.win_rate * 100).toFixed(1)}%
+                            </div>
+                            <div class="text-gray-500">$${day.avg_pnl.toFixed(2)} avg</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function updateParameterSuggestions(parameterData) {
+            const container = document.getElementById('parameter-suggestions');
+            const suggestions = parameterData.suggestions || [];
+
+            if (suggestions.length === 0) {
+                container.innerHTML = '<div class="col-span-full text-center text-gray-500 py-8">No parameter optimization suggestions available</div>';
+                return;
+            }
+
+            container.innerHTML = suggestions.slice(0, 6).map(suggestion => `
+                <div class="bg-white p-6 rounded-lg shadow-sm card-hover priority-${suggestion.priority}">
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="font-semibold text-lg">${suggestion.parameter.replace(/_/g, ' ').toUpperCase()}</h4>
+                        <span class="px-2 py-1 rounded text-xs font-medium priority-${suggestion.priority}">
+                            ${suggestion.priority.toUpperCase()}
+                        </span>
+                    </div>
+                    <p class="text-sm text-gray-600 mb-3">${suggestion.reason}</p>
+                    <div class="space-y-2 text-sm">
+                        <div><strong>Current:</strong> ${suggestion.current_value}</div>
+                        <div><strong>Suggested:</strong> ${suggestion.suggested_value}</div>
+                        <div><strong>Impact:</strong> ${suggestion.expected_impact}</div>
+                    </div>
+                    <button onclick="applyRecommendation('${suggestion.config_location}', '${suggestion.suggested_value}', '${suggestion.parameter}')" 
+                            class="mt-4 w-full action-button bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm">
+                        Apply Change
+                    </button>
+                </div>
+            `).join('');
+        }
+
+        function updateRecommendationsTable(actionableData, parameterData) {
+            const tbody = document.getElementById('recommendations-table');
+            
+            const allRecs = [
+                ...(actionableData.recommendations || []).map(r => ({...r, source: 'actionable'})),
+                ...(parameterData.suggestions || []).map(s => ({...s, source: 'parameter', type: s.parameter}))
+            ];
+
+            if (allRecs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">No recommendations available</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = allRecs.map(rec => `
+                <tr class="hover:bg-gray-50">
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        <span class="px-2 py-1 rounded text-xs font-medium priority-${rec.priority}">
+                            ${rec.priority.toUpperCase()}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                        ${rec.type.replace(/_/g, ' ')}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        ${rec.current_value}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        ${rec.recommended_value || rec.suggested_value}
+                    </td>
+                    <td class="px-6 py-4 text-sm text-gray-500">
+                        ${rec.impact || rec.expected_impact}
+                    </td>
+                    <td class="px-6 py-4 text-sm text-gray-500 font-mono">
+                        ${rec.config_path || rec.config_location}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                        <button onclick="applyRecommendation('${rec.config_path || rec.config_location}', '${rec.recommended_value || rec.suggested_value}', '${rec.type}')" 
+                                class="action-button bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 text-xs">
+                            Apply
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function applyRecommendation(configPath, value, type) {
+            if (!confirm(`Apply this recommendation?\n\nConfig: ${configPath}\nValue: ${value}\n\nThis will update your config.yaml file and create a backup.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/v1/config/apply-recommendation', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
                     },
-                    plugins: {
-                        legend: {
-                            display: true,
-                            position: 'top'
-                        }
-                    }
-                }
-            });
-        }
+                    body: JSON.stringify({
+                        config_path: configPath,
+                        value: value,
+                        type: type
+                    })
+                });
 
-        function updateStrategyChart(strategies) {
-            const ctx = document.getElementById('strategyChart').getContext('2d');
-            
-            if (strategyChart) {
-                strategyChart.destroy();
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    alert(`✅ Successfully applied!\n\n${result.message}\n\nBackup created: ${result.backup_created.split('/').pop()}`);
+                    
+                    // Refresh analytics to show updated state
+                    fetchAllAnalytics();
+                } else {
+                    alert(`❌ Failed to apply:\n\n${result.message}`);
+                }
+            } catch (error) {
+                alert(`❌ Error applying recommendation:\n\n${error.message}`);
             }
-
-            const labels = strategies.map(s => s.strategy);
-            const trades = strategies.map(s => s.closed_trades);
-            const winRates = strategies.map(s => s.win_rate_pct);
-
-            strategyChart = new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Closed Trades',
-                        data: trades,
-                        backgroundColor: [
-                            'rgba(59, 130, 246, 0.8)',
-                            'rgba(16, 185, 129, 0.8)',
-                            'rgba(245, 158, 11, 0.8)',
-                            'rgba(239, 68, 68, 0.8)',
-                            'rgba(139, 92, 246, 0.8)'
-                        ],
-                        borderColor: [
-                            'rgba(59, 130, 246, 1)',
-                            'rgba(16, 185, 129, 1)',
-                            'rgba(245, 158, 11, 1)',
-                            'rgba(239, 68, 68, 1)',
-                            'rgba(139, 92, 246, 1)'
-                        ],
-                        borderWidth: 2
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            display: true,
-                            position: 'bottom'
-                        },
-                        tooltip: {
-                            callbacks: {
-                                label: function(context) {
-                                    const strategy = strategies[context.dataIndex];
-                                    return `${context.label}: ${context.formattedValue} trades (${strategy.win_rate_pct}% win rate)`;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
         }
 
         // Event listeners
-        document.getElementById('refresh-analytics').addEventListener('click', fetchAnalytics);
+        document.getElementById('refresh-analytics').addEventListener('click', fetchAllAnalytics);
+
+        // Auto-refresh every 5 minutes
+        setInterval(fetchAllAnalytics, 5 * 60 * 1000);
 
         // Initialize
-        document.addEventListener('DOMContentLoaded', fetchAnalytics);
+        document.addEventListener('DOMContentLoaded', fetchAllAnalytics);
     </script>
 </body>
 </html>

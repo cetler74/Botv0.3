@@ -309,6 +309,7 @@ services:
       - ./services/web-dashboard-service/main.py:/app/main.py
       - ./services/web-dashboard-service/static:/app/static
       - ./services/web-dashboard-service/templates:/app/templates
+      - ./config:/app/config
     networks:
       - trading-bot-network
     depends_on:

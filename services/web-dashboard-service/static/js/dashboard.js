@@ -190,12 +190,10 @@ class Dashboard {
     }
     
     async updatePortfolio() {
-        console.log('updatePortfolio() called');
         try {
             const response = await fetch('/api/portfolio');
             if (response.ok) {
                 const data = await response.json();
-                console.log('Portfolio data received:', data);
                 this.updatePortfolioUI(data);
             }
         } catch (error) {
@@ -254,21 +252,17 @@ class Dashboard {
         totalUnrealizedPnlElement.className = `h4 ${this.getPnlClass(totalUnrealizedPnl)}`;
         // Update win rate
         const winRate = data.win_rate || 0;
-        winRateElement.textContent = `${(winRate * 100).toFixed(1)}%`;
+        winRateElement.textContent = `${winRate.toFixed(1)}%`;
         // Update per-exchange breakdown table
         if (data.exchanges) {
-            console.log('Exchange data received:', data.exchanges);
             const exchangeRows = Object.entries(data.exchanges).map(([exchange, ex]) => ({
                 exchange,
                 total_balance: ex.balance,
-                available_balance: ex.available_balance || ex.available,
+                available_balance: ex.available,
                 total_pnl: ex.total_pnl,
                 timestamp: ex.timestamp
             }));
-            console.log('Mapped exchange rows:', exchangeRows);
             updateExchangeBreakdownTable(exchangeRows);
-        } else {
-            console.log('No exchange data in response:', data);
         }
     }
     
@@ -311,7 +305,7 @@ class Dashboard {
     
     async updateRecentTrades() {
         try {
-            const response = await fetch('/api/trades?limit=50');
+            const response = await fetch('/api/trades?limit=10');
             if (response.ok) {
                 const data = await response.json();
                 this.updateRecentTradesUI(data.trades || []);
@@ -338,18 +332,18 @@ class Dashboard {
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm font-semibold ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${(trade.unrealized_pnl || 0).toFixed(2)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${(trade.unrealized_pnl || 0).toFixed(2)}${this.calculatePnlPercentage(trade)}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm align-middle">
                     <span class="badge ${trade.status === 'OPEN' ? 'bg-success' : trade.status === 'CLOSED' ? 'bg-secondary' : 'bg-warning'}">${trade.status || 'N/A'}</span>
                 </td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden" title="${trade.entry_reason || 'N/A'}">${this.truncateText(trade.entry_reason || 'N/A', 30)}</td>
                 <td class="profit-trigger-col align-middle">
                   ${trade.profit_protection || 'inactive'}
-                  <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
+                  <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}${this.calculatePnlPercentage(trade)}` : 'None'}</div>
                 </td>
                 <td class="trailing-stop-col align-middle">
                   ${trade.trail_stop || 'inactive'}
-                  <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
+                  <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}${this.calculatePnlPercentage(trade)}` : 'None'}</div>
                 </td>
                 <td class="highest-price-col text-right align-middle">
                   ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
@@ -390,14 +384,8 @@ class Dashboard {
     }
     
     startPeriodicUpdates() {
-        console.log('startPeriodicUpdates() called');
-        // Initial load
-        this.updateTradingStatus();
-        this.updatePortfolio();
-        this.updateRiskExposure();
         // Update data every 30 seconds
         this.updateInterval = setInterval(() => {
-            console.log('Periodic update triggered');
             this.updateTradingStatus();
             this.updatePortfolio();
             this.updateRiskExposure();
@@ -449,6 +437,36 @@ class Dashboard {
             return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
         }
         return uptimeString;
+    }
+    
+    calculatePnlPercentage(trade) {
+        // Calculate current PnL percentage for open trades
+        if (trade.status === 'OPEN' && trade.entry_price) {
+            if (trade.current_price) {
+                // Use current_price if available
+                const entryPrice = parseFloat(trade.entry_price);
+                const currentPrice = parseFloat(trade.current_price);
+                if (entryPrice > 0) {
+                    const pnlPercentage = ((currentPrice - entryPrice) / entryPrice) * 100;
+                    return ` (${pnlPercentage >= 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%)`;
+                }
+            } else if (trade.unrealized_pnl !== undefined && trade.position_size) {
+                // Fallback: calculate percentage from unrealized_pnl and position_size
+                const entryPrice = parseFloat(trade.entry_price);
+                const positionSize = parseFloat(trade.position_size);
+                const unrealizedPnl = parseFloat(trade.unrealized_pnl);
+                if (entryPrice > 0 && positionSize > 0) {
+                    const pnlPercentage = (unrealizedPnl / (entryPrice * position_size)) * 100;
+                    return ` (${pnlPercentage >= 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%)`;
+                }
+            }
+        }
+        // For closed trades, use realized PnL percentage if available
+        else if (trade.status === 'CLOSED' && trade.realized_pnl_pct !== undefined) {
+            const pnlPercentage = parseFloat(trade.realized_pnl_pct);
+            return ` (${pnlPercentage >= 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%)`;
+        }
+        return '';
     }
     
     getStatusBadgeClass(status) {
@@ -515,9 +533,7 @@ class Dashboard {
 }
 
 function updateExchangeBreakdownTable(exchangeData) {
-    console.log('updateExchangeBreakdownTable called with:', exchangeData);
     const tbody = document.getElementById('exchange-breakdown-table-body');
-    console.log('Table body element:', tbody);
     tbody.innerHTML = '';
     if (!exchangeData || exchangeData.length === 0) {
         const row = document.createElement('tr');
@@ -566,11 +582,11 @@ function updateTradeHistoryUI(trades) {
             <td class="px-2 sm:px-4 py-3 text-sm font-medium ${Dashboard.prototype.getPnlClass(trade.realized_pnl_pct)} text-right align-middle">${trade.realized_pnl_pct !== undefined ? trade.realized_pnl_pct.toFixed(2) + '%' : 'N/A'}</td>
             <td class="profit-trigger-col align-middle">
               ${trade.profit_protection || 'inactive'}
-              <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}` : 'None'}</div>
+              <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}${Dashboard.prototype.calculatePnlPercentage(trade)}` : 'None'}</div>
             </td>
             <td class="trailing-stop-col align-middle">
               ${trade.trail_stop || 'inactive'}
-              <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}` : 'None'}</div>
+              <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}${Dashboard.prototype.calculatePnlPercentage(trade)}` : 'None'}</div>
             </td>
             <td class="highest-price-col text-right align-middle">
               ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
@@ -595,19 +611,12 @@ Dashboard.prototype.updateTradeHistory = async function() {
 };
 
 function updateExchangeStatus(exchanges) {
-    console.log('updateExchangeStatus called with:', exchanges);
     const exchangeStatus = document.getElementById('exchange-status');
-    if (!exchangeStatus) {
-        console.error('exchange-status element not found');
-        return;
-    }
     exchangeStatus.innerHTML = '';
     Object.entries(exchanges).forEach(([name, info]) => {
-        console.log(`Processing exchange ${name}:`, info);
         const exchangeDiv = document.createElement('div');
         // Use status string from API
         const isHealthy = info.status && info.status.toLowerCase() === 'healthy';
-        console.log(`Exchange ${name} status: ${info.status}, isHealthy: ${isHealthy}`);
         const statusClass = isHealthy ? 'status-online' : 'status-offline';
         const statusText = isHealthy ? 'Online' : 'Offline';
         exchangeDiv.className = 'flex items-center p-4 border rounded-lg';

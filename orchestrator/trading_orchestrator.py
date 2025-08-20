@@ -334,6 +334,14 @@ class TradingOrchestrator:
                 logger.info(f"[RiskMgmt] Trailing stop triggered for trade {trade_id} (reason: {reason})")
                 await self._execute_trade_exit(trade, current_price, reason)
                 return
+            
+            # CRITICAL FIX: Add enhanced exit logic
+            enhanced_exit_needed = await self._check_enhanced_exit_conditions(trade, current_price)
+            if enhanced_exit_needed:
+                exit_reason, exit_type = enhanced_exit_needed
+                logger.info(f"[RiskMgmt] Enhanced exit triggered for trade {trade_id}: {exit_type} - {exit_reason}")
+                await self._execute_trade_exit(trade, current_price, f"{exit_type}_{exit_reason}")
+                return
             # Check strategy exit signals
             exit_signals = await self.strategy_manager.check_exit_signals(exchange_name, pair, trade)
             if exit_signals:
@@ -444,6 +452,14 @@ class TradingOrchestrator:
                     continue
                 else:
                     logger.info(f"[EntryCycle] Trade limit NOT reached for {exchange_name}: {len(open_trades)}/{max_trades}. Processing entry cycle for this exchange.")
+                
+                # CRITICAL FIX: Check daily loss limit before processing new trades
+                daily_loss_pct = await self._check_daily_loss_limit(exchange_name)
+                max_daily_loss = self.config_manager.get_trading_config().get('max_daily_loss_per_exchange', 0.05)
+                if daily_loss_pct >= max_daily_loss:
+                    logger.warning(f"[EntryCycle] Daily loss limit reached for {exchange_name}: {daily_loss_pct:.2%} >= {max_daily_loss:.2%}. Skipping new trades.")
+                    continue
+                
                 for pair in pairs:
                     # Validate pair before making API calls
                     if not pair or not isinstance(pair, str) or pair.strip() == "":
@@ -471,6 +487,136 @@ class TradingOrchestrator:
                         
         except Exception as e:
             logger.error(f"Error in entry cycle: {e}")
+    
+    async def _check_daily_loss_limit(self, exchange_name: str) -> float:
+        """Check daily loss percentage for an exchange"""
+        try:
+            if not self.database_manager:
+                return 0.0
+            
+            from datetime import datetime, timedelta
+            today = datetime.utcnow().date()
+            
+            # Get today's trades for this exchange
+            today_trades = await self.database_manager.get_trades_by_date_range(
+                exchange_name, today, today
+            )
+            
+            if not today_trades:
+                return 0.0
+            
+            # Calculate total realized PnL for today
+            total_realized_pnl = sum(
+                float(trade.get('realized_pnl', 0) or 0) 
+                for trade in today_trades 
+                if trade.get('status') == 'CLOSED'
+            )
+            
+            # Get exchange balance to calculate percentage
+            balances = await self.exchange_manager.get_balance(exchange_name)
+            if not balances or 'total' not in balances:
+                return 0.0
+            
+            total_balance = float(balances['total'])
+            if total_balance <= 0:
+                return 0.0
+            
+            # Calculate daily loss percentage
+            daily_loss_pct = abs(total_realized_pnl) / total_balance if total_realized_pnl < 0 else 0.0
+            
+            logger.debug(f"[DailyLoss] {exchange_name}: realized_pnl=${total_realized_pnl:.2f}, "
+                        f"balance=${total_balance:.2f}, loss_pct={daily_loss_pct:.2%}")
+            
+            return daily_loss_pct
+            
+        except Exception as e:
+            logger.error(f"Error checking daily loss limit for {exchange_name}: {e}")
+            return 0.0
+    
+    async def _check_enhanced_exit_conditions(self, trade: Dict, current_price: float) -> Optional[Tuple[str, str]]:
+        """Check enhanced exit conditions: momentum-based, correlation-based, and time-based exits"""
+        try:
+            exchange_name = trade.get('exchange')
+            pair = trade.get('pair')
+            entry_time = trade.get('entry_time')
+            trade_id = trade.get('trade_id')
+            
+            # Get current market data for the pair
+            market_data = await self.exchange_manager.get_ohlcv(exchange_name, pair, '1h', limit=50)
+            if market_data is None or len(market_data) < 14:
+                return None
+            
+            # 1. MOMENTUM-BASED EXIT: RSI deterioration for long positions
+            try:
+                import pandas_ta as ta
+                rsi = ta.rsi(market_data['close'], length=14)
+                if rsi is not None and not rsi.empty:
+                    current_rsi = rsi.iloc[-1]
+                    if not pd.isna(current_rsi) and current_rsi < 40:
+                        return ("momentum_deterioration", f"RSI dropped to {current_rsi:.1f}")
+            except Exception as e:
+                logger.debug(f"Error calculating RSI for momentum exit: {e}")
+            
+            # 2. CORRELATION-BASED EXIT: Check BTC crash for altcoin positions
+            if not pair.upper().startswith(('BTC', 'ETH')):
+                try:
+                    btc_data = await self.exchange_manager.get_ohlcv(exchange_name, 'BTC/USDC', '1h', limit=6)
+                    if btc_data is not None and len(btc_data) >= 6:
+                        btc_current = btc_data['close'].iloc[-1]
+                        btc_6h_ago = btc_data['close'].iloc[-6]
+                        btc_6h_change = (btc_current - btc_6h_ago) / btc_6h_ago
+                        
+                        # Exit altcoin longs if BTC drops >5% in 6 hours
+                        if btc_6h_change < -0.05:
+                            return ("btc_correlation", f"BTC down {btc_6h_change:.2%} in 6h")
+                except Exception as e:
+                    logger.debug(f"Error checking BTC correlation: {e}")
+            
+            # 3. TIME-BASED EXIT: Exit trades >24h old in downtrends
+            if entry_time:
+                try:
+                    from datetime import datetime, timedelta
+                    if isinstance(entry_time, str):
+                        entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                    else:
+                        entry_dt = entry_time
+                    
+                    trade_age = datetime.utcnow().replace(tzinfo=entry_dt.tzinfo) - entry_dt
+                    
+                    if trade_age > timedelta(hours=24):
+                        # Check if market is in downtrend
+                        if len(market_data) >= 21:
+                            ema_9 = ta.ema(market_data['close'], length=9)
+                            ema_21 = ta.ema(market_data['close'], length=21)
+                            if ema_9 is not None and ema_21 is not None:
+                                current_ema_9 = ema_9.iloc[-1]
+                                current_ema_21 = ema_21.iloc[-1]
+                                if not pd.isna(current_ema_9) and not pd.isna(current_ema_21):
+                                    if current_ema_9 < current_ema_21:
+                                        return ("time_limit_downtrend", f"Trade age {trade_age.total_seconds()/3600:.1f}h in downtrend")
+                except Exception as e:
+                    logger.debug(f"Error checking time-based exit: {e}")
+            
+            # 4. VOLUME-BASED EXIT: Exit on high volume selling
+            try:
+                if len(market_data) >= 20:
+                    current_volume = market_data['volume'].iloc[-1]
+                    avg_volume = market_data['volume'].tail(20).mean()
+                    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+                    
+                    # Check if high volume is accompanied by price drop
+                    price_change = (market_data['close'].iloc[-1] - market_data['close'].iloc[-2]) / market_data['close'].iloc[-2]
+                    
+                    if volume_ratio > 3.0 and price_change < -0.02:  # 3x volume with >2% drop
+                        return ("volume_selling", f"High volume ({volume_ratio:.1f}x) with {price_change:.2%} drop")
+            except Exception as e:
+                logger.debug(f"Error checking volume-based exit: {e}")
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced exit conditions check: {e}")
+            return None
             
     async def _check_available_balance(self) -> bool:
         """Check if there's sufficient balance for new trades by checking the trading.balance table"""
