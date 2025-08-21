@@ -2572,7 +2572,7 @@ class TradingOrchestrator:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # Try to get order history from exchange service
-                response = await client.get(f"{exchange_service_url}/api/v1/trading/order-history/{exchange_name}")
+                response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/history/{exchange_name}?symbol={pair}")
                 
                 if response.status_code == 200:
                     order_history = response.json().get('orders', [])
@@ -2593,7 +2593,7 @@ class TradingOrchestrator:
                     logger.warning(f"⚠️ Failed to get order history from {exchange_name}: {response.status_code}")
                 
                 # Try alternative endpoint for recent orders
-                recent_response = await client.get(f"{exchange_service_url}/api/v1/trading/recent-orders/{exchange_name}")
+                recent_response = await client.get(f"{exchange_service_url}/api/v1/trading/mytrades/{exchange_name}?symbol={pair}")
                 
                 if recent_response.status_code == 200:
                     recent_orders = recent_response.json().get('orders', [])
