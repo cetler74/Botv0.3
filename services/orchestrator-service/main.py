@@ -1,6 +1,18 @@
 """
 Orchestrator Service for the Multi-Exchange Trading Bot
 Main trading coordination and decision making
+
+VERSION: 2.1.0 (2025-08-24)
+CHANGELOG:
+- v2.1.0: ENHANCED RISK MANAGEMENT - Multi-layered safety system
+  * LAYER 1: Current unrealized PnL protection (2+ negative positions)
+  * LAYER 2: Recent realized losses & cooldown periods (24h analysis)
+  * LAYER 3: Portfolio-level drawdown protection ($100+ loss threshold)
+  * LAYER 4: Exchange-level risk assessment (systematic performance)
+  * ADDED: Historical loss pattern detection (2+ losses = cooldown)
+  * ADDED: Large single loss protection ($20+ threshold)
+  * ADDED: Comprehensive risk logging for transparency
+  * MAINTAINED: Original 2-negative-position threshold for entry adjustment
 """
 
 import asyncio
@@ -11,6 +23,11 @@ import signal
 import sys
 import os
 import httpx
+
+# Version tracking
+ORCHESTRATOR_VERSION = "2.1.0"
+VERSION_DATE = "2025-08-24"
+RISK_MANAGEMENT_VERSION = "2.1.0"
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1990,32 +2007,57 @@ class TradingOrchestrator:
 
     async def _check_pair_risk_management(self, exchange_name: str, pair: str) -> bool:
         """
-        Risk Management: Check if it's safe to open a new trade for this pair
-        Returns False if the pair has 2+ open positions with negative unrealized_pnl
+        Enhanced Risk Management v2.1.0: Multi-layered safety checks for trading pairs
+        
+        Checks multiple risk factors:
+        1. Current unrealized PnL (allows 2 negative positions for entry adjustment)
+        2. Recent realized losses and cooldown periods  
+        3. Historical performance analysis
+        4. Portfolio-level drawdown protection
+        
+        Returns False if any risk threshold is exceeded
         """
         try:
-            # Get all open trades for this exchange and pair
+            logger.info(f"🔍 [RISK MANAGEMENT v2.1.0] Comprehensive risk analysis for {pair} on {exchange_name}")
+            
+            # Get all trades (open and recent closed) for comprehensive analysis
             async with httpx.AsyncClient(timeout=60.0) as client:
+                # Get open trades
                 response = await client.get(f"{database_service_url}/api/v1/trades/open")
                 response.raise_for_status()
                 open_trades = response.json()['trades']
+                
+                # Get recent closed trades (last 24 hours) for historical analysis
+                from datetime import datetime, timedelta
+                yesterday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+                
+                try:
+                    response = await client.get(f"{database_service_url}/api/v1/trades")
+                    response.raise_for_status()
+                    all_trades = response.json()['trades']
+                    recent_closed_trades = [
+                        trade for trade in all_trades 
+                        if (trade.get('status') in ['CLOSED', 'FAILED'] and 
+                            trade.get('exchange') == exchange_name and 
+                            trade.get('pair') == pair and
+                            trade.get('exit_time', trade.get('updated_at', '')) >= yesterday)
+                    ]
+                except Exception:
+                    recent_closed_trades = []  # Fallback if historical data unavailable
             
-            # Filter trades for this specific exchange and pair
-            pair_trades = [
+            # === LAYER 1: Current Unrealized PnL Check (Original Logic) ===
+            pair_open_trades = [
                 trade for trade in open_trades 
                 if trade.get('exchange') == exchange_name and trade.get('pair') == pair
             ]
             
-            if len(pair_trades) < 2:
-                # Less than 2 positions, safe to trade
-                logger.info(f"✅ [RISK CHECK] {pair} on {exchange_name} has {len(pair_trades)} open positions (< 2) - SAFE TO TRADE")
-                return True
-            
-            # Count positions with negative unrealized_pnl
             negative_positions = []
-            for trade in pair_trades:
+            total_unrealized_pnl = 0
+            
+            for trade in pair_open_trades:
                 try:
                     unrealized_pnl = float(trade.get('unrealized_pnl', 0))
+                    total_unrealized_pnl += unrealized_pnl
                     if unrealized_pnl < 0:
                         negative_positions.append({
                             'trade_id': trade.get('trade_id'),
@@ -2032,17 +2074,94 @@ class TradingOrchestrator:
                         'position_size': trade.get('position_size')
                     })
             
-            # Risk management rule: Block if 2+ positions are negative
+            # Check 1: Block if 2+ open positions are negative (keeps original logic)
             if len(negative_positions) >= 2:
                 total_negative_pnl = sum(pos['unrealized_pnl'] for pos in negative_positions)
-                logger.warning(f"🚫 Risk Management Block: {pair} on {exchange_name}")
-                logger.warning(f"   - Total positions: {len(pair_trades)}")
+                logger.warning(f"🚫 [LAYER 1] Unrealized PnL Block: {pair} on {exchange_name}")
+                logger.warning(f"   - Total open positions: {len(pair_open_trades)}")
                 logger.warning(f"   - Negative positions: {len(negative_positions)}")
                 logger.warning(f"   - Combined negative PnL: ${total_negative_pnl:.2f}")
                 logger.warning(f"   - Negative trades: {[pos['trade_id'][:8] for pos in negative_positions]}")
                 return False
             
-            logger.info(f"✅ Risk Check Passed: {pair} on {exchange_name} - {len(negative_positions)}/2+ negative positions")
+            # === LAYER 2: Recent Realized Losses & Cooldown Analysis ===
+            recent_losses = []
+            total_recent_realized_pnl = 0
+            
+            for trade in recent_closed_trades:
+                try:
+                    realized_pnl = float(trade.get('realized_pnl', 0))
+                    total_recent_realized_pnl += realized_pnl
+                    if realized_pnl < 0:
+                        recent_losses.append({
+                            'trade_id': trade.get('trade_id'),
+                            'realized_pnl': realized_pnl,
+                            'exit_time': trade.get('exit_time', trade.get('updated_at')),
+                            'exit_reason': trade.get('exit_reason', 'unknown')
+                        })
+                except (ValueError, TypeError):
+                    pass
+            
+            # Check 2: Block if 2+ realized losses in last 24h (pattern failure)
+            if len(recent_losses) >= 2:
+                total_recent_loss = sum(loss['realized_pnl'] for loss in recent_losses)
+                logger.warning(f"🚫 [LAYER 2] Recent Loss Pattern Block: {pair} on {exchange_name}")
+                logger.warning(f"   - Recent losses (24h): {len(recent_losses)}")
+                logger.warning(f"   - Total realized loss: ${total_recent_loss:.2f}")
+                logger.warning(f"   - Loss trades: {[loss['trade_id'][:8] for loss in recent_losses]}")
+                logger.warning(f"   - Cooldown required: Wait for market regime change")
+                return False
+            
+            # Check 3: Block if single large recent loss (>1% of typical position)
+            if recent_losses:
+                largest_loss = min(loss['realized_pnl'] for loss in recent_losses)
+                if largest_loss < -20:  # More than $20 loss (configurable threshold)
+                    logger.warning(f"🚫 [LAYER 2] Large Recent Loss Block: {pair} on {exchange_name}")
+                    logger.warning(f"   - Largest recent loss: ${largest_loss:.2f}")
+                    logger.warning(f"   - Risk: Pair showing adverse behavior")
+                    return False
+            
+            # === LAYER 3: Portfolio-Level Drawdown Protection ===
+            all_open_trades = open_trades  # All exchanges, all pairs
+            portfolio_unrealized_pnl = sum(
+                float(trade.get('unrealized_pnl', 0)) 
+                for trade in all_open_trades
+                if trade.get('unrealized_pnl') is not None
+            )
+            
+            # Check 4: Block if portfolio drawdown exceeds threshold
+            if portfolio_unrealized_pnl < -100:  # More than $100 total unrealized loss
+                logger.warning(f"🚫 [LAYER 3] Portfolio Drawdown Block: {pair} on {exchange_name}")
+                logger.warning(f"   - Portfolio unrealized PnL: ${portfolio_unrealized_pnl:.2f}")
+                logger.warning(f"   - Risk: Prevent additional exposure during drawdown")
+                return False
+            
+            # === LAYER 4: Exchange-Level Risk Assessment ===
+            exchange_trades = [
+                trade for trade in all_open_trades 
+                if trade.get('exchange') == exchange_name
+            ]
+            exchange_unrealized_pnl = sum(
+                float(trade.get('unrealized_pnl', 0)) 
+                for trade in exchange_trades
+                if trade.get('unrealized_pnl') is not None
+            )
+            
+            # Check 5: Block if exchange showing poor performance
+            if len(exchange_trades) >= 3 and exchange_unrealized_pnl < -50:  # $50+ loss across 3+ trades
+                logger.warning(f"🚫 [LAYER 4] Exchange Performance Block: {pair} on {exchange_name}")
+                logger.warning(f"   - Exchange open trades: {len(exchange_trades)}")
+                logger.warning(f"   - Exchange unrealized PnL: ${exchange_unrealized_pnl:.2f}")
+                logger.warning(f"   - Risk: Exchange showing systematic issues")
+                return False
+            
+            # === ALL CHECKS PASSED ===
+            logger.info(f"✅ [RISK MANAGEMENT v2.1.0] All layers passed for {pair} on {exchange_name}")
+            logger.info(f"   - Open positions: {len(pair_open_trades)} (negative: {len(negative_positions)})")
+            logger.info(f"   - Recent losses (24h): {len(recent_losses)}")
+            logger.info(f"   - Portfolio PnL: ${portfolio_unrealized_pnl:.2f}")
+            logger.info(f"   - Exchange PnL: ${exchange_unrealized_pnl:.2f}")
+            logger.info(f"   - Status: APPROVED FOR TRADING")
             return True
             
         except Exception as e:
@@ -5582,6 +5701,8 @@ async def websocket_orders(websocket: WebSocket):
 @app.on_event("startup")
 async def startup_event():
     """Initialize orchestrator and start trading loop on startup"""
+    logger.info(f"🚀 Orchestrator Service v{ORCHESTRATOR_VERSION} ({VERSION_DATE}) starting up")
+    logger.info(f"🛡️ Enhanced Risk Management v{RISK_MANAGEMENT_VERSION} - Multi-layered protection active")
     await orchestrator.initialize()
     await orchestrator.start_trading()
     await hybrid_order_tracker.start_background_tasks()
