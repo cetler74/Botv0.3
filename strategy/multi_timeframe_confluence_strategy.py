@@ -2,6 +2,14 @@
 Multi-Timeframe Confluence Strategy for Crypto Sideways Trading
 Win Rate: 82% | Average Profit: 5.2% per trade | Signals: 1.8 per day
 
+VERSION: 2.1.1 (2025-08-24)
+CHANGELOG:
+- v2.1.1: ASSET-SPECIFIC VOLATILITY THRESHOLDS
+  * ADDED: Asset-specific volatility overrides (CRO/USD: 8.0%, DOGE: 7.0%, etc.)
+  * FIXED: CRO trading blocked by inappropriate 2% volatility filter
+  * ENHANCED: Intelligent threshold selection per trading pair
+  * IMPROVED: Volatility check logging with threshold transparency
+
 This strategy achieves high win rates by confirming sideways ranges on daily charts
 while executing entries on hourly timeframes, waiting for at least two technical
 confirmations before entering positions.
@@ -60,9 +68,22 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         self.hourly_timeframe = self._get_config_param('hourly_timeframe', '1h')
         self.min_confluence = self._get_config_param('min_confluence', 3)  # Minimum confirmations needed - ENHANCED from config
         
-        # UPDATED: More realistic sideways market criteria
+        # UPDATED: More realistic sideways market criteria with asset-specific overrides
         self.max_price_range_pct = self._get_config_param('max_price_range_pct', 15.0)  # Increased from 5% to 15%
-        self.max_daily_volatility_pct = self._get_config_param('max_daily_volatility_pct', 5.0)  # NEW: Skip extreme volatility
+        self.max_daily_volatility_pct = self._get_config_param('max_daily_volatility_pct', 5.0)  # DEFAULT: Skip extreme volatility
+        
+        # ASSET-SPECIFIC VOLATILITY THRESHOLDS v2.1.1
+        self.asset_volatility_overrides = {
+            'CRO/USD': 8.0,    # CRO naturally trades 5-6% daily, allow up to 8%
+            'CRO/USDC': 8.0,   # Same for USDC pair
+            'DOGE/USD': 7.0,   # DOGE can be volatile, allow higher threshold
+            'DOGE/USDC': 7.0,  # Same for USDC pair
+            'SHIB/USD': 10.0,  # Meme coins need higher thresholds
+            'APE/USD': 6.0,    # NFT tokens tend to be more volatile
+            'MANA/USD': 6.0,   # Gaming tokens higher volatility
+            'SAND/USD': 6.0,   # Gaming tokens higher volatility
+            # Add more as needed based on asset behavior
+        }
         self.max_volume_ratio = self._get_config_param('max_volume_ratio', 1.5)  # Increased from 1.2 to 1.5
         self.min_sideways_periods = self._get_config_param('min_sideways_periods', 7)  # Reduced from 10 to 7
         self.atr_stop_loss_multiplier = self._get_config_param('atr_stop_loss_multiplier', 1.5)  # NEW: ATR-based stop loss
@@ -71,9 +92,10 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         self.daily_data = None
         self.hourly_data = None
         
-        self.logger.info(f"MultiTimeframeConfluenceStrategy initialized with ENHANCED parameters: "
+        self.logger.info(f"MultiTimeframeConfluenceStrategy v2.1.1 initialized with ENHANCED parameters: "
                    f"ADX threshold={self.adx_threshold}, trending ADX={self.trending_adx_threshold}, "
-                   f"min confluence={self.min_confluence}, max daily volatility={self.max_daily_volatility_pct}%, "
+                   f"min confluence={self.min_confluence}, max daily volatility={self.max_daily_volatility_pct}% (default), "
+                   f"asset-specific overrides={len(self.asset_volatility_overrides)} pairs, "
                    f"stop loss={self.stop_loss_pct:.1%}, ATR multiplier={self.atr_stop_loss_multiplier}")
     
     def _get_config_param(self, param_name: str, default_value: Any) -> Any:
@@ -303,7 +325,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             # Fallback to percentage-based stop loss
             return current_price * (1 - self.stop_loss_pct)
     
-    def _detect_sideways_market(self) -> Tuple[bool, str]:
+    def _detect_sideways_market(self, pair: str) -> Tuple[bool, str]:
         """
         Detect sideways market conditions using hourly data with enhanced filters.
         
@@ -325,8 +347,16 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                 daily_low = recent_24h['low'].min()
                 daily_volatility = (daily_high - daily_low) / daily_low * 100
                 
-                if daily_volatility > self.max_daily_volatility_pct:
-                    return False, f"Daily volatility too high: {daily_volatility:.2f}% > {self.max_daily_volatility_pct}%"
+                # Get asset-specific volatility threshold (v2.1.1 enhancement)
+                effective_volatility_threshold = self.asset_volatility_overrides.get(
+                    pair, self.max_daily_volatility_pct
+                )
+                
+                if daily_volatility > effective_volatility_threshold:
+                    return False, f"Daily volatility too high: {daily_volatility:.2f}% > {effective_volatility_threshold}% (asset-specific threshold)"
+                    
+                # Log successful volatility check with threshold used
+                self.logger.info(f"✅ Volatility check passed: {daily_volatility:.2f}% <= {effective_volatility_threshold}% for {pair}")
         except Exception as e:
             self.logger.warning(f"Error calculating daily volatility: {e}")
             
@@ -526,7 +556,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         # Set the hourly data for sideways market detection
         self.hourly_data = hourly_data
         try:
-            is_sideways, market_condition = self._detect_sideways_market()
+            is_sideways, market_condition = self._detect_sideways_market(pair)
             # CRITICAL FIX: Allow both sideways AND trending markets to increase trade frequency
             market_suitable = is_sideways
             
@@ -668,7 +698,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
     
     async def get_strategy_info(self) -> Dict[str, Any]:
         """Get current strategy information and state."""
-        sideways_status, condition = self._detect_sideways_market() if self.daily_data is not None else (False, "No data")
+        sideways_status, condition = self._detect_sideways_market("UNKNOWN") if self.daily_data is not None else (False, "No data")
         
         return {
             'name': self.name,

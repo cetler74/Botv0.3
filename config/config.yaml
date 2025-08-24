@@ -110,7 +110,6 @@ mcp:
       min_volume_24h: 2000000  # Increased from 1000000 for higher liquidity
   blacklisted_pairs:
   - ACH/USD
-  - 1INCH/USD  # EMERGENCY: 100% loss rate on recent trades
   - AAVE/USD
   - CRO/USD   # EMERGENCY: 100% loss rate on recent trades  
   - BNB/USDC  # EMERGENCY: Recent losses
@@ -149,13 +148,13 @@ strategies:
       fixed_tp_pct: 0.06  # Lower from 0.08 for faster exits
       max_trade_duration_hours: 6  # Much shorter from 18 - faster exits
       min_bearish_engulfing: 2.0  # Much higher from 1.2 - very strong engulfing required
-      min_confidence: 0.95  # Much higher from 0.8 - near perfect confidence
+      min_confidence: 0.75  # Reduced from 0.95 - realistic confidence threshold
       profit_lock_percentage: 0.01  # Lower from 0.015 for faster profit protection
       trailing_stop_trigger: 0.015  # Lower from 0.02 for earlier trailing
       min_engulfing_size_multiplier: 1.5  # Much higher from 0.6 - very strong engulfing
       regime_aware: true
       require_adx_and_volume_confirmation: true
-      min_volume_multiplier: 5.0  # Much higher from 2.0 - exceptional volume required
+      min_volume_multiplier: 2.0  # Reduced from 5.0 - reasonable volume requirement
       min_rsi_range: 10  # Tighter from 20 - more restrictive RSI range
       sma_period: 100  # Much longer from 50 for more stability
       stop_loss_pct: 0.008  # Much tighter from 0.8 
@@ -201,10 +200,10 @@ strategies:
       volume_quality_filter: true
       volume_threshold: 3.0  # Much higher from 1.8 for exceptional volume
       volume_threshold_percentage: 0.9  # Much higher from 0.6
-      min_confidence_score: 0.95  # Much higher from 0.85 - near perfect confidence only
+      min_confidence_score: 0.75  # Reduced from 0.95 - realistic confidence threshold
       require_trend_confirmation: true
       avoid_consolidation: true
-      min_momentum_strength: 0.9  # Much higher from 0.7 - exceptional momentum only
+      min_momentum_strength: 0.6  # Reduced from 0.9 - reasonable momentum requirement
       max_drawdown_entry: 0.005  # Much tighter from 0.02
       cooldown_after_loss: 24  # Much longer from 6 hours
     target_timeframes:
@@ -225,14 +224,14 @@ strategies:
       entry_confirmation_required: true  # Changed from false - always require confirmation
       max_volume_ratio: 1.5  # Lower from 2.0 for more normal volume
       medium_period: 25  # Longer from 15
-      min_confluence: 5  # Higher from 3 - more confluence signals required
-      required_timeframe_agreement: 5  # Higher from 3 - all timeframes must agree
-      min_confidence: 0.95  # Much higher from 0.8 - near perfect confidence
+      min_confluence: 3  # Reduced from 5 - realistic confluence requirement
+      required_timeframe_agreement: 3  # Reduced from 5 - reasonable timeframe agreement
+      min_confidence: 0.70  # Reduced from 0.95 - realistic confidence threshold
       profit_protection_enabled: true
       dynamic_stop_loss: true
-      min_sideways_periods: 10  # Doubled from 5 - avoid consolidation
-      rsi_overbought: 55  # Much lower from 70 - avoid any overbought
-      rsi_oversold: 45  # Much higher from 30 - avoid any oversold  
+      min_sideways_periods: 5  # Reduced from 10 - allow more opportunities
+      rsi_overbought: 70  # Restored from 55 - normal overbought level
+      rsi_oversold: 30  # Restored from 45 - normal oversold level  
       short_period: 10  # Doubled from 5
       stop_loss_pct: 0.008  # Tighter from 0.015
       take_profit_pct: 0.06  # Lower from 0.08 for faster exits
@@ -304,19 +303,24 @@ strategy_manager:
   max_concurrent_analyses: 10
   signal_cache_duration: 300
 trading:
-  max_concurrent_trades: 1  # EMERGENCY: Only 1 trade at a time until profitability improves
+  max_concurrent_trades: 15  # Updated: 5 trades per exchange × 3 exchanges = 15 total
   max_daily_loss: 0.002  # EMERGENCY: Ultra-tight daily loss limit (0.2%)
-  max_daily_trades: 2  # EMERGENCY: Maximum 2 trades per day for testing
+  max_daily_trades: 50  # Updated: Increased from 2 to 50 daily trades
   win_rate_threshold: 0.9  # EMERGENCY: Require 90% win rate or stop trading
   consecutive_loss_limit: 1  # EMERGENCY: Stop after any loss
   max_total_loss: 0.01  # EMERGENCY: 1% maximum total loss limit
-  max_trades_per_exchange: 1  # EMERGENCY: Only 1 trade per exchange per day
+  max_trades_per_exchange: 5  # Updated: Increased from 1 to 5 trades per exchange
   min_exchange_balance: 50.0
   min_order_size_usd:
-    cryptocom: 100.0
-    binance: 150.0
+    cryptocom: 200.0
+    binance: 200.0
     bybit: 75.0
-    default: 100.0
+    default: 200.0
+  default_min_order_amount: 0.0001  # Fallback minimum order amount in crypto units
+  sanitization:
+    prevent_zero_rounding: true
+    min_crypto_precision: 8
+    max_crypto_precision: 12
   risk_reward_minimum: 2.0
   mode: live
   position_size_percentage: 0.1  # Restored to original value
