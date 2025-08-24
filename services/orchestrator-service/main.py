@@ -23,6 +23,7 @@ from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTEN
 # Add the project root to the path to import core modules
 sys.path.append('/app')
 from core.strategy_manager import StrategyManager
+from redis_order_manager import RedisOrderManager
 from core.database_manager import DatabaseManager
 
 # Configure logging
@@ -481,6 +482,10 @@ class TradingOrchestrator:
         self._config = None
         self.config_manager = None  # Will be initialized in initialize() method
         
+        # Initialize Redis-based order processing
+        self.redis_order_manager = RedisOrderManager()
+        self.use_redis_processing = True  # Feature flag for hybrid mode
+        
     async def _emit_order_created_event(self, local_order_id: str, client_order_id: str, trade_id: Optional[str], 
                                        exchange: str, symbol: str, side: str, order_type: str, 
                                        amount: float, price: Optional[float] = None) -> bool:
@@ -566,6 +571,9 @@ class TradingOrchestrator:
             
             # Initialize database manager
             await self._initialize_database_manager()
+            
+            # Initialize Redis order management
+            await self._initialize_redis_order_manager()
             
             # Initialize strategy manager
             await self._initialize_strategy_manager()
@@ -733,16 +741,18 @@ class TradingOrchestrator:
                 exchanges = response.json()['exchanges']
 
                 for exchange_name in exchanges:
-                    # Get exchange configuration to check max_pairs limit
+                    # Get exchange configuration to check max_pairs limit and base_currency
                     exchange_config_response = await client.get(f"{config_service_url}/api/v1/config/exchanges/{exchange_name}")
                     if exchange_config_response.status_code == 200:
                         exchange_config = exchange_config_response.json()
                         max_pairs = exchange_config.get('max_pairs', 10)
+                        base_currency = exchange_config.get('base_currency', 'USDC')
                         logger.info(f"[DEBUG] {exchange_name} config from service: {exchange_config}")
                         logger.info(f"[DEBUG] {exchange_name} max_pairs extracted: {max_pairs}")
                     else:
                         max_pairs = 10  # Default fallback
-                        logger.warning(f"[DEBUG] {exchange_name} config service error: {exchange_config_response.status_code}, using fallback max_pairs: {max_pairs}")
+                        base_currency = 'USDC'  # Default fallback
+                        logger.warning(f"[DEBUG] {exchange_name} config service error: {exchange_config_response.status_code}, using fallback max_pairs: {max_pairs}, base_currency: {base_currency}")
                     
                     # Get latest pair selection from database
                     pairs_response = await client.get(f"{database_service_url}/api/v1/pairs/{exchange_name}")
@@ -768,11 +778,11 @@ class TradingOrchestrator:
                         else:
                             # Pairs array is empty, generate new pairs using pair selector
                             logger.info(f"Empty pairs found for {exchange_name} in database, generating new pair selection")
-                            await self._generate_and_store_pairs(client, exchange_name, max_pairs)
+                            await self._generate_and_store_pairs(client, exchange_name, max_pairs, base_currency)
                     else:
                         # No pairs endpoint available, generate new pairs using pair selector
                         logger.info(f"No pairs found for {exchange_name} in database, generating new pair selection")
-                        await self._generate_and_store_pairs(client, exchange_name, max_pairs)
+                        await self._generate_and_store_pairs(client, exchange_name, max_pairs, base_currency)
                         
                 logger.info(f"Initialized pair selections for {len(exchanges)} exchanges")
         except Exception as e:
@@ -1149,6 +1159,58 @@ class TradingOrchestrator:
             logger.error(f"Failed to initialize database manager: {e}")
             raise
     
+    async def _initialize_redis_order_manager(self) -> None:
+        """Initialize Redis order management system"""
+        try:
+            await self.redis_order_manager.initialize()
+            
+            # Check if Redis services are healthy
+            is_healthy = await self.redis_order_manager.is_healthy()
+            
+            if is_healthy:
+                logger.info("✅ Redis order management system initialized successfully")
+                self.use_redis_processing = True
+                
+                # Get queue statistics to verify functionality
+                stats = await self.redis_order_manager.get_queue_statistics()
+                logger.info(f"📊 Redis queue stats: {stats}")
+                
+                # Test Redis connection with a ping
+                await self.redis_order_manager.redis_client.ping()
+                logger.info("✅ Redis connectivity verified")
+                
+            else:
+                logger.warning("⚠️ Redis order services not healthy, falling back to direct processing")
+                self.use_redis_processing = False
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Redis order manager: {e}")
+            logger.warning("⚠️ Falling back to direct order processing")
+            self.use_redis_processing = False
+    
+    async def _check_redis_health_periodically(self) -> None:
+        """Periodically check Redis health and switch processing modes if needed"""
+        while self.running:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                
+                if self.use_redis_processing:
+                    # Check if Redis is still healthy
+                    is_healthy = await self.redis_order_manager.is_healthy()
+                    if not is_healthy:
+                        logger.warning("⚠️ Redis services became unhealthy, switching to direct processing")
+                        self.use_redis_processing = False
+                else:
+                    # Check if Redis has recovered
+                    is_healthy = await self.redis_order_manager.is_healthy()
+                    if is_healthy:
+                        logger.info("✅ Redis services recovered, switching back to Redis processing")
+                        self.use_redis_processing = True
+                        
+            except Exception as e:
+                logger.error(f"❌ Error in Redis health check: {e}")
+                await asyncio.sleep(30)  # Wait before retrying
+    
     async def _initialize_strategy_manager(self) -> None:
         """Initialize strategy manager with database and config"""
         try:
@@ -1182,6 +1244,11 @@ class TradingOrchestrator:
             # Start order monitoring in background
             logger.info("🔄 Starting order monitoring in background")
             order_monitoring_task = asyncio.create_task(self._monitor_pending_orders())
+            
+            # Start Redis health monitoring in background
+            if hasattr(self, 'redis_order_manager'):
+                logger.info("🔄 Starting Redis health monitoring in background")
+                redis_health_task = asyncio.create_task(self._check_redis_health_periodically())
             
             while self.running:
                 try:
@@ -1827,45 +1894,74 @@ class TradingOrchestrator:
             return False
             
     async def _check_pair_entry(self, exchange_name: str, pair: str) -> None:
-        """Check if a pair should be entered - each strategy is independent"""
+        """Check if a pair should be entered - each strategy is independent with detailed logging"""
         try:
-            # RISK MANAGEMENT: Check for existing negative positions on this pair
+            logger.info(f"🔍 [ENTRY CHECK] Starting entry evaluation for {pair} on {exchange_name}")
+            
+            # CONDITION CHECK 1: Risk Management
+            logger.info(f"🔍 [CONDITION 1] Checking risk management for {pair} on {exchange_name}")
             if not await self._check_pair_risk_management(exchange_name, pair):
-                logger.warning(f"🚫 Risk Management Block: Skipping {pair} on {exchange_name} - has 2+ losing positions")
+                logger.warning(f"❌ [CONDITION 1] Risk Management Block: Skipping {pair} on {exchange_name} - has 2+ losing positions")
                 return
+            else:
+                logger.info(f"✅ [CONDITION 1] Risk management check passed for {pair} on {exchange_name}")
             
             # Handle different symbol formats for different exchanges
             # All exchanges use format without slashes for strategy service
             strategy_pair = pair.replace('/', '')
             
-            # Get individual strategy signals instead of consensus
+            # CONDITION CHECK 2: Get Strategy Signals
+            logger.info(f"🔍 [CONDITION 2] Fetching strategy signals for {strategy_pair} on {exchange_name}")
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.get(f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}")
                 
                 # Handle 404 for unsupported pairs gracefully
                 if response.status_code == 404:
-                    logger.debug(f"No signals available for {pair} on {exchange_name} - pair not supported by strategy service")
+                    logger.info(f"❌ [CONDITION 2] No signals available for {pair} on {exchange_name} - pair not supported by strategy service")
                     return
                 
                 response.raise_for_status()
                 signals_data = response.json()
             
+            logger.info(f"✅ [CONDITION 2] Successfully fetched signals for {pair} on {exchange_name}")
+            
+            # DETAILED SIGNAL ANALYSIS
+            consensus = signals_data.get('consensus', {})
+            logger.info(f"📊 [CONSENSUS] {pair} on {exchange_name}: Signal={consensus.get('signal', 'unknown').upper()}, Confidence={consensus.get('confidence', 0):.2f}, Agreement={consensus.get('agreement', 0):.1f}%")
+            
             # Check each strategy independently
             strategies = signals_data.get('strategies', {})
+            logger.info(f"📋 [STRATEGIES] Analyzing {len(strategies)} individual strategies for {pair} on {exchange_name}")
+            
+            any_buy_signal = False
             for strategy_name, signal_data in strategies.items():
                 signal = signal_data.get('signal')
                 confidence = signal_data.get('confidence', 0)
                 strength = signal_data.get('strength', 0)
                 
-                # If any strategy generates a buy signal, execute the trade
-                if signal == 'buy' and confidence > 0.5:  # Minimum confidence threshold
-                    logger.info(f"Strategy {strategy_name} generated BUY signal for {pair} on {exchange_name} (confidence: {confidence:.2f})")
+                # LOG EACH STRATEGY RESULT
+                logger.info(f"   📈 {strategy_name}: Signal={signal.upper() if signal else 'NONE'}, Confidence={confidence:.2f}, Strength={strength:.2f}")
+                
+                # CONDITION CHECK 3: Buy Signal Check
+                if signal == 'buy':
+                    any_buy_signal = True
+                    logger.info(f"🎯 [CONDITION 3] {strategy_name} generated BUY signal for {pair} on {exchange_name}")
                     
-                    # Apply momentum filter to prevent buying peaks or falling knives
+                    # CONDITION CHECK 4: Confidence Threshold
+                    min_confidence = 0.5
+                    if confidence <= min_confidence:
+                        logger.info(f"❌ [CONDITION 4] {strategy_name} confidence {confidence:.2f} <= {min_confidence} - INSUFFICIENT")
+                        continue
+                    else:
+                        logger.info(f"✅ [CONDITION 4] {strategy_name} confidence {confidence:.2f} > {min_confidence} - SUFFICIENT")
+                    
+                    # CONDITION CHECK 5: Momentum Filter
+                    logger.info(f"🔍 [CONDITION 5] Checking momentum filter for {pair} on {exchange_name}")
                     allow_entry, filter_reason = await self.momentum_filter.should_allow_entry(exchange_name, pair)
                     
                     if allow_entry:
-                        logger.info(f"🟢 Momentum filter APPROVED entry for {pair} on {exchange_name}: {filter_reason}")
+                        logger.info(f"✅ [CONDITION 5] Momentum filter APPROVED entry for {pair} on {exchange_name}: {filter_reason}")
+                        logger.info(f"🚀 [TRADE EXECUTION] ALL CONDITIONS MET - Executing trade for {pair} on {exchange_name} with {strategy_name}")
                         await self._execute_trade_entry(exchange_name, pair, {
                             'strategy': strategy_name,
                             'signal': signal,
@@ -1873,9 +1969,18 @@ class TradingOrchestrator:
                             'strength': strength
                         })
                     else:
-                        logger.warning(f"🔴 Momentum filter BLOCKED entry for {pair} on {exchange_name}: {filter_reason}")
+                        logger.warning(f"❌ [CONDITION 5] Momentum filter BLOCKED entry for {pair} on {exchange_name}: {filter_reason}")
+                    
                     # Only execute one trade per pair per cycle to avoid over-trading
                     break
+                else:
+                    logger.info(f"   ⚪ {strategy_name}: Signal is '{signal}', not 'buy' - SKIPPED")
+            
+            # FINAL SUMMARY
+            if not any_buy_signal:
+                logger.info(f"📄 [SUMMARY] No buy signals generated for {pair} on {exchange_name} - all strategies returned 'hold'")
+            else:
+                logger.info(f"📄 [SUMMARY] Entry evaluation completed for {pair} on {exchange_name}")
                 
         except Exception as e:
             logger.error(f"Error checking pair entry for {pair} on {exchange_name}: {str(e)}")
@@ -1903,7 +2008,7 @@ class TradingOrchestrator:
             
             if len(pair_trades) < 2:
                 # Less than 2 positions, safe to trade
-                logger.info(f"✅ Risk Check Passed: {pair} on {exchange_name} has {len(pair_trades)} open positions")
+                logger.info(f"✅ [RISK CHECK] {pair} on {exchange_name} has {len(pair_trades)} open positions (< 2) - SAFE TO TRADE")
                 return True
             
             # Count positions with negative unrealized_pnl
@@ -1949,7 +2054,7 @@ class TradingOrchestrator:
             return False
             
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
-        """Execute trade entry with actual order placement (market orders only)"""
+        """Execute trade entry with Redis queue-based processing (HYBRID MODE)"""
         try:
             # CRITICAL: Check real-time balance before placing order
             try:
@@ -1966,6 +2071,16 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.error(f"❌ Failed to check balance for {exchange_name}: {e}")
                 return
+            
+            # CHECK IF USING REDIS-BASED PROCESSING  
+            logger.info(f"🔀 Processing mode: {'Redis-based queue' if self.use_redis_processing else 'Direct database'}")
+            if self.use_redis_processing:
+                logger.info(f"🚀 Using Redis-based order processing for {pair} on {exchange_name}")
+                return await self._execute_redis_trade_entry(exchange_name, pair, signal, available_balance)
+            
+            # FALLBACK: DIRECT PROCESSING (Legacy Mode)
+            logger.info(f"⚡ Using direct order processing for {pair} on {exchange_name}")
+            
             # STRATEGY-SPECIFIC POSITION SIZING
             strategy_name = signal.get('strategy', 'default')
             position_percentage, max_position_usd = await self._get_strategy_position_config(strategy_name)
@@ -2054,8 +2169,37 @@ class TradingOrchestrator:
                         }
                         logger.warning(f"🚨 CRITICAL RECOVERY: Using synthetic fill data for trade creation")
                     else:
-                        logger.error(f"💥 RECOVERY FAILED: Could not verify order fill on exchange - trade will be missing from database")
-                        return
+                        # FINAL FALLBACK: Check if order is already marked as FILLED in our database
+                        logger.warning(f"🔄 FINAL FALLBACK: Checking database for order {order_result['id']} status...")
+                        try:
+                            async with httpx.AsyncClient(timeout=30.0) as client:
+                                db_response = await client.get(f"{database_service_url}/api/v1/orders/{order_result['id']}")
+                                if db_response.status_code == 200:
+                                    db_order = db_response.json()
+                                    if (db_order.get('status') == 'FILLED' and 
+                                        db_order.get('filled_amount', 0) > 0 and 
+                                        db_order.get('filled_price', 0) > 0):
+                                        
+                                        logger.info(f"✅ DATABASE RECOVERY: Order {order_result['id']} is FILLED in database - creating trade record")
+                                        filled_order = {
+                                            'id': order_result['id'],
+                                            'average': str(db_order['filled_price']),
+                                            'filled': str(db_order['filled_amount']),
+                                            'amount': str(db_order['filled_amount']),
+                                            'status': 'filled',
+                                            'symbol': pair,
+                                            'database_recovery': True
+                                        }
+                                        logger.warning(f"🚨 DATABASE RECOVERY: Using database fill data for trade creation")
+                                    else:
+                                        logger.error(f"💥 FINAL RECOVERY FAILED: Order {order_result['id']} not filled in database either - trade will be missing")
+                                        return
+                                else:
+                                    logger.error(f"💥 DATABASE CHECK FAILED: Could not retrieve order {order_result['id']} from database")
+                                    return
+                        except Exception as db_recovery_error:
+                            logger.error(f"💥 DATABASE RECOVERY EXCEPTION: {db_recovery_error}")
+                            return
                         
                 except Exception as recovery_error:
                     logger.error(f"💥 RECOVERY EXCEPTION: {recovery_error}")
@@ -2104,6 +2248,84 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"❌ Exception in _execute_trade_entry: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+    
+    async def _execute_redis_trade_entry(
+        self, 
+        exchange_name: str, 
+        pair: str, 
+        signal: Dict[str, Any], 
+        available_balance: float
+    ) -> None:
+        """Execute trade entry using Redis-based queue processing"""
+        try:
+            # STRATEGY-SPECIFIC POSITION SIZING
+            strategy_name = signal.get('strategy', 'default')
+            position_percentage, max_position_usd = await self._get_strategy_position_config(strategy_name)
+            
+            position_value_usdc = min(
+                available_balance * position_percentage,
+                max_position_usd
+            )
+            
+            logger.info(f"[Redis Queue] Strategy: {strategy_name}, Position: ${position_value_usdc:.2f}")
+            
+            # Check minimum order size from config 
+            min_order_size_usd = await self._get_min_order_size_for_exchange(exchange_name)
+            logger.info(f"📏 Min order size for {exchange_name}: ${min_order_size_usd}")
+            
+            if position_value_usdc < min_order_size_usd:
+                if available_balance >= min_order_size_usd:
+                    position_value_usdc = min_order_size_usd
+                    logger.info(f"💡 Using minimum order size: ${min_order_size_usd}")
+                else:
+                    logger.warning(f"🚫 Insufficient balance for minimum order: ${available_balance:.2f} < ${min_order_size_usd}")
+                    return
+            
+            # Calculate position size in units
+            current_price = signal.get('current_price', 0)
+            if current_price <= 0:
+                # Fallback: fetch current price from price feed service
+                logger.info(f"📈 Signal missing price for {pair}, fetching current price...")
+                current_price = await self._get_current_price(exchange_name, pair)
+                if current_price <= 0:
+                    logger.error(f"❌ Invalid price for {pair}: {current_price}")
+                    return
+                
+            position_size_units = position_value_usdc / current_price
+            sanitized_position_size = await self._sanitize_numeric_value_async(position_size_units)
+            
+            # Generate trade ID
+            trade_id = str(uuid.uuid4())
+            
+            # Create PENDING trade record first
+            await self.redis_order_manager.create_pending_trade_record(
+                trade_id=trade_id,
+                signal=signal,
+                exchange_name=exchange_name,
+                pair=pair,
+                position_size=sanitized_position_size,
+                strategy_name=strategy_name
+            )
+            
+            # Submit to Redis queue for processing
+            success = await self.redis_order_manager.execute_trade_entry_async(
+                signal=signal,
+                exchange_name=exchange_name,
+                pair=pair,
+                sanitized_position_size=sanitized_position_size,
+                trade_id=trade_id,
+                strategy_name=strategy_name
+            )
+            
+            if success:
+                logger.info(f"✅ Redis trade entry submitted: {trade_id} for {pair} on {exchange_name}")
+            else:
+                logger.error(f"❌ Redis trade entry failed: {trade_id} for {pair} on {exchange_name}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error in Redis trade entry: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
 
@@ -2631,23 +2853,87 @@ class TradingOrchestrator:
             return False
 
     async def _get_minimum_order_size(self, exchange_name: str, pair: str) -> float:
-        """Get minimum order size for a trading pair"""
+        """Get minimum order size for a trading pair from exchange info"""
         try:
-            # Default minimum sizes by exchange
-            defaults = {
-                'binance': 0.0001,  # 0.0001 BTC minimum
-                'bybit': 0.0001,
-                'cryptocom': 0.0001
-            }
+            # Get request timeout from config
+            timeout = await self._get_config_value('exchange_manager.request_timeout', 30)
             
-            # TODO: Could fetch actual minimum sizes from exchange info
-            # For now, use conservative defaults
-            return defaults.get(exchange_name, 0.0001)
+            # Try to get from exchange service first
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(f"{exchange_service_url}/api/v1/market/info/{exchange_name}/{pair}")
+                if response.status_code == 200:
+                    market_info = response.json()
+                    min_amount = market_info.get('limits', {}).get('amount', {}).get('min')
+                    if min_amount and min_amount > 0:
+                        logger.info(f"📏 Got min order size from exchange for {pair} on {exchange_name}: {min_amount}")
+                        return float(min_amount)
+            
+            # Fallback: Try to get from exchange-specific config
+            min_amount = await self._get_config_value(f'exchanges.{exchange_name}.min_order_amount', None)
+            if min_amount:
+                logger.info(f"📏 Got min order size from config for {pair} on {exchange_name}: {min_amount}")
+                return float(min_amount)
+            
+            # Final fallback: Get default minimum from config
+            default_min = await self._get_config_value('trading.default_min_order_amount', None)
+            if default_min:
+                logger.warning(f"⚠️ Using default minimum order size for {pair} on {exchange_name}: {default_min}")
+                return float(default_min)
+            
+            logger.error(f"❌ No minimum order size configured for {pair} on {exchange_name}")
+            raise ValueError(f"No minimum order size configuration found for {exchange_name}")
             
         except Exception as e:
             logger.error(f"Error getting minimum order size for {pair} on {exchange_name}: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
-            return 0.0001  # Conservative default
+            raise
+
+    async def _get_config_value(self, config_path: str, default_value=None):
+        """Get a configuration value from config service using dot notation path"""
+        try:
+            # Get request timeout from config (use a reasonable default for this bootstrap call)
+            timeout = 30
+            
+            config_url = f"{config_service_url}/api/v1/config/all"
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(config_url)
+                response.raise_for_status()
+                full_config = response.json()
+                
+                # Navigate through the config using dot notation
+                keys = config_path.split('.')
+                value = full_config
+                for key in keys:
+                    if isinstance(value, dict) and key in value:
+                        value = value[key]
+                    else:
+                        return default_value
+                
+                return value
+                
+        except Exception as e:
+            logger.error(f"❌ Error getting config value '{config_path}': {e}")
+            if default_value is not None:
+                logger.warning(f"⚠️ Using default value for '{config_path}': {default_value}")
+                return default_value
+            raise ValueError(f"Failed to get required config value '{config_path}': {e}")
+
+    async def _get_min_order_size_for_exchange(self, exchange_name: str) -> float:
+        """Get minimum order size in USD from config for an exchange"""
+        try:
+            min_order_sizes = await self._get_config_value('trading.min_order_size_usd', {})
+            min_size = min_order_sizes.get(exchange_name, min_order_sizes.get('default'))
+            
+            if min_size is None:
+                logger.error(f"❌ No min_order_size_usd configured for {exchange_name} and no default found")
+                raise ValueError(f"Missing min_order_size_usd config for {exchange_name}")
+            
+            logger.info(f"📏 Retrieved min order size for {exchange_name}: ${min_size}")
+            return float(min_size)
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting min order size from config for {exchange_name}: {e}")
+            raise ValueError(f"Failed to get min order size from config for {exchange_name}: {e}")
 
     def _convert_pair_format(self, exchange_name: str, pair: str) -> str:
         """Convert pair format for exchange service calls"""
@@ -4436,10 +4722,11 @@ class TradingOrchestrator:
             logger.error(f"❌ Error placing limit order with sanitized values for {pair} on {exchange_name}: {str(e)}")
             return None
 
-    def _sanitize_numeric_value(self, value: float) -> float:
-        """Sanitize numeric values to prevent decimal conversion errors"""
+    async def _sanitize_numeric_value_async(self, value: float) -> float:
+        """Sanitize numeric values to prevent decimal conversion errors using config"""
         try:
             if value is None:
+                logger.warning(f"🔧 Sanitizing None value, returning 0.0")
                 return 0.0
             
             # Convert to float first
@@ -4447,36 +4734,82 @@ class TradingOrchestrator:
             
             # Handle special cases
             if float_value == 0:
+                logger.warning(f"🔧 Sanitizing zero value, returning 0.0")
                 return 0.0
             if float_value < 0:
-                return abs(float_value)  # Ensure positive
+                logger.warning(f"🔧 Sanitizing negative value {float_value}, making positive")
+                float_value = abs(float_value)  # Ensure positive
+            
+            # CRITICAL: Check for NaN/infinity values that would break JSON
+            if np.isnan(float_value) or np.isinf(float_value):
+                logger.error(f"❌ Invalid numeric value (NaN/inf): {value}, returning 0.0")
+                return 0.0
+            
+            # Get precision settings from config
+            max_precision = await self._get_config_value('trading.sanitization.max_crypto_precision', 12)
+            min_precision = await self._get_config_value('trading.sanitization.min_crypto_precision', 8)
+            prevent_zero_rounding = await self._get_config_value('trading.sanitization.prevent_zero_rounding', True)
             
             # Format to remove scientific notation and excessive precision
-            # Use g format to remove trailing zeros, then convert back to float
-            formatted_str = f"{float_value:.10g}"
+            formatted_str = f"{float_value:.{max_precision}g}"
             sanitized_value = float(formatted_str)
             
-            # Ensure reasonable precision based on value size
-            if sanitized_value >= 1:
-                # For values >= 1, use 2 decimal places
+            # CRITICAL: More conservative rounding for crypto amounts based on value size
+            if sanitized_value >= 1000:
+                # For large values, use minimal decimal places
                 sanitized_value = round(sanitized_value, 2)
-            elif sanitized_value >= 0.01:
-                # For values >= 0.01, use 4 decimal places
+            elif sanitized_value >= 100:
+                # For hundreds, use 3 decimal places
+                sanitized_value = round(sanitized_value, 3)
+            elif sanitized_value >= 1:
+                # For values >= 1, use 4 decimal places
                 sanitized_value = round(sanitized_value, 4)
-            elif sanitized_value >= 0.0001:
-                # For values >= 0.0001, use 6 decimal places
+            elif sanitized_value >= 0.001:
+                # For values >= 0.001, use 6 decimal places
                 sanitized_value = round(sanitized_value, 6)
             else:
-                # For very small values, use 8 decimal places
-                sanitized_value = round(sanitized_value, 8)
+                # For very small values, use minimum precision from config
+                sanitized_value = round(sanitized_value, min_precision)
+                
+                # CRITICAL: Ensure we never round small crypto amounts to zero if configured
+                if prevent_zero_rounding and sanitized_value == 0.0 and float_value > 0:
+                    sanitized_value = float_value  # Keep original value
+                    logger.warning(f"🔧 Prevented rounding to zero: {value} -> {sanitized_value}")
             
             logger.info(f"🔧 Sanitized numeric value: {value} -> {sanitized_value}")
             return sanitized_value
             
         except (ValueError, TypeError) as e:
             logger.error(f"❌ Error sanitizing numeric value {value}: {e}")
-            # Return a safe fallback value
+            # CRITICAL: Don't return 0.0 for position sizes - this breaks orders!
+            try:
+                fallback = float(value) if value is not None else 0.0
+                if fallback > 0:
+                    logger.warning(f"🔧 Using fallback value for failed sanitization: {fallback}")
+                    return fallback
+            except:
+                pass
             return 0.0
+
+    def _sanitize_numeric_value(self, value: float) -> float:
+        """Synchronous wrapper for backward compatibility"""
+        # For existing code that can't be made async, use a simpler sanitization
+        try:
+            if value is None or value == 0:
+                return 0.0
+            
+            float_value = float(value)
+            if np.isnan(float_value) or np.isinf(float_value):
+                return 0.0
+            
+            # Use a reasonable precision without config lookup
+            if float_value > 0:
+                sanitized = round(abs(float_value), 8)
+                return sanitized if sanitized > 0 else float_value
+            return 0.0
+            
+        except (ValueError, TypeError):
+            return float(value) if value and value > 0 else 0.0
 
     async def _monitor_pending_orders(self):
         """Background task to monitor pending limit orders"""

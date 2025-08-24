@@ -1,6 +1,17 @@
 """
 Market Regime Detector for Strategy Selection
 Analyzes market conditions to determine which trading strategies are most appropriate
+
+VERSION: 2.0.0 (2025-08-24)
+CHANGELOG:
+- v2.0.0: CRITICAL CRYPTO MARKET OPTIMIZATION UPDATE
+  * FIXED: Division by zero error in Bollinger Band position calculation
+  * IMPROVED: Updated all volatility thresholds for 2025 cryptocurrency markets
+  * ENHANCED: Recalibrated ADX thresholds (20/35 instead of 25/40) for crypto trends
+  * OPTIMIZED: RSI extreme levels (25/75 instead of 30/70) for crypto momentum
+  * REFINED: Volume analysis periods (10 vs 5) for crypto intraday volatility
+  * TUNED: Price range analysis (15 vs 20 periods) for faster regime detection
+  * RESOLVED: Contradictory regime classifications causing strategy selection errors
 """
 
 import pandas as pd
@@ -11,6 +22,10 @@ from typing import Dict, List, Tuple, Optional
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+# Version tracking
+MARKET_REGIME_DETECTOR_VERSION = "2.0.0"
+VERSION_DATE = "2025-08-24"
 
 class MarketRegime(Enum):
     TRENDING_UP = "trending_up"
@@ -30,14 +45,18 @@ class MarketRegimeDetector:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         
-        # Thresholds for regime detection
-        self.adx_trend_threshold = 25      # ADX > 25 indicates trending
-        self.adx_strong_trend = 40         # ADX > 40 indicates strong trend
-        self.rsi_overbought = 70           # RSI > 70 overbought (potential reversal)
-        self.rsi_oversold = 30             # RSI < 30 oversold (potential reversal)
-        self.bb_squeeze_threshold = 0.02   # Bollinger Band squeeze threshold
-        self.volume_spike_multiplier = 2.0 # Volume spike for breakout detection
-        self.price_range_sideways = 0.05   # 5% price range for sideways market
+        # Log version information on initialization
+        self.logger.info(f"🔄 Market Regime Detector v{MARKET_REGIME_DETECTOR_VERSION} ({VERSION_DATE}) - Crypto-Optimized")
+        
+        # Thresholds for regime detection - UPDATED FOR 2025 CRYPTO MARKETS
+        self.adx_trend_threshold = 20      # ADX > 20 indicates trending (crypto-optimized)
+        self.adx_strong_trend = 35         # ADX > 35 indicates strong trend (crypto-optimized)
+        self.adx_sideways_threshold = 15   # ADX < 15 indicates sideways/ranging
+        self.rsi_overbought = 75           # RSI > 75 overbought (crypto sustains momentum longer)
+        self.rsi_oversold = 25             # RSI < 25 oversold (crypto sustains momentum longer)
+        self.bb_squeeze_threshold = 0.012  # 1.2% Bollinger Band squeeze (crypto-optimized)
+        self.volume_spike_multiplier = 2.5 # Volume spike for crypto's explosive moves
+        self.price_range_sideways = 0.03   # 3% price range for sideways market (tighter for crypto)
         
     def detect_regime(self, ohlcv: pd.DataFrame, pair: str = "Unknown") -> Tuple[MarketRegime, Dict[str, any]]:
         """
@@ -119,20 +138,26 @@ class MarketRegimeDetector:
         bb_lower = bb['BBL_20_2.0'].iloc[-1]
         bb_middle = bb['BBM_20_2.0'].iloc[-1]
         indicators['bb_width'] = (bb_upper - bb_lower) / bb_middle
-        indicators['bb_position'] = (ohlcv['close'].iloc[-1] - bb_lower) / (bb_upper - bb_lower)
+        
+        # CRITICAL FIX: Prevent division by zero when Bollinger Bands collapse
+        bb_range = bb_upper - bb_lower
+        if bb_range > 0 and not np.isnan(bb_range):
+            indicators['bb_position'] = (ohlcv['close'].iloc[-1] - bb_lower) / bb_range
+        else:
+            indicators['bb_position'] = 0.5  # Neutral position when bands collapse
         
         # ATR for volatility
         indicators['atr'] = ta.atr(ohlcv['high'], ohlcv['low'], ohlcv['close'], length=14).iloc[-1]
         indicators['atr_pct'] = indicators['atr'] / ohlcv['close'].iloc[-1]
         
-        # Volume analysis
-        current_volume = ohlcv['volume'].tail(5).mean()
+        # Volume analysis - IMPROVED FOR CRYPTO INTRADAY VOLATILITY
+        current_volume = ohlcv['volume'].tail(10).mean()  # Extended from 5 to 10 periods
         avg_volume = ohlcv['volume'].tail(50).mean()
         indicators['volume_ratio'] = current_volume / avg_volume if avg_volume > 0 else 1.0
         
-        # Price range analysis (last 20 periods)
-        recent_high = ohlcv['high'].tail(20).max()
-        recent_low = ohlcv['low'].tail(20).min()
+        # Price range analysis - OPTIMIZED FOR CRYPTO REGIME CHANGES
+        recent_high = ohlcv['high'].tail(15).max()  # Reduced from 20 to 15 for faster regime detection
+        recent_low = ohlcv['low'].tail(15).min()
         current_price = ohlcv['close'].iloc[-1]
         indicators['price_range_pct'] = (recent_high - recent_low) / current_price
         
@@ -207,8 +232,8 @@ class MarketRegimeDetector:
         # Price in middle of Bollinger Bands
         in_bb_middle = 0.3 < indicators['bb_position'] < 0.7
         
-        # Low volatility
-        low_volatility = indicators['atr_pct'] < 0.02
+        # Low volatility - CRYPTO-OPTIMIZED THRESHOLD
+        low_volatility = indicators['atr_pct'] < 0.015  # Tightened from 2% to 1.5%
         
         conditions['low_adx'] = low_adx
         conditions['narrow_range'] = narrow_range
@@ -245,8 +270,8 @@ class MarketRegimeDetector:
         # Price breaking out of Bollinger Bands
         bb_breakout = indicators['bb_position'] < 0.05 or indicators['bb_position'] > 0.95
         
-        # Recent volatility expansion
-        volatility_expansion = indicators['atr_pct'] > 0.03
+        # Recent volatility expansion - CRYPTO-OPTIMIZED
+        volatility_expansion = indicators['atr_pct'] > 0.025  # Reduced from 3% to 2.5%
         
         conditions['volume_spike'] = volume_spike
         conditions['bb_squeeze'] = bb_squeeze
@@ -272,13 +297,14 @@ class MarketRegimeDetector:
         """Analyze volatility conditions"""
         conditions = {}
         
+        # UPDATED 2025 CRYPTO VOLATILITY THRESHOLDS
         # High volatility conditions
-        high_atr = indicators['atr_pct'] > 0.04
-        wide_bb = indicators['bb_width'] > 0.05
+        high_atr = indicators['atr_pct'] > 0.03   # Reduced from 4% to 3% for crypto
+        wide_bb = indicators['bb_width'] > 0.04   # Reduced from 5% to 4%
         
-        # Low volatility conditions (CRITICAL FIX: Relaxed thresholds)
-        low_atr = indicators['atr_pct'] < 0.01   # CRITICAL FIX: Reduced from 0.015 to 0.01
-        narrow_bb = indicators['bb_width'] < 0.015  # CRITICAL FIX: Reduced from 0.02 to 0.015
+        # Low volatility conditions
+        low_atr = indicators['atr_pct'] < 0.008   # Reduced to 0.8% for crypto precision
+        narrow_bb = indicators['bb_width'] < 0.012  # 1.2% for crypto squeeze detection
         
         conditions['high_atr'] = high_atr
         conditions['wide_bb'] = wide_bb
