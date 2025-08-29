@@ -1,3 +1,29 @@
+from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, calculate_realized_pnl_with_fees
+
+def calculate_trade_pnl_with_fees(entry_price: float, current_price: float, position_size: float, 
+                                entry_fee_amount: float = 0.0, exit_fee_amount: float = 0.0) -> float:
+    """
+    Calculate unrealized PnL with fees for database service.
+    """
+    try:
+        # Create a mock position object for the enhanced PnL function
+        class MockPosition:
+            def __init__(self, entry_price, position_size, entry_fee, exit_fee):
+                self.entry_price = entry_price
+                self.position_size = position_size
+                self.entry_fee_amount = entry_fee
+                self.exit_fee_amount = exit_fee
+                self.position = 'long'  # SPOT trading - always long
+                self.side = 'buy'       # SPOT trading - always buy
+        
+        position = MockPosition(entry_price, position_size, entry_fee_amount, exit_fee_amount)
+        return calculate_unrealized_pnl(position, current_price)
+    except Exception as e:
+        logger.error(f"Error calculating PnL with fees: {e}")
+        # Fallback to basic calculation
+        return (current_price - entry_price) * position_size
+
+
 """
 Database Service for the Multi-Exchange Trading Bot
 Centralized database operations and data persistence
@@ -144,6 +170,8 @@ class PortfolioSummary(BaseModel):
     total_unrealized_pnl: float
     active_trades: int
     total_trades: int
+    daily_total_trades: int
+    daily_closed_trades: int
     win_rate: float
     exchanges: Dict[str, Dict[str, Any]]
 
@@ -1021,6 +1049,7 @@ async def get_trades(
         # Build base query with calculated fields
         base_query = """
             SELECT *,
+                   pair as symbol,
                    (COALESCE(current_price, entry_price, 0) * COALESCE(position_size, 0)) as notional_value,
                    profit_protection_trigger as profit_trigger,
                    trail_stop_trigger as trailing_stop,
@@ -1056,7 +1085,22 @@ async def get_trades(
         
         trades = await db_manager.execute_query(base_query, tuple(params))
         logger.info(f"Fetched {len(trades)} trades from database with sort_by={sort_by}, sort_order={sort_order}")
-        return {"trades": trades}
+        
+        # Get total count for pagination (without LIMIT/OFFSET)
+        count_query = "SELECT COUNT(*) as total FROM trading.trades"
+        count_params = []
+        
+        if where_conditions:
+            count_query += " WHERE " + " AND ".join(where_conditions)
+            # Use the same params but without the LIMIT and OFFSET values (last 2 params)
+            # params structure: [status?, exchange?, limit, offset]
+            where_param_count = len([c for c in where_conditions])
+            count_params = params[:where_param_count] if where_param_count > 0 else []
+        
+        total_result = await db_manager.execute_single_query(count_query, tuple(count_params) if count_params else ())
+        total = total_result.get('total', 0) if total_result else 0
+        
+        return {"trades": trades, "total": total}
     except Exception as e:
         logger.error(f"Failed to get trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1069,10 +1113,10 @@ async def get_open_trades(exchange: Optional[str] = None):
     
     try:
         if exchange:
-            query = "SELECT * FROM trading.trades WHERE status = 'OPEN' AND exchange = %s ORDER BY entry_time DESC"
+            query = "SELECT *, pair as symbol FROM trading.trades WHERE status = 'OPEN' AND exchange = %s ORDER BY entry_time DESC"
             trades = await db_manager.execute_query(query, (exchange,))
         else:
-            query = "SELECT * FROM trading.trades WHERE status = 'OPEN' ORDER BY entry_time DESC"
+            query = "SELECT *, pair as symbol FROM trading.trades WHERE status = 'OPEN' ORDER BY entry_time DESC"
             trades = await db_manager.execute_query(query)
         
         return {"trades": trades}
@@ -1087,7 +1131,7 @@ async def get_trade(trade_id: str):
         raise HTTPException(status_code=503, detail="Database not initialized")
     
     try:
-        query = "SELECT * FROM trading.trades WHERE trade_id = %s"
+        query = "SELECT *, pair as symbol FROM trading.trades WHERE trade_id = %s"
         trade = await db_manager.execute_single_query(query, (trade_id,))
         if not trade:
             raise HTTPException(status_code=404, detail="Trade not found")
@@ -1105,20 +1149,84 @@ async def update_trade(trade_id: str, update_data: Dict[str, Any]):
         raise HTTPException(status_code=503, detail="Database not initialized")
     
     try:
+        # Get current trade data to calculate total fees
+        current_trade_query = """
+            SELECT status, entry_price, entry_fee_amount, exit_fee_amount, fees 
+            FROM trading.trades 
+            WHERE trade_id = %s
+        """
+        current_trade = await db_manager.execute_single_query(current_trade_query, (trade_id,))
+        
         # Build dynamic update query
         set_clauses = []
         params = []
+        
+        # Track fee-related updates to recalculate total fees
+        fee_related_update = False
         
         for key, value in update_data.items():
             if key in ['exit_price', 'exit_id', 'exit_time', 'unrealized_pnl', 
                       'realized_pnl', 'highest_price', 'current_price', 'profit_protection', 
                       'profit_protection_trigger', 'trail_stop', 'trail_stop_trigger',
-                      'exit_reason', 'fees', 'status', 'entry_id', 'position_size', 'entry_price']:
+                      'exit_reason', 'fees', 'status', 'entry_id', 'position_size', 'entry_price',
+                      'entry_fee_amount', 'entry_fee_currency', 'exit_fee_amount', 
+                      'exit_fee_currency', 'total_fees_usd']:
                 # Normalize status values for consistency
                 if key == 'status':
                     value = normalize_status(value, "trade")
+                
+                # Track if this is a fee-related update
+                if key in ['entry_fee_amount', 'exit_fee_amount', 'status']:
+                    fee_related_update = True
+                
                 set_clauses.append(f"{key} = %s")
                 params.append(value)
+        
+        # Auto-calculate total fees if fee amounts or status changed
+        if fee_related_update and current_trade:
+            # Get updated values, using current trade data as fallback
+            status = update_data.get('status', current_trade.get('status', 'OPEN'))
+            entry_fee_amount = update_data.get('entry_fee_amount', current_trade.get('entry_fee_amount', 0))
+            exit_fee_amount = update_data.get('exit_fee_amount', current_trade.get('exit_fee_amount', 0))
+            entry_fee_currency = update_data.get('entry_fee_currency', current_trade.get('entry_fee_currency'))
+            exit_fee_currency = update_data.get('exit_fee_currency', current_trade.get('exit_fee_currency'))
+            
+            # Calculate total fees based on trade status
+            if status == 'OPEN':
+                # For OPEN trades: total_fees = entry_fee_amount
+                total_fees = float(entry_fee_amount or 0)
+            else:
+                # For CLOSED trades: total_fees = entry_fee_amount + exit_fee_amount  
+                total_fees = float(entry_fee_amount or 0) + float(exit_fee_amount or 0)
+            
+            # Calculate total fees in USD using conversion function
+            total_fees_usd = 0.0
+            if entry_fee_amount and entry_fee_amount > 0 and entry_fee_currency:
+                # Convert entry fee to USD
+                if entry_fee_currency.upper() in ['USD', 'USDC', 'USDT']:
+                    total_fees_usd += float(entry_fee_amount)
+                else:
+                    # For non-USD currencies, estimate conversion (1 USDC ≈ $1)
+                    # This could be enhanced with actual price lookups
+                    total_fees_usd += float(entry_fee_amount)
+            
+            if status != 'OPEN' and exit_fee_amount and exit_fee_amount > 0 and exit_fee_currency:
+                # Convert exit fee to USD for closed trades
+                if exit_fee_currency.upper() in ['USD', 'USDC', 'USDT']:
+                    total_fees_usd += float(exit_fee_amount)
+                else:
+                    # For non-USD currencies, estimate conversion
+                    total_fees_usd += float(exit_fee_amount)
+            
+            # Only add fees update if not already in update_data
+            if 'fees' not in update_data:
+                set_clauses.append("fees = %s")
+                params.append(total_fees)
+                
+            # Always update total_fees_usd when fees change
+            if 'total_fees_usd' not in update_data:
+                set_clauses.append("total_fees_usd = %s")
+                params.append(total_fees_usd)
                 
         if not set_clauses:
             raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -1276,33 +1384,53 @@ async def update_current_prices(update_data: Dict[str, Any]):
         if not all([pair, exchange, current_price]):
             raise HTTPException(status_code=400, detail="Missing required fields: pair, exchange, current_price")
             
-        # Update current price and recalculate unrealized PnL for open trades
-        update_query = """
-            UPDATE trading.trades 
-            SET 
-                current_price = %s,
-                last_price_update = NOW(),
-                price_updates_count = COALESCE(price_updates_count, 0) + 1,
-                unrealized_pnl = CASE 
-                    WHEN status = 'OPEN' THEN 
-                        (%s - entry_price) * position_size 
-                    ELSE unrealized_pnl 
-                END,
-                highest_price = CASE 
-                    WHEN %s > COALESCE(highest_price, entry_price) THEN %s
-                    ELSE highest_price
-                END,
-                updated_at = NOW()
-            WHERE 
-                pair = %s 
-                AND exchange = %s 
-                AND status = 'OPEN'
+        # First, get all open trades for this pair/exchange to calculate PnL
+        get_trades_query = """
+            SELECT trade_id, entry_price, position_size, entry_fee_amount, exit_fee_amount
+            FROM trading.trades 
+            WHERE pair = %s AND exchange = %s AND status = 'OPEN'
         """
         
-        result = await db_manager.execute_query(
-            update_query, 
-            (current_price, current_price, current_price, current_price, pair, exchange)
-        )
+        trades = await db_manager.execute_query(get_trades_query, (pair, exchange))
+        
+        # Update each trade with calculated PnL
+        updated_count = 0
+        for trade in trades:
+            try:
+                # Calculate PnL with fees
+                unrealized_pnl = calculate_trade_pnl_with_fees(
+                    entry_price=trade['entry_price'],
+                    current_price=current_price,
+                    position_size=trade['position_size'],
+                    entry_fee_amount=trade.get('entry_fee_amount', 0) or 0,
+                    exit_fee_amount=trade.get('exit_fee_amount', 0) or 0
+                )
+                
+                # Update the trade
+                update_query = """
+                    UPDATE trading.trades 
+                    SET 
+                        current_price = %s,
+                        last_price_update = NOW(),
+                        price_updates_count = COALESCE(price_updates_count, 0) + 1,
+                        unrealized_pnl = %s,
+                        highest_price = CASE 
+                            WHEN %s > COALESCE(highest_price, entry_price) THEN %s
+                            ELSE highest_price
+                        END,
+                        updated_at = NOW()
+                    WHERE trade_id = %s
+                """
+                
+                await db_manager.execute_query(
+                    update_query, 
+                    (current_price, unrealized_pnl, current_price, current_price, trade['trade_id'])
+                )
+                updated_count += 1
+                
+            except Exception as e:
+                logger.error(f"Error updating trade {trade['trade_id']}: {e}")
+                continue
         
         # Get count of updated trades
         count_query = "SELECT COUNT(*) as count FROM trading.trades WHERE pair = %s AND exchange = %s AND status = 'OPEN'"
@@ -2205,19 +2333,21 @@ async def get_portfolio_summary():
         pnl_result = await db_manager.execute_single_query(pnl_query)
         if not pnl_result:
             pnl_result = {"total_realized_pnl": 0, "daily_realized_pnl": 0}
-        # Get trade statistics
+        # Get trade statistics including daily counts
         trade_query = """
             SELECT 
                 COUNT(*) as total_trades,
                 COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as active_trades,
                 COUNT(CASE WHEN status = 'CLOSED' AND realized_pnl > 0 THEN 1 END) as winning_trades,
                 COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_trades,
+                COUNT(CASE WHEN entry_time >= CURRENT_DATE THEN 1 END) as daily_total_trades,
+                COUNT(CASE WHEN entry_time >= CURRENT_DATE AND status = 'CLOSED' THEN 1 END) as daily_closed_trades,
                 COALESCE(SUM(CASE WHEN status = 'OPEN' THEN unrealized_pnl ELSE 0 END), 0) as total_unrealized_pnl
             FROM trading.trades
         """
         trade_result = await db_manager.execute_single_query(trade_query)
         if not trade_result:
-            trade_result = {"total_trades": 0, "active_trades": 0, "winning_trades": 0, "closed_trades": 0, "total_unrealized_pnl": 0}
+            trade_result = {"total_trades": 0, "active_trades": 0, "winning_trades": 0, "closed_trades": 0, "daily_total_trades": 0, "daily_closed_trades": 0, "total_unrealized_pnl": 0}
         # Calculate win rate
         win_rate = 0
         if trade_result['closed_trades'] > 0:
@@ -2230,13 +2360,31 @@ async def get_portfolio_summary():
             ORDER BY exchange, timestamp DESC
         """
         exchanges = await db_manager.execute_query(exchange_query)
+        
+        # Get invested amounts per exchange (sum of position values for open trades)
+        invested_query = """
+            SELECT 
+                exchange,
+                COALESCE(SUM(position_size * entry_price), 0) as invested_amount
+            FROM trading.trades 
+            WHERE status = 'OPEN'
+            GROUP BY exchange
+        """
+        invested_amounts = await db_manager.execute_query(invested_query)
+        invested_dict = {}
+        if invested_amounts:
+            for inv in invested_amounts:
+                invested_dict[inv['exchange']] = float(inv['invested_amount'])
+        
         exchange_dict = {}
         if exchanges:
             for ex in exchanges:
-                exchange_dict[ex['exchange']] = {
+                exchange_name = ex['exchange']
+                exchange_dict[exchange_name] = {
                     'balance': float(ex['balance']),
                     'available': float(ex['available_balance']),
                     'available_balance': float(ex['available_balance']),
+                    'invested_amount': invested_dict.get(exchange_name, 0.0),
                     'total_pnl': float(ex.get('total_pnl', 0)),
                     'daily_pnl': float(ex.get('daily_pnl', 0)),
                     'timestamp': ex['timestamp'].isoformat() if ex.get('timestamp') is not None else None
@@ -2249,6 +2397,8 @@ async def get_portfolio_summary():
             total_unrealized_pnl=trade_result['total_unrealized_pnl'] or 0,
             active_trades=trade_result['active_trades'] or 0,
             total_trades=trade_result['total_trades'] or 0,
+            daily_total_trades=trade_result['daily_total_trades'] or 0,
+            daily_closed_trades=trade_result['daily_closed_trades'] or 0,
             win_rate=win_rate,
             exchanges=exchange_dict
         )
@@ -2489,6 +2639,79 @@ async def update_strategy_performance(strategy_name: str, performance_data: Dict
         
     except Exception as e:
         logger.error(f"Failed to update strategy performance for {strategy_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/analytics/strategy-performance")
+async def get_all_strategy_performance():
+    """Get calculated performance metrics for all strategies based on closed trades"""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    
+    try:
+        query = """
+            SELECT 
+                strategy,
+                COUNT(*) as total_trades,
+                COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open_trades,
+                COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_trades,
+                COUNT(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 THEN 1 END) as winning_trades,
+                ROUND(
+                    COUNT(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 THEN 1 END)::numeric / 
+                    NULLIF(COUNT(CASE WHEN status = 'CLOSED' THEN 1 END), 0) * 100, 1
+                ) as win_rate_percentage,
+                ROUND(
+                    SUM(CASE WHEN status = 'CLOSED' THEN 
+                        COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0)
+                        ELSE 0 END), 2
+                ) as total_pnl,
+                ROUND(
+                    AVG(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 
+                        THEN COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) END), 2
+                ) as avg_winning_trade,
+                ROUND(
+                    AVG(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) < 0 
+                        THEN COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) END), 2
+                ) as avg_losing_trade
+            FROM trading.trades 
+            WHERE strategy IS NOT NULL AND strategy != ''
+            GROUP BY strategy 
+            ORDER BY strategy
+        """
+        
+        results = await db_manager.execute_query(query)
+        
+        if not results:
+            return {"strategies": {}}
+        
+        # Format results
+        strategy_performance = {}
+        for row in results:
+            strategy_name = row['strategy']
+            
+            # Calculate win rate as decimal (0.0 to 1.0)
+            win_rate = float(row['win_rate_percentage'] or 0) / 100.0
+            
+            strategy_performance[strategy_name] = {
+                "total_trades": int(row['total_trades'] or 0),
+                "open_trades": int(row['open_trades'] or 0),
+                "closed_trades": int(row['closed_trades'] or 0),
+                "winning_trades": int(row['winning_trades'] or 0),
+                "win_rate": win_rate,
+                "win_rate_percentage": float(row['win_rate_percentage'] or 0),
+                "total_pnl": float(row['total_pnl'] or 0),
+                "avg_winning_trade": float(row['avg_winning_trade'] or 0),
+                "avg_losing_trade": float(row['avg_losing_trade'] or 0),
+                "profit_factor": (
+                    abs(float(row['avg_losing_trade'] or 0)) / abs(float(row['avg_winning_trade'] or 1))
+                    if row['avg_winning_trade'] and row['avg_losing_trade'] and row['avg_losing_trade'] != 0
+                    else 0
+                )
+            }
+        
+        return {"strategies": strategy_performance}
+        
+    except Exception as e:
+        logger.error(f"Failed to calculate strategy performance: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Reconciliation: pull exchange data and synchronize DB (definitive fix path)

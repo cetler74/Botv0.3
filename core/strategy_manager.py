@@ -1,3 +1,5 @@
+from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
+
 """
 Strategy Manager for the Multi-Exchange Trading Bot
 Coordinates all strategy analysis and signal generation using existing strategy files
@@ -344,7 +346,7 @@ class StrategyManager:
     async def apply_profit_protection(self, trade_data: Dict[str, Any], current_price: float) -> Tuple[bool, Optional[str]]:
         """Apply profit protection logic using existing strategy_pnl module"""
         try:
-            from strategy.strategy_pnl import check_profit_protection_enhanced, restore_profit_protection_state
+            from strategy.strategy_pnl_enhanced import check_profit_protection_enhanced, restore_profit_protection_state
             class ProfitProtectionState:
                 def __init__(self):
                     self.profit_protection_active = False
@@ -370,7 +372,7 @@ class StrategyManager:
             if entry_price <= 0 or position_size <= 0:
                 logger.error(f"[ProfitProtection] Trade {trade_data.get('trade_id')} entry_price or position_size <= 0. Skipping.")
                 return False, None
-            unrealized_pnl = (current_price - entry_price) * position_size
+            unrealized_pnl = calculate_unrealized_pnl_with_fees(entry_price, current_price, position_size)
             should_exit, reason, risk_data = check_profit_protection_enhanced(
                 state=state,
                 unrealized_pnl=unrealized_pnl,
@@ -399,7 +401,7 @@ class StrategyManager:
     async def apply_trailing_stop(self, trade_data: Dict[str, Any], current_price: float) -> Tuple[bool, Optional[str]]:
         """Apply trailing stop logic using existing strategy_pnl module"""
         try:
-            from strategy.strategy_pnl import manage_trailing_stop_enhanced
+            from strategy.strategy_pnl_enhanced import manage_trailing_stop_enhanced
             class TrailingStopState:
                 def __init__(self):
                     self.trailing_stop_active = False

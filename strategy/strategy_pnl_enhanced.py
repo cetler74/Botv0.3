@@ -265,17 +265,54 @@ def calculate_unrealized_pnl(position, current_price, trade_id=None, fee_rate=0.
     else:  # short, sell
         gross_pnl = (entry_price - current_price) * position_size
     
-    # Apply transaction fees (entry and potential exit)
-    entry_fee = entry_price * position_size * fee_rate
-    exit_fee = current_price * position_size * fee_rate
-    unrealized_pnl = gross_pnl - entry_fee - exit_fee
+    # Apply transaction fees - USE ACTUAL FEES from exchange, not estimated fees
+    # Get actual entry fee from position object
+    actual_entry_fee = 0.0
+    if hasattr(position, 'entry_fee_amount') and position.entry_fee_amount:
+        actual_entry_fee = float(position.entry_fee_amount)
+        
+    # For exit fee, use actual if available (for closed positions), otherwise estimate
+    actual_exit_fee = 0.0
+    if hasattr(position, 'exit_fee_amount') and position.exit_fee_amount:
+        actual_exit_fee = float(position.exit_fee_amount)
+    else:
+        # Estimate exit fee only if position doesn't have actual fee data
+        actual_exit_fee = current_price * position_size * fee_rate
+        
+    unrealized_pnl = gross_pnl - actual_entry_fee - actual_exit_fee
+    
+    if trade_id:
+        logger.info(f"[Trade {trade_id}] [PnL] Fee calculation - actual_entry_fee={actual_entry_fee}, estimated_exit_fee={actual_exit_fee}")
     
     pnl_percentage = (current_price - entry_price) / entry_price * 100 if entry_price != 0 and position_type in ['long', 'buy'] else (entry_price - current_price) / entry_price * 100
     
     if trade_id:
-        logger.info(f"[Trade {trade_id}] [PnL] Calculated unrealized PnL: {unrealized_pnl:.5f} ({pnl_percentage:.2f}%) (gross={gross_pnl:.5f}, entry_fee={entry_fee:.5f}, exit_fee={exit_fee:.5f})")
+        logger.info(f"[Trade {trade_id}] [PnL] Calculated unrealized PnL: {unrealized_pnl:.5f} ({pnl_percentage:.2f}%) (gross={gross_pnl:.5f}, actual_entry_fee={actual_entry_fee:.5f}, estimated_exit_fee={actual_exit_fee:.5f})")
         
     return unrealized_pnl
+
+def calculate_realized_pnl_with_fees(entry_price: float, exit_price: float, position_size: float,
+                                   entry_fee: float = 0.0, exit_fee: float = 0.0) -> float:
+    """
+    Calculate realized PnL for SPOT trading (long positions only) including fees.
+    
+    Args:
+        entry_price: Entry price of the position
+        exit_price: Exit price of the position
+        position_size: Size of the position
+        entry_fee: Actual entry fee
+        exit_fee: Actual exit fee
+        
+    Returns:
+        Realized PnL including fees
+    """
+    # SPOT trading - always long positions
+    gross_pnl = (exit_price - entry_price) * position_size
+    
+    # Calculate net PnL after fees
+    realized_pnl = gross_pnl - entry_fee - exit_fee
+    
+    return realized_pnl
 
 def check_profit_protection_enhanced(state, unrealized_pnl, entry_price, position_size, 
                                    config, ohlcv_data=None, trade_id=None, logger=None, 

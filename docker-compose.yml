@@ -109,6 +109,17 @@ services:
       - EXCHANGE_BYBIT_API_SECRET=${EXCHANGE_BYBIT_API_SECRET}
       - EXCHANGE_CRYPTOCOM_API_KEY=${EXCHANGE_CRYPTOCOM_API_KEY}
       - EXCHANGE_CRYPTOCOM_API_SECRET=${EXCHANGE_CRYPTOCOM_API_SECRET}
+      # Enable WebSocket User Data Streams
+      - BINANCE_ENABLE_USER_DATA_STREAM=true
+      - BINANCE_API_KEY=${EXCHANGE_BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${EXCHANGE_BINANCE_API_SECRET}
+      - CRYPTOCOM_ENABLE_USER_DATA_STREAM=true
+      - CRYPTOCOM_API_KEY=${EXCHANGE_CRYPTOCOM_API_KEY}
+      - CRYPTOCOM_API_SECRET=${EXCHANGE_CRYPTOCOM_API_SECRET}
+      # Enable Bybit WebSocket User Data Streams
+      - BYBIT_ENABLE_USER_DATA_STREAM=true
+      - BYBIT_API_KEY=${EXCHANGE_BYBIT_API_KEY}
+      - BYBIT_API_SECRET=${EXCHANGE_BYBIT_API_SECRET}
     volumes:
       - ./services/exchange-service/main.py:/app/main.py
       - ./scripts:/app/scripts
@@ -190,6 +201,64 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  # Redis-based Order Queue Service
+  order-queue-service:
+    build: ./services/order-queue-service
+    container_name: trading-bot-order-queue
+    ports:
+      - "8011:8007"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - DATABASE_SERVICE_URL=http://database-service:8002
+    volumes:
+      - ./services/order-queue-service:/app
+    networks:
+      - trading-bot-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+      database-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Redis-based Fill Detection Service
+  fill-detection-service:
+    build: ./services/fill-detection-service
+    container_name: trading-bot-fill-detection
+    ports:
+      - "8012:8008"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - EXCHANGE_SERVICE_URL=http://exchange-service:8003
+      - DATABASE_SERVICE_URL=http://database-service:8002
+    volumes:
+      - ./services/fill-detection-service:/app
+    networks:
+      - trading-bot-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+      database-service:
+        condition: service_healthy
+      order-queue-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   # MCP Service
   mcp-service:
@@ -329,6 +398,29 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  # Redis Streams Exporter for Prometheus
+  redis-exporter:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile.redis-exporter
+    container_name: trading-bot-redis-exporter
+    ports:
+      - "8010:8009"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - trading-bot-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   # Monitoring Services (Optional)
   prometheus:

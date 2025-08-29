@@ -53,8 +53,40 @@ async def select_top_pairs_ccxt(exchange_id, base_currency='USDC', num_pairs=10,
         return 0
     pairs = sorted(pairs, key=get_volume, reverse=True)
     await exchange.close()
-    # Do not sanitize symbols: use the exact symbol as returned by the exchange
-    sanitized_pairs = pairs[:num_pairs]
+    
+    # Validate pairs have usable market data (especially important for crypto.com)
+    validated_pairs = []
+    if exchange_id.lower() == 'cryptocom':
+        # For crypto.com, validate each pair has OHLCV data via exchange service
+        logger.info(f"[PairSelector] Validating {len(pairs[:num_pairs*2])} crypto.com pairs for OHLCV data availability...")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Test more pairs than needed to account for invalid ones
+            test_pairs = pairs[:num_pairs * 2]  # Test 2x pairs to account for failures
+            for symbol in test_pairs:
+                try:
+                    # Convert symbol format for URL (remove slash)
+                    url_symbol = symbol.replace('/', '')
+                    response = await client.get(
+                        f"http://exchange-service:8003/api/v1/market/ohlcv/cryptocom/{url_symbol}",
+                        params={'timeframe': '1h', 'limit': 5}
+                    )
+                    if response.status_code == 200:
+                        validated_pairs.append(symbol)
+                        logger.debug(f"[PairSelector] ✅ Validated {symbol} (OHLCV data available)")
+                        if len(validated_pairs) >= num_pairs:
+                            break  # We have enough validated pairs
+                    else:
+                        logger.debug(f"[PairSelector] ❌ Skipped {symbol} (no OHLCV data: {response.status_code})")
+                except Exception as e:
+                    logger.debug(f"[PairSelector] ❌ Skipped {symbol} (validation error: {e})")
+        
+        sanitized_pairs = validated_pairs[:num_pairs]
+        logger.info(f"[PairSelector] Validated {len(validated_pairs)} out of {len(test_pairs)} crypto.com pairs")
+    else:
+        # For other exchanges, use pairs as-is (no validation needed)
+        sanitized_pairs = pairs[:num_pairs]
+    
     logger.info(f"[CCXT PairSelector] Top {num_pairs} pairs for {exchange_id} {base_currency}: {sanitized_pairs}")
     return {
         "selected_pairs": sanitized_pairs,

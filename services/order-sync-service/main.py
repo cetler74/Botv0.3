@@ -76,13 +76,14 @@ class ReconcilerV2:
     async def emit_corrective_event(self, event_type: str, aggregate_id: str, payload: dict, correlation_id: str = None) -> bool:
         """Emit a corrective event instead of direct database mutation"""
         try:
+            import uuid
             event_data = {
-                'aggregate_id': aggregate_id,
+                'aggregate_id': aggregate_id if aggregate_id else str(uuid.uuid4()),
                 'aggregate_type': 'order',
                 'event_type': event_type,
                 'payload': payload,
-                'correlation_id': correlation_id,
-                'causation_id': f"reconciler-v2-{datetime.utcnow().isoformat()}"
+                'correlation_id': correlation_id if correlation_id else str(uuid.uuid4()),
+                'causation_id': str(uuid.uuid4())
             }
             
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -228,7 +229,7 @@ class ReconcilerV2:
             'timestamp': datetime.utcnow().isoformat()
         }
         
-        await self.emit_corrective_event('OrderUpdate', local_order.get('local_order_id'), payload, 'reconciler-status-fix')
+        await self.emit_corrective_event('OrderUpdate', local_order.get('local_order_id'), payload, str(uuid.uuid4()))
     
     async def emit_fill_correction_event(self, local_order: dict, exchange_order: dict):
         """Emit OrderFilled event for missing fills"""
@@ -252,7 +253,7 @@ class ReconcilerV2:
             'correction_reason': 'Reconciler v2 detected missing fill from exchange'
         }
         
-        await self.emit_corrective_event('OrderFilled', local_order.get('local_order_id'), payload, 'reconciler-fill-correction')
+        await self.emit_corrective_event('OrderFilled', local_order.get('local_order_id'), payload, str(uuid.uuid4()))
     
     async def import_orphaned_orders(self, exchange_orders: dict, local_orders: dict, exchange: str, result: dict):
         """Import orders that exist on exchange but not locally"""
@@ -292,7 +293,7 @@ class ReconcilerV2:
             'exchange_data': exchange_order
         }
         
-        await self.emit_corrective_event('OrderImportedFromExchange', local_order_id, payload, 'reconciler-orphan-import')
+        await self.emit_corrective_event('OrderImportedFromExchange', local_order_id, payload, str(uuid.uuid4()))
     
     async def handle_unknown_local_orders(self, local_orders: dict, exchange_orders: dict, exchange: str, result: dict):
         """Handle orders that exist locally but not on exchange"""
@@ -326,7 +327,7 @@ class ReconcilerV2:
             'timestamp': datetime.utcnow().isoformat()
         }
         
-        await self.emit_corrective_event('OrderUpdate', local_order.get('local_order_id'), payload, 'reconciler-missing-order')
+        await self.emit_corrective_event('OrderUpdate', local_order.get('local_order_id'), payload, str(uuid.uuid4()))
     
     def normalize_exchange_status(self, exchange_status: str) -> str:
         """Normalize exchange status to our internal format"""

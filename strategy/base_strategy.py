@@ -14,7 +14,7 @@ import numpy as np
 from core.database_manager import DatabaseManager
 #from exchange import BaseExchange
 from strategy.condition_logger import ConditionLogger
-from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, restore_profit_protection_state
+from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, restore_profit_protection_state
 
 logger = logging.getLogger(__name__)
 

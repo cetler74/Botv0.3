@@ -41,13 +41,14 @@ class PriceFeedManager:
         self.price_cache = {}  # Local price cache for fast access
         self.shutdown_event = asyncio.Event()
         self.tasks = []
+        # Default config - will be loaded from config service
         self.config = {
-            'enable_websocket_prices': False,
+            'enable_websocket_prices': True,  # Default to enabled, load from config
             'stale_price_threshold_seconds': 30,
             'rest_poll_interval_seconds': 1,
             'ws': {
                 'max_concurrent_subscriptions_per_exchange': 50,
-                'subscribe_only_for_open_trades': True
+                'subscribe_only_for_open_trades': False  # Subscribe to all selected pairs
             }
         }
         
@@ -81,18 +82,113 @@ class PriceFeedManager:
             raise
     
     async def _load_active_pairs(self):
-        """Load active trading pairs from open trades"""
+        """Load active trading pairs based on configuration and trading activity"""
+        try:
+            logger.info(f"🔧 DEBUG: _load_active_pairs called, current config: {self.config}")
+            
+            # Clear existing pairs for fresh discovery
+            self.active_pairs.clear()
+            
+            # Determine subscription strategy
+            subscribe_only_for_open_trades = self.config.get('ws', {}).get('subscribe_only_for_open_trades', False)
+            logger.info(f"🔧 DEBUG: subscribe_only_for_open_trades = {subscribe_only_for_open_trades}")
+            
+            if subscribe_only_for_open_trades:
+                logger.info("📊 Using open-trades-only subscription strategy")
+                
+                # Method 1: Load pairs from open trades (currently being traded)
+                async with self.db_pool.acquire() as conn:
+                    open_trades_query = """
+                        SELECT DISTINCT exchange, pair 
+                        FROM trading.trades 
+                        WHERE status = 'OPEN'
+                    """
+                    open_trades = await conn.fetch(open_trades_query)
+                    
+                    for row in open_trades:
+                        exchange = row['exchange']
+                        pair = row['pair']
+                        
+                        if exchange not in self.active_pairs:
+                            self.active_pairs[exchange] = set()
+                        self.active_pairs[exchange].add(pair)
+                    
+                    if open_trades:
+                        logger.info(f"📊 Loaded pairs from open trades: {dict((k, list(v)) for k, v in self.active_pairs.items())}")
+                    
+                    # Method 2: Load pairs from recent trading activity (last 24 hours)
+                    recent_trades_query = """
+                        SELECT DISTINCT exchange, pair 
+                        FROM trading.trades 
+                        WHERE created_at >= NOW() - INTERVAL '24 hours'
+                        ORDER BY exchange, pair
+                    """
+                    recent_trades = await conn.fetch(recent_trades_query)
+                    
+                    for row in recent_trades:
+                        exchange = row['exchange']
+                        pair = row['pair']
+                        
+                        if exchange not in self.active_pairs:
+                            self.active_pairs[exchange] = set()
+                        self.active_pairs[exchange].add(pair)
+                    
+                    if recent_trades:
+                        logger.info(f"📊 Added pairs from recent trades (24h): {dict((k, list(v)) for k, v in self.active_pairs.items())}")
+            
+            else:
+                logger.info("📊 Using all-selected-pairs subscription strategy")
+                
+                # Load ALL selected pairs for WebSocket monitoring
+                logger.info("📊 Loading all selected trading pairs for WebSocket monitoring...")
+                
+                # Define all selected pairs per exchange based on your specified list
+                all_selected_pairs = {
+                    'binance': [
+                        'BNB/USDC', 'BTC/USDC', 'ETH/USDC', 'XRP/USDC', 'XLM/USDC',
+                        'LINK/USDC', 'LTC/USDC', 'TRX/USDC', 'ADA/USDC', 'NEO/USDC',
+                        'ATOM/USDC', 'ETC/USDC', 'ALGO/USDC', 'DOGE/USDC', 'ONT/USDC'
+                    ],
+                    'cryptocom': [
+                        'CRO/USD', '1INCH/USD', 'AAVE/USD', 'ACH/USD', 'ACT/USD',
+                        'ADA/USD', 'AI16Z/USD', 'AIXBT/USD', 'AKT/USD', 'ALGO/USD',
+                        'ALICE/USD', 'ANIME/USD', 'ANKR/USD', 'APE/USD', 'API3/USD'
+                    ],
+                    'bybit': [
+                        'ETH/USDC', 'BTC/USDC', 'XLM/USDC', 'SOL/USDC', 'XRP/USDC',
+                        'LTC/USDC', 'MANA/USDC', 'SAND/USDC', 'DOT/USDC', 'LUNC/USDC',
+                        'DOGE/USDC', 'AVAX/USDC', 'ADA/USDC', 'OP/USDC', 'APEX/USDC'
+                    ]
+                }
+                
+                # Add all selected pairs to active monitoring
+                for exchange, pairs in all_selected_pairs.items():
+                    self.active_pairs[exchange] = set(pairs)
+                
+                logger.info(f"✅ Loaded ALL {sum(len(pairs) for pairs in all_selected_pairs.values())} selected pairs for WebSocket monitoring:")
+                for exchange, pairs in self.active_pairs.items():
+                    logger.info(f"   📡 {exchange.upper()}: {len(pairs)} pairs - {list(sorted(pairs))}")
+            
+            # If still no pairs found, log and use dynamic subscription
+            if not any(self.active_pairs.values()):
+                logger.info("📊 No trading pairs found, will subscribe dynamically based on requests")
+                # The WebSocket subscriptions will happen when the orchestrator requests prices
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to load active pairs: {e}")
+    
+    async def _load_open_trades_pairs(self):
+        """Fallback method to load pairs from open trades only"""
         try:
             async with self.db_pool.acquire() as conn:
-                # Get all open trades to determine which pairs we need to track
-                query = """
+                open_trades_query = """
                     SELECT DISTINCT exchange, pair 
                     FROM trading.trades 
                     WHERE status = 'OPEN'
                 """
-                rows = await conn.fetch(query)
+                open_trades = await conn.fetch(open_trades_query)
                 
-                for row in rows:
+                for row in open_trades:
                     exchange = row['exchange']
                     pair = row['pair']
                     
@@ -100,10 +196,10 @@ class PriceFeedManager:
                         self.active_pairs[exchange] = set()
                     self.active_pairs[exchange].add(pair)
                 
-                logger.info(f"📊 Loaded active pairs: {dict(self.active_pairs)}")
-                
+                if open_trades:
+                    logger.info(f"📊 Fallback: Loaded pairs from open trades: {dict((k, list(v)) for k, v in self.active_pairs.items())}")
         except Exception as e:
-            logger.error(f"❌ Failed to load active pairs: {e}")
+            logger.error(f"❌ Error loading open trades pairs: {e}")
     
     async def _initialize_websocket_handlers(self):
         """Initialize WebSocket connections to exchanges"""
@@ -202,13 +298,31 @@ class PriceFeedManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _load_realtime_config(self):
+        """Load realtime configuration from config service"""
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{CONFIG_SERVICE_URL}/api/v1/config/realtime")
-                if resp.status_code == 200:
-                    self.config = resp.json()
+                response = await client.get(f"{CONFIG_SERVICE_URL}/api/v1/config/realtime")
+                if response.status_code == 200:
+                    realtime_config = response.json()
+                    logger.info(f"🔧 Raw config received: {realtime_config}")
+                    
+                    # Update config with values from config service
+                    self.config['enable_websocket_prices'] = realtime_config.get('enable_websocket_prices', True)
+                    self.config['stale_price_threshold_seconds'] = realtime_config.get('stale_price_threshold_seconds', 30)
+                    self.config['rest_poll_interval_seconds'] = realtime_config.get('rest_poll_interval_seconds', 1)
+                    
+                    # Update WebSocket specific config
+                    ws_config = realtime_config.get('ws', {})
+                    self.config['ws']['max_concurrent_subscriptions_per_exchange'] = ws_config.get('max_concurrent_subscriptions_per_exchange', 50)
+                    self.config['ws']['subscribe_only_for_open_trades'] = ws_config.get('subscribe_only_for_open_trades', False)
+                    
+                    logger.info(f"✅ Loaded realtime config: WebSocket={self.config['enable_websocket_prices']}, OpenTradesOnly={self.config['ws']['subscribe_only_for_open_trades']}")
+                else:
+                    logger.warning(f"Failed to load realtime config from config service: {response.status_code}")
         except Exception as e:
-            logger.warning(f"Realtime config not available, using defaults: {e}")
+            logger.warning(f"Error loading realtime config, using defaults: {e}")
+            
+
 
     async def _update_prices_from_ws_if_available(self):
         """Update prices from WebSocket and return set of pairs that were successfully updated"""
@@ -541,6 +655,39 @@ async def health_check():
         }
     except Exception as e:
         return {"status": "unhealthy", "reason": str(e)}
+
+@app.post("/api/v1/pairs/subscribe")
+async def subscribe_to_pair(request: dict):
+    """Subscribe to price updates for a specific trading pair"""
+    try:
+        exchange = request.get('exchange')
+        pair = request.get('pair')
+        
+        if not exchange or not pair:
+            return {"status": "error", "message": "Exchange and pair are required"}
+        
+        # Add pair to active monitoring
+        if exchange not in price_feed_manager.active_pairs:
+            price_feed_manager.active_pairs[exchange] = set()
+        
+        was_new = pair not in price_feed_manager.active_pairs[exchange]
+        price_feed_manager.active_pairs[exchange].add(pair)
+        
+        if was_new:
+            # Subscribe to WebSocket for this pair
+            await price_feed_manager._sync_ws_subscriptions()
+            logger.info(f"📡 Dynamically subscribed to {exchange}/{pair}")
+        
+        return {
+            "status": "subscribed",
+            "exchange": exchange,
+            "pair": pair,
+            "was_new": was_new
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to subscribe to pair: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/status")
 async def get_status():

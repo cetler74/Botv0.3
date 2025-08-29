@@ -1,3 +1,5 @@
+from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
+
 """
 VWMA Hull strategy implementation for the crypto trading bot.
 Uses Volume Weighted Moving Average and Hull Moving Average for trend following.
@@ -10,7 +12,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from strategy.base_strategy import BaseStrategy, StrategyState
-from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, manage_trailing_stop, restore_profit_protection_state
+from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, manage_trailing_stop, restore_profit_protection_state
 from strategy.condition_logger import ConditionLogger
 
 class VWMAHullStrategy(BaseStrategy):
@@ -314,22 +316,40 @@ class VWMAHullStrategy(BaseStrategy):
         if not isinstance(data, pd.Series):
             data = pd.Series(data)
             
+        # Validate sufficient data for Hull MA calculation
+        required_periods = max(self.hull_period, int(np.sqrt(self.hull_period)))
+        if len(data) < required_periods:
+            self.logger.warning(f"❌ [HULL MA] Insufficient data for Hull MA: {len(data)} < {required_periods} required")
+            # Return NaN series with same index as input
+            return pd.Series([np.nan] * len(data), index=data.index if hasattr(data, 'index') else None)
+        
         half_length = int(self.hull_period / 2)
         sqrt_length = int(np.sqrt(self.hull_period))
-        wma_half = data.rolling(half_length).mean()
-        wma_full = data.rolling(self.hull_period).mean()
+        
+        # Calculate WMAs with validation
+        wma_half = data.rolling(half_length, min_periods=half_length).mean()
+        wma_full = data.rolling(self.hull_period, min_periods=self.hull_period).mean()
         
         # Ensure rolling results are pandas Series
         if isinstance(wma_half, np.ndarray):
-            wma_half = pd.Series(wma_half)
+            wma_half = pd.Series(wma_half, index=data.index if hasattr(data, 'index') else None)
         if isinstance(wma_full, np.ndarray):
-            wma_full = pd.Series(wma_full)
-            
-        hull = (2 * wma_half - wma_full).rolling(sqrt_length).mean()
+            wma_full = pd.Series(wma_full, index=data.index if hasattr(data, 'index') else None)
+        
+        # Calculate Hull MA
+        hull_raw = 2 * wma_half - wma_full
+        hull = hull_raw.rolling(sqrt_length, min_periods=sqrt_length).mean()
         
         # Ensure final result is pandas Series
         if isinstance(hull, np.ndarray):
-            hull = pd.Series(hull)
+            hull = pd.Series(hull, index=data.index if hasattr(data, 'index') else None)
+        
+        # Log calculation status
+        valid_values = hull.dropna()
+        self.logger.debug(f"✅ [HULL MA] Calculated Hull MA: {len(valid_values)} valid values out of {len(hull)} (period={self.hull_period})")
+        
+        if len(valid_values) == 0:
+            self.logger.warning(f"⚠️ [HULL MA] All Hull MA values are NaN (period={self.hull_period}, data_len={len(data)})")
             
         if indicators_cache is not None and cache_key:
             indicators_cache[cache_key] = hull
@@ -528,7 +548,7 @@ class VWMAHullStrategy(BaseStrategy):
                 # Calculate unrealized PnL
                 self.logger.info(f"[DEBUG] PnL calc: trade_id={self.trade_id}, entry_price={self.state.entry_price}, current_price={current_price}, position_size={self.state.position_size}, position={self.state.position}")
                 if self.state.position == 'long':
-                    unrealized_pnl = (current_price - self.state.entry_price) * self.state.position_size
+                    unrealized_pnl = calculate_unrealized_pnl_with_fees(self.state.entry_price, current_price, self.state.position_size)
                 else:
                     unrealized_pnl = (self.state.entry_price - current_price) * self.state.position_size
                 # Update performance

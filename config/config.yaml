@@ -60,8 +60,6 @@ exchanges:
     sandbox: false
     websocket_url: wss://stream.crypto.com/v2/market
     websocket_private: wss://stream.crypto.com/v2/user
-invalid:
-  path: test
 logging:
   backup_count: 5
   file: logs/trading_bot.log
@@ -77,7 +75,6 @@ mcp:
       enabled: true
       max_size: 1000
       ttl_seconds: 3600
-    enabled: true
     features:
       news_analysis: true
       real_time_data: true
@@ -96,43 +93,372 @@ mcp:
       max_results: 10
       search_type: web
     timeout: 30
-  pair_selector:
-    scoring_weights:
-      market_cap: 0.3  # Increased from 0.2 for more stable pairs
-      spread: 0.2  # Increased from 0.1 for better liquidity
-      volatility: 0.2  # Reduced from 0.3 for less volatile pairs
-      volume_24h: 0.3  # Reduced from 0.4 for more balanced selection
-      selection_criteria:
-      max_spread_percentage: 0.3  # Reduced from 0.5 for tighter spreads
-      max_volatility: 0.08  # Reduced from 0.1 for less volatile pairs
-      min_market_cap: 500000000  # Increased from 100000000 for more stable pairs
-      min_volatility: 0.015  # Increased from 0.01 for minimum movement
-      min_volume_24h: 2000000  # Increased from 1000000 for higher liquidity
+pair_selector:
+  update_interval_minutes: 60
+  max_pairs_per_exchange: 15
+  scoring_weights:
+    volume_24h: 0.3
+    volatility: 0.2
+    market_cap: 0.3
+    spread: 0.2
+  selection_criteria:
+    min_volume_24h: 2000000
+    min_volatility: 0.015
+    max_volatility: 0.08
+    min_market_cap: 500000000
+    max_spread_percentage: 0.3
   blacklisted_pairs:
   - ACH/USD
   - AAVE/USD
-  - CRO/USD   # EMERGENCY: 100% loss rate on recent trades  
+  # CRO/USD removed for pair-specific optimization implementation
   - BNB/USDC  # EMERGENCY: Recent losses
   - XLM/USDC  # EMERGENCY: Recent losses
-  auto_blacklist:
-    enabled: true
-    min_trades_threshold: 10
-    max_win_rate_threshold: 0.45
-    max_avg_pnl_threshold: -0.1
-    cooling_period_hours: 24
-    max_consecutive_losses: 5
   replacement_selection:
     enabled: true
     min_volume_24h_multiplier: 1.5
     min_market_cap_multiplier: 1.2
     exclude_new_listings_days: 7
-  update_interval_minutes: 60
 redis:
   db: 0
   host: localhost
   max_connections: 20
   password: ''
   port: 6379
+# EXCHANGE-SPECIFIC MARKET CONDITIONS
+# Generic market conditions optimized for each exchange's characteristics
+exchange_specific_configs:
+  binance:
+    # Binance: World's largest exchange - $133B volume, 34% market share, superior liquidity
+    market_conditions:
+      # Volume patterns (based on $32B daily volume, 411 coins, 1493 pairs)
+      volume_patterns:
+        min_volume_24h: 50000000        # Higher threshold for Binance's massive liquidity
+        volume_spike_threshold: 2.5     # Strong volume spikes on major pairs
+        volume_ma_periods: 20           # Longer periods for stable volume analysis
+        min_volume_consistency: 0.8     # High consistency on liquid markets
+        volume_surge_multiplier: 3.5    # Binance shows strong institutional volume surges
+        min_sustainable_volume: 30000000 # Higher minimum for trend sustainability
+        
+      # Volatility profiles (optimized for major pairs: BTC, ETH, SOL, etc.)
+      volatility_profiles:
+        min_atr_threshold: 0.01         # Higher baseline for major crypto volatility
+        max_atr_threshold: 0.08         # Account for crypto market volatility
+        volatility_ma_periods: 14       # Standard periods for crypto analysis
+        volatility_spike_multiplier: 2.5 # Strong volatility spikes on news
+        bollinger_band_period: 21       # Slightly longer for stable signals
+        volatility_breakout_threshold: 0.02 # Clear breakout detection
+        
+      # Technical indicators (optimized for USDC pairs trading)
+      technical_indicators:
+        adx_threshold: 35               # Higher for confirmed trends on liquid pairs
+        adx_trending_threshold: 50      # Strong trending confirmation
+        rsi_overbought: 75             # Standard overbought for crypto
+        rsi_oversold: 25               # Standard oversold levels
+        bb_squeeze_threshold: 0.02      # Tighter for breakout detection
+        confluence_required: 3          # Higher confidence for major pairs
+        macd_signal_strength: 0.003     # Sensitive to momentum changes
+        volume_rsi_threshold: 70        # Volume momentum threshold
+        
+      # Market microstructure (Binance-specific characteristics)
+      microstructure:
+        tick_size_adjustment: 0.00001   # Fine granularity for USDC pairs
+        spread_tolerance: 0.0008        # Tight spreads on liquid pairs
+        order_book_depth: 15            # Deep order books on major pairs
+        price_precision: 5              # High precision for USDC pairs
+        min_order_size_usd: 15.0        # Binance minimum order size
+        min_order_quantity: 50          # Quantity-based minimums
+        liquidity_depth_levels: 20      # Deep market depth analysis
+        market_impact_threshold: 0.0005 # Low market impact on liquid pairs
+
+  bybit:
+    # Bybit: 2nd largest exchange - derivatives focus, 60M+ users, $44B futures volume
+    market_conditions:
+      # Volume patterns (based on $5B spot, $44B futures volume)
+      volume_patterns:
+        min_volume_24h: 25000000        # Lower than Binance but substantial
+        volume_spike_threshold: 3.0     # Higher spikes due to derivatives activity
+        volume_ma_periods: 16           # Responsive to futures-driven moves
+        min_volume_consistency: 0.75    # Good consistency on major pairs
+        volume_surge_multiplier: 4.0    # Strong derivatives-driven surges
+        min_sustainable_volume: 15000000 # Moderate sustainability threshold
+        
+      # Volatility profiles (derivatives-influenced volatility)
+      volatility_profiles:
+        min_atr_threshold: 0.012        # Higher due to derivatives influence
+        max_atr_threshold: 0.15         # Much higher ceiling for leverage effects
+        volatility_ma_periods: 12       # Faster response to derivatives moves
+        volatility_spike_multiplier: 3.0 # Strong leverage-driven volatility
+        bollinger_band_period: 18       # Shorter for derivatives responsiveness
+        volatility_breakout_threshold: 0.025 # Higher threshold for true breakouts
+        
+      # Technical indicators (derivatives-optimized)
+      technical_indicators:
+        adx_threshold: 32               # Medium-high for derivatives trends
+        adx_trending_threshold: 48      # Strong trending with leverage
+        rsi_overbought: 80             # Higher - leverage can extend moves
+        rsi_oversold: 20               # Lower - leverage can extend drops
+        bb_squeeze_threshold: 0.018     # Adjusted for derivatives volatility
+        confluence_required: 2          # Lower - derivatives move faster
+        macd_signal_strength: 0.004     # More sensitive for derivatives
+        volume_rsi_threshold: 65        # Lower threshold for faster signals
+        
+      # Market microstructure (Bybit derivatives-focused)
+      microstructure:
+        tick_size_adjustment: 0.0001    # Standard crypto precision
+        spread_tolerance: 0.0012        # Slightly wider spreads
+        order_book_depth: 12            # Good depth for major pairs
+        price_precision: 4              # Standard USDC precision
+        min_order_size_usd: 12.0        # Bybit minimum orders
+        min_order_quantity: 75          # Moderate minimums
+        liquidity_depth_levels: 15      # Good depth analysis
+        market_impact_threshold: 0.0008 # Slightly higher impact
+
+  cryptocom:
+    # Crypto.com: Native CRO advantage, tight spreads, growing ecosystem
+    market_conditions:
+      # Volume patterns (CRO-optimized but generic for other USD pairs)
+      volume_patterns:
+        min_volume_24h: 15000000        # Lower threshold for USD pairs
+        volume_spike_threshold: 2.8     # Strong spikes on ecosystem growth
+        volume_ma_periods: 14           # Responsive to ecosystem developments
+        min_volume_consistency: 0.7     # Good consistency on native exchange
+        volume_surge_multiplier: 3.2    # Ecosystem-driven volume surges
+        min_sustainable_volume: 10000000 # Lower sustainability threshold
+        
+      # Volatility profiles (USD pairs vs USDC)
+      volatility_profiles:
+        min_atr_threshold: 0.009        # Moderate baseline for USD pairs
+        max_atr_threshold: 0.06         # Conservative ceiling for USD
+        volatility_ma_periods: 13       # Fast response to ecosystem news
+        volatility_spike_multiplier: 2.2 # Moderate spikes on USD pairs
+        bollinger_band_period: 19       # Balanced period for analysis
+        volatility_breakout_threshold: 0.015 # Moderate breakout threshold
+        
+      # Technical indicators (USD pair optimized)
+      technical_indicators:
+        adx_threshold: 28               # Lower for USD pair trends
+        adx_trending_threshold: 42      # Confirmed trending on USD
+        rsi_overbought: 77             # High threshold for USD pairs
+        rsi_oversold: 23               # Low threshold for support
+        bb_squeeze_threshold: 0.016     # Moderate squeeze detection
+        confluence_required: 3          # Standard confidence requirement
+        macd_signal_strength: 0.0025    # Balanced sensitivity
+        volume_rsi_threshold: 68        # Volume momentum for USD pairs
+        
+      # Market microstructure (Crypto.com USD pairs)
+      microstructure:
+        tick_size_adjustment: 0.0001    # USD pair precision
+        spread_tolerance: 0.0015        # Moderate spreads on USD
+        order_book_depth: 10            # Standard depth for USD pairs
+        price_precision: 4              # USD precision standard
+        min_order_size_usd: 10.0        # Crypto.com minimums
+        min_order_quantity: 100         # Standard quantity minimums
+        liquidity_depth_levels: 12      # Moderate depth analysis
+        market_impact_threshold: 0.001  # Standard impact threshold
+
+# PAIR-SPECIFIC OPTIMIZATIONS  
+# Custom market conditions for specific trading pairs
+pair_specific_configs:
+  "SAND/USDC":
+    exchange: "bybit"
+    market_conditions:
+      # Volume patterns for SAND/USDC (higher volatility token)
+      volume_patterns:
+        min_volume_24h: 15000000        # Based on SAND's typical volume
+        volume_spike_threshold: 2.5     # Higher threshold for SAND's volatility
+        volume_ma_periods: 14           # Standard periods
+        min_volume_consistency: 0.6     # Lower consistency due to higher volatility
+        volume_surge_multiplier: 3.0    # SAND shows strong volume surges
+        min_sustainable_volume: 10000000 # Minimum for sustainable trends
+        
+      # Volatility profiles (SAND has higher volatility ~9-12%)
+      volatility_profiles:
+        min_atr_threshold: 0.010        # Higher based on SAND's volatility
+        max_atr_threshold: 0.035        # Account for SAND's volatility spikes
+        volatility_ma_periods: 12       # Responsive to SAND's momentum
+        volatility_spike_multiplier: 2.5 # SAND shows significant volatility spikes
+        bollinger_band_period: 20       # Standard for SAND analysis
+        volatility_breakout_threshold: 0.015 # Based on SAND's breakout patterns
+        
+      # Technical indicator signals (optimized for SAND's volatility)
+      technical_indicators:
+        adx_threshold: 28               # Lower for SAND's trending nature
+        adx_trending_threshold: 42      # Confirmed SAND trends
+        rsi_overbought: 75             # Lower threshold - SAND can be volatile
+        rsi_oversold: 25               # Higher threshold - SAND support levels
+        bb_squeeze_threshold: 0.018     # Wider for SAND's volatility
+        confluence_required: 2          # Lower confidence for SAND signals
+        macd_signal_strength: 0.003     # SAND-specific MACD sensitivity
+        volume_rsi_threshold: 60        # Volume RSI for SAND momentum
+        
+      # Market microstructure (Bybit Exchange specific)
+      microstructure:
+        tick_size_adjustment: 0.0001    # SAND/USDC precision
+        spread_tolerance: 0.002         # Wider spreads for SAND
+        order_book_depth: 8             # Standard depth for SAND
+        price_precision: 4              # SAND/USDC precision
+        min_order_size_usd: 75.0        # Bybit minimum order size
+        min_order_quantity: 100         # Minimum SAND quantity
+        liquidity_depth_levels: 10      # Order book levels to analyze
+        market_impact_threshold: 0.0015 # Higher market impact for SAND
+        
+      # Strategy-specific overrides for SAND/USDC
+      strategy_overrides:
+        multi_timeframe_confluence:
+          min_confluence: 2             # Lower for SAND's clear patterns
+          max_daily_volatility_pct: 12.0 # Higher - SAND can handle higher volatility
+          max_volume_ratio: 3.5         # Higher - SAND shows strong volume ratios
+          adx_threshold: 25             # Lower - SAND trends well with lower ADX
+          trending_adx_threshold: 38    # SAND confirmed trends
+          bullish_momentum_threshold: 0.015 # SAND momentum threshold
+          
+        vwma_hull:
+          crossover_confidence_boost: 0.80    # Lower for SAND's volatility
+          trend_confidence_boost: 0.85        # Lower confidence for SAND trends
+          min_volatility_threshold: 0.010     # Based on SAND's volatility
+          volume_threshold: 1.8               # SAND volume patterns
+          min_absolute_volume: 10000          # Based on SAND volume analysis
+          trend_threshold: 0.020              # SAND trend strength
+          min_price_move: 0.006               # SAND minimum significant moves
+          hull_period: 16                     # Optimized for SAND price cycles
+          vwma_period: 24                     # SAND volume-weighted periods
+
+  "MANA/USDC":
+    exchange: "bybit"
+    market_conditions:
+      # Volume patterns for MANA/USDC (moderate volatility token)
+      volume_patterns:
+        min_volume_24h: 12000000        # Based on MANA's typical volume
+        volume_spike_threshold: 2.2     # Moderate threshold for MANA
+        volume_ma_periods: 14           # Standard periods
+        min_volume_consistency: 0.65     # Moderate consistency
+        volume_surge_multiplier: 2.8    # MANA shows moderate volume surges
+        min_sustainable_volume: 8000000 # Minimum for sustainable trends
+        
+      # Volatility profiles (MANA has moderate volatility ~6-8%)
+      volatility_profiles:
+        min_atr_threshold: 0.008        # Based on MANA's volatility
+        max_atr_threshold: 0.025        # Account for MANA's volatility spikes
+        volatility_ma_periods: 12       # Responsive to MANA's momentum
+        volatility_spike_multiplier: 2.2 # MANA shows moderate volatility spikes
+        bollinger_band_period: 20       # Standard for MANA analysis
+        volatility_breakout_threshold: 0.012 # Based on MANA's breakout patterns
+        
+      # Technical indicator signals (optimized for MANA)
+      technical_indicators:
+        adx_threshold: 30               # Standard for MANA's trending nature
+        adx_trending_threshold: 45      # Confirmed MANA trends
+        rsi_overbought: 77             # Standard threshold for MANA
+        rsi_oversold: 23               # Standard threshold for MANA
+        bb_squeeze_threshold: 0.016     # Standard for MANA
+        confluence_required: 2          # Standard confidence for MANA signals
+        macd_signal_strength: 0.0025     # MANA-specific MACD sensitivity
+        volume_rsi_threshold: 65        # Volume RSI for MANA momentum
+        
+      # Market microstructure (Bybit Exchange specific)
+      microstructure:
+        tick_size_adjustment: 0.0001    # MANA/USDC precision
+        spread_tolerance: 0.0015        # Standard spreads for MANA
+        order_book_depth: 8             # Standard depth for MANA
+        price_precision: 4              # MANA/USDC precision
+        min_order_size_usd: 75.0        # Bybit minimum order size
+        min_order_quantity: 100         # Minimum MANA quantity
+        liquidity_depth_levels: 10      # Order book levels to analyze
+        market_impact_threshold: 0.001  # Standard market impact for MANA
+        
+      # Strategy-specific overrides for MANA/USDC
+      strategy_overrides:
+        multi_timeframe_confluence:
+          min_confluence: 2             # Standard for MANA
+          max_daily_volatility_pct: 10.0 # Higher - MANA can handle moderate volatility
+          max_volume_ratio: 3.0         # Standard - MANA shows good volume ratios
+          adx_threshold: 28             # Standard - MANA trends well
+          trending_adx_threshold: 42    # MANA confirmed trends
+          bullish_momentum_threshold: 0.018 # MANA momentum threshold
+          
+        vwma_hull:
+          crossover_confidence_boost: 0.85    # Standard for MANA
+          trend_confidence_boost: 0.90        # Standard confidence for MANA trends
+          min_volatility_threshold: 0.008     # Based on MANA's volatility
+          volume_threshold: 2.0               # MANA volume patterns
+          min_absolute_volume: 8000           # Based on MANA volume analysis
+          trend_threshold: 0.018              # MANA trend strength
+          min_price_move: 0.005               # MANA minimum significant moves
+          hull_period: 16                     # Optimized for MANA price cycles
+          vwma_period: 24                     # MANA volume-weighted periods
+
+  "CRO/USD":
+    exchange: "cryptocom"
+    market_conditions:
+      # Volume patterns for CRO/USD (research-based: $25-42M daily volume)
+      volume_patterns:
+        min_volume_24h: 20000000        # Based on actual $24.90-41.92M observed volume
+        volume_spike_threshold: 2.2     # Higher threshold for CRO's growth phase
+        volume_ma_periods: 14           # Standard periods for CRO's price cycles
+        min_volume_consistency: 0.7     # Higher consistency for mature token
+        volume_surge_multiplier: 2.8    # CRO shows strong volume surges during moves
+        min_sustainable_volume: 15000000 # Minimum for sustainable trends
+        
+      # Volatility profiles (research-based: 5.52% current volatility)
+      volatility_profiles:
+        min_atr_threshold: 0.008        # Higher based on CRO's ~5.52% volatility
+        max_atr_threshold: 0.025        # Account for CRO's growth volatility spikes
+        volatility_ma_periods: 12       # Responsive to CRO's momentum phases
+        volatility_spike_multiplier: 2.0 # CRO shows significant volatility spikes
+        bollinger_band_period: 20       # Standard for CRO price analysis
+        volatility_breakout_threshold: 0.012 # Based on historical breakout patterns
+        
+      # Technical indicator signals (optimized for CRO's bullish trend)
+      technical_indicators:
+        adx_threshold: 30               # Medium strength for CRO's trending nature
+        adx_trending_threshold: 45      # Higher for confirmed CRO trends
+        rsi_overbought: 78             # Higher threshold - CRO can stay overbought
+        rsi_oversold: 22               # Lower threshold - strong support levels
+        bb_squeeze_threshold: 0.015     # Tighter for CRO's breakout patterns
+        confluence_required: 3          # Higher confidence for CRO signals
+        macd_signal_strength: 0.002     # CRO-specific MACD sensitivity
+        volume_rsi_threshold: 65        # Volume RSI for CRO momentum
+        
+      # Market microstructure (Crypto.com Exchange specific)
+      microstructure:
+        tick_size_adjustment: 0.0001    # CRO/USD precision based on exchange specs
+        spread_tolerance: 0.002         # CRO spreads typically narrow on home exchange
+        order_book_depth: 8             # Deeper order book for native token
+        price_precision: 4              # CRO/USD shows 4 decimal precision
+        min_order_size_usd: 10.0        # Crypto.com minimum order size
+        min_order_quantity: 100         # Minimum CRO quantity based on tick size
+        liquidity_depth_levels: 10      # Number of order book levels to analyze
+        market_impact_threshold: 0.001  # Lower market impact on home exchange
+        
+      # Strategy-specific overrides for CRO/USD (research-optimized)
+      strategy_overrides:
+        multi_timeframe_confluence:
+          min_confluence: 2             # Lower for CRO's clear trend patterns
+          max_daily_volatility_pct: 6.0 # Higher - CRO can handle higher volatility
+          max_volume_ratio: 3.0         # Higher - CRO shows strong volume ratios
+          adx_threshold: 25             # Lower - CRO trends well with lower ADX
+          trending_adx_threshold: 40    # CRO confirmed trends
+          bullish_momentum_threshold: 0.02 # CRO momentum threshold
+          
+        vwma_hull:
+          crossover_confidence_boost: 0.75    # Balanced for CRO's momentum
+          trend_confidence_boost: 0.80        # Higher confidence for CRO trends
+          min_volatility_threshold: 0.012     # Based on CRO's 5.52% volatility
+          volume_threshold: 2.0               # CRO volume patterns
+          min_absolute_volume: 12000          # Based on CRO volume analysis
+          trend_threshold: 0.018              # CRO trend strength
+          min_price_move: 0.008               # CRO minimum significant moves
+          hull_period: 16                     # Optimized for CRO price cycles
+          vwma_period: 24                     # CRO volume-weighted periods
+          
+        heikin_ashi:
+          adx_threshold: 28             # CRO trend strength
+          rsi_uptrend_min: 40           # CRO bullish bias
+          rsi_uptrend_max: 75           # CRO overbought tolerance
+          min_trend_strength: 0.0015    # CRO minimum trend strength
+          volume_threshold_percentage: 0.18  # CRO volume requirements
+          candle_body_ratio: 0.7        # CRO candlestick pattern strength
+
 strategies:
   engulfing_multi_tf:
     enabled: true  # Keep enabled but with much stricter parameters
@@ -157,7 +483,7 @@ strategies:
       min_volume_multiplier: 2.0  # Reduced from 5.0 - reasonable volume requirement
       min_rsi_range: 10  # Tighter from 20 - more restrictive RSI range
       sma_period: 100  # Much longer from 50 for more stability
-      stop_loss_pct: 0.008  # Much tighter from 0.8 
+      stop_loss_pct: 0.030  # 3% - appropriate for crypto volatility 
       strict_volume_adx: true  # Changed from false - strict volume and ADX required
       take_profit_pct: 0.06  # Lower from 1.5 for faster exits
       target_timeframes:
@@ -171,82 +497,89 @@ strategies:
       use_volume_confirmation: true
       volume_avg_period: 25  # Much longer from 10 for more stable volume analysis
   heikin_ashi:
-    enabled: true  # RE-ENABLED with ultra-strict parameters to prevent losses
+    enabled: false  # DISABLED - Poor performance (26% win rate, 1:0.6 risk/reward)
     parameters:
+      # PROBLEM ANALYSIS: Ultra-restrictive parameters causing:
+      # - 26.1% win rate (terrible)
+      # - 1:0.6 risk/reward ratio (should be >1:2)
+      # - Many forced closes and stop losses
+      # - Poor entry quality despite high thresholds
+      
+      # Previous problematic settings (now disabled):
       adx_period: 14
-      adx_threshold: 50  # Drastically increased from 35 - only very strong trends
+      adx_threshold: 30  # Reduced from 45 - was too restrictive
       atr_period: 14
-      atr_threshold: 0.002  # Doubled from 0.001 for much higher volatility requirement
+      atr_threshold: 0.008  # Increased from 0.002 - allow normal volatility
       ema_fast_period: 12
       ema_slow_period: 26
-      max_hold_time_hours: 6  # Reduced from 12 for faster exits
-      min_candle_size: 0.008  # Tripled from 0.003 for much stronger signals
-      min_candles: 100  # Doubled from 50 for much more data
-      min_trend_strength: 0.01  # 2.5x increase from 0.004 for very strong trends only
-      min_volume: 5000  # 4x increase from 1200 for exceptional volume
-      primary_timeframe: 1h
-      require_ema_confluence: true
-      risk_per_trade: 0.003  # Halved from 0.006 for much tighter risk
-      rsi_buy_threshold: 55  # Much higher from 45 for better entries
-      rsi_confluence_threshold: 60  # Much higher from 50
-      rsi_overbought: 55  # Much lower from 65 - avoid overbought entirely
-      rsi_oversold: 45  # Much higher from 35 - avoid oversold entirely
+      max_hold_time_hours: 12  # Increased from 6 - allow trends to develop
+      min_candle_size: 0.003  # Reduced from 0.008 - was too restrictive
+      min_candles: 50  # Reduced from 100 - was too restrictive
+      min_trend_strength: 0.004  # Reduced from 0.01 - was too restrictive
+      min_volume: 2000  # Reduced from 5000 - was too restrictive
+      primary_timeframe: 4h  # Changed from 1h - longer timeframe for stability
+      require_ema_confluence: false  # Disabled - was too restrictive
+      risk_per_trade: 0.01  # Increased from 0.003 - proper position sizing
+      rsi_buy_threshold: 45  # Reduced from 55 - allow earlier entries
+      rsi_confluence_threshold: 50  # Reduced from 60
+      rsi_overbought: 70  # Increased from 55 - normal overbought level
+      rsi_oversold: 30  # Reduced from 45 - normal oversold level
       rsi_period: 14
-      rsi_uptrend_max: 50  # Much lower from 60
-      rsi_uptrend_min: 50  # Much higher from 45 - very narrow range
-      trend_period: 21  # Increased from 14 for more confirmation
-      volume_sma_period: 50  # Much higher from 20
-      volume_spike_multiplier: 5.0  # Doubled from 2.5 for exceptional volume spikes
-      volume_quality_filter: true
-      volume_threshold: 3.0  # Much higher from 1.8 for exceptional volume
-      volume_threshold_percentage: 0.9  # Much higher from 0.6
-      min_confidence_score: 0.75  # Reduced from 0.95 - realistic confidence threshold
-      require_trend_confirmation: true
-      avoid_consolidation: true
-      min_momentum_strength: 0.6  # Reduced from 0.9 - reasonable momentum requirement
-      max_drawdown_entry: 0.005  # Much tighter from 0.02
-      cooldown_after_loss: 24  # Much longer from 6 hours
+      rsi_uptrend_max: 75  # Increased from 60 - allow stronger uptrends
+      rsi_uptrend_min: 40  # Reduced from 45 - earlier trend entries
+      trend_period: 14  # Reduced from 21 - more responsive
+      volume_sma_period: 20  # Reduced from 50 - more responsive
+      volume_spike_multiplier: 2.5  # Reduced from 5.0 - was too restrictive
+      volume_quality_filter: false  # Disabled - was too restrictive
+      volume_threshold: 1.8  # Reduced from 3.0 - was too restrictive
+      volume_threshold_percentage: 0.6  # Reduced from 0.9 - was too restrictive
+      min_confidence_score: 0.65  # Reduced from 0.75 - allow more opportunities
+      require_trend_confirmation: false  # Disabled - was too restrictive
+      avoid_consolidation: false  # Disabled - was too restrictive
+      min_momentum_strength: 0.5  # Reduced from 0.6
+      max_drawdown_entry: 0.02  # Increased from 0.005 - allow normal volatility
+      cooldown_after_loss: 6  # Reduced from 24 - was too restrictive
     target_timeframes:
     - 1h  # Changed back to 1h for stability
     - 15m  # Keep 15m for confirmation
   multi_timeframe_confluence:
-    enabled: true  # Keep enabled but with much stricter parameters
+    enabled: true  # Keep enabled but with more reasonable parameters
     parameters:
-      adx_threshold: 40  # Much higher from 15 - strong trend required
-      trending_adx_threshold: 50  # Much higher from 25 - very strong trend required
+      adx_threshold: 20  # Reduced from 40 - allow moderate trends
+      trending_adx_threshold: 30  # Reduced from 50 - allow normal trends
       bb_period: 20
       bb_std: 2
-      confluence_threshold: 0.98  # Near perfect from 0.9 - exceptional confluence only
+      confluence_threshold: 0.75  # Reduced from 0.98 - reasonable confluence
       smart_exit_enabled: true
-      long_period: 50  # Longer from 30 for more confirmation
-      max_price_range_pct: 15.0  # Much tighter from 35.0 - avoid volatile conditions
-      max_daily_volatility_pct: 2.0  # Much lower from 5.0 - only stable conditions
-      entry_confirmation_required: true  # Changed from false - always require confirmation
-      max_volume_ratio: 1.5  # Lower from 2.0 for more normal volume
-      medium_period: 25  # Longer from 15
-      min_confluence: 3  # Reduced from 5 - realistic confluence requirement
-      required_timeframe_agreement: 3  # Reduced from 5 - reasonable timeframe agreement
-      min_confidence: 0.70  # Reduced from 0.95 - realistic confidence threshold
+      long_period: 30  # Reduced from 50 - more responsive
+      max_price_range_pct: 25.0  # Increased from 15.0 - allow more volatility
+      max_daily_volatility_pct: 12.0  # Increased from 8.0 - allow crypto volatility
+      entry_confirmation_required: false  # Changed to false - allow faster entries
+      max_volume_ratio: 2.5  # Increased from 1.5 - allow volume spikes
+      medium_period: 15  # Reduced from 25 - more responsive
+      min_confluence: 2  # Reduced from 3 - easier to meet
+      required_timeframe_agreement: 2  # Reduced from 3 - easier agreement
+      min_confidence: 0.75  # CRITICAL: Increased to 0.75 - much higher entry quality required
       profit_protection_enabled: true
       dynamic_stop_loss: true
-      min_sideways_periods: 5  # Reduced from 10 - allow more opportunities
-      rsi_overbought: 70  # Restored from 55 - normal overbought level
-      rsi_oversold: 30  # Restored from 45 - normal oversold level  
-      short_period: 10  # Doubled from 5
-      stop_loss_pct: 0.008  # Tighter from 0.015
-      take_profit_pct: 0.06  # Lower from 0.08 for faster exits
-      vwap_period: 50  # Much longer from 20
-      atr_stop_loss_multiplier: 2.0  # Higher from 1.5 for more room
-      position_size_percentage: 0.05  # Much smaller from 0.15 for lower risk
-      max_position_size_usd: 100  # Halved from 200 for lower risk
-      position_size_multiplier: 1.5  # Lower from 2.5
+      min_sideways_periods: 3  # Reduced from 5 - allow more opportunities
+      rsi_overbought: 75  # Increased from 70 - allow higher RSI
+      rsi_oversold: 25  # Reduced from 30 - allow lower RSI
+      short_period: 8  # Reduced from 10 - more responsive
+      stop_loss_pct: 0.030  # 3% - appropriate for crypto volatility
+      take_profit_pct: 0.08  # Increased from 0.06 - better risk-reward
+      vwap_period: 30  # Reduced from 50 - more responsive
+      atr_stop_loss_multiplier: 2.0  # Keep same
+      position_size_percentage: 0.10  # Increased from 0.05 - reasonable size
+      max_position_size_usd: 200  # Increased from 100 - reasonable size
+      position_size_multiplier: 2.0  # Increased from 1.5 - better sizing
       enable_trending_trades: true
-      min_market_stability: 0.95  # Much higher from 0.8 - exceptional stability only
-      avoid_high_volatility: true
-      max_daily_range: 0.08  # Much lower from 0.15 - very tight range only
-      require_volume_confirmation: true
-      min_rsi_divergence: 10  # Doubled from 5 - stronger divergence required
-      cooldown_after_loss_hours: 12  # Tripled from 4 - much longer cooldown
+      min_market_stability: 0.70  # Reduced from 0.85 - allow more market conditions
+      avoid_high_volatility: false  # Changed to false - allow volatility
+      max_daily_range: 0.20  # Increased from 0.12 - allow crypto ranges
+      require_volume_confirmation: false  # Changed to false - not always required
+      min_rsi_divergence: 5  # Reduced from 10 - easier to meet
+      cooldown_after_loss_hours: 6  # Reduced from 12 - faster recovery
     target_timeframes:
     - 1h
     - 15m
@@ -261,40 +594,40 @@ strategies:
     - 1h
     - 15m
   vwma_hull:
-    enabled: true  # RE-ENABLED with ultra-strict parameters to prevent losses  
+    enabled: true  # ENTRY QUALITY FOCUSED: More reasonable parameters for better opportunities
     parameters:
-      atr_period: 14  # Increased for more stability
-      atr_threshold: 0.003  # Tripled from 0.0008 for much higher volatility requirement
-      crossover_confidence_boost: 0.98  # Near perfect confidence required
-      hull_period: 50  # Much longer from 21 for extreme stability
-      min_absolute_volume: 10000  # 10x increase from 1000 for exceptional volume
-      min_price_move: 0.005  # 5x increase from 0.001 for very strong moves only
-      min_volatility_threshold: 0.01  # 4x increase from 0.0025 for high volatility only
+      atr_period: 14  # Keep same
+      atr_threshold: 0.003  # Reduced from 0.005 - allow lower volatility
+      crossover_confidence_boost: 0.75  # Reduced from 0.90 - more reasonable confidence
+      hull_period: 14  # Keep same
+      min_absolute_volume: 8000  # Reduced from 12000 - allow lower volume
+      min_price_move: 0.005  # Reduced from 0.008 - allow smaller moves
+      min_volatility_threshold: 0.008  # Reduced from 0.012 - allow lower volatility
       scalping_enabled: false  # Keep disabled
-      strength_multiplier: 50  # Doubled from 25 for exceptional signals only
-      trend_confidence_boost: 0.98  # Near perfect confidence required
-      trend_threshold: 0.02  # 4x increase from 0.005 for extremely strong trends
+      strength_multiplier: 50  # Reduced from 75 - more reasonable signals
+      trend_confidence_boost: 0.85  # Reduced from 0.99 - more reasonable confidence
+      trend_threshold: 0.015  # Reduced from 0.025 - allow weaker trends
       volatility_adjustment: true
-      volume_method: percentile
-      volume_percentile: 0.9  # Much higher from 0.5 for exceptional volume
-      volume_threshold: 2.5  # Much higher from 0.8 for exceptional volume
-      profit_target_multiplier: 5.0  # Much higher from 3.0 for better risk-reward
-      volume_window: 100  # Doubled from 50 for much more data
-      vwma_period: 50  # Much longer from 20 for extreme stability
-      min_confidence_score: 0.95  # Much higher from 0.8 - near perfect confidence only
-      require_volume_breakout: true
-      avoid_range_bound_markets: true
-      min_trend_duration: 12  # Tripled from 4 for much more confirmation
-      max_rsi_entry: 45  # Much lower from 55 - avoid any overbought conditions
-      min_rsi_entry: 55  # Much higher from 45 - only strong uptrend entries
-      require_price_momentum: true
-      stop_loss_atr_multiplier: 2.0  # Higher from 1.5 for more room
-      # New strict filters
-      require_multi_timeframe_confirmation: true
-      min_breakout_strength: 0.02  # 2% minimum breakout required
-      max_recent_drawdown: 0.005  # No entries if recent 0.5% drawdown
-      require_increasing_volume_trend: true
-      min_bullish_candles_sequence: 3  # Require 3 consecutive bullish candles
+      volume_method: adaptive  # Keep same
+      volume_percentile: 0.3  # Reduced from 0.4 - allow lower volume
+      volume_threshold: 1.5  # Reduced from 2.0 - allow lower volume spikes
+      profit_target_multiplier: 2.5  # Reduced from 3.0 - more achievable targets
+      volume_window: 30  # Reduced from 50 - more responsive
+      vwma_period: 20  # Reduced from 25 - more responsive
+      min_confidence_score: 0.65  # Reduced from 0.85 - more realistic
+      require_volume_breakout: false  # Changed to false - not always required
+      avoid_range_bound_markets: false  # Changed to false - allow range trading
+      min_trend_duration: 8  # Reduced from 15 - less confirmation required
+      max_rsi_entry: 50  # Increased from 40 - allow higher RSI
+      min_rsi_entry: 50  # Reduced from 60 - allow lower momentum
+      require_price_momentum: false  # Changed to false - not always required
+      stop_loss_atr_multiplier: 2.0  # Keep same
+      # Relaxed filters
+      require_multi_timeframe_confirmation: false  # Changed to false - allow single timeframe
+      min_breakout_strength: 0.015  # Reduced from 0.025 - allow smaller breakouts
+      max_recent_drawdown: 0.015  # Increased from 0.005 - allow more drawdown
+      require_increasing_volume_trend: false  # Changed to false - not always required
+      min_bullish_candles_sequence: 1  # Reduced from 3 - allow single candle
     target_timeframes:
     - 1h
     - 15m
@@ -303,13 +636,13 @@ strategy_manager:
   max_concurrent_analyses: 10
   signal_cache_duration: 300
 trading:
-  max_concurrent_trades: 15  # Updated: 5 trades per exchange × 3 exchanges = 15 total
+  max_concurrent_trades: 9  # Updated: 3 trades per exchange × 3 exchanges = 9 total
   max_daily_loss: 0.002  # EMERGENCY: Ultra-tight daily loss limit (0.2%)
   max_daily_trades: 50  # Updated: Increased from 2 to 50 daily trades
   win_rate_threshold: 0.9  # EMERGENCY: Require 90% win rate or stop trading
   consecutive_loss_limit: 1  # EMERGENCY: Stop after any loss
   max_total_loss: 0.01  # EMERGENCY: 1% maximum total loss limit
-  max_trades_per_exchange: 5  # Updated: Increased from 1 to 5 trades per exchange
+  max_trades_per_exchange: 3  # Updated: Reduced from 5 to 3 trades per exchange
   min_exchange_balance: 50.0
   min_order_size_usd:
     cryptocom: 200.0
@@ -348,14 +681,23 @@ trading:
       priority: low
   profit_protection:
     enabled: true
-    lock_percentage: 0.015  # Reduced from 0.02 for faster profit locking
-    trigger_percentage: 0.01  # Reduced from 0.015 for earlier activation
-    partial_exit_percentage: 70  # Increased from 60 for more profit taking
-    activation_threshold: 0.008  # Reduced from 0.012 for earlier activation
+    fee_aware: true  # NEW: Enable fee-aware profit calculations
+    estimated_entry_fee: 0.001  # NEW: 0.1% entry fee
+    estimated_exit_fee: 0.001   # NEW: 0.1% exit fee
+    estimated_partial_exit_fee: 0.001  # NEW: 0.1% per partial exit
+    lock_percentage: 0.018  # CRITICAL: Increased to 1.8% - account for fees
+    trigger_percentage: 0.007  # CRITICAL: 0.7% early activation - unified with activation_threshold
+    partial_exit_percentage: 80  # Increased for more profit taking
+    activation_threshold: 0.007  # CRITICAL: 0.7% early activation - YOUR EXCELLENT SUGGESTION
     max_drawdown: 0.15  # Reduced from 0.2 for tighter protection
     consecutive_threshold: 3  # Reduced from 4 for faster response
     significant_decrease_multiplier: 0.0008  # Reduced from 0.001 for tighter protection
-  stop_loss_percentage: 0.008  # Reduced from 0.012 for much tighter stops
+    # NEW: Fee-aware profit guarantee settings
+    partial_exit_levels: [0.008, 0.013, 0.018, 0.023]  # CRITICAL: Fee-adjusted levels (0.8%, 1.3%, 1.8%, 2.3%)
+    partial_exit_sizes: [0.3, 0.3, 0.2, 0.2]  # Exit 30%, 30%, 20%, 20% at each level
+    guaranteed_min_profit: 0.006  # CRITICAL: 0.6% guaranteed net profit after fees
+    break_even_plus: 0.005  # CRITICAL: 0.5% net profit after fees
+  stop_loss_percentage: 0.030  # 3% - appropriate for crypto volatility
   take_profit_percentage: 0.04  # Reduced from 0.06 for faster exits
   max_daily_loss_per_exchange: 0.05
   dynamic_stop_loss_enabled: true
@@ -363,7 +705,7 @@ trading:
     enabled: true
     step_percentage: 0.0035  # This calculates how far below the highest price the exit trigger is set
     #trigger_percentage: 0.007  # ← UNUSED: Orchestrator uses activation_threshold instead
-    activation_threshold: 0.006  # This is the trigger percentage used to start trailing.
+    activation_threshold: 0.007  # CRITICAL: 0.7% early activation - matches profit protection for consistency
     max_trail_distance: 0.0035  # Not used in the code.
     #base_trailing_distance: 0.12  # Not used in the code.
     min_trigger_distance_percentage: 0.005
@@ -416,7 +758,7 @@ realtime:
     - 30
     heartbeat_interval_seconds: 20
     max_concurrent_subscriptions_per_exchange: 50
-    subscribe_only_for_open_trades: true
+    subscribe_only_for_open_trades: false
     exchanges:
       binance:
         enable: true

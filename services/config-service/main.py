@@ -506,6 +506,84 @@ async def get_trading_mode():
     mode = trading_config.get('mode', 'simulation')
     return {"mode": mode, "is_simulation": mode == 'simulation', "is_live": mode == 'live'}
 
+@app.get("/api/v1/config/pair_specific/{pair}/{strategy_name}")
+async def get_pair_specific_config(pair: str, strategy_name: str, exchange: Optional[str] = None):
+    """Get pair-specific configuration overrides for a strategy"""
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    
+    try:
+        # Get pair-specific configurations
+        pair_configs = config_data.get('pair_specific_configs', {})
+        
+        if pair not in pair_configs:
+            raise HTTPException(status_code=404, detail=f"No configuration found for pair {pair}")
+            
+        pair_config = pair_configs[pair]
+        
+        # Verify exchange match if specified
+        if exchange and pair_config.get('exchange') != exchange:
+            logger.warning(f"Exchange mismatch for pair {pair}: expected {exchange}, found {pair_config.get('exchange')}")
+            raise HTTPException(status_code=404, detail=f"No configuration found for pair {pair} on exchange {exchange}")
+        
+        # Get strategy-specific overrides
+        strategy_overrides = pair_config.get('market_conditions', {}).get('strategy_overrides', {})
+        overrides = strategy_overrides.get(strategy_name, {})
+        
+        # Also include general market conditions for this pair
+        market_conditions = pair_config.get('market_conditions', {})
+        
+        return {
+            "pair": pair,
+            "strategy": strategy_name,
+            "exchange": pair_config.get('exchange'),
+            "overrides": overrides,
+            "market_conditions": {
+                "volume_patterns": market_conditions.get('volume_patterns', {}),
+                "volatility_profiles": market_conditions.get('volatility_profiles', {}),
+                "technical_indicators": market_conditions.get('technical_indicators', {}),
+                "microstructure": market_conditions.get('microstructure', {})
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting pair-specific config for {pair}/{strategy_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get pair configuration: {str(e)}")
+
+@app.get("/api/v1/config/pair_specific/{pair}")
+async def get_pair_market_conditions(pair: str, exchange: Optional[str] = None):
+    """Get all market conditions for a specific pair"""
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    
+    try:
+        pair_configs = config_data.get('pair_specific_configs', {})
+        
+        if pair not in pair_configs:
+            raise HTTPException(status_code=404, detail=f"No configuration found for pair {pair}")
+            
+        pair_config = pair_configs[pair]
+        
+        # Verify exchange match if specified
+        if exchange and pair_config.get('exchange') != exchange:
+            raise HTTPException(status_code=404, detail=f"No configuration found for pair {pair} on exchange {exchange}")
+        
+        return {
+            "pair": pair,
+            "exchange": pair_config.get('exchange'),
+            "market_conditions": pair_config.get('market_conditions', {}),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting market conditions for {pair}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get pair market conditions: {str(e)}")
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",

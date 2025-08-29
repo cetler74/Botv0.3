@@ -157,6 +157,7 @@ class ConfigManager:
         self._validate_exchange_configs()
         self._validate_trading_config()
         self._validate_strategy_configs()
+        self._validate_pair_specific_configs()
         
     def _validate_database_config(self) -> None:
         """Validate database configuration"""
@@ -378,4 +379,69 @@ class ConfigManager:
         
     def set_database_manager(self, database_manager) -> None:
         """Set database manager for alerts and audit logging"""
-        self.database_manager = database_manager 
+        self.database_manager = database_manager
+        
+    def _validate_pair_specific_configs(self) -> None:
+        """Validate pair-specific configuration section"""
+        if 'pair_specific_configs' not in self.config_data:
+            logger.info("No pair-specific configurations found - using global defaults")
+            return
+            
+        pair_configs = self.config_data['pair_specific_configs']
+        for pair, config in pair_configs.items():
+            logger.info(f"Validating pair-specific config for {pair}")
+            
+            # Validate required fields
+            if 'exchange' not in config:
+                logger.warning(f"Pair {pair} missing exchange specification")
+                
+            # Validate market conditions structure
+            if 'market_conditions' in config:
+                self._validate_market_conditions(pair, config['market_conditions'])
+                
+    def _validate_market_conditions(self, pair: str, conditions: Dict[str, Any]) -> None:
+        """Validate market conditions for a specific pair"""
+        expected_sections = ['volume_patterns', 'volatility_profiles', 'technical_indicators', 'microstructure']
+        for section in expected_sections:
+            if section not in conditions:
+                logger.warning(f"Pair {pair} missing {section} configuration")
+                
+    def get_pair_specific_config(self, pair: str, exchange: str = None) -> Dict[str, Any]:
+        """Get pair-specific configuration with fallback to global defaults"""
+        pair_configs = self.config_data.get('pair_specific_configs', {})
+        
+        # Check for exact pair match
+        if pair in pair_configs:
+            config = pair_configs[pair]
+            # Verify exchange match if specified
+            if exchange and config.get('exchange') != exchange:
+                logger.warning(f"Exchange mismatch for pair {pair}: expected {exchange}, found {config.get('exchange')}")
+                return {}
+            logger.info(f"Using pair-specific configuration for {pair}")
+            return config
+            
+        # No specific config found
+        logger.debug(f"No pair-specific configuration for {pair}, using global defaults")
+        return {}
+        
+    def get_pair_strategy_overrides(self, pair: str, strategy_name: str, exchange: str = None) -> Dict[str, Any]:
+        """Get strategy-specific overrides for a pair"""
+        pair_config = self.get_pair_specific_config(pair, exchange)
+        
+        if not pair_config:
+            return {}
+            
+        strategy_overrides = pair_config.get('market_conditions', {}).get('strategy_overrides', {})
+        overrides = strategy_overrides.get(strategy_name, {})
+        
+        if overrides:
+            logger.info(f"Applying {len(overrides)} strategy overrides for {strategy_name} on {pair}")
+            for key, value in overrides.items():
+                logger.debug(f"  {key}: {value}")
+                
+        return overrides
+        
+    def get_pair_market_conditions(self, pair: str, exchange: str = None) -> Dict[str, Any]:
+        """Get market conditions configuration for a specific pair"""
+        pair_config = self.get_pair_specific_config(pair, exchange)
+        return pair_config.get('market_conditions', {}) 

@@ -104,6 +104,12 @@ class HealthResponse(BaseModel):
     total_services: int
 
 # API Endpoints
+@app.get("/favicon.ico")
+async def favicon():
+    """Return empty favicon to prevent 404 errors"""
+    from fastapi.responses import Response
+    return Response(content="", media_type="image/x-icon")
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
@@ -159,6 +165,21 @@ async def original_dashboard(request: Request):
 async def test_page(request: Request):
     """Test page to debug JavaScript"""
     return templates.TemplateResponse("test.html", {"request": request})
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug_page(request: Request):
+    """Debug page to test API endpoints and JavaScript"""
+    return templates.TemplateResponse("debug.html", {"request": request})
+
+@app.get("/test-dashboard", response_class=HTMLResponse)
+async def test_dashboard_page(request: Request):
+    """Test dashboard page with all required elements"""
+    return templates.TemplateResponse("test-dashboard.html", {"request": request})
+
+@app.get("/csv-test", response_class=HTMLResponse)
+async def csv_test_page(request: Request):
+    """CSV export test page"""
+    return templates.TemplateResponse("csv_test.html", {"request": request})
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page(request: Request):
@@ -368,6 +389,18 @@ async def api_pnl_unrealized(exchange: str, symbol: str):
         logger.error(f"Error proxying unrealized PnL: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/strategy-performance")
+async def get_strategy_performance():
+    """Get strategy performance metrics"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{database_service_url}/api/v1/analytics/strategy-performance")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error getting strategy performance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/trades")
 async def get_trades(
     page: int = 1, 
@@ -398,18 +431,9 @@ async def get_trades(
             response.raise_for_status()
             data = response.json()
             
-            # Calculate pagination info
+            # Use the total count from database service response
             trades = data.get('trades', [])
-            total_trades = len(trades) if limit >= 1000 else None  # If we're getting all, count them
-            
-            # If we don't have total count, try to get it
-            if total_trades is None:
-                count_response = await client.get(f"{database_service_url}/api/v1/trades", params={"limit": 10000})
-                if count_response.status_code == 200:
-                    all_trades = count_response.json().get('trades', [])
-                    total_trades = len(all_trades)
-                else:
-                    total_trades = len(trades)
+            total_trades = data.get('total', len(trades))  # Use total from database service
             
             # Calculate pagination metadata
             total_pages = (total_trades + limit - 1) // limit if total_trades > 0 else 1
@@ -433,118 +457,6 @@ async def get_trades(
             }
     except Exception as e:
         logger.error(f"Error getting trades: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/trade-history")
-async def get_trade_history(
-    page: int = 1, 
-    limit: int = 20, 
-    filter: str = "all",
-    exchange: Optional[str] = None,
-    sort_by: str = "exit_time",
-    sort_order: str = "desc"
-):
-    """Get trade history with pagination, filtering and sorting"""
-    try:
-        async with httpx.AsyncClient() as client:
-            # Build query parameters
-            params = {
-                "page": int(page),
-                "limit": int(limit),
-                "status": "CLOSED",  # Only get closed trades
-                "sort_by": sort_by,
-                "sort_order": sort_order
-            }
-            
-            if exchange:
-                params["exchange"] = exchange
-                
-            # Add filter-specific parameters
-            if filter == "profitable":
-                params["min_pnl"] = 0.01  # Positive PnL
-            elif filter == "losing":
-                params["max_pnl"] = -0.01  # Negative PnL
-            elif filter == "no_dust":
-                params["exclude_exit_reason"] = "dust_amount_below_minimum"  # Exclude dust trades
-            elif filter == "today":
-                today = datetime.utcnow().date()
-                params["start_date"] = today.isoformat()
-                params["end_date"] = today.isoformat()
-            elif filter == "week":
-                week_ago = datetime.utcnow().date() - timedelta(days=7)
-                params["start_date"] = week_ago.isoformat()
-            elif filter == "month":
-                month_ago = datetime.utcnow().date() - timedelta(days=30)
-                params["start_date"] = month_ago.isoformat()
-            
-            # Use the dedicated trade history endpoint which handles pagination properly
-            response = await client.get(f"{database_service_url}/api/v1/trades/closed/history", params=params)
-            
-            if response.status_code == 200:
-                # The history endpoint returns proper pagination, format it correctly
-                data = response.json()
-                
-                # Ensure proper pagination format
-                if 'total_pages' in data and 'page' in data:
-                    page_num = data['page']
-                    total_pages = data['total_pages']
-                    total_count = data.get('total', 0)
-                    
-                    # Add standard pagination format
-                    data['pagination'] = {
-                        "page": page_num,
-                        "limit": limit,
-                        "total": total_count,
-                        "total_pages": total_pages,
-                        "has_next": page_num < total_pages,
-                        "has_prev": page_num > 1
-                    }
-                    data['sorting'] = {
-                        "sort_by": sort_by,
-                        "sort_order": sort_order
-                    }
-                
-                return data
-            else:
-                # Fallback to general trades endpoint and build pagination
-                logger.warning(f"History endpoint failed ({response.status_code}), using fallback method")
-                
-                # Get all closed trades first to calculate proper total count
-                count_params = params.copy()
-                count_params.pop('page', None)  # Remove page to get all
-                count_params.pop('limit', None)  # Remove limit to get all
-                count_params['limit'] = 10000  # Large limit to get all trades
-                
-                count_response = await client.get(f"{database_service_url}/api/v1/trades", params=count_params)
-                all_trades = count_response.json().get('trades', []) if count_response.status_code == 200 else []
-                
-                # Filter closed trades for accurate count
-                closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
-                total_trades = len(closed_trades)
-                
-                # Now get the paginated results
-                fallback_response = await client.get(f"{database_service_url}/api/v1/trades", params=params)
-                fallback_response.raise_for_status()
-                data = fallback_response.json()
-                
-                # Build proper pagination info with accurate totals
-                total_pages = (total_trades + limit - 1) // limit if total_trades > 0 else 1
-                data['pagination'] = {
-                    "page": page,
-                    "limit": limit,
-                    "total": total_trades,
-                    "total_pages": total_pages,
-                    "has_next": page < total_pages,
-                    "has_prev": page > 1
-                }
-                data['sorting'] = {
-                    "sort_by": sort_by,
-                    "sort_order": sort_order
-                }
-                
-                return data
-    except Exception as e:
-        logger.error(f"Error getting trade history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/exchanges")
@@ -760,6 +672,10 @@ async def broadcast_updates():
             trading_status = await get_trading_status()
             risk_exposure = await get_risk_exposure()
             
+            # Get real-time order status updates
+            orders_status = await get_orders_status()
+            websocket_status = await get_websocket_status()
+            
             # Broadcast portfolio update
             await websocket_manager.broadcast({
                 "type": "portfolio_update",
@@ -778,12 +694,22 @@ async def broadcast_updates():
                 "data": risk_exposure
             })
             
+            # Broadcast real-time order status update
+            await websocket_manager.broadcast({
+                "type": "orders_status_update",
+                "data": {
+                    "orders": orders_status,
+                    "websocket_status": websocket_status,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            })
+            
             # Wait before next update
-            await asyncio.sleep(30)  # Update every 30 seconds
+            await asyncio.sleep(10)  # Update every 10 seconds for real-time feel
             
         except Exception as e:
             logger.error(f"Error in broadcast updates: {e}")
-            await asyncio.sleep(60)  # Wait longer on error
+            await asyncio.sleep(30)  # Wait shorter on error for better responsiveness
 
 # Configuration endpoints
 @app.get("/api/config/all")
@@ -1864,6 +1790,20 @@ async def get_websocket_status():
     except Exception as e:
         logger.error(f"Error getting WebSocket status: {str(e)}")
         return {"error": f"Error getting WebSocket status: {str(e)}"}
+
+@app.get("/api/v1/bybit/websocket/health")
+async def get_bybit_websocket_health():
+    """Get Bybit WebSocket health status"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get("http://exchange-service:8003/api/v1/websocket/bybit/health")
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"error": f"Failed to get Bybit WebSocket health: {response.status_code}"}
+    except Exception as e:
+        logger.error(f"Error getting Bybit WebSocket health: {str(e)}")
+        return {"error": f"Error getting Bybit WebSocket health: {str(e)}"}
 
 @app.get("/api/v1/performance/metrics")
 async def get_performance_metrics():
@@ -3315,6 +3255,112 @@ async def get_current_config():
         
     except Exception as e:
         logger.error(f"Error getting current config: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/v1/trades/export/csv")
+async def export_trades_csv(
+    status: Optional[str] = None,
+    exchange: Optional[str] = None,
+    pair: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 1000
+):
+    """Export trades data to CSV format"""
+    try:
+        # Build query parameters
+        params = {"limit": limit}
+        if status:
+            params["status"] = status
+        if exchange:
+            params["exchange"] = exchange
+        if pair:
+            params["pair"] = pair
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        
+        # Get trades from database service
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{database_service_url}/api/v1/trades", params=params)
+            response.raise_for_status()
+            trades_data = response.json()
+            trades = trades_data.get('trades', [])
+        
+        if not trades:
+            return {"error": "No trades found for export"}
+        
+        # Generate CSV content
+        import csv
+        import io
+        from datetime import datetime
+        
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, escapechar='\\')
+        
+        # Write header
+        headers = [
+            'Trade ID', 'Pair', 'Exchange', 'Status', 'Entry Time', 'Exit Time',
+            'Entry Price', 'Exit Price', 'Current Price', 'Position Size',
+            'Notional Value', 'Unrealized PnL', 'Realized PnL', 'Entry Reason',
+            'Exit Reason', 'Strategy', 'Entry ID', 'Exit ID', 'Profit Protection',
+            'Profit Protection Trigger', 'Trailing Stop', 'Trailing Stop Trigger',
+            'Highest Price', 'Created At', 'Updated At'
+        ]
+        writer.writerow(headers)
+        
+        # Write data rows
+        for trade in trades:
+            # Clean and escape problematic fields
+            entry_reason = str(trade.get('entry_reason', '')).replace('\n', ' ').replace('\r', ' ')
+            exit_reason = str(trade.get('exit_reason', '')).replace('\n', ' ').replace('\r', ' ')
+            
+            row = [
+                trade.get('trade_id', ''),
+                trade.get('pair', ''),
+                trade.get('exchange', ''),
+                trade.get('status', ''),
+                trade.get('entry_time', ''),
+                trade.get('exit_time', ''),
+                trade.get('entry_price', ''),
+                trade.get('exit_price', ''),
+                trade.get('current_price', ''),
+                trade.get('position_size', ''),
+                trade.get('entry_price', 0) * trade.get('position_size', 0) if trade.get('entry_price') and trade.get('position_size') else '',
+                trade.get('unrealized_pnl', ''),
+                trade.get('realized_pnl', ''),
+                entry_reason,
+                exit_reason,
+                trade.get('strategy', ''),
+                trade.get('entry_id', ''),
+                trade.get('exit_id', ''),
+                trade.get('profit_protection', ''),
+                trade.get('profit_protection_trigger', ''),
+                trade.get('trail_stop', ''),
+                trade.get('trail_stop_trigger', ''),
+                trade.get('highest_price', ''),
+                trade.get('created_at', ''),
+                trade.get('updated_at', '')
+            ]
+            writer.writerow(row)
+        
+        csv_content = output.getvalue()
+        output.close()
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"trades_export_{timestamp}.csv"
+        
+        return {
+            "status": "success",
+            "filename": filename,
+            "csv_content": csv_content,
+            "trade_count": len(trades)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error exporting trades to CSV: {e}")
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":

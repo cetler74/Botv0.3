@@ -108,6 +108,9 @@ class MarketRegimeDetector:
                            f"RSI: {indicators['rsi']:.1f} | "
                            f"Vol Ratio: {indicators['volume_ratio']:.2f}")
             
+            # Store analysis for strategy filtering
+            self._last_analysis = analysis
+            
             return regime, analysis
             
         except Exception as e:
@@ -160,6 +163,14 @@ class MarketRegimeDetector:
         recent_low = ohlcv['low'].tail(15).min()
         current_price = ohlcv['close'].iloc[-1]
         indicators['price_range_pct'] = (recent_high - recent_low) / current_price
+        
+        # Calculate trend strength for strategy filtering
+        if indicators['adx'] > 0:
+            # Trend strength based on ADX and EMA separation
+            ema_separation = abs(indicators['ema_fast'] - indicators['ema_slow']) / indicators['ema_slow']
+            indicators['trend_strength'] = (indicators['adx'] / 100.0) * ema_separation
+        else:
+            indicators['trend_strength'] = 0.0
         
         return indicators
     
@@ -344,7 +355,7 @@ class MarketRegimeDetector:
         
         return regime_map.get(regime_name, MarketRegime.LOW_VOLATILITY)
 
-    def get_applicable_strategies(self, regime: MarketRegime) -> List[str]:
+    def get_applicable_strategies(self, regime: MarketRegime, pair: str = None, exchange: str = None) -> List[str]:
         """
         Get list of strategies most suitable for the detected market regime
         BALANCED APPROACH: Prioritize regime-appropriate strategies while ensuring 
@@ -364,8 +375,8 @@ class MarketRegimeDetector:
                 "multi_timeframe_confluence"   # SECONDARY: Trend confirmation
             ],
             MarketRegime.SIDEWAYS: [
+                "heikin_ashi",  # ADD THIS
                 "multi_timeframe_confluence",  # PRIMARY: Designed for ranging markets
-                "heikin_ashi",                 # SECONDARY: Can catch trend breaks
                 "vwma_hull"                    # SECONDARY: Volume analysis in ranges
             ],
             MarketRegime.REVERSAL_ZONE: [
@@ -384,14 +395,58 @@ class MarketRegimeDetector:
                 "multi_timeframe_confluence"   # SECONDARY: Stability check
             ],
             MarketRegime.LOW_VOLATILITY: [
+                "heikin_ashi",  # ADD THIS
                 "multi_timeframe_confluence",  # PRIMARY: Conservative for low vol
-                "heikin_ashi",                 # SECONDARY: Trend emergence detection
-                "vwma_hull"                    # SECONDARY: Volume pattern analysis
+                "vwma_hull"                    # SECONDARY: Better for low volatility than Heikin Ashi
             ]
         }
         
-        return strategy_mapping.get(regime, [
+        strategies = strategy_mapping.get(regime, [
             "multi_timeframe_confluence",     # Safe fallback
             "heikin_ashi",                    # Broad applicability  
             "vwma_hull"                       # Volume-based analysis
         ])
+        
+        # ADDITIONAL PROTECTION: Remove Heikin Ashi if market conditions are unsuitable
+        # EXCEPTIONS: Don't filter Heikin Ashi in regimes where it's PRIMARY or essential
+        regime_exceptions = [MarketRegime.REVERSAL_ZONE, MarketRegime.BREAKOUT, MarketRegime.HIGH_VOLATILITY, 
+                           MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN]
+        if "heikin_ashi" in strategies and regime not in regime_exceptions:
+            # Check for choppy/ranging conditions that hurt Heikin Ashi performance
+            market_analysis = getattr(self, '_last_analysis', {})
+            indicators = market_analysis.get('indicators', {})
+            
+            # Remove Heikin Ashi if trend strength is too weak (choppy market)
+            trend_strength = indicators.get('trend_strength', 0)
+            if trend_strength < 0.001:  # Reduced threshold to allow more opportunities
+                strategies = [s for s in strategies if s != "heikin_ashi"]
+                logger.info(f"🚫 Blocking Heikin Ashi: Weak trend strength {trend_strength:.4f} < 0.001")
+            
+            # Remove Heikin Ashi if volatility is too low (ranging market)  
+            atr_pct = indicators.get('atr_pct', 0)
+            if atr_pct < 0.005:  # Very low volatility = ranging market
+                strategies = [s for s in strategies if s != "heikin_ashi"]
+                logger.info(f"🚫 Blocking Heikin Ashi: Low volatility {atr_pct:.4f} < 0.005")
+        elif "heikin_ashi" in strategies and regime in regime_exceptions:
+            logger.info(f"✅ Preserving Heikin Ashi for {regime.value} regime - essential for this market condition")
+        
+        # PAIR-SPECIFIC OPTIMIZATIONS for USD pairs
+        if pair and "/USD" in pair:
+            logger.info(f"🎯 Applying USD pair strategy optimizations for {pair}")
+            
+            # For CRO/USD specifically, prioritize strategies that work better with USD pairs
+            if pair == "CRO/USD":
+                # Reorder to prioritize vwma_hull for CRO/USD - it handles lower volatility better
+                if "vwma_hull" in strategies and "multi_timeframe_confluence" in strategies:
+                    # Put vwma_hull first for CRO/USD
+                    strategies_reordered = ["vwma_hull"]
+                    strategies_reordered.extend([s for s in strategies if s != "vwma_hull"])
+                    strategies = strategies_reordered
+                    logger.info(f"🔄 Prioritized VWMA Hull for CRO/USD (better for USD pair characteristics)")
+                    
+                # Also include multi_timeframe_confluence with relaxed parameters
+                if "multi_timeframe_confluence" not in strategies:
+                    strategies.append("multi_timeframe_confluence")
+                    logger.info(f"➕ Added Multi-Timeframe Confluence for CRO/USD with relaxed parameters")
+        
+        return strategies

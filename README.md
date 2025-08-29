@@ -27,6 +27,13 @@ A sophisticated multi-exchange perpetual futures trading bot that operates on Bi
 - **Alert System**: Comprehensive alerting for critical events
 - **Historical Data**: Complete trade history and performance metrics
 
+### 🔄 Real-Time WebSocket Integration
+- **Binance User Data Stream**: Real-time order execution and fill notifications
+- **Live Order Tracking**: Instant order status updates without polling delays
+- **WebSocket Health Monitoring**: Automatic connection management with fallback
+- **Real-Time Dashboard**: Live updates with WebSocket status indicators
+- **Event-Driven Architecture**: Redis streams for efficient event processing
+
 ## Architecture
 
 ### Microservices Design
@@ -72,15 +79,18 @@ The bot is built with a modern microservices architecture for scalability, maint
 - **Data**: PostgreSQL with connection pooling
 
 #### 3. **Exchange Service** (Port 8003)
-- **Purpose**: Multi-exchange operations and market data management
+- **Purpose**: Multi-exchange operations and market data management with WebSocket integration
 - **Responsibilities**:
   - Manage connections to multiple exchanges (Binance, Crypto.com, Bybit)
   - Handle rate limiting and API quotas
   - Fetch market data (tickers, OHLCV, order books)
   - Execute trades and manage orders
   - Handle account operations (balance, positions)
-- **API**: REST endpoints for market data, trading operations, account info
-- **Data**: Real-time exchange data with caching
+  - **Binance WebSocket User Data Stream** for real-time order execution
+  - Automatic listen key management with encryption and refresh
+  - Real-time event processing and error handling
+- **API**: REST endpoints for market data, trading operations, account info, WebSocket status
+- **Data**: Real-time exchange data with caching and WebSocket streaming
 
 #### 4. **Strategy Service** (Port 8004)
 - **Purpose**: Strategy analysis and signal generation
@@ -310,6 +320,9 @@ exchanges:
     sandbox: false
     base_currency: USDC
     max_pairs: 10
+    # WebSocket configuration
+    websocket_url: wss://stream.binance.com:9443/ws/!ticker@arr
+    websocket_private: wss://stream.binance.com:9443/ws
 
 # Trading Configuration
 trading:
@@ -319,6 +332,29 @@ trading:
   position_size_percentage: 0.1
   min_confidence: 0.6
 ```
+
+### WebSocket Configuration
+
+To enable real-time WebSocket integration, set these environment variables in `docker-compose.yml`:
+
+```yaml
+environment:
+  # Enable Binance User Data Stream WebSocket
+  - BINANCE_ENABLE_USER_DATA_STREAM=true
+  - BINANCE_API_KEY=${EXCHANGE_BINANCE_API_KEY}
+  - BINANCE_API_SECRET=${EXCHANGE_BINANCE_API_SECRET}
+  
+  # Optional WebSocket Configuration
+  - BINANCE_LISTEN_KEY_REFRESH_INTERVAL=3000  # 50 minutes in seconds
+  - BINANCE_LISTEN_KEY_ENCRYPTION_KEY=<base64-key>  # For secure key storage
+```
+
+**Key Features:**
+- **Real-time Order Updates**: Get instant notifications of order fills, cancellations, and status changes
+- **Automatic Listen Key Management**: Handles Binance listen key creation, refresh, and cleanup
+- **Connection Health Monitoring**: Automatic reconnection with circuit breaker patterns
+- **Graceful Fallback**: Seamlessly falls back to REST API if WebSocket disconnects
+- **Security**: Encrypted listen key storage and secure connection management
 
 ### Trading Modes
 

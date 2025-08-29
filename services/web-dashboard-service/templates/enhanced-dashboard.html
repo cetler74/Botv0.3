@@ -435,6 +435,127 @@
             letter-spacing: 0.05em;
         }
 
+        /* WebSocket Status Indicators */
+        .websocket-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            transition: all 0.3s ease;
+        }
+
+        .websocket-indicator.connected {
+            background-color: #10b981;
+            box-shadow: 0 0 6px rgba(16, 185, 129, 0.6);
+        }
+
+        .websocket-indicator.disconnected {
+            background-color: #ef4444;
+            box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
+        }
+        
+        .websocket-indicator.connecting {
+            background-color: #f59e0b;
+            box-shadow: 0 0 6px rgba(245, 158, 11, 0.6);
+        }
+        
+        .websocket-indicator.error {
+            background-color: #dc2626;
+            box-shadow: 0 0 6px rgba(220, 38, 38, 0.6);
+        }
+        
+        .websocket-indicator.not-implemented {
+            background-color: #6b7280;
+            box-shadow: 0 0 6px rgba(107, 114, 128, 0.6);
+        }
+
+        .websocket-indicator.pulse {
+            animation: pulse 2s infinite;
+        }
+        
+        .websocket-indicator.blink {
+            animation: blink 1s infinite;
+        }
+        
+        .websocket-indicator.fade {
+            opacity: 0.5;
+            animation: fade 3s infinite;
+        }
+        
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0.3; }
+        }
+        
+        @keyframes fade {
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 0.8; }
+        }
+        
+        /* Badge Styles for WebSocket Summary */
+        .badge {
+            display: inline-block;
+            font-weight: 600;
+            line-height: 1;
+            text-align: center;
+            white-space: nowrap;
+            vertical-align: baseline;
+            border-radius: 0.375rem;
+            transition: all 0.2s ease;
+        }
+        
+        .badge-success {
+            background-color: rgba(16, 185, 129, 0.9);
+            color: white;
+        }
+        
+        .badge-warning {
+            background-color: rgba(245, 158, 11, 0.9);
+            color: white;
+        }
+        
+        .badge-danger {
+            background-color: rgba(239, 68, 68, 0.9);
+            color: white;
+        }
+        
+        .badge-secondary {
+            background-color: rgba(107, 114, 128, 0.9);
+            color: white;
+        }
+
+        /* Order Status Badges */
+        .order-status-badge {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            min-width: 20px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .order-status-badge.new {
+            background: rgba(59, 130, 246, 0.8);
+        }
+
+        .order-status-badge.filled {
+            background: rgba(16, 185, 129, 0.8);
+        }
+
+        .order-status-badge.cancelled {
+            background: rgba(239, 68, 68, 0.8);
+        }
+
+        /* Real-time update indicator */
+        .last-update {
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.6);
+            margin-top: 4px;
+        }
+
         .badge-success {
             background-color: #28a745;
             color: white;
@@ -559,6 +680,17 @@
         .custom-scrollbar::-webkit-scrollbar-thumb:hover {
             background: #94a3b8;
         }
+        
+        /* Fee column styles */
+        .fee-col {
+            width: 80px;
+            min-width: 70px;
+            font-size: 0.75rem;
+        }
+        
+        .text-red-600 {
+            color: #dc2626 !important;
+        }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -578,6 +710,35 @@
                     <div class="flex items-center">
                         <span class="status-indicator status-online" id="connection-status"></span>
                         <span id="connection-text" class="text-sm font-medium">Connected</span>
+                    </div>
+                    
+                    <!-- WebSocket Status Indicators -->
+                    <div class="flex items-center space-x-3 text-xs">
+                        <span class="text-white opacity-75">WebSocket:</span>
+                        <div class="flex items-center space-x-1">
+                            <div class="websocket-indicator connected pulse" data-websocket-indicator="binance" title="Binance WebSocket: Connected"></div>
+                            <span class="text-white text-xs opacity-60">Binance</span>
+                        </div>
+                        <div class="flex items-center space-x-1">
+                            <div class="websocket-indicator disconnected" data-websocket-indicator="bybit" title="Bybit WebSocket: Disconnected"></div>
+                            <span class="text-white text-xs opacity-60">Bybit</span>
+                        </div>
+                        <div class="flex items-center space-x-1">
+                            <div class="websocket-indicator connecting" data-websocket-indicator="cryptocom" title="Crypto.com WebSocket: Initializing"></div>
+                            <span class="text-white text-xs opacity-60">Crypto.com</span>
+                        </div>
+                        <div class="ml-2">
+                            <span id="websocket-summary" class="badge badge-warning text-xs px-2 py-1 rounded-full">0/3 Connected</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Real-time Order Status Badges -->
+                    <div class="flex items-center space-x-2 text-xs">
+                        <span class="text-white opacity-75">Orders:</span>
+                        <div class="order-status-badge new" data-order-status="new" title="New Orders">0</div>
+                        <div class="order-status-badge filled" data-order-status="filled" title="Filled Orders">0</div>
+                        <div class="order-status-badge cancelled" data-order-status="cancelled" title="Cancelled Orders">0</div>
+                        <div class="last-update" data-last-update>Last update: --:--:--</div>
                     </div>
 
                     <!-- Navigation Links -->
@@ -676,6 +837,69 @@
                         <div>
                             <div class="text-sm text-gray-500 font-medium">Uptime</div>
                             <div id="bot-uptime" class="text-lg font-bold text-gray-900 font-mono">Loading...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- WebSocket Connection Monitoring -->
+        <div class="enhanced-card animate-in mb-8" style="--delay: 0.3s">
+            <div class="enhanced-card-content">
+                <h3 class="text-xl font-bold text-gray-900 mb-4 flex items-center">
+                    <i class="fas fa-wifi text-green-600 mr-3"></i>
+                    WebSocket Connections
+                </h3>
+                <div id="websocket-monitoring" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Binance WebSocket Status -->
+                    <div class="exchange-websocket-card bg-gray-50 p-4 rounded-lg" data-exchange="binance">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center">
+                                <div class="websocket-indicator connected pulse mr-2" data-websocket-indicator="binance"></div>
+                                <span class="font-semibold text-gray-900">Binance</span>
+                            </div>
+                            <span class="websocket-status-text text-sm text-green-600" data-status-text="binance">Connected</span>
+                        </div>
+                        <div class="websocket-details text-xs text-gray-500" data-details="binance">
+                            <div>Status: <span class="websocket-connection-status">Connected</span></div>
+                            <div>Last Update: <span class="websocket-last-update">--</span></div>
+                            <div>Callbacks: <span class="websocket-callbacks">--</span></div>
+                        </div>
+                    </div>
+                    
+                    <!-- Crypto.com WebSocket Status -->
+                    <div class="exchange-websocket-card bg-yellow-50 border-2 border-yellow-200 p-4 rounded-lg" data-exchange="cryptocom">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center">
+                                <div class="websocket-indicator connecting blink mr-2" data-websocket-indicator="cryptocom"></div>
+                                <span class="font-semibold text-gray-900">Crypto.com</span>
+                            </div>
+                            <span class="websocket-status-text text-sm text-yellow-600" data-status-text="cryptocom">Initializing</span>
+                        </div>
+                        <div class="websocket-details text-xs text-gray-500" data-details="cryptocom">
+                            <div>Status: <span class="websocket-connection-status">Initializing</span></div>
+                            <div>Last Update: <span class="websocket-last-update">--</span></div>
+                            <div>Callbacks: <span class="websocket-callbacks">--</span></div>
+                            <div>Circuit Breaker: <span class="websocket-circuit-breaker">--</span></div>
+                        </div>
+                    </div>
+                    
+                    <!-- Bybit WebSocket Status -->
+                    <div class="exchange-websocket-card bg-gray-50 p-4 rounded-lg" data-exchange="bybit">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center">
+                                <div class="websocket-indicator not-implemented mr-2" data-websocket-indicator="bybit"></div>
+                                <span class="font-semibold text-gray-900">Bybit</span>
+                            </div>
+                            <span class="websocket-status-text text-sm text-gray-500" data-status-text="bybit">Not Implemented</span>
+                        </div>
+                        <div class="websocket-details text-xs text-gray-500" data-details="bybit">
+                            <div>Status: <span class="websocket-connection-status">Not Implemented</span></div>
+                            <div>Last Update: <span class="websocket-last-update">--</span></div>
+                            <div>Callbacks: <span class="websocket-callbacks">--</span></div>
+                            <div id="bybit-health-metrics" class="mt-2 p-2 bg-gray-50 rounded">
+                                <!-- Health metrics will be populated by JavaScript -->
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -788,6 +1012,51 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Total Trades -->
+            <div class="enhanced-card animate-in" style="--delay: 0.8s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-blue-600 mr-4">
+                            <i class="fas fa-chart-line text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Total Trades</p>
+                            <p class="text-2xl font-bold text-gray-900" id="total-trades-count">0</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Daily Opened -->
+            <div class="enhanced-card animate-in" style="--delay: 0.9s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-green-600 mr-4">
+                            <i class="fas fa-door-open text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Daily Opened</p>
+                            <p class="text-2xl font-bold text-gray-900" id="daily-opened-trades">0</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Daily Closed -->
+            <div class="enhanced-card animate-in" style="--delay: 1.0s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-red-600 mr-4">
+                            <i class="fas fa-door-closed text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Daily Closed</p>
+                            <p class="text-2xl font-bold text-gray-900" id="daily-closed-trades">0</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- Per-Exchange Balances Toggle Button -->
@@ -815,6 +1084,7 @@
                                 <th>Exchange</th>
                                 <th class="text-right">Total Balance</th>
                                 <th class="text-right">Available Balance</th>
+                                <th class="text-right">Invested Amount</th>
                                 <th class="text-right">Total PnL</th>
                                 <th class="mobile-hidden text-center">Last Updated</th>
                             </tr>
@@ -848,6 +1118,10 @@
                             <i class="fas fa-sync-alt"></i>
                             <span>Refresh</span>
                         </button>
+                        <button id="export-trades-csv" class="enhanced-btn btn-success text-sm">
+                            <i class="fas fa-download"></i>
+                            <span>Export CSV</span>
+                        </button>
                     </div>
                 </div>
 
@@ -877,6 +1151,22 @@
                         </div>
                         <span class="ml-3 text-sm font-medium text-gray-700">Highest Price</span>
                     </label>
+                    <label class="flex items-center cursor-pointer">
+                        <input type="checkbox" class="toggle-recent-trades-col sr-only" data-col="entry-id" checked>
+                        <div class="relative">
+                            <div class="block bg-gray-600 w-14 h-8 rounded-full"></div>
+                            <div class="dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition"></div>
+                        </div>
+                        <span class="ml-3 text-sm font-medium text-gray-700">Entry ID</span>
+                    </label>
+                    <label class="flex items-center cursor-pointer">
+                        <input type="checkbox" class="toggle-recent-trades-col sr-only" data-col="exit-id" checked>
+                        <div class="relative">
+                            <div class="block bg-gray-600 w-14 h-8 rounded-full"></div>
+                            <div class="dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition"></div>
+                        </div>
+                        <span class="ml-3 text-sm font-medium text-gray-700">Exit ID</span>
+                    </label>
                 </div>
 
                 <!-- Recent Trades Table -->
@@ -887,22 +1177,32 @@
                                 <th>Trade ID</th>
                                 <th>Pair</th>
                                 <th class="mobile-hidden">Exchange</th>
-                                <th class="mobile-hidden">Entry Time</th>
+                                <th class="sortable mobile-hidden cursor-pointer hover:bg-gray-100" data-sort="entry_time">
+                                    Entry Time <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="sortable mobile-hidden cursor-pointer hover:bg-gray-100" data-sort="exit_time">
+                                    Exit Time <i class="fas fa-sort ml-1"></i>
+                                </th>
                                 <th>Entry Price</th>
                                 <th>Current Price</th>
                                 <th>Amount (units)</th>
                                 <th>Notional Value ($)</th>
+                                <th class="fee-col mobile-hidden">Entry Fee</th>
+                                <th class="fee-col mobile-hidden">Exit Fee</th>
+                                <th class="fee-col">Total Fees ($)</th>
                                 <th>Unrealized PnL</th>
                                 <th>Status</th>
                                 <th class="mobile-hidden">Entry Reason</th>
                                 <th class="profit-trigger-col">Profit Trigger</th>
                                 <th class="trailing-stop-col">Trailing Stop</th>
                                 <th class="highest-price-col">Highest Price</th>
+                                <th class="entry-id-col">Entry ID</th>
+                                <th class="exit-id-col">Exit ID</th>
                             </tr>
                         </thead>
                         <tbody id="trades-table-body" class="loading">
                             <tr>
-                                <td colspan="14" class="text-center py-8">
+                                <td colspan="17" class="text-center py-8">
                                     <div class="flex items-center justify-center">
                                         <i class="fas fa-spinner spinner text-blue-500 mr-2"></i>
                                         Loading recent trades...
@@ -941,113 +1241,6 @@
             </div>
         </div>
 
-        <!-- Trade History -->
-        <div class="enhanced-card animate-in" style="--delay: 1.0s">
-            <div class="enhanced-card-content">
-                <div class="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
-                    <h3 class="text-xl font-bold text-gray-900 mb-4 md:mb-0 flex items-center">
-                        <i class="fas fa-history text-green-600 mr-3"></i>
-                        Trade History
-                    </h3>
-                    <div class="flex flex-col md:flex-row gap-3">
-                        <button id="refresh-history" class="enhanced-btn btn-primary text-sm">
-                            <i class="fas fa-sync-alt"></i>
-                            <span>Refresh</span>
-                        </button>
-                        <select id="history-filter" class="px-4 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
-                            <option value="all">All Trades</option>
-                            <option value="profitable">Profitable Only</option>
-                            <option value="losing">Losing Only</option>
-                            <option value="today">Today</option>
-                            <option value="week">This Week</option>
-                            <option value="month">This Month</option>
-                        </select>
-                    </div>
-                </div>
-                
-                <!-- Column toggles -->
-                <div class="flex flex-wrap gap-3 mb-4">
-                    <label class="flex items-center cursor-pointer">
-                        <input type="checkbox" class="toggle-col sr-only" data-col="profit-trigger" checked>
-                        <div class="relative">
-                            <div class="block bg-gray-600 w-14 h-8 rounded-full"></div>
-                            <div class="dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition"></div>
-                        </div>
-                        <span class="ml-3 text-sm font-medium text-gray-700">Profit Trigger</span>
-                    </label>
-                    <label class="flex items-center cursor-pointer">
-                        <input type="checkbox" class="toggle-col sr-only" data-col="trailing-stop" checked>
-                        <div class="relative">
-                            <div class="block bg-gray-600 w-14 h-8 rounded-full"></div>
-                            <div class="dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition"></div>
-                        </div>
-                        <span class="ml-3 text-sm font-medium text-gray-700">Trailing Stop</span>
-                    </label>
-                    <label class="flex items-center cursor-pointer">
-                        <input type="checkbox" class="toggle-col sr-only" data-col="highest-price" checked>
-                        <div class="relative">
-                            <div class="block bg-gray-600 w-14 h-8 rounded-full"></div>
-                            <div class="dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition"></div>
-                        </div>
-                        <span class="ml-3 text-sm font-medium text-gray-700">Highest Price</span>
-                    </label>
-                </div>
-
-                <!-- Trade History Table -->
-                <div class="custom-scrollbar">
-                    <table class="enhanced-table w-full">
-                        <thead>
-                            <tr>
-                                <th class="sortable" data-sort="trade_id">Trade ID</th>
-                                <th class="sortable" data-sort="pair">Pair</th>
-                                <th class="sortable" data-sort="exchange">Exchange</th>
-                                <th class="sortable" data-sort="entry_time">Entry Time</th>
-                                <th class="sortable" data-sort="entry_price">Entry Price</th>
-                                <th class="sortable" data-sort="position_size">Amount</th>
-                                <th class="sortable" data-sort="exit_time">Exit Time</th>
-                                <th class="sortable" data-sort="exit_price">Exit Price</th>
-                                <th class="sortable" data-sort="entry_reason">Entry Reason</th>
-                                <th class="sortable" data-sort="exit_reason">Exit Reason</th>
-                                <th class="sortable" data-sort="realized_pnl">Realized PnL</th>
-                                <th class="sortable" data-sort="pnl_percentage">PnL %</th>
-                                <th class="profit-trigger-col sortable" data-sort="profit_protection">Profit Trigger</th>
-                                <th class="trailing-stop-col sortable" data-sort="trail_stop">Trailing Stop</th>
-                                <th class="highest-price-col sortable" data-sort="highest_price">Highest Price</th>
-                            </tr>
-                        </thead>
-                        <tbody id="trade-history-table-body" class="loading">
-                            <tr>
-                                <td colspan="15" class="text-center py-8">
-                                    <div class="flex items-center justify-center">
-                                        <i class="fas fa-spinner spinner text-blue-500 mr-2"></i>
-                                        Loading trade history...
-                                    </div>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- Pagination -->
-                <div class="flex flex-col md:flex-row md:justify-between items-center mt-6 gap-4">
-                    <div class="text-sm text-gray-500">
-                        <span id="history-summary">Loading...</span>
-                    </div>
-                    <div class="flex items-center space-x-2">
-                        <button id="prev-page" class="enhanced-btn btn-primary text-sm disabled:opacity-50" disabled>
-                            <i class="fas fa-chevron-left"></i>
-                            <span class="hidden md:inline">Previous</span>
-                        </button>
-                        <span id="page-info" class="px-4 py-2 text-sm text-gray-600 bg-gray-100 rounded-lg font-medium">Page 1</span>
-                        <button id="next-page" class="enhanced-btn btn-primary text-sm disabled:opacity-50" disabled>
-                            <span class="hidden md:inline">Next</span>
-                            <i class="fas fa-chevron-right"></i>
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
 
     <!-- Enhanced Emergency Stop Modal -->
     <div id="emergency-modal" class="enhanced-modal">
@@ -1076,5 +1269,11 @@
 
     <!-- Include enhanced dashboard JavaScript -->
     <script src="/static/js/enhanced-dashboard.js"></script>
+    <script>
+        // Add test data for sorting when backend is not available
+        window.addEventListener('load', function() {
+            // Dashboard initialization complete - no hardcoded data
+        });
+    </script>
 </body>
 </html>

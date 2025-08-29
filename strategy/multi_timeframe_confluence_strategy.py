@@ -23,7 +23,7 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any, Union
 
 from strategy.base_strategy import BaseStrategy
-from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced
+from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced
 from strategy.condition_logger import ConditionLogger
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         self.rsi_oversold = self._get_config_param('rsi_oversold', 30)
         self.rsi_overbought = self._get_config_param('rsi_overbought', 70)
         self.trending_adx_threshold = self._get_config_param('trending_adx_threshold', 30)  # From config
+        self.bullish_momentum_threshold = self._get_config_param('bullish_momentum_threshold', 0.6)  # Default 60% momentum threshold
         self.bb_period = self._get_config_param('bb_period', 20)
         self.bb_std = self._get_config_param('bb_std', 2)
         self.vwap_period = self._get_config_param('vwap_period', 20)
@@ -94,6 +95,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         
         self.logger.info(f"MultiTimeframeConfluenceStrategy v2.1.1 initialized with ENHANCED parameters: "
                    f"ADX threshold={self.adx_threshold}, trending ADX={self.trending_adx_threshold}, "
+                   f"bullish momentum threshold={self.bullish_momentum_threshold}, "
                    f"min confluence={self.min_confluence}, max daily volatility={self.max_daily_volatility_pct}% (default), "
                    f"asset-specific overrides={len(self.asset_volatility_overrides)} pairs, "
                    f"stop loss={self.stop_loss_pct:.1%}, ATR multiplier={self.atr_stop_loss_multiplier}")

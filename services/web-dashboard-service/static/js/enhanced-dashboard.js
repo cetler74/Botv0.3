@@ -18,8 +18,12 @@ class EnhancedDashboard {
         this.animationQueue = [];
         
         // Recent Trades table properties
-        this.currentTradesFilter = 'OPEN';
+        this.currentTradesFilter = 'OPEN';  // Default to OPEN trades only
         this.currentTradesSearch = '';
+        this.currentRecentTradesSort = null;
+        this.currentTradesPage = 1;
+        this.tradesPerPage = 20;
+        this.totalTrades = 0;
         
         // Trading configuration
         this.tradingConfig = {
@@ -45,7 +49,15 @@ class EnhancedDashboard {
         this.setupColumnToggles();
         this.setupRecentTradesControls();
         this.startPeriodicUpdates();
+        
+        // Immediate data loading
+        console.log('Dashboard initializing - loading data immediately...');
         this.fetchBotStatus();
+        this.updatePortfolio();
+        this.refreshRecentTrades();
+        this.updateExchangeStatus();
+        this.updateBybitWebSocketStatus();
+        this.updateStrategyPerformance();
     }
 
     async fetchTradingConfig() {
@@ -94,17 +106,17 @@ class EnhancedDashboard {
         
         this.ws = new WebSocket(wsUrl);
         
+        // WebSocket event handlers
         this.ws.onopen = () => {
-            console.log('WebSocket connected');
-            this.updateConnectionStatus('connected');
+            console.log('WebSocket connected for real-time updates');
             this.reconnectAttempts = 0;
-            this.showNotification('Connected to server', 'success');
+            this.updateConnectionStatus('connected');
         };
         
         this.ws.onmessage = (event) => {
             try {
-                const data = JSON.parse(event.data);
-                this.handleWebSocketMessage(data);
+                const message = JSON.parse(event.data);
+                this.handleWebSocketMessage(message);
             } catch (error) {
                 console.error('Error parsing WebSocket message:', error);
             }
@@ -113,12 +125,12 @@ class EnhancedDashboard {
         this.ws.onclose = () => {
             console.log('WebSocket disconnected');
             this.updateConnectionStatus('disconnected');
-            this.scheduleReconnect();
+            this.attemptReconnect();
         };
         
         this.ws.onerror = (error) => {
             console.error('WebSocket error:', error);
-            this.updateConnectionStatus('disconnected');
+            this.updateConnectionStatus('error');
         };
     }
     
@@ -179,10 +191,12 @@ class EnhancedDashboard {
         const refreshTradesBtn = document.getElementById('refresh-trades');
         const tradesFilter = document.getElementById('trades-filter');
         const tradeSearch = document.getElementById('trade-search');
+        const exportTradesBtn = document.getElementById('export-trades-csv');
 
         if (refreshTradesBtn) refreshTradesBtn.addEventListener('click', () => this.refreshRecentTrades());
         if (tradesFilter) tradesFilter.addEventListener('change', (e) => this.filterRecentTrades(e.target.value));
         if (tradeSearch) tradeSearch.addEventListener('input', (e) => this.searchRecentTrades(e.target.value));
+        if (exportTradesBtn) exportTradesBtn.addEventListener('click', () => this.exportTradesToCSV());
 
         // Exchange breakdown toggle
         const toggleExchangeBtn = document.getElementById('toggle-exchange-breakdown');
@@ -200,10 +214,24 @@ class EnhancedDashboard {
 
     setupTableSorting() {
         const sortableHeaders = document.querySelectorAll('.sortable');
+        console.log(`Found ${sortableHeaders.length} sortable headers`);
+        
         sortableHeaders.forEach(header => {
-            header.addEventListener('click', () => {
+            header.addEventListener('click', (e) => {
+                e.preventDefault();
                 const column = header.dataset.sort;
-                this.sortTable(column);
+                const tableBody = header.closest('table').querySelector('tbody');
+                
+                console.log(`Sorting by column: ${column}, table body ID: ${tableBody ? tableBody.id : 'undefined'}`);
+                
+                // Check if this is recent trades table or trade history table
+                if (tableBody && tableBody.id === 'trades-table-body') {
+                    console.log('Sorting Recent Trades table');
+                    this.sortRecentTrades(column, header);
+                } else {
+                    console.log('Sorting Trade History table');
+                    this.sortTable(column);
+                }
             });
         });
     }
@@ -292,6 +320,125 @@ class EnhancedDashboard {
         this.refreshTradeHistory();
     }
 
+    sortRecentTrades(column, headerElement) {
+        console.log(`sortRecentTrades called with column: ${column}`);
+        
+        // Get current direction from the header element
+        const currentDirection = headerElement.classList.contains('sort-desc') ? 'desc' : 'asc';
+        const newDirection = currentDirection === 'desc' ? 'asc' : 'desc';
+        
+        // Store sort state
+        this.currentRecentTradesSort = {
+            column: column,
+            direction: newDirection
+        };
+
+        console.log(`Sort direction: ${currentDirection} -> ${newDirection}`);
+
+        // Clear all sort indicators for this table
+        const table = headerElement.closest('table');
+        table.querySelectorAll('.sortable i').forEach(icon => {
+            icon.className = 'fas fa-sort ml-1';
+        });
+
+        // Update current header indicator
+        const icon = headerElement.querySelector('i');
+        if (icon) {
+            icon.className = newDirection === 'desc' ? 'fas fa-sort-down ml-1' : 'fas fa-sort-up ml-1';
+            console.log(`Updated icon to: ${icon.className}`);
+        }
+
+        // Add sort class to header
+        table.querySelectorAll('.sortable').forEach(header => {
+            header.classList.remove('sort-asc', 'sort-desc');
+        });
+        headerElement.classList.add(`sort-${newDirection}`);
+
+        // Try to re-fetch and re-render the trades with sorting
+        try {
+            this.refreshRecentTrades();
+            console.log('Called refreshRecentTrades');
+        } catch (error) {
+            console.error('Error in refreshRecentTrades:', error);
+            // Fallback: try to sort existing data in the table
+            this.sortExistingTableData(column, newDirection);
+        }
+    }
+
+    sortExistingTableData(column, direction) {
+        console.log('Fallback: sorting existing table data');
+        const tbody = document.getElementById('trades-table-body');
+        if (!tbody) {
+            console.log('No table body found for sorting');
+            return;
+        }
+
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        console.log(`Found ${rows.length} rows to sort`);
+
+        if (rows.length === 0) {
+            console.log('No rows to sort');
+            return;
+        }
+
+        // Filter out empty/error rows
+        const validRows = rows.filter(row => {
+            const cells = row.querySelectorAll('td');
+            return cells.length > 4 && !row.querySelector('.text-center'); // Skip error/loading rows
+        });
+
+        console.log(`Found ${validRows.length} valid rows to sort`);
+
+        if (validRows.length === 0) {
+            console.log('No valid rows to sort');
+            return;
+        }
+
+        // Sort the rows
+        validRows.sort((a, b) => {
+            const columnIndex = column === 'entry_time' ? 3 : column === 'exit_time' ? 4 : -1;
+            if (columnIndex === -1) {
+                console.log('Invalid column for sorting');
+                return 0;
+            }
+
+            const aCells = a.querySelectorAll('td');
+            const bCells = b.querySelectorAll('td');
+            
+            const aText = (aCells[columnIndex] && aCells[columnIndex].textContent ? aCells[columnIndex].textContent.trim() : '') || '';
+const bText = (bCells[columnIndex] && bCells[columnIndex].textContent ? bCells[columnIndex].textContent.trim() : '') || '';
+            
+            console.log(`Comparing: "${aText}" vs "${bText}"`);
+
+            let aValue, bValue;
+            
+            if (aText === 'N/A' || aText === '') {
+                aValue = 0;
+            } else {
+                aValue = new Date(aText).getTime();
+            }
+            
+            if (bText === 'N/A' || bText === '') {
+                bValue = 0;
+            } else {
+                bValue = new Date(bText).getTime();
+            }
+            
+            if (direction === 'desc') {
+                return bValue - aValue;
+            } else {
+                return aValue - bValue;
+            }
+        });
+
+        // Clear and re-append sorted rows
+        tbody.innerHTML = '';
+        validRows.forEach(row => tbody.appendChild(row));
+        
+        console.log('Table sorted successfully');
+    }
+
+
     updateConnectionStatus(status) {
         const indicator = document.getElementById('connection-status');
         const text = document.getElementById('connection-text');
@@ -331,6 +478,9 @@ class EnhancedDashboard {
             case 'risk_exposure_update':
                 this.updateRiskExposure(data.data);
                 break;
+            case 'orders_status_update':
+                this.updateOrdersStatus(data.data);
+                break;
             case 'trade_update':
                 this.refreshTradeHistory();
                 this.refreshRecentTrades();
@@ -350,9 +500,11 @@ class EnhancedDashboard {
     async updatePortfolio(data) {
         if (!data) {
             try {
+                console.log('Fetching portfolio data...');
                 const response = await fetch('/api/portfolio');
                 if (response.ok) {
                     data = await response.json();
+                    console.log('Portfolio data received:', data);
                 } else {
                     console.error('Failed to fetch portfolio data');
                     return;
@@ -366,6 +518,34 @@ class EnhancedDashboard {
         this.updatePortfolioUI(data);
     }
     
+    updateTradingStatus(data) {
+        console.log('Updating trading status:', data);
+        // Update trading status display
+        const statusElement = document.getElementById('trading-status');
+        if (statusElement && data.status) {
+            statusElement.textContent = data.status;
+            statusElement.className = `status-badge ${data.status}`;
+        }
+    }
+
+    updateRiskExposure(data) {
+        console.log('Updating risk exposure:', data);
+        // Update risk exposure display if we have a risk exposure section
+        const riskElement = document.getElementById('risk-exposure');
+        if (riskElement && data.exposure) {
+            riskElement.textContent = `${data.exposure}%`;
+        }
+    }
+
+    updateOrdersStatus(data) {
+        console.log('Updating orders status:', data);
+        // Update orders status if we have an orders section
+        const ordersElement = document.getElementById('orders-status');
+        if (ordersElement && data.orders) {
+            ordersElement.textContent = `${data.orders.length} active orders`;
+        }
+    }
+
     updatePortfolioUI(data) {
         const elements = {
             'total-balance': data.total_balance || 0,
@@ -374,7 +554,10 @@ class EnhancedDashboard {
             'daily-pnl': data.daily_pnl || 0,
             'open-trades': data.active_trades || 0,
             'total-unrealized-pnl': data.total_unrealized_pnl || 0,
-            'win-rate': `${(data.win_rate || 0).toFixed(1)}%`
+            'win-rate': `${(data.win_rate || 0).toFixed(1)}%`,
+            'total-trades-count': data.total_trades || 0,
+            'daily-opened-trades': data.daily_total_trades || 0,
+            'daily-closed-trades': data.daily_closed_trades || 0
         };
 
         // Update each element with animation
@@ -382,7 +565,8 @@ class EnhancedDashboard {
             setTimeout(() => {
                 const element = document.getElementById(id);
                 if (element) {
-                    const isMonetary = typeof value === 'number' && id !== 'open-trades';
+                    const tradeCountFields = ['open-trades', 'total-trades-count', 'daily-opened-trades', 'daily-closed-trades'];
+                    const isMonetary = typeof value === 'number' && !tradeCountFields.includes(id);
                     const displayValue = isMonetary ? this.formatCurrency(value) : value;
                     
                     // Animate value change
@@ -411,6 +595,276 @@ class EnhancedDashboard {
 
         // Update tooltips
         this.updateTooltips(data);
+    }
+
+    updateOrdersStatus(data) {
+        /**
+         * Update real-time order status display
+         * @param {Object} data - Order status data with orders and WebSocket status
+         */
+        if (!data) return;
+        
+        const { orders, websocket_status, timestamp } = data;
+        
+        // Update WebSocket connection indicators
+        this.updateWebSocketIndicators(websocket_status);
+        
+        // Update order status badges and real-time indicators
+        this.updateOrderStatusBadges(orders);
+        
+        // Update last update timestamp
+        this.updateLastUpdateTime(timestamp);
+        
+        // Log real-time update for debugging
+        console.log('Real-time order status update:', {
+            orders_count: (orders && orders.orders ? orders.orders.length : 0) || 0,
+websocket_connected: (websocket_status && websocket_status.connections ? websocket_status.connections : null),
+cryptocom_status: (websocket_status && websocket_status.connections && websocket_status.connections.cryptocom ? websocket_status.connections.cryptocom : null),
+            timestamp: timestamp
+        });
+    }
+    
+    updateWebSocketIndicators(websocketStatus) {
+        /**
+         * Update WebSocket connection status indicators with enhanced Crypto.com support
+         */
+        if (!websocketStatus || !websocketStatus.connections) return;
+        
+        Object.entries(websocketStatus.connections).forEach(([exchange, status]) => {
+            const indicator = document.querySelector(`[data-websocket-indicator="${exchange}"]`);
+            if (indicator) {
+                const isConnected = status.connected || false;
+                const connectionStatus = status.status || 'unknown';
+                
+                // Enhanced status classification
+                let statusClass = 'disconnected';
+                let statusText = 'Disconnected';
+                
+                if (isConnected) {
+                    statusClass = 'connected';
+                    statusText = 'Connected';
+                } else if (connectionStatus === 'connecting' || connectionStatus === 'initializing') {
+                    statusClass = 'connecting';
+                    statusText = 'Connecting';
+                } else if (connectionStatus === 'error') {
+                    statusClass = 'error';
+                    statusText = 'Error';
+                } else if (connectionStatus === 'not_implemented') {
+                    statusClass = 'not-implemented';
+                    statusText = 'Not Implemented';
+                }
+                
+                indicator.className = `websocket-indicator ${statusClass}`;
+                
+                // Enhanced tooltip with more information
+                let tooltipText = `${exchange.charAt(0).toUpperCase() + exchange.slice(1)} WebSocket: ${statusText}`;
+                if (status.last_update) {
+                    const lastUpdate = new Date(status.last_update);
+                    tooltipText += `\nLast Update: ${lastUpdate.toLocaleTimeString()}`;
+                }
+                if (status.error) {
+                    tooltipText += `\nError: ${status.error}`;
+                }
+                if (status.registered_callbacks) {
+                    tooltipText += `\nCallbacks: ${status.registered_callbacks}`;
+                }
+                
+                indicator.title = tooltipText;
+                
+                // Add visual effects based on status
+                indicator.classList.remove('pulse', 'blink', 'fade');
+                if (isConnected) {
+                    indicator.classList.add('pulse');
+                } else if (connectionStatus === 'connecting' || connectionStatus === 'initializing') {
+                    indicator.classList.add('blink');
+                } else if (connectionStatus === 'error') {
+                    indicator.classList.add('fade');
+                }
+            }
+        });
+        
+        // Update global WebSocket status summary
+        this.updateWebSocketStatusSummary(websocketStatus);
+    }
+    
+    updateWebSocketStatusSummary(websocketStatus) {
+        /**
+         * Update global WebSocket connection summary for monitoring
+         */
+        if (!websocketStatus || !websocketStatus.connections) return;
+        
+        const connections = websocketStatus.connections;
+        const totalExchanges = Object.keys(connections).length;
+        const connectedExchanges = Object.values(connections).filter(status => status.connected).length;
+        const connectingExchanges = Object.values(connections).filter(status => 
+            status.status === 'connecting' || status.status === 'initializing').length;
+        const errorExchanges = Object.values(connections).filter(status => status.status === 'error').length;
+        
+        // Update connection summary badge if it exists
+        const summaryElement = document.getElementById('websocket-summary');
+        if (summaryElement) {
+            let summaryText = `${connectedExchanges}/${totalExchanges} Connected`;
+            let summaryClass = 'success';
+            
+            if (connectedExchanges === 0) {
+                summaryClass = 'danger';
+            } else if (connectedExchanges < totalExchanges) {
+                summaryClass = 'warning';
+            }
+            
+            if (connectingExchanges > 0) {
+                summaryText += ` (${connectingExchanges} connecting)`;
+            }
+            if (errorExchanges > 0) {
+                summaryText += ` (${errorExchanges} errors)`;
+            }
+            
+            summaryElement.textContent = summaryText;
+            summaryElement.className = `badge badge-${summaryClass}`;
+        }
+        
+        // Update detailed WebSocket monitoring cards
+        this.updateDetailedWebSocketCards(websocketStatus);
+        
+        // Log detailed status for debugging
+        console.log('WebSocket Status Summary:', {
+            total: totalExchanges,
+            connected: connectedExchanges,
+            connecting: connectingExchanges,
+            errors: errorExchanges,
+            details: connections
+        });
+    }
+    
+    updateDetailedWebSocketCards(websocketStatus) {
+        /**
+         * Update detailed WebSocket monitoring cards with comprehensive status information
+         */
+        if (!websocketStatus || !websocketStatus.connections) return;
+        
+        Object.entries(websocketStatus.connections).forEach(([exchange, status]) => {
+            const card = document.querySelector(`[data-exchange="${exchange}"]`);
+            if (!card) return;
+            
+            // Update status text and color
+            const statusText = card.querySelector(`[data-status-text="${exchange}"]`);
+            const connectionStatus = status.status || 'unknown';
+            const isConnected = status.connected || false;
+            
+            let displayText = 'Disconnected';
+            let textColorClass = 'text-gray-500';
+            let cardBgClass = 'bg-gray-50';
+            
+            if (isConnected) {
+                displayText = 'Connected';
+                textColorClass = 'text-green-600';
+                cardBgClass = 'bg-green-50 border-2 border-green-200';
+            } else if (connectionStatus === 'connecting' || connectionStatus === 'initializing') {
+                displayText = 'Connecting';
+                textColorClass = 'text-yellow-600';
+                cardBgClass = 'bg-yellow-50 border-2 border-yellow-200';
+            } else if (connectionStatus === 'error') {
+                displayText = 'Error';
+                textColorClass = 'text-red-600';
+                cardBgClass = 'bg-red-50 border-2 border-red-200';
+            } else if (connectionStatus === 'not_implemented') {
+                displayText = 'Not Implemented';
+                textColorClass = 'text-gray-500';
+                cardBgClass = 'bg-gray-50';
+            }
+            
+            if (statusText) {
+                statusText.textContent = displayText;
+                statusText.className = `websocket-status-text text-sm ${textColorClass}`;
+            }
+            
+            // Update card background
+            card.className = `exchange-websocket-card p-4 rounded-lg ${cardBgClass}`;
+            
+            // Update detailed information
+            const details = card.querySelector(`[data-details="${exchange}"]`);
+            if (details) {
+                const connectionStatusSpan = details.querySelector('.websocket-connection-status');
+                const lastUpdateSpan = details.querySelector('.websocket-last-update');
+                const callbacksSpan = details.querySelector('.websocket-callbacks');
+                const circuitBreakerSpan = details.querySelector('.websocket-circuit-breaker');
+                
+                if (connectionStatusSpan) {
+                    connectionStatusSpan.textContent = connectionStatus || 'unknown';
+                }
+                
+                if (lastUpdateSpan && status.last_update) {
+                    const lastUpdate = new Date(status.last_update);
+                    lastUpdateSpan.textContent = lastUpdate.toLocaleTimeString();
+                } else if (lastUpdateSpan) {
+                    lastUpdateSpan.textContent = '--';
+                }
+                
+                if (callbacksSpan) {
+                    callbacksSpan.textContent = status.registered_callbacks || '0';
+                }
+                
+                if (circuitBreakerSpan && status.circuit_breaker) {
+                    circuitBreakerSpan.textContent = status.circuit_breaker.state || 'unknown';
+                } else if (circuitBreakerSpan) {
+                    circuitBreakerSpan.textContent = 'N/A';
+                }
+            }
+        });
+    }
+    
+    updateOrderStatusBadges(ordersData) {
+        /**
+         * Update order status badges with real-time information
+         */
+        if (!ordersData || !ordersData.orders) return;
+        
+        const orders = ordersData.orders;
+        const statusCounts = {
+            'new': 0,
+            'filled': 0, 
+            'partially_filled': 0,
+            'cancelled': 0,
+            'pending': 0
+        };
+        
+        // Count orders by status
+        orders.forEach(order => {
+            const status = (order.status || 'unknown').toLowerCase();
+            if (statusCounts.hasOwnProperty(status)) {
+                statusCounts[status]++;
+            }
+        });
+        
+        // Update status count badges
+        Object.entries(statusCounts).forEach(([status, count]) => {
+            const badge = document.querySelector(`[data-order-status="${status}"]`);
+            if (badge) {
+                badge.textContent = count;
+                
+                // Add animation for count changes
+                if (parseInt(badge.dataset.previousCount || '0') !== count) {
+                    badge.classList.add('animate-bounce-in');
+                    setTimeout(() => badge.classList.remove('animate-bounce-in'), 600);
+                }
+                badge.dataset.previousCount = count;
+            }
+        });
+    }
+    
+    updateLastUpdateTime(timestamp) {
+        /**
+         * Update last update timestamp display
+         */
+        if (!timestamp) return;
+        
+        const timeElement = document.querySelector('[data-last-update]');
+        if (timeElement) {
+            const updateTime = new Date(timestamp);
+            timeElement.textContent = `Last update: ${updateTime.toLocaleTimeString()}`;
+            timeElement.classList.add('animate-fade-in');
+            setTimeout(() => timeElement.classList.remove('animate-fade-in'), 300);
+        }
     }
 
     calculateAvailableBalance(data) {
@@ -465,9 +919,11 @@ class EnhancedDashboard {
 
     async fetchBotStatus() {
         try {
+            console.log('Fetching bot status...');
             const response = await fetch('/api/bot-status');
             if (!response.ok) throw new Error('Failed to fetch bot status');
             const data = await response.json();
+            console.log('Bot status received:', data);
             
             this.updateBotStatusUI(data);
         } catch (error) {
@@ -870,7 +1326,7 @@ class EnhancedDashboard {
             tbody.classList.add('loading');
             tbody.innerHTML = `
                 <tr>
-                    <td colspan="14" class="text-center py-8">
+                    <td colspan="16" class="text-center py-8">
                         <div class="flex items-center justify-center">
                             <i class="fas fa-spinner spinner text-blue-500 mr-2"></i>
                             Loading recent trades...
@@ -882,19 +1338,30 @@ class EnhancedDashboard {
 
         try {
             const params = new URLSearchParams({
-                limit: 100 // Get more trades to ensure we show all open trades
+                page: this.currentTradesPage,
+                limit: this.tradesPerPage,
+                sort_by: 'entry_time',
+                sort_order: 'desc'
             });
-
-            // If filtering to OPEN trades only, request them specifically from API
-            if (this.currentTradesFilter === 'OPEN') {
-                params.set('status', 'OPEN');
-                params.set('limit', 50); // We can use lower limit when filtering server-side
+            
+            // Add status filter if not 'all'
+            const normalizedFilter = this.currentTradesFilter.toLowerCase();
+            if (normalizedFilter !== 'all' && normalizedFilter !== '') {
+                params.set('status', this.currentTradesFilter.toUpperCase());
+            }
+            
+            // Add sorting if available
+            if (this.currentRecentTradesSort && this.currentRecentTradesSort.column) {
+                params.set('sort_by', this.currentRecentTradesSort.column);
+                params.set('sort_order', this.currentRecentTradesSort.direction);
             }
 
             const response = await fetch(`/api/trades?${params}`);
             if (response.ok) {
                 const data = await response.json();
+                this.totalTrades = data.pagination ? data.pagination.total : (data.total || 0);
                 this.updateRecentTradesUI(data.trades || []);
+                this.updateTradesPagination();
             } else {
                 throw new Error('Failed to fetch recent trades');
             }
@@ -908,15 +1375,119 @@ class EnhancedDashboard {
         }
     }
 
+    async exportTradesToCSV() {
+        try {
+            // Show loading state
+            const exportButton = document.getElementById('export-trades-csv');
+            const originalText = exportButton.innerHTML;
+            exportButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Exporting...';
+            exportButton.disabled = true;
+            
+            // Get current filter values
+            const statusFilter = (document.getElementById('trades-filter') ? document.getElementById('trades-filter').value : null) || 'all';
+const searchTerm = (document.getElementById('trade-search') ? document.getElementById('trade-search').value : null) || '';
+            
+            // Build query parameters
+            const params = new URLSearchParams();
+            if (statusFilter && statusFilter !== 'all') {
+                params.append('status', statusFilter);
+            }
+            if (searchTerm) {
+                params.append('pair', searchTerm); // Use pair parameter for search
+            }
+            params.append('limit', '10000'); // Export more trades
+            
+            // Call the export endpoint with cache-busting
+            const timestamp = Date.now();
+            const response = await fetch(`/api/v1/trades/export/csv?${params.toString()}&_t=${timestamp}`);
+            
+            if (!response.ok) {
+                throw new Error(`Export failed: ${response.statusText}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.status === 'error') {
+                throw new Error(data.message || 'Export failed');
+            }
+            
+            // Create and download the CSV file
+            console.log('CSV content length:', data.csv_content.length);
+            console.log('Trade count from API:', data.trade_count);
+            console.log('First 500 chars of CSV:', data.csv_content.substring(0, 500));
+            
+            // Use a more robust download method for large files
+            try {
+                // Method 1: Blob with explicit MIME type
+                const blob = new Blob([data.csv_content], { 
+                    type: 'text/csv;charset=utf-8;' 
+                });
+                console.log('Blob size:', blob.size);
+                
+                const link = document.createElement('a');
+                const url = URL.createObjectURL(blob);
+                link.setAttribute('href', url);
+                link.setAttribute('download', data.filename);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                // Clean up the URL object
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                
+            } catch (blobError) {
+                console.error('Blob method failed:', blobError);
+                
+                // Method 2: Data URL fallback
+                try {
+                    const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(data.csv_content);
+                    const link = document.createElement('a');
+                    link.href = dataUrl;
+                    link.download = data.filename;
+                    link.style.display = 'none';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                } catch (dataUrlError) {
+                    console.error('Data URL method failed:', dataUrlError);
+                    throw new Error('All download methods failed');
+                }
+            }
+            
+            // Show success notification
+            this.showNotification(`Successfully exported ${data.trade_count} trades to CSV`, 'success');
+            
+        } catch (error) {
+            console.error('Error exporting trades to CSV:', error);
+            this.showNotification(`Export failed: ${error.message}`, 'error');
+        } finally {
+            // Restore button state
+            const exportButton = document.getElementById('export-trades-csv');
+            if (exportButton) {
+                exportButton.innerHTML = '<i class="fas fa-download"></i><span>Export CSV</span>';
+                exportButton.disabled = false;
+            }
+        }
+    }
+
     updateRecentTradesUI(trades) {
         const tbody = document.getElementById('trades-table-body');
         if (!tbody) return;
 
-        // Apply current filters
-        const filteredTrades = this.applyRecentTradesFilter(trades);
+        // Server-side filtering is now handled, but still apply search filter if needed
+        let filteredTrades = trades;
+        if (this.currentTradesSearch) {
+            const searchLower = this.currentTradesSearch.toLowerCase();
+            filteredTrades = trades.filter(trade => 
+                (trade.trade_id && trade.trade_id.toLowerCase().includes(searchLower)) ||
+                (trade.pair && trade.pair.toLowerCase().includes(searchLower)) ||
+                (trade.exchange && trade.exchange.toLowerCase().includes(searchLower))
+            );
+        }
 
         if (filteredTrades.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="14" class="text-center py-8 text-gray-500">No trades found</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="16" class="text-center py-8 text-gray-500">No trades found</td></tr>';
             return;
         }
 
@@ -952,11 +1523,21 @@ class EnhancedDashboard {
                 <td class="font-semibold">${trade.pair || 'N/A'}</td>
                 <td class="mobile-hidden">${trade.exchange || 'N/A'}</td>
                 <td class="mobile-hidden text-sm">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="mobile-hidden text-sm">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
                 <td class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
                 <td class="text-right font-mono">${this.formatCurrency(trade.current_price, 4)}</td>
                 <td class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
                 <td class="text-right font-mono" id="notional-value-${trade.trade_id || 'N/A'}">
                     ${this.formatCurrency(((trade.entry_price || 0) * (trade.position_size || 0)), 2)}
+                </td>
+                <td class="fee-col mobile-hidden text-right font-mono text-red-600" title="Entry fee: ${trade.entry_fee_amount || 0} ${trade.entry_fee_currency || ''}">
+                    ${trade.entry_fee_amount !== null && trade.entry_fee_amount !== undefined && trade.entry_fee_currency ? (trade.entry_fee_amount.toFixed(4) + ' ' + trade.entry_fee_currency) : 'N/A'}
+                </td>
+                <td class="fee-col mobile-hidden text-right font-mono text-red-600" title="Exit fee: ${trade.exit_fee_amount || 0} ${trade.exit_fee_currency || ''}">
+                    ${trade.exit_fee_amount !== null && trade.exit_fee_amount !== undefined && trade.exit_fee_currency ? (trade.exit_fee_amount.toFixed(4) + ' ' + trade.exit_fee_currency) : 'N/A'}
+                </td>
+                <td class="fee-col text-right font-mono text-red-600" title="Total fees in USD">
+                    ${trade.total_fees_usd ? this.formatCurrency(trade.total_fees_usd, 2) : this.formatCurrency(trade.fees || 0, 2)}
                 </td>
                 <td class="text-right font-mono ${pnlClass}">
                     ${this.formatCurrency(trade.unrealized_pnl || 0, 2)}
@@ -1005,6 +1586,12 @@ class EnhancedDashboard {
                     ${trade.highest_price !== undefined && trade.highest_price !== null ? 
                       this.formatCurrency(trade.highest_price, 6) : 'None'}
                 </td>
+                <td class="entry-id-col font-mono text-sm" title="${trade.entry_id || 'N/A'}">
+                    ${trade.entry_id || 'N/A'}
+                </td>
+                <td class="exit-id-col font-mono text-sm" title="${trade.exit_id || 'N/A'}">
+                    ${trade.exit_id || 'N/A'}
+                </td>
             </tr>
         `;
     }
@@ -1012,9 +1599,14 @@ class EnhancedDashboard {
     applyRecentTradesFilter(trades) {
         let filtered = trades;
 
-        // Apply status filter
-        if (this.currentTradesFilter !== 'all') {
-            filtered = filtered.filter(trade => trade.status === this.currentTradesFilter);
+        // Apply status filter - normalize filter value to handle case variations
+        const normalizedFilter = this.currentTradesFilter.toLowerCase();
+        
+        // Only filter if not 'all' or 'All'
+        if (normalizedFilter !== 'all' && normalizedFilter !== '') {
+            // Convert filter to uppercase to match database status format (OPEN, CLOSED, FAILED)
+            const statusFilter = this.currentTradesFilter.toUpperCase();
+            filtered = filtered.filter(trade => trade.status === statusFilter);
         }
 
         // Apply search filter
@@ -1024,6 +1616,30 @@ class EnhancedDashboard {
                 (trade.trade_id && trade.trade_id.toLowerCase().includes(searchLower)) ||
                 (trade.pair && trade.pair.toLowerCase().includes(searchLower))
             );
+        }
+
+        // Apply sorting
+        if (this.currentRecentTradesSort && this.currentRecentTradesSort.column) {
+            filtered.sort((a, b) => {
+                const column = this.currentRecentTradesSort.column;
+                const direction = this.currentRecentTradesSort.direction;
+                
+                let aValue, bValue;
+                
+                if (column === 'entry_time' || column === 'exit_time') {
+                    aValue = a[column] ? new Date(a[column]).getTime() : 0;
+                    bValue = b[column] ? new Date(b[column]).getTime() : 0;
+                } else {
+                    aValue = a[column] || '';
+                    bValue = b[column] || '';
+                }
+                
+                if (direction === 'desc') {
+                    return bValue > aValue ? 1 : -1;
+                } else {
+                    return aValue > bValue ? 1 : -1;
+                }
+            });
         }
 
         return filtered;
@@ -1047,12 +1663,75 @@ class EnhancedDashboard {
 
     filterRecentTrades(filter) {
         this.currentTradesFilter = filter;
+        this.currentTradesPage = 1; // Reset to first page when filtering
         this.refreshRecentTrades();
     }
 
     searchRecentTrades(searchTerm) {
         this.currentTradesSearch = searchTerm;
+        this.currentTradesPage = 1; // Reset to first page when searching
         this.refreshRecentTrades();
+    }
+
+    updateTradesPagination() {
+        // Create or update pagination info
+        const tradesSection = document.querySelector('#trades-table-body').closest('.enhanced-card');
+        if (!tradesSection) return;
+        
+        // Remove existing pagination if it exists
+        const existingPagination = tradesSection.querySelector('.trades-pagination');
+        if (existingPagination) existingPagination.remove();
+        
+        const totalPages = Math.ceil(this.totalTrades / this.tradesPerPage);
+        if (totalPages <= 1) return; // Don't show pagination for single page
+        
+        const start = (this.currentTradesPage - 1) * this.tradesPerPage + 1;
+        const end = Math.min(this.currentTradesPage * this.tradesPerPage, this.totalTrades);
+        
+        const paginationHTML = `
+            <div class="trades-pagination mt-4 flex items-center justify-between px-4 py-3 bg-white border-t border-gray-200">
+                <div class="flex items-center text-sm text-gray-700">
+                    <span>Showing ${start}-${end} of ${this.totalTrades} trades</span>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <button class="trades-prev-page px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed" 
+                            ${this.currentTradesPage <= 1 ? 'disabled' : ''}>
+                        <i class="fas fa-chevron-left mr-1"></i> Previous
+                    </button>
+                    <span class="text-sm text-gray-700">
+                        Page ${this.currentTradesPage} of ${totalPages}
+                    </span>
+                    <button class="trades-next-page px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                            ${this.currentTradesPage >= totalPages ? 'disabled' : ''}>
+                        Next <i class="fas fa-chevron-right ml-1"></i>
+                    </button>
+                </div>
+            </div>
+        `;
+        
+        tradesSection.insertAdjacentHTML('beforeend', paginationHTML);
+        
+        // Add event listeners
+        const prevBtn = tradesSection.querySelector('.trades-prev-page');
+        const nextBtn = tradesSection.querySelector('.trades-next-page');
+        
+        if (prevBtn) {
+            prevBtn.addEventListener('click', () => {
+                if (this.currentTradesPage > 1) {
+                    this.currentTradesPage--;
+                    this.refreshRecentTrades();
+                }
+            });
+        }
+        
+        if (nextBtn) {
+            nextBtn.addEventListener('click', () => {
+                if (this.currentTradesPage < totalPages) {
+                    this.currentTradesPage++;
+                    this.refreshRecentTrades();
+                }
+            });
+        }
     }
 
     startPeriodicUpdates() {
@@ -1062,6 +1741,7 @@ class EnhancedDashboard {
             this.fetchBotStatus();
             this.refreshRecentTrades();
             this.updateExchangeStatus();
+            this.updateBybitWebSocketStatus();
             this.updateStrategyPerformance();
         }, 30000);
         
@@ -1070,6 +1750,7 @@ class EnhancedDashboard {
         this.refreshTradeHistory();
         this.refreshRecentTrades();
         this.updateExchangeStatus();
+        this.updateBybitWebSocketStatus();
         this.updateStrategyPerformance();
     }
 
@@ -1101,6 +1782,7 @@ class EnhancedDashboard {
                     exchange: exchange,
                     total_balance: data.balance,
                     available_balance: data.available_balance || data.available,
+                    invested_amount: data.invested_amount || 0,
                     total_pnl: data.total_pnl,
                     timestamp: data.timestamp
                 })) : [];
@@ -1118,7 +1800,7 @@ class EnhancedDashboard {
         if (!exchangeData || exchangeData.length === 0) {
             tbody.innerHTML = `
                 <tr>
-                    <td colspan="5" class="text-center py-8 text-gray-500">
+                    <td colspan="6" class="text-center py-8 text-gray-500">
                         <div class="flex items-center justify-center">
                             <i class="fas fa-info-circle mr-2"></i>
                             No per-exchange balance data available
@@ -1140,6 +1822,7 @@ class EnhancedDashboard {
                     </td>
                     <td class="text-right font-mono">${this.formatCurrency(exchange.total_balance || 0, 2)}</td>
                     <td class="text-right font-mono">${this.formatCurrency(exchange.available_balance || 0, 2)}</td>
+                    <td class="text-right font-mono text-blue-600">${this.formatCurrency(exchange.invested_amount || 0, 2)}</td>
                     <td class="text-right font-mono ${this.getPnlClass(exchange.total_pnl || 0)}">
                         ${this.formatCurrency(exchange.total_pnl || 0, 2)}
                     </td>
@@ -1315,58 +1998,140 @@ class EnhancedDashboard {
         }
     }
 
+    async updateBybitWebSocketStatus() {
+        try {
+            const response = await fetch('/api/v1/websocket/bybit/status');
+            if (response.ok) {
+                const data = await response.json();
+                this.updateBybitWebSocketDisplay(data);
+            } else {
+                console.error('Failed to fetch Bybit WebSocket status');
+            }
+        } catch (error) {
+            console.error('Error updating Bybit WebSocket status:', error);
+        }
+    }
+
+    updateBybitWebSocketDisplay(data) {
+        const bybitStatusElement = document.querySelector('[data-status-text="bybit"]');
+        const bybitConnectionElement = document.querySelector('.websocket-connection-status');
+        
+        if (!data || !data.manager_status) {
+            if (bybitStatusElement) {
+                bybitStatusElement.textContent = 'Error';
+                bybitStatusElement.className = 'websocket-status-text text-sm text-red-600';
+            }
+            if (bybitConnectionElement) {
+                bybitConnectionElement.textContent = 'Error';
+            }
+            return;
+        }
+
+        const managerStatus = data.manager_status;
+        const connected = managerStatus.connected || false;
+        const running = managerStatus.running || false;
+        const state = managerStatus.state || 'unknown';
+        
+        let statusText = 'Disconnected';
+        let statusClass = 'text-red-600';
+        
+        if (connected && running) {
+            statusText = 'Connected';
+            statusClass = 'text-green-600';
+        } else if (connected && state === 'authenticating') {
+            statusText = 'Authenticating';
+            statusClass = 'text-yellow-600';
+        } else if (connected) {
+            statusText = 'Connected';
+            statusClass = 'text-green-600';
+        }
+        
+        // Update status text
+        if (bybitStatusElement) {
+            bybitStatusElement.textContent = statusText;
+            bybitStatusElement.className = `websocket-status-text text-sm ${statusClass}`;
+        }
+        
+        // Update connection status
+        if (bybitConnectionElement) {
+            bybitConnectionElement.textContent = statusText;
+        }
+        
+        // Update connection details if available
+        if (managerStatus.connection_metrics && managerStatus.connection_metrics.auth_metrics) {
+            const authMetrics = managerStatus.connection_metrics.auth_metrics;
+            const lastUpdate = authMetrics.last_auth_time ? 
+                new Date(authMetrics.last_auth_time).toLocaleTimeString() : 
+                new Date().toLocaleTimeString();
+            
+            // Update last update time
+            const lastUpdateElement = bybitConnectionElement?.parentElement?.querySelector('.last-update');
+            if (lastUpdateElement) {
+                lastUpdateElement.textContent = `Last Update: ${lastUpdate}`;
+            }
+            
+            // Update callback count
+            const callbackElement = bybitConnectionElement?.parentElement?.querySelector('.callback-count');
+            if (callbackElement && data.callback_counts) {
+                const totalCallbacks = Object.values(data.callback_counts).reduce((sum, count) => sum + count, 0);
+                callbackElement.textContent = `Callbacks: ${totalCallbacks}`;
+            }
+        }
+    }
+
+    updateBybitHealthMetrics(healthData) {
+        const metricsContainer = document.getElementById('bybit-health-metrics');
+        if (!metricsContainer || !healthData.current_metrics) return;
+        
+        const metrics = healthData.current_metrics;
+        let metricsHTML = '<div class="grid grid-cols-2 gap-2 text-xs">';
+        
+        Object.entries(metrics).forEach(([metricName, metric]) => {
+            const value = metric.value || 0;
+            const unit = metric.unit || '';
+            const status = metric.status || 'unknown';
+            
+            let statusColor = 'text-gray-500';
+            if (status === 'healthy') statusColor = 'text-green-600';
+            else if (status === 'degraded') statusColor = 'text-yellow-600';
+            else if (status === 'unhealthy') statusColor = 'text-red-600';
+            else if (status === 'critical') statusColor = 'text-red-800';
+            
+            metricsHTML += `
+                <div class="flex justify-between">
+                    <span class="font-medium">${metricName.replace(/_/g, ' ')}:</span>
+                    <span class="${statusColor}">${value}${unit}</span>
+                </div>
+            `;
+        });
+        
+        metricsHTML += '</div>';
+        metricsContainer.innerHTML = metricsHTML;
+    }
+
     async updateStrategyPerformance() {
         try {
-            // Get trade data to calculate strategy performance
-            const tradesResponse = await fetch('/api/trades?limit=200');
-            if (!tradesResponse.ok) return;
-            const tradesData = await tradesResponse.json();
+            // Use the new strategy performance API endpoint
+            const strategyResponse = await fetch('/api/strategy-performance');
+            if (!strategyResponse.ok) return;
+            const strategyData = await strategyResponse.json();
 
             const strategyPerformanceContainer = document.getElementById('strategy-performance');
             if (!strategyPerformanceContainer) return;
 
-            // Calculate strategy statistics
-            const strategies = {};
-            const trades = tradesData.trades || [];
+            const strategies = strategyData.strategies || {};
 
-            trades.forEach(trade => {
-                const strategy = trade.strategy || 'unknown';
-                const status = trade.status;
-                const realizedPnl = parseFloat(trade.realized_pnl || 0);
+            if (Object.keys(strategies).length === 0) {
+                strategyPerformanceContainer.innerHTML = '<div class="text-center text-gray-500 p-4">No strategy performance data available</div>';
+                return;
+            }
 
-                if (!strategies[strategy]) {
-                    strategies[strategy] = {
-                        total: 0,
-                        wins: 0,
-                        losses: 0,
-                        open: 0,
-                        totalPnl: 0,
-                        enabled: true
-                    };
-                }
-
-                strategies[strategy].total += 1;
-
-                if (status === 'OPEN') {
-                    strategies[strategy].open += 1;
-                } else if (status === 'CLOSED' && realizedPnl !== 0) {
-                    strategies[strategy].totalPnl += realizedPnl;
-                    if (realizedPnl > 0) {
-                        strategies[strategy].wins += 1;
-                    } else {
-                        strategies[strategy].losses += 1;
-                    }
-                }
-            });
-
-            const strategyCards = Object.keys(strategies).map(strategyName => {
-                const stats = strategies[strategyName];
-                const closedTrades = stats.wins + stats.losses;
-                const winRate = closedTrades > 0 ? (stats.wins / closedTrades * 100) : 0;
+            const strategyCards = Object.entries(strategies).map(([strategyName, stats]) => {
+                const winRate = stats.win_rate_percentage || 0;
                 
-                // Determine performance color
+                // Determine performance color based on win rate
                 let performanceColor = 'gray';
-                if (closedTrades === 0) {
+                if (stats.closed_trades === 0) {
                     performanceColor = 'gray';
                 } else if (winRate >= 60) {
                     performanceColor = 'green';
@@ -1386,11 +2151,11 @@ class EnhancedDashboard {
                         <div class="space-y-1">
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">Total:</span>
-                                <span class="font-medium">${stats.total}</span>
+                                <span class="font-medium">${stats.total_trades}</span>
                             </div>
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">Open:</span>
-                                <span class="font-medium">${stats.open}</span>
+                                <span class="font-medium">${stats.open_trades}</span>
                             </div>
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">Win Rate:</span>
@@ -1398,7 +2163,7 @@ class EnhancedDashboard {
                             </div>
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">PnL:</span>
-                                <span class="font-medium ${this.getPnlClass(stats.totalPnl)}">${this.formatCurrency(stats.totalPnl, 2)}</span>
+                                <span class="font-medium ${this.getPnlClass(stats.total_pnl)}">${this.formatCurrency(stats.total_pnl, 2)}</span>
                             </div>
                         </div>
                     </div>
@@ -1421,6 +2186,10 @@ class EnhancedDashboard {
 
         } catch (error) {
             console.error('Error updating strategy performance:', error);
+            const strategyPerformanceContainer = document.getElementById('strategy-performance');
+            if (strategyPerformanceContainer) {
+                strategyPerformanceContainer.innerHTML = '<div class="text-center text-red-500 p-4">Error loading strategy performance</div>';
+            }
         }
     }
 
@@ -1437,6 +2206,7 @@ class EnhancedDashboard {
 
 // Initialize dashboard when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
+    console.log('DOM loaded, initializing dashboard...');
     window.dashboard = new EnhancedDashboard();
 });
 
@@ -1448,6 +2218,6 @@ window.addEventListener('beforeunload', () => {
 });
 
 // Expose some functions globally for compatibility
-window.fetchPortfolio = () => window.dashboard?.updatePortfolio();
-window.fetchBotStatus = () => window.dashboard?.fetchBotStatus();
-window.connectWebSocket = () => window.dashboard?.setupWebSocket();
+window.fetchPortfolio = () => (window.dashboard ? window.dashboard.updatePortfolio() : null);
+window.fetchBotStatus = () => (window.dashboard ? window.dashboard.fetchBotStatus() : null);
+window.connectWebSocket = () => (window.dashboard ? window.dashboard.setupWebSocket() : null);

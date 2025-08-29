@@ -56,6 +56,12 @@ class Dashboard {
         document.getElementById('start-btn').addEventListener('click', () => this.startTrading());
         document.getElementById('stop-btn').addEventListener('click', () => this.stopTrading());
         document.getElementById('emergency-btn').addEventListener('click', () => this.emergencyStop());
+        
+        // CSV Export button
+        const exportButton = document.getElementById('export-trades-csv');
+        if (exportButton) {
+            exportButton.addEventListener('click', () => this.exportTradesToCSV());
+        }
     }
     
     setupToast() {
@@ -328,6 +334,7 @@ class Dashboard {
                 <td class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exchange || 'N/A'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
@@ -530,6 +537,68 @@ class Dashboard {
         
         return tooltip.trim();
     }
+    
+    async exportTradesToCSV() {
+        try {
+            // Show loading state
+            const exportButton = document.getElementById('export-trades-csv');
+            const originalText = exportButton.innerHTML;
+            exportButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Exporting...';
+            exportButton.disabled = true;
+            
+            // Get current filter values
+            const statusFilter = document.getElementById('trades-filter')?.value || 'all';
+            const searchTerm = document.getElementById('trade-search')?.value || '';
+            
+            // Build query parameters
+            const params = new URLSearchParams();
+            if (statusFilter && statusFilter !== 'all') {
+                params.append('status', statusFilter);
+            }
+            if (searchTerm) {
+                params.append('pair', searchTerm); // Use pair parameter for search
+            }
+            params.append('limit', '10000'); // Export more trades
+            
+            // Call the export endpoint
+            const response = await fetch(`/api/v1/trades/export/csv?${params.toString()}`);
+            
+            if (!response.ok) {
+                throw new Error(`Export failed: ${response.statusText}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.status === 'error') {
+                throw new Error(data.message || 'Export failed');
+            }
+            
+            // Create and download the CSV file
+            const blob = new Blob([data.csv_content], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', data.filename);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            // Show success notification
+            this.showNotification(`Successfully exported ${data.trade_count} trades to CSV`, 'success');
+            
+        } catch (error) {
+            console.error('Error exporting trades to CSV:', error);
+            this.showNotification(`Export failed: ${error.message}`, 'error');
+        } finally {
+            // Restore button state
+            const exportButton = document.getElementById('export-trades-csv');
+            if (exportButton) {
+                exportButton.innerHTML = '<i class="fas fa-download"></i><span>Export CSV</span>';
+                exportButton.disabled = false;
+            }
+        }
+    }
 }
 
 function updateExchangeBreakdownTable(exchangeData) {
@@ -559,7 +628,6 @@ function updateExchangeBreakdownTable(exchangeData) {
 }
 
 // Add this function for trade history rendering (similar to updateRecentTradesUI)
-function updateTradeHistoryUI(trades) {
     const tbody = document.getElementById('trade-history-table-body');
     if (!tbody) return;
     if (!trades || trades.length === 0) {
@@ -595,15 +663,10 @@ function updateTradeHistoryUI(trades) {
     `).join('');
 }
 
-// Patch the dashboard to call updateTradeHistoryUI after fetching trade history
-// (Assume the function that fetches trade history is called updateTradeHistory)
-const origUpdateTradeHistory = Dashboard.prototype.updateTradeHistory;
-Dashboard.prototype.updateTradeHistory = async function() {
     try {
         const response = await fetch('/api/trades/closed/history?limit=20');
         if (response.ok) {
             const data = await response.json();
-            updateTradeHistoryUI(data.trades || []);
         }
     } catch (error) {
         console.error('Error updating trade history:', error);

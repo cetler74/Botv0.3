@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY services/orchestrator-service/main.py .
+COPY services/orchestrator-service/redis_order_manager.py .
 # Copy core module needed for pair selection
 COPY core ./core
 

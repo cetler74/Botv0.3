@@ -47,7 +47,7 @@ import pandas_ta as ta
 from datetime import datetime, timezone, timedelta
 import os
 from strategy.base_strategy import BaseStrategy
-from strategy.strategy_pnl import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, manage_trailing_stop, restore_profit_protection_state
+from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced, manage_trailing_stop, restore_profit_protection_state
 import asyncio
 from strategy.condition_logger import ConditionLogger
 

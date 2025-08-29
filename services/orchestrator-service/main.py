@@ -1,18 +1,21 @@
+from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
+
 """
 Orchestrator Service for the Multi-Exchange Trading Bot
 Main trading coordination and decision making
 
-VERSION: 2.1.0 (2025-08-24)
+VERSION: 2.5.0 (2025-08-28)
 CHANGELOG:
-- v2.1.0: ENHANCED RISK MANAGEMENT - Multi-layered safety system
-  * LAYER 1: Current unrealized PnL protection (2+ negative positions)
-  * LAYER 2: Recent realized losses & cooldown periods (24h analysis)
+- v2.5.0: CRITICAL TRADING FIXES - Stop Loss Hemorrhaging and Risk Management
+  * FIXED: Risk logic now correctly requires 1+ losses (not 2+) to match consecutive_loss_limit=1
+  * FIXED: Stop loss changed from 0.8% to 3% - appropriate for crypto market volatility  
+  * CORRECTED: Prevents repeat trades on losing pairs after ANY negative result
+  * LAYER 1: Current unrealized PnL protection (1+ negative positions)
+  * LAYER 2: Historical loss pattern protection (1+ losses within 2 hours) - NOW WORKING!
   * LAYER 3: Portfolio-level drawdown protection ($100+ loss threshold)
   * LAYER 4: Exchange-level risk assessment (systematic performance)
-  * ADDED: Historical loss pattern detection (2+ losses = cooldown)
-  * ADDED: Large single loss protection ($20+ threshold)
-  * ADDED: Comprehensive risk logging for transparency
-  * MAINTAINED: Original 2-negative-position threshold for entry adjustment
+  * ENHANCED: Proper crypto-appropriate stop loss levels prevent normal volatility exits
+  * ULTIMATE: Stops money hemorrhaging from tight stops + broken loss prevention
 """
 
 import asyncio
@@ -25,9 +28,9 @@ import os
 import httpx
 
 # Version tracking
-ORCHESTRATOR_VERSION = "2.1.0"
-VERSION_DATE = "2025-08-24"
-RISK_MANAGEMENT_VERSION = "2.1.0"
+ORCHESTRATOR_VERSION = "2.4.0"
+VERSION_DATE = "2025-08-25"
+RISK_MANAGEMENT_VERSION = "2.4.0"
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -244,7 +247,7 @@ class OrderTracker:
         }
         self.performance_lock = asyncio.Lock()
     
-    async def track_order(self, order_id: str, order_data: dict, timeout_seconds: int = 300):
+    async def track_order(self, order_id: str, order_data: dict, timeout_seconds: int = 120):
         """Track a new order with timeout"""
         self.pending_orders[order_id] = {
             'order_data': order_data,
@@ -282,7 +285,7 @@ class OrderTracker:
         
         order_info = self.pending_orders[order_id]
         created_at = order_info['created_at']
-        timeout_seconds = self.order_timeouts.get(order_id, 300)
+        timeout_seconds = self.order_timeouts.get(order_id, 120)
         
         time_pending = datetime.utcnow() - created_at
         return time_pending.total_seconds() > timeout_seconds
@@ -1012,7 +1015,7 @@ class TradingOrchestrator:
             
             # Get all open trades from database
             async with httpx.AsyncClient(timeout=60.0) as client:
-                trades_response = await client.get(f"{database_service_url}/api/v1/trades?status=OPEN")
+                trades_response = await client.get(f"{database_service_url}/api/v1/trades?status=OPEN,EXIT_FAILED")
                 if trades_response.status_code != 200:
                     logger.error(f"❌ Failed to get open trades: {trades_response.status_code}")
                     return sync_results
@@ -1358,6 +1361,13 @@ class TradingOrchestrator:
                 logger.warning(f"[ExitCheck] Skipping: invalid or missing trade_id: {trade_id}")
                 return
 
+            # Special handling for EXIT_FAILED trades
+            status = trade.get('status')
+            if status == 'EXIT_FAILED':
+                logger.warning(f"[Trade {trade_id}] [EXIT_FAILED] Trade requires manual intervention - skipping automatic exit checks")
+                logger.warning(f"[Trade {trade_id}] [EXIT_FAILED] Please manually close position for {trade.get('pair')} on {trade.get('exchange')}")
+                return
+
             # Get trading configuration for stop loss and trailing stop
             default_stop_loss = -2.0  # Fallback if config fetch fails
             trailing_trigger_pct = 2.0  # Fallback if config fetch fails
@@ -1422,7 +1432,7 @@ class TradingOrchestrator:
             try:
                 if position_size > 0:  # Long position
                     pnl_percentage = ((current_price - entry_price) / entry_price) * 100
-                    unrealized_pnl = (current_price - entry_price) * position_size
+                    unrealized_pnl = calculate_unrealized_pnl_with_fees(entry_price, current_price, position_size)
                 else:  # Short position
                     pnl_percentage = ((entry_price - current_price) / entry_price) * 100
                     unrealized_pnl = (entry_price - current_price) * position_size
@@ -1441,11 +1451,15 @@ class TradingOrchestrator:
             except Exception:
                 highest_price = current_price
 
-            # Update trade with current data
+            # Update trade with current data and increment price update counter
+            current_count = trade.get('price_updates_count', 0)
             await self._update_trade_data(trade_id, {
                 'unrealized_pnl': unrealized_pnl,
                 'highest_price': highest_price,
-                'current_price': current_price
+                'current_price': current_price,
+                'price_updates_count': current_count + 1,
+                'last_price_update': datetime.utcnow().isoformat(),
+                'websocket_price_source': getattr(self, '_last_price_source', 'rest') == 'websocket'
             })
 
             # Check exit conditions with profit protection
@@ -1918,7 +1932,7 @@ class TradingOrchestrator:
             # CONDITION CHECK 1: Risk Management
             logger.info(f"🔍 [CONDITION 1] Checking risk management for {pair} on {exchange_name}")
             if not await self._check_pair_risk_management(exchange_name, pair):
-                logger.warning(f"❌ [CONDITION 1] Risk Management Block: Skipping {pair} on {exchange_name} - has 2+ losing positions")
+                logger.warning(f"❌ [CONDITION 1] Risk Management Block: Skipping {pair} on {exchange_name} - risk management check failed")
                 return
             else:
                 logger.info(f"✅ [CONDITION 1] Risk management check passed for {pair} on {exchange_name}")
@@ -2018,7 +2032,7 @@ class TradingOrchestrator:
         Returns False if any risk threshold is exceeded
         """
         try:
-            logger.info(f"🔍 [RISK MANAGEMENT v2.1.0] Comprehensive risk analysis for {pair} on {exchange_name}")
+            logger.info(f"🔍 [RISK MANAGEMENT v2.4.0] Enhanced protection analysis for {pair} on {exchange_name}")
             
             # Get all trades (open and recent closed) for comprehensive analysis
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -2026,22 +2040,47 @@ class TradingOrchestrator:
                 response = await client.get(f"{database_service_url}/api/v1/trades/open")
                 response.raise_for_status()
                 open_trades = response.json()['trades']
-                
-                # Get recent closed trades (last 24 hours) for historical analysis
-                from datetime import datetime, timedelta
-                yesterday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-                
+            
+                # Get recent closed trades for loss pattern analysis (within 2 hours only)
                 try:
                     response = await client.get(f"{database_service_url}/api/v1/trades")
                     response.raise_for_status()
                     all_trades = response.json()['trades']
-                    recent_closed_trades = [
-                        trade for trade in all_trades 
+                    
+                    # Filter closed trades to only those from last 2 hours with losses
+                    two_hours_ago = datetime.now() - timedelta(hours=2)
+                    recent_closed_trades = []
+                    
+                    for trade in all_trades:
                         if (trade.get('status') in ['CLOSED', 'FAILED'] and 
                             trade.get('exchange') == exchange_name and 
                             trade.get('pair') == pair and
-                            trade.get('exit_time', trade.get('updated_at', '')) >= yesterday)
-                    ]
+                            trade.get('realized_pnl') is not None and
+                            float(trade.get('realized_pnl', 0)) < 0):  # Only negative PnL trades
+                            
+                            # Check if trade was closed within last 2 hours
+                            try:
+                                # Try exit_time first, fallback to updated_at
+                                exit_time_str = trade.get('exit_time') or trade.get('updated_at')
+                                if exit_time_str:
+                                    # Parse timestamp (handle both with and without timezone)
+                                    if 'T' in exit_time_str:
+                                        if '+' in exit_time_str:
+                                            exit_time = datetime.fromisoformat(exit_time_str.replace('Z', '+00:00'))
+                                        else:
+                                            exit_time = datetime.fromisoformat(exit_time_str.replace('Z', ''))
+                                        
+                                        # Convert to naive datetime for comparison (assume UTC)
+                                        if exit_time.tzinfo:
+                                            exit_time = exit_time.replace(tzinfo=None)
+                                        
+                                        # Only include if within last 2 hours
+                                        if exit_time >= two_hours_ago:
+                                            recent_closed_trades.append(trade)
+                            except Exception as time_parse_error:
+                                # If we can't parse time, skip this trade to be safe
+                                logger.debug(f"Could not parse exit time for trade {trade.get('trade_id')}: {time_parse_error}")
+                                continue
                 except Exception:
                     recent_closed_trades = []  # Fallback if historical data unavailable
             
@@ -2074,8 +2113,8 @@ class TradingOrchestrator:
                         'position_size': trade.get('position_size')
                     })
             
-            # Check 1: Block if 2+ open positions are negative (keeps original logic)
-            if len(negative_positions) >= 2:
+            # Check 1: Block if 1+ open positions are negative (enhanced protection)
+            if len(negative_positions) >= 1:
                 total_negative_pnl = sum(pos['unrealized_pnl'] for pos in negative_positions)
                 logger.warning(f"🚫 [LAYER 1] Unrealized PnL Block: {pair} on {exchange_name}")
                 logger.warning(f"   - Total open positions: {len(pair_open_trades)}")
@@ -2084,41 +2123,59 @@ class TradingOrchestrator:
                 logger.warning(f"   - Negative trades: {[pos['trade_id'][:8] for pos in negative_positions]}")
                 return False
             
-            # === LAYER 2: Recent Realized Losses & Cooldown Analysis ===
-            recent_losses = []
-            total_recent_realized_pnl = 0
+            # === LAYER 2: Combined Loss Pattern Protection ===
+            # Look at BOTH concurrent open losing positions AND historical closed losses
             
-            for trade in recent_closed_trades:
+            # A) Current open positions that are losing
+            current_losing_positions = []
+            for trade in pair_open_trades:
                 try:
-                    realized_pnl = float(trade.get('realized_pnl', 0))
-                    total_recent_realized_pnl += realized_pnl
-                    if realized_pnl < 0:
-                        recent_losses.append({
+                    unrealized_pnl = float(trade.get('unrealized_pnl', 0))
+                    if unrealized_pnl < 0:  # Any negative position
+                        current_losing_positions.append({
                             'trade_id': trade.get('trade_id'),
-                            'realized_pnl': realized_pnl,
-                            'exit_time': trade.get('exit_time', trade.get('updated_at')),
-                            'exit_reason': trade.get('exit_reason', 'unknown')
+                            'pnl': unrealized_pnl,
+                            'type': 'open_loss'
                         })
                 except (ValueError, TypeError):
                     pass
             
-            # Check 2: Block if 2+ realized losses in last 24h (pattern failure)
-            if len(recent_losses) >= 2:
-                total_recent_loss = sum(loss['realized_pnl'] for loss in recent_losses)
-                logger.warning(f"🚫 [LAYER 2] Recent Loss Pattern Block: {pair} on {exchange_name}")
-                logger.warning(f"   - Recent losses (24h): {len(recent_losses)}")
-                logger.warning(f"   - Total realized loss: ${total_recent_loss:.2f}")
-                logger.warning(f"   - Loss trades: {[loss['trade_id'][:8] for loss in recent_losses]}")
-                logger.warning(f"   - Cooldown required: Wait for market regime change")
+            # B) Historical closed losses (already filtered to negative PnL)
+            historical_losses = []
+            for trade in recent_closed_trades:
+                try:
+                    realized_pnl = float(trade.get('realized_pnl', 0))
+                    historical_losses.append({
+                        'trade_id': trade.get('trade_id'),
+                        'pnl': realized_pnl,
+                        'type': 'closed_loss'
+                    })
+                except (ValueError, TypeError):
+                    pass
+            
+            # Combine both types of losses
+            total_losses = current_losing_positions + historical_losses
+            
+            # Check 2: Block if 1 or more losses exist (current OR historical) - matches consecutive_loss_limit: 1
+            if len(total_losses) >= 1:
+                total_loss_amount = sum(loss['pnl'] for loss in total_losses)
+                open_loss_count = len(current_losing_positions)
+                closed_loss_count = len(historical_losses)
+                
+                logger.warning(f"🚫 [LAYER 2] Loss Protection Block: {pair} on {exchange_name}")
+                logger.warning(f"   - Losses detected: {len(total_losses)} (open: {open_loss_count}, closed: {closed_loss_count})")
+                logger.warning(f"   - Combined loss amount: ${total_loss_amount:.2f}")
+                logger.warning(f"   - Loss trades: {[loss['trade_id'][:8] for loss in total_losses]}")
+                logger.warning(f"   - Protection: consecutive_loss_limit=1 - blocking after ANY loss on this pair")
                 return False
             
-            # Check 3: Block if single large recent loss (>1% of typical position)
-            if recent_losses:
-                largest_loss = min(loss['realized_pnl'] for loss in recent_losses)
+            # Check 3: Block if single large loss exists
+            if recent_closed_trades:
+                largest_loss = min(float(trade.get('realized_pnl', 0)) for trade in recent_closed_trades)
                 if largest_loss < -20:  # More than $20 loss (configurable threshold)
-                    logger.warning(f"🚫 [LAYER 2] Large Recent Loss Block: {pair} on {exchange_name}")
-                    logger.warning(f"   - Largest recent loss: ${largest_loss:.2f}")
-                    logger.warning(f"   - Risk: Pair showing adverse behavior")
+                    logger.warning(f"🚫 [LAYER 2] Large Loss Block: {pair} on {exchange_name}")
+                    logger.warning(f"   - Largest loss: ${largest_loss:.2f}")
+                    logger.warning(f"   - Risk: Pair showing severe adverse behavior")
                     return False
             
             # === LAYER 3: Portfolio-Level Drawdown Protection ===
@@ -2156,9 +2213,9 @@ class TradingOrchestrator:
                 return False
             
             # === ALL CHECKS PASSED ===
-            logger.info(f"✅ [RISK MANAGEMENT v2.1.0] All layers passed for {pair} on {exchange_name}")
+            logger.info(f"✅ [RISK MANAGEMENT v2.4.0] All layers passed for {pair} on {exchange_name}")
             logger.info(f"   - Open positions: {len(pair_open_trades)} (negative: {len(negative_positions)})")
-            logger.info(f"   - Recent losses (24h): {len(recent_losses)}")
+            logger.info(f"   - Historical losses: {len(historical_losses) if 'historical_losses' in locals() else 0}")
             logger.info(f"   - Portfolio PnL: ${portfolio_unrealized_pnl:.2f}")
             logger.info(f"   - Exchange PnL: ${exchange_unrealized_pnl:.2f}")
             logger.info(f"   - Status: APPROVED FOR TRADING")
@@ -2175,6 +2232,14 @@ class TradingOrchestrator:
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
         """Execute trade entry with Redis queue-based processing (HYBRID MODE)"""
         try:
+            # CRITICAL PROTECTION: Check risk management before executing trade
+            logger.info(f"🛡️ [RISK CHECK] Checking risk management for {pair} on {exchange_name}")
+            risk_check_passed = await self._check_pair_risk_management(exchange_name, pair)
+            if not risk_check_passed:
+                logger.warning(f"🚫 [RISK BLOCK] Trade blocked by risk management for {pair} on {exchange_name}")
+                return
+            logger.info(f"✅ [RISK CHECK] Risk management passed for {pair} on {exchange_name}")
+            
             # CRITICAL: Check real-time balance before placing order
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
@@ -2231,11 +2296,13 @@ class TradingOrchestrator:
                 logger.warning(f"[TradeEntry] Could not fetch min_order_size_usd from config, using default: ${min_order_size_usd}")
             
             if position_value_usdc < min_order_size_usd:
-                if available_balance >= min_order_size_usd:
-                    logger.info(f"💡 Calculated position size (${position_value_usdc:.2f}) is below minimum (${min_order_size_usd}). Using minimum order size for {pair} on {exchange_name}.")
-                    position_value_usdc = min_order_size_usd
+                # Add 3% safety buffer to account for price fluctuations, fees, and rounding
+                min_order_with_buffer = min_order_size_usd * 1.03
+                if available_balance >= min_order_with_buffer:
+                    logger.info(f"💡 Calculated position size (${position_value_usdc:.2f}) is below minimum (${min_order_size_usd}). Using minimum order size with 3% safety buffer: ${min_order_with_buffer:.2f} for {pair} on {exchange_name}.")
+                    position_value_usdc = min_order_with_buffer
                 else:
-                    logger.warning(f"🚫 Available balance (${available_balance:.2f}) is insufficient for minimum order size (${min_order_size_usd}). Skipping order for {pair} on {exchange_name}.")
+                    logger.warning(f"🚫 Available balance (${available_balance:.2f}) is insufficient for minimum order size with buffer (${min_order_with_buffer:.2f}). Skipping order for {pair} on {exchange_name}.")
                     return
             entry_price = await self._get_current_price(exchange_name, pair)
             if entry_price <= 0:
@@ -2395,11 +2462,13 @@ class TradingOrchestrator:
             logger.info(f"📏 Min order size for {exchange_name}: ${min_order_size_usd}")
             
             if position_value_usdc < min_order_size_usd:
-                if available_balance >= min_order_size_usd:
-                    position_value_usdc = min_order_size_usd
-                    logger.info(f"💡 Using minimum order size: ${min_order_size_usd}")
+                # Add 3% safety buffer to account for price fluctuations, fees, and rounding
+                min_order_with_buffer = min_order_size_usd * 1.03
+                if available_balance >= min_order_with_buffer:
+                    position_value_usdc = min_order_with_buffer
+                    logger.info(f"💡 Using minimum order size with 3% safety buffer: ${min_order_with_buffer:.2f}")
                 else:
-                    logger.warning(f"🚫 Insufficient balance for minimum order: ${available_balance:.2f} < ${min_order_size_usd}")
+                    logger.warning(f"🚫 Insufficient balance for minimum order with buffer: ${available_balance:.2f} < ${min_order_with_buffer:.2f}")
                     return
             
             # Calculate position size in units
@@ -2414,6 +2483,78 @@ class TradingOrchestrator:
                 
             position_size_units = position_value_usdc / current_price
             sanitized_position_size = await self._sanitize_numeric_value_async(position_size_units)
+            
+            # ========== CRITICAL VALIDATION: PREVENT $0.00 ORDERS ==========
+            logger.info(f"🔍 [ORDER VALIDATION] Pre-exchange validation for {pair} on {exchange_name}")
+            logger.info(f"   💵 Position Value USD: ${position_value_usdc:.2f}")
+            logger.info(f"   📈 Current Price: ${current_price:.8f}")
+            logger.info(f"   📦 Raw Position Size: {position_size_units:.8f}")
+            logger.info(f"   ✨ Sanitized Position Size: {sanitized_position_size:.8f}")
+            
+            # VALIDATION 1: Check if sanitized position size is zero or invalid
+            if sanitized_position_size <= 0:
+                error_msg = f"❌ [VALIDATION FAILED] Zero/negative position size detected"
+                logger.error(f"{error_msg}: {sanitized_position_size}")
+                logger.error(f"   💵 Position Value: ${position_value_usdc:.2f}")
+                logger.error(f"   📈 Price: ${current_price:.8f}")
+                logger.error(f"   📦 Raw Size: {position_size_units:.8f}")
+                
+                # CREATE FAILED TRADE RECORD WITH ACTUAL FAILURE REASON
+                trade_id = str(uuid.uuid4())
+                await self._create_failed_trade_record(
+                    trade_id=trade_id,
+                    exchange_name=exchange_name,
+                    pair=pair,
+                    strategy_name=strategy_name,
+                    failure_reason=f"Zero position size after sanitization: {sanitized_position_size}",
+                    position_value_usd=position_value_usdc,
+                    current_price=current_price,
+                    raw_position_size=position_size_units
+                )
+                return
+            
+            # VALIDATION 2: Check if position value would result in dust trade
+            calculated_value = sanitized_position_size * current_price
+            if calculated_value < min_order_size_usd:
+                error_msg = f"❌ [VALIDATION FAILED] Order value below minimum"
+                logger.error(f"{error_msg}: ${calculated_value:.2f} < ${min_order_size_usd}")
+                
+                # CREATE FAILED TRADE RECORD WITH ACTUAL FAILURE REASON
+                trade_id = str(uuid.uuid4())
+                await self._create_failed_trade_record(
+                    trade_id=trade_id,
+                    exchange_name=exchange_name,
+                    pair=pair,
+                    strategy_name=strategy_name,
+                    failure_reason=f"Order value ${calculated_value:.2f} below minimum ${min_order_size_usd}",
+                    position_value_usd=position_value_usdc,
+                    current_price=current_price,
+                    raw_position_size=position_size_units
+                )
+                return
+            
+            # VALIDATION 3: Check for extremely small position sizes that might be rounded to zero
+            if sanitized_position_size < 0.000001:  # 1 millionth unit threshold
+                error_msg = f"❌ [VALIDATION FAILED] Position size too small for exchange"
+                logger.error(f"{error_msg}: {sanitized_position_size} < 0.000001")
+                
+                # CREATE FAILED TRADE RECORD WITH ACTUAL FAILURE REASON
+                trade_id = str(uuid.uuid4())
+                await self._create_failed_trade_record(
+                    trade_id=trade_id,
+                    exchange_name=exchange_name,
+                    pair=pair,
+                    strategy_name=strategy_name,
+                    failure_reason=f"Position size {sanitized_position_size} too small for exchange (< 0.000001)",
+                    position_value_usd=position_value_usdc,
+                    current_price=current_price,
+                    raw_position_size=position_size_units
+                )
+                return
+            
+            logger.info(f"✅ [ORDER VALIDATION] All validations passed for {pair} on {exchange_name}")
+            logger.info(f"   ✨ Final position size: {sanitized_position_size:.8f}")
+            logger.info(f"   💰 Final order value: ${calculated_value:.2f}")
             
             # Generate trade ID
             trade_id = str(uuid.uuid4())
@@ -2445,6 +2586,67 @@ class TradingOrchestrator:
                 
         except Exception as e:
             logger.error(f"❌ Error in Redis trade entry: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+
+    async def _create_failed_trade_record(
+        self,
+        trade_id: str,
+        exchange_name: str,
+        pair: str,
+        strategy_name: str,
+        failure_reason: str,
+        position_value_usd: float = 0.0,
+        current_price: float = 0.0,
+        raw_position_size: float = 0.0
+    ) -> None:
+        """Create a FAILED trade record with actual failure reason instead of strategy entry reason"""
+        try:
+            logger.warning(f"📝 [FAILED TRADE RECORD] Creating failure record for {trade_id}")
+            logger.warning(f"   🔍 Failure Reason: {failure_reason}")
+            logger.warning(f"   💱 Exchange: {exchange_name}")
+            logger.warning(f"   💰 Pair: {pair}")
+            logger.warning(f"   🎯 Strategy: {strategy_name}")
+            
+            # Create comprehensive trade record with failure details
+            trade_data = {
+                'trade_id': trade_id,
+                'exchange': exchange_name,
+                'pair': pair,
+                'strategy': strategy_name,
+                'status': 'FAILED',
+                'side': 'buy',  # Entry orders are always buy
+                'entry_price': current_price if current_price > 0 else None,
+                'position_size': 0.0,  # Zero since order failed validation
+                'position_value_usd': position_value_usd,
+                'entry_reason': failure_reason,  # ACTUAL failure reason, not strategy reason
+                'exit_reason': None,
+                'realized_pnl': 0.0,
+                'unrealized_pnl': 0.0,
+                'fees': 0.0,
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat(),
+                'entry_time': datetime.utcnow().isoformat(),
+                'exit_time': None,
+                'order_id': None,  # No order was created
+                'fill_id': None,  # No fill occurred
+                'metadata': {
+                    'validation_failure': True,
+                    'raw_position_size': raw_position_size,
+                    'calculated_value': raw_position_size * current_price if current_price > 0 else 0,
+                    'failure_type': 'pre_exchange_validation'
+                }
+            }
+            
+            # Store to database
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(f"{database_service_url}/api/v1/trades", json=trade_data)
+                response.raise_for_status()
+                
+            logger.info(f"✅ [FAILED TRADE RECORD] Created failure record {trade_id} with reason: {failure_reason}")
+            
+        except Exception as e:
+            logger.error(f"❌ [FAILED TRADE RECORD] Error creating failure record: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
 
@@ -2796,7 +2998,7 @@ class TradingOrchestrator:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
 
-    async def _wait_for_order_fill(self, exchange_name: str, order_id: str, pair: str, timeout: int = 30, original_order: Optional[Dict[str, Any]] = None, amount: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    async def _wait_for_order_fill(self, exchange_name: str, order_id: str, pair: str, timeout: int = 60, original_order: Optional[Dict[str, Any]] = None, amount: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Wait for order to fill with timeout"""
         try:
             # First check if the original order already shows as filled (common for market orders)
@@ -2807,7 +3009,7 @@ class TradingOrchestrator:
             start_time = time.time()
             check_count = 0
             
-            while time.time() - start_time < timeout and check_count < 6:  # Max 6 checks
+            while time.time() - start_time < timeout and check_count < 12:  # Max 12 checks for extended monitoring
                 try:
                     async with httpx.AsyncClient(timeout=60.0) as client:
                         # Get order status from exchange service
@@ -2834,58 +3036,27 @@ class TradingOrchestrator:
                             if not order_found:
                                 logger.info(f"🔍 Order {order_id} not in open orders - likely filled instantly")
                                 
-                                # For market orders on exchanges like Crypto.com, they fill instantly
-                                # The original order response should contain the fill information
+                                # CRITICAL FIX: NEVER create synthetic orders without exchange confirmation
+                                # The original order response should contain ACTUAL fill information from exchange
                                 if original_order:
                                     orig_status = str(original_order.get('status', '')).lower()
-                                    if orig_status in ['closed', 'filled']:
-                                        logger.info(f"✅ Order {order_id} filled instantly - status: {orig_status}")
-                                        logger.info(f"✅ Fill details - filled: {original_order.get('filled', 'N/A')}, average: {original_order.get('average', 'N/A')}")
+                                    filled_amount = original_order.get('filled', 0)
+                                    avg_price = original_order.get('average')
+                                    
+                                    # MANDATORY: Verify ALL fill data is present and valid
+                                    if (orig_status in ['closed', 'filled'] and 
+                                        filled_amount and filled_amount > 0 and
+                                        avg_price and avg_price > 0):
+                                        logger.info(f"✅ EXCHANGE CONFIRMED: Order {order_id} filled {filled_amount:.8f} at ${avg_price:.6f}")
                                         return original_order
                                     else:
-                                        logger.warning(f"⚠️ Original order status is {orig_status}, not filled")
+                                        logger.error(f"🚨 EXCHANGE CONFIRMATION FAILED: Order {order_id} status={orig_status}, filled={filled_amount}, price={avg_price}")
+                                        return None  # Do NOT create synthetic orders
                                 
-                                # For exchanges where market orders fill instantly, try to get actual fill price from order history
-                                logger.info(f"🔍 Order {order_id} not in open orders, checking order history for actual fill price...")
-                                
-                                # Try to get actual fill price from exchange order history
-                                actual_fill_price = await self._get_order_fill_price_from_history(exchange_name, order_id, pair)
-                                
-                                if actual_fill_price > 0:
-                                    logger.info(f"✅ Found actual fill price from order history: ${actual_fill_price:.6f}")
-                                    return {
-                                        'id': order_id,
-                                        'status': 'closed',
-                                        'filled': amount,
-                                        'average': actual_fill_price,  # Use actual fill price from exchange
-                                        'info': {'orderId': order_id, 'exchange': exchange_name}
-                                    }
-                                else:
-                                    # Fallback: Use current market price if order history unavailable
-                                    logger.warning(f"⚠️ Could not get actual fill price from history, falling back to current market price")
-                                    try:
-                                        async with httpx.AsyncClient(timeout=10.0) as price_client:
-                                            exchange_pair = pair.replace('/', '') if pair else ''
-                                            price_response = await price_client.get(f"{exchange_service_url}/api/v1/market/ticker/{exchange_name}/{exchange_pair}")
-                                            if price_response.status_code == 200:
-                                                ticker = price_response.json()
-                                                current_market_price = float(ticker.get('last', 0.0))
-                                                logger.warning(f"📈 Using current market price as fallback: ${current_market_price:.6f}")
-                                            else:
-                                                current_market_price = 0.0
-                                                logger.error(f"💥 Failed to get fallback market price for {pair} on {exchange_name}")
-                                    except Exception as price_error:
-                                        current_market_price = 0.0
-                                        logger.error(f"💥 Price fetch error: {price_error}")
-                                    
-                                    if current_market_price > 0:
-                                        return {
-                                            'id': order_id,
-                                            'status': 'closed',
-                                            'filled': amount,
-                                            'average': current_market_price,
-                                            'info': {'orderId': order_id, 'exchange': exchange_name}
-                                        }
+                                # CRITICAL: Do NOT assume orders are filled without exchange confirmation
+                                logger.error(f"🚨 CRITICAL: Order {order_id} not found in open orders and no valid original order data")
+                                logger.error(f"🚨 REFUSING to create synthetic fill data - this prevents database-exchange mismatches")
+                                return None  # Force manual verification
                         
                         check_count += 1
                         if check_count < 6:
@@ -3006,6 +3177,39 @@ class TradingOrchestrator:
             logger.error(f"Error getting minimum order size for {pair} on {exchange_name}: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
             raise
+
+    async def _create_critical_alert(self, trade_id: str, message: str) -> None:
+        """Create a critical alert for trades requiring manual intervention."""
+        try:
+            alert_data = {
+                'trade_id': trade_id,
+                'alert_type': 'CRITICAL_EXIT_FAILURE',
+                'message': message,
+                'severity': 'HIGH',
+                'requires_manual_action': True,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            # Log the critical alert
+            logger.critical(f"🚨 CRITICAL ALERT: {message} | Trade: {trade_id}")
+            
+            # Try to save to database alerts table if it exists
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{database_service_url}/api/v1/alerts", 
+                        json=alert_data,
+                        timeout=5.0
+                    )
+                    if response.status_code == 200:
+                        logger.info(f"✅ Critical alert saved to database for trade {trade_id}")
+                    else:
+                        logger.warning(f"⚠️ Failed to save alert to database: {response.status_code}")
+            except Exception as db_error:
+                logger.error(f"❌ Failed to save critical alert to database: {str(db_error)}")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to create critical alert for trade {trade_id}: {str(e)}")
 
     async def _get_config_value(self, config_path: str, default_value=None):
         """Get a configuration value from config service using dot notation path"""
@@ -3163,6 +3367,31 @@ class TradingOrchestrator:
             exit_order_result = await self._place_smart_order(exchange_name, pair, 'sell', sanitized_position_size, trade_id)
             if not exit_order_result:
                 logger.error(f"❌ Failed to place SELL order for {pair} on {exchange_name}")
+                
+                # Check if this is a minimum order value issue on SELL orders
+                # Some exchanges apply minimum order values to both BUY and SELL
+                current_price = await self._get_current_price(exchange_name, pair)
+                if current_price > 0:
+                    position_value_usd = sanitized_position_size * current_price
+                    logger.warning(f"💰 SELL ORDER FAILED: Position value ${position_value_usd:.2f} for {sanitized_position_size:.8f} {pair}")
+                    
+                    # For critical exits (trailing stops, stop losses), close position anyway to prevent further losses
+                    if exit_reason and ('trailing_stop' in exit_reason or 'stop_loss' in exit_reason):
+                        logger.warning(f"🚨 CRITICAL EXIT FAILED: Closing position anyway due to {exit_reason}")
+                        logger.warning(f"💸 Risk Management: Marking {pair} as closed to prevent further losses")
+                        
+                        # Close position in database to prevent further losses
+                        dust_exit_success = await self._close_dust_position(
+                            trade_id, exchange_name, pair, sanitized_position_size, 
+                            f"force_close_{exit_reason}"
+                        )
+                        
+                        if dust_exit_success:
+                            logger.info(f"✅ FORCE CLOSE SUCCESS: {pair} position marked as closed for risk management")
+                            return
+                        else:
+                            logger.error(f"❌ FORCE CLOSE FAILED: Could not mark {pair} position as closed")
+                
                 return
             
             # Wait for exit order to fill
@@ -3179,18 +3408,20 @@ class TradingOrchestrator:
                     emergency_exit_result = await self._place_market_order(exchange_name, pair, 'sell', sanitized_position_size, trade_id)
                     if not emergency_exit_result:
                         logger.error(f"💥 CRITICAL FAILURE: Emergency market order also failed for {pair} on {exchange_name}")
-                        # Force close the trade in database to prevent further losses
-                        logger.error(f"🆘 FORCE CLOSING: Marking trade {trade_id} as closed to prevent further losses")
-                        await self._update_trade_status(trade_id, 'CLOSED', f'emergency_force_close_{exit_reason}')
+                        # NEVER force close - mark for manual intervention
+                        logger.error(f"🚨 MARKING FOR MANUAL INTERVENTION: Trade {trade_id} requires manual exit due to order failures")
+                        await self._update_trade_status(trade_id, 'EXIT_FAILED', f'emergency_exit_failed_{exit_reason}')
+                        await self._create_critical_alert(trade_id, f"Manual intervention required: Exit orders failed for {pair} on {exchange_name}")
                         return
                     
                     # Wait for emergency market order to fill (shorter timeout for market orders)
                     filled_exit_order = await self._wait_for_order_fill(exchange_name, emergency_exit_result['id'], pair, timeout=10, original_order=emergency_exit_result, amount=position_size)
                     if not filled_exit_order:
                         logger.error(f"💥 CRITICAL FAILURE: Emergency market order failed to fill for {pair} on {exchange_name}")
-                        # Force close the trade in database to prevent further losses
-                        logger.error(f"🆘 FORCE CLOSING: Marking trade {trade_id} as closed to prevent further losses")  
-                        await self._update_trade_status(trade_id, 'CLOSED', f'emergency_force_close_{exit_reason}')
+                        # NEVER force close - mark for manual intervention
+                        logger.error(f"🚨 MARKING FOR MANUAL INTERVENTION: Trade {trade_id} requires manual exit due to fill timeout")  
+                        await self._update_trade_status(trade_id, 'EXIT_FAILED', f'emergency_fill_timeout_{exit_reason}')
+                        await self._create_critical_alert(trade_id, f"Manual intervention required: Emergency order failed to fill for {pair} on {exchange_name}")
                         return
                     
                     logger.info(f"✅ EMERGENCY SUCCESS: Market order filled for {pair} on {exchange_name}")
@@ -3214,15 +3445,43 @@ class TradingOrchestrator:
             
             realized_pnl = (exit_price - entry_price) * filled_amount - exit_fees - float(trade.get('fees', 0))
             
-            # Update trade in database with exit details
+            # CRITICAL FIX: MANDATORY EXCHANGE CONFIRMATION BEFORE MARKING CLOSED
+            # Verify the filled_exit_order contains valid fill confirmation
+            if not filled_exit_order or not filled_exit_order.get('id') or not filled_exit_order.get('filled'):
+                logger.error(f"🚨 CRITICAL: Cannot mark trade {trade_id} as CLOSED - no valid fill confirmation from exchange")
+                await self._update_trade_status(trade_id, 'EXIT_FAILED', f'no_exchange_confirmation_{exit_reason}')
+                await self._create_critical_alert(trade_id, f"Manual intervention required: Exit order lacks exchange confirmation for {pair} on {exchange_name}")
+                return
+            
+            # Verify filled amount is reasonable (not zero or negative)
+            filled_amount_check = float(filled_exit_order.get('filled', 0))
+            if filled_amount_check <= 0:
+                logger.error(f"🚨 CRITICAL: Cannot mark trade {trade_id} as CLOSED - invalid filled amount: {filled_amount_check}")
+                await self._update_trade_status(trade_id, 'EXIT_FAILED', f'invalid_fill_amount_{exit_reason}')
+                await self._create_critical_alert(trade_id, f"Manual intervention required: Invalid fill amount {filled_amount_check} for {pair} on {exchange_name}")
+                return
+            
+            # Verify exchange order ID exists and is valid
+            exit_order_id = filled_exit_order.get('id')
+            if not exit_order_id or exit_order_id == '':
+                logger.error(f"🚨 CRITICAL: Cannot mark trade {trade_id} as CLOSED - no valid exchange order ID")
+                await self._update_trade_status(trade_id, 'EXIT_FAILED', f'no_order_id_{exit_reason}')
+                await self._create_critical_alert(trade_id, f"Manual intervention required: No exchange order ID for {pair} on {exchange_name}")
+                return
+            
+            logger.info(f"✅ EXCHANGE CONFIRMATION VERIFIED: Order {exit_order_id} filled {filled_amount_check} {pair.split('/')[0]} on {exchange_name}")
+            
+            # Update trade in database with exit details ONLY after exchange confirmation
             exit_data = {
                 'status': 'CLOSED',
                 'exit_price': exit_price,
-                'exit_id': filled_exit_order.get('id'),  # Store real exit order ID
+                'exit_id': exit_order_id,  # Store verified exchange order ID
                 'exit_reason': exit_reason,
                 'exit_time': datetime.utcnow().isoformat(),
                 'realized_pnl': realized_pnl,
-                'fees': float(trade.get('fees', 0)) + exit_fees  # Total fees
+                'fees': float(trade.get('fees', 0)) + exit_fees,  # Total fees
+                'exchange_confirmed': True,  # NEW FLAG: Confirms exchange validation
+                'filled_amount': filled_amount_check  # Store actual filled amount
             }
             
             await self._update_trade_data(trade_id, exit_data)
@@ -3423,10 +3682,36 @@ class TradingOrchestrator:
             return {'error': str(e)}
 
     async def _get_current_price(self, exchange_name: str, pair: str) -> float:
-        """Get current market price for a pair - Enhanced with real-time price feed service"""
+        """Get current market price for a pair - Enhanced with WebSocket and real-time price feed service"""
         try:
-            # First try to get price from the enhanced price feed service direct endpoint
+            # First try WebSocket live data for most recent price (skip status check - direct access)
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    # Direct WebSocket price access - bypass status check for better reliability
+                    exchange_symbol = self._convert_pair_format(exchange_name, pair)
+                    live_response = await client.get(f"{exchange_service_url}/api/v1/market/ticker-live/{exchange_name}/{exchange_symbol}?stale_threshold_seconds=5")
+                    if live_response.status_code == 200:
+                        live_data = live_response.json()
+                        price = float(live_data.get('last', 0))
+                        source = live_data.get('source', 'unknown')
+                        if price > 0:
+                            logger.info(f"📡 Real-time price via {source}: {exchange_name}/{pair} = ${price:.8f}")
+                            # Store the source for later use in trade updates
+                            self._last_price_source = source
+                            return price
+            except Exception as ws_e:
+                logger.debug(f"WebSocket price unavailable: {ws_e}")
+            
+            # Second try to get price from the enhanced price feed service direct endpoint  
             price_feed_service_url = "http://price-feed-service:8007"
+            
+            # Dynamic subscription: Notify price-feed service about this pair
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    await client.post(f"{price_feed_service_url}/api/v1/pairs/subscribe", 
+                                     json={'exchange': exchange_name, 'pair': pair})
+            except Exception:
+                pass  # Don't fail if subscription fails
             
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
@@ -3444,6 +3729,7 @@ class TradingOrchestrator:
                             cache_hit = data.get('cache_hit', False)
                             source = data.get('source', 'unknown')
                             logger.info(f"📈 Got price from feed service: {exchange_name}/{pair} = ${price:.8f} (cache_hit={cache_hit}, source={source})")
+                            self._last_price_source = source  # Could be 'websocket' or 'rest' 
                             return price
                     else:
                         logger.info(f"🔍 Price feed endpoint returned {response.status_code} for {exchange_name}/{pair} (tried {encoded_pair})")
@@ -3461,6 +3747,7 @@ class TradingOrchestrator:
                 ticker_data = response.json()
                 price = float(ticker_data.get('last', 0.0))
                 logger.debug(f"📊 Got price from REST API fallback: {exchange_name}/{pair} = ${price:.8f}")
+                self._last_price_source = 'rest'  # Final fallback is always REST API
                 return price
                 
         except Exception as e:
@@ -4075,7 +4362,23 @@ class TradingOrchestrator:
                 response = await client.get(f"{exchange_service_url}/api/v1/market/ohlcv/{exchange_name}/{pair}?timeframe=5m&limit=12")
                 if response.status_code == 200:
                     ohlcv_data = response.json()
-                    prices = [float(candle[4]) for candle in ohlcv_data.get('data', [])]  # Close prices
+                    # Safely extract close prices with validation
+                    prices = []
+                    for candle in ohlcv_data.get('data', []):
+                        try:
+                            if isinstance(candle, list) and len(candle) > 4:
+                                close_price = candle[4]
+                                # Handle both string and numeric values
+                                if isinstance(close_price, (int, float)):
+                                    prices.append(float(close_price))
+                                elif isinstance(close_price, str) and close_price.replace('.', '').replace('-', '').isdigit():
+                                    prices.append(float(close_price))
+                                else:
+                                    logger.warning(f"Invalid close price format: {close_price} (type: {type(close_price)})")
+                                    continue
+                        except (ValueError, TypeError, IndexError) as e:
+                            logger.warning(f"Error parsing OHLCV candle {candle}: {e}")
+                            continue
                     
                     if len(prices) >= 6:
                         # Calculate price volatility over last 6 periods (30 minutes)
@@ -4172,7 +4475,7 @@ class TradingOrchestrator:
         
         # Return defaults if config fetch fails
         return {
-            'limit_order_timeout_seconds': 300,
+            'limit_order_timeout_seconds': 120,  # Increased from 30s effective timeout to 120s for limit orders
             'max_retry_attempts': 2,
             'competitive_pricing_enabled': True,
             'competitive_pricing_buffer': 0.0001
@@ -4808,7 +5111,7 @@ class TradingOrchestrator:
                             'order_type': 'limit',
                             'trade_id': trade_id
                         }
-                        await order_tracker.track_order(order['id'], order_data, timeout_seconds=300)
+                        await order_tracker.track_order(order['id'], order_data, timeout_seconds=120)
                         
                         # Record order to database
                         db_order_data = {
@@ -4821,7 +5124,7 @@ class TradingOrchestrator:
                             'amount': amount,
                             'price': sanitized_limit_price,
                             'status': 'pending',
-                            'timeout_seconds': 300
+                            'timeout_seconds': 120
                         }
                         await self._record_order_to_database(db_order_data)
                         

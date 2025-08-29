@@ -17,12 +17,24 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response
 from pydantic import BaseModel
+from binance_websocket_integration import binance_websocket, router as binance_ws_router
+from cryptocom_websocket_integration import cryptocom_websocket, router as cryptocom_ws_router
+from bybit_websocket_integration import router as bybit_ws_router
+from health_monitor import HealthMonitorService, binance_websocket_health_check, cryptocom_websocket_health_check, redis_health_check
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Exchange Service", version="1.0.0")
+
+# Include WebSocket routers
+app.include_router(binance_ws_router)
+app.include_router(cryptocom_ws_router)
+app.include_router(bybit_ws_router)
+
+# Global health monitor
+health_monitor: Optional[HealthMonitorService] = None
 
 class WebSocketExchangeHandler:
     """Exchange-specific WebSocket handler"""
@@ -239,27 +251,34 @@ class WebSocketExchangeHandler:
                         bid = item.get('b')
                         ask = item.get('a')
                         _update_ticker_cache(self.exchange_name, symbol, last, bid, ask)
+                        if last:  # Only log if we have a valid price
+                            logger.info(f"🎯 Binance ticker: {symbol} = ${last} (bid: ${bid}, ask: ${ask})")
                     self.last_update = datetime.utcnow().isoformat()
                     return True
                 elif isinstance(data, dict) and data.get('s') and data.get('c'):
                     symbol = data.get('s')
-                    _update_ticker_cache(self.exchange_name, symbol, data.get('c'), data.get('b'), data.get('a'))
+                    last = data.get('c')
+                    bid = data.get('b')
+                    ask = data.get('a')
+                    _update_ticker_cache(self.exchange_name, symbol, last, bid, ask)
+                    if last:  # Only log if we have a valid price
+                        logger.info(f"🎯 Binance ticker: {symbol} = ${last} (bid: ${bid}, ask: ${ask})")
                     self.last_update = datetime.utcnow().isoformat()
                     return True
 
             # Bybit v5 public spot tickers
             if self.exchange_name.lower() == 'bybit':
                 if isinstance(data, dict) and data.get('topic') and 'tickers' in str(data.get('topic')):
-                    payload = data.get('data') or []
-                    if isinstance(payload, dict):
-                        payload = [payload]
-                    for item in payload:
-                        symbol = item.get('symbol')
-                        last = item.get('lastPrice') or item.get('last_price')
-                        bid = item.get('bid1Price') or item.get('bid_price')
-                        ask = item.get('ask1Price') or item.get('ask_price')
-                        if symbol:
+                    ticker_data = data.get('data')
+                    if isinstance(ticker_data, dict):
+                        # Bybit data is a single object, not an array
+                        symbol = ticker_data.get('symbol')
+                        last = ticker_data.get('lastPrice')
+                        bid = ticker_data.get('bid1Price')
+                        ask = ticker_data.get('ask1Price')
+                        if symbol and last:
                             _update_ticker_cache(self.exchange_name, symbol, last, bid, ask)
+                            logger.info(f"🎯 Bybit ticker: {symbol} = ${last} (bid: ${bid}, ask: ${ask})")
                     self.last_update = datetime.utcnow().isoformat()
                     return True
 
@@ -352,11 +371,14 @@ class WebSocketExchangeHandler:
             # Binance all-tickers stream needs no per-symbol subscribe when using !ticker@arr
             if self.exchange_name.lower() == 'binance':
                 return
-            # Bybit subscribe
+            # Bybit subscribe (limit: 10 args per request)
             if self.exchange_name.lower() == 'bybit' and self.connection:
                 topics = [f"tickers.{sym}" for sym in new_syms]
-                msg = {"op": "subscribe", "args": topics}
-                await self.connection.send(json.dumps(msg))
+                # Split into chunks of 10 to respect Bybit's limit
+                for i in range(0, len(topics), 10):
+                    chunk = topics[i:i+10]
+                    msg = {"op": "subscribe", "args": chunk}
+                    await self.connection.send(json.dumps(msg))
             # Crypto.com subscribe
             if self.exchange_name.lower() == 'cryptocom' and self.connection:
                 # Crypto.com expects ticker channels in format: ticker.INSTRUMENT_NAME (e.g., ticker.AAVE_USD)
@@ -378,8 +400,10 @@ class WebSocketExchangeHandler:
                     channels.append(f"ticker.{instrument}")
                 
                 if channels:
-                    msg = {"id": int(time.time()), "method": "subscribe", "params": {"channels": channels}, "nonce": int(time.time()*1000)}
+                    # Crypto.com WebSocket API format - simplified without id/nonce
+                    msg = {"method": "subscribe", "params": {"channels": channels}}
                     await self.connection.send(json.dumps(msg))
+                    logger.info(f"Crypto.com subscription request: {msg}")
         except Exception as e:
             logger.warning(f"Subscription error for {self.exchange_name}: {e}")
 
@@ -407,7 +431,8 @@ class WebSocketExchangeHandler:
                     channels.append(f"ticker.{instrument}")
                 
                 if channels:
-                    msg = {"id": int(time.time()), "method": "unsubscribe", "params": {"channels": channels}, "nonce": int(time.time()*1000)}
+                    # Crypto.com WebSocket API format - simplified without id/nonce  
+                    msg = {"method": "unsubscribe", "params": {"channels": channels}}
                     await self.connection.send(json.dumps(msg))
         except Exception as e:
             logger.warning(f"Unsubscribe error for {self.exchange_name}: {e}")
@@ -693,9 +718,19 @@ class ExchangeManager:
                         'rate_limit_delay': config.get('rate_limit_delay', 0.1)
                     }
                     
-                    # Initialize WebSocket handler
+                    # Initialize WebSocket handler with correct URLs
                     websocket_config = config.copy()
-                    websocket_config['websocket_url'] = config.get('websocket_url')
+                    
+                    # Add proper WebSocket URLs for each exchange
+                    if exchange_name == 'binance':
+                        websocket_config['websocket_url'] = 'wss://stream.binance.com:9443/ws/!ticker@arr'
+                    elif exchange_name == 'cryptocom':
+                        websocket_config['websocket_url'] = 'wss://stream.crypto.com/v2/market'
+                    elif exchange_name == 'bybit':
+                        websocket_config['websocket_url'] = 'wss://stream.bybit.com/v5/public/spot'
+                    else:
+                        websocket_config['websocket_url'] = config.get('websocket_url')  # Fallback
+                    
                     asyncio.create_task(websocket_manager.initialize_handler(exchange_name, websocket_config))
                     
                     logger.info(f"✅ Successfully initialized {exchange_name} exchange")
@@ -1086,24 +1121,53 @@ async def place_order(order_request: OrderRequest):
         
         # Handle dust amounts that are below exchange minimums
         if exchange == 'binance':
-            # Binance minimum order sizes vary by symbol - updated with correct minimums:
+            # Binance minimum order validation - now based on $200 minimum notional value
+            # Get current price to calculate notional value
+            current_price = None
+            try:
+                # Use symbol format without slashes for Binance ticker lookup (BTC/USDC -> BTCUSDC)
+                ticker_symbol = order_request.symbol.replace('/', '')
+                ticker_response = await get_ticker(exchange, ticker_symbol)
+                current_price = float(ticker_response.get('last', 0))
+            except Exception as e:
+                logger.warning(f"Could not get current price for {order_request.symbol} on {exchange}: {e}")
+                
+            if current_price:
+                notional_value = order_request.amount * current_price
+                min_notional = 200.0  # NEW: Binance minimum notional is now $200 USD
+                
+                # IMPORTANT: Only apply minimum order value to BUY orders, not SELL orders
+                # SELL orders should be allowed to close any existing position regardless of size
+                if order_request.side.lower() == 'buy' and notional_value < min_notional:
+                    logger.warning(f"⚠️  BUY order notional ${notional_value:.2f} below minimum ${min_notional} for {order_request.symbol} on {exchange}")
+                    raise HTTPException(status_code=422, 
+                        detail=f"MINIMUM_ORDER_VALUE: Order value ${notional_value:.2f} below Binance minimum ${min_notional} USD for {order_request.symbol}. Current amount {order_request.amount} at ${current_price:.4f} = ${notional_value:.2f}. Need at least {min_notional/current_price:.4f} tokens.")
+                elif order_request.side.lower() == 'sell':
+                    logger.info(f"✅ SELL order allowed: ${notional_value:.2f} value for {order_request.symbol} on {exchange} (no minimum for sells)")
+            
+            # Also check absolute minimum amounts for specific assets (fallback)
             min_amounts = {
-                'NEO/USDC': 0.01,
+                'BTC/USDC': 0.00001,  # BTC minimum
                 'BTC/USDT': 0.00001,
+                'ETH/USDC': 0.0001,   # ETH minimum
                 'ETH/USDT': 0.0001,
-                'BNB/USDT': 0.01,
-                'LINK/USDC': 1.0,    # LINK minimum is actually 1.0 LINK (not 0.001)
-                'LINK/USDT': 1.0     # LINK minimum is 1.0 LINK across all pairs
+                'BNB/USDT': 0.01,     # BNB minimum
+                'LINK/USDC': 1.0,     # LINK minimum is 1.0 LINK
+                'LINK/USDT': 1.0,
+                'NEO/USDC': 0.01,     # NEO minimum
+                'default': 0.001      # Conservative default
             }
-            min_amount = min_amounts.get(order_request.symbol, 0.001)  # Default 0.001
-            if order_request.amount < min_amount:
-                # For dust amounts, return a descriptive error instead of blocking
-                logger.warning(f"⚠️  Dust amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
+            min_amount = min_amounts.get(order_request.symbol, min_amounts['default'])
+            # IMPORTANT: Only apply minimum amount validation to BUY orders, not SELL orders
+            if order_request.side.lower() == 'buy' and order_request.amount < min_amount:
+                logger.warning(f"⚠️  BUY order amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
                 raise HTTPException(status_code=422, 
-                    detail=f"DUST_AMOUNT: Order amount {order_request.amount} below exchange minimum {min_amount} for {order_request.symbol}. Consider closing position through manual trade or accumulating more assets.")
+                    detail=f"MINIMUM_ORDER_VALUE: Amount {order_request.amount} below Binance minimum {min_amount} for {order_request.symbol}. Binance now requires minimum order values of $200 USD.")
+            elif order_request.side.lower() == 'sell':
+                logger.info(f"✅ SELL order allowed: {order_request.amount} {order_request.symbol} on {exchange} (no minimum amount for sells)")
         
         elif exchange == 'cryptocom':
-            # Crypto.com minimum order validation - based on minimum notional values
+            # Crypto.com minimum order validation - now based on $200 minimum notional value
             # Get current price to calculate notional value
             current_price = None
             try:
@@ -1114,47 +1178,79 @@ async def place_order(order_request: OrderRequest):
                 
             if current_price:
                 notional_value = order_request.amount * current_price
-                min_notional = 12.0  # Crypto.com minimum notional is ~$12 USD per their API docs
+                min_notional = 200.0  # NEW: Crypto.com minimum notional is now $200 USD
+                
+                # IMPORTANT: Only apply minimum order value to BUY orders, not SELL orders
+                if order_request.side.lower() == 'buy' and notional_value < min_notional:
+                    logger.warning(f"⚠️  BUY order notional ${notional_value:.2f} below minimum ${min_notional} for {order_request.symbol} on {exchange}")
+                    raise HTTPException(status_code=422, 
+                        detail=f"MINIMUM_ORDER_VALUE: Order value ${notional_value:.2f} below Crypto.com minimum ${min_notional} USD for {order_request.symbol}. Current amount {order_request.amount} at ${current_price:.4f} = ${notional_value:.2f}. Need at least {min_notional/current_price:.4f} tokens.")
+                elif order_request.side.lower() == 'sell':
+                    logger.info(f"✅ SELL order allowed: ${notional_value:.2f} value for {order_request.symbol} on {exchange} (no minimum for sells)")
+            
+            # Also check absolute minimum amounts for specific assets (fallback validation)
+            min_amounts_crypto = {
+                'BTC/USD': 0.00001,   # BTC minimum
+                'ETH/USD': 0.0001,    # ETH minimum  
+                'ADA/USD': 250.0,     # ADA ~$0.80 = $200 minimum
+                'ALGO/USD': 200.0,    # ALGO ~$1.00 = $200 minimum
+                'AVAX/USD': 5.0,      # AVAX ~$40 = $200 minimum
+                'DOGE/USD': 600.0,    # DOGE ~$0.33 = $200 minimum
+                'DOT/USD': 50.0,      # DOT ~$4.00 = $200 minimum
+                'LTC/USD': 2.0,       # LTC ~$100 = $200 minimum
+                'MATIC/USD': 200.0,   # MATIC ~$1.00 = $200 minimum
+                'SOL/USD': 1.0,       # SOL ~$200 = $200 minimum
+                'XRP/USD': 100.0,     # XRP ~$2.00 = $200 minimum
+                'default': 0.001      # Conservative default
+            }
+            min_amount = min_amounts_crypto.get(order_request.symbol, min_amounts_crypto['default'])
+            # IMPORTANT: Only apply minimum amount validation to BUY orders, not SELL orders
+            if order_request.side.lower() == 'buy' and order_request.amount < min_amount:
+                logger.warning(f"⚠️  BUY order amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
+                raise HTTPException(status_code=422, 
+                    detail=f"MINIMUM_ORDER_VALUE: Amount {order_request.amount} below Crypto.com minimum {min_amount} for {order_request.symbol}. Crypto.com now requires minimum order values of $200 USD.")
+            elif order_request.side.lower() == 'sell':
+                logger.info(f"✅ SELL order allowed: {order_request.amount} {order_request.symbol} on {exchange} (no minimum amount for sells)")
+        
+        elif exchange == 'bybit':
+            # Bybit minimum order validation - based on minimum notional values
+            # Bybit requires minimum order values of approximately $5-10 USD for most spot pairs
+            current_price = None
+            try:
+                ticker_response = await get_ticker(exchange, order_request.symbol)
+                current_price = float(ticker_response.get('last', 0))
+            except:
+                logger.warning(f"Could not get current price for {order_request.symbol} on {exchange}")
+                
+            if current_price:
+                notional_value = order_request.amount * current_price
+                min_notional = 5.0  # Bybit minimum order value is approximately $5 USD
                 if notional_value < min_notional:
                     logger.warning(f"⚠️  Order notional ${notional_value:.2f} below minimum ${min_notional} for {order_request.symbol} on {exchange}")
                     raise HTTPException(status_code=422, 
-                        detail=f"DUST_AMOUNT: Order notional ${notional_value:.2f} below exchange minimum ${min_notional} for {order_request.symbol}. Consider accumulating larger position or manual trade.")
+                        detail=f"INSUFFICIENT_BALANCE: Order value ${notional_value:.2f} below Bybit minimum ${min_notional} USD for {order_request.symbol}. Current amount {order_request.amount} at ${current_price:.4f} = ${notional_value:.2f}. Need at least {min_notional/current_price:.4f} tokens.")
             
-            # Also check absolute minimum amounts for specific assets
-            min_amounts_crypto = {
-                'BTC/USD': 0.00001,
-                'ETH/USD': 0.0001,
-                'ACH/USD': 1.0,     # ACH requires at least 1 token
-                'ACT/USD': 1.0,     # ACT requires at least 1 token
-                'ADA/USD': 1.0,     # ADA requires at least 1 token
-                'ALGO/USD': 1.0,    # ALGO requires at least 1 token
-                'APE/USD': 0.1,     # APE requires at least 0.1 token
-                'AVAX/USD': 0.01,   # AVAX requires at least 0.01 token
-                'DOGE/USD': 1.0,    # DOGE requires at least 1 token
-                'DOT/USD': 0.1,     # DOT requires at least 0.1 token
-                'LTC/USD': 0.001,   # LTC requires at least 0.001 token
-                'MATIC/USD': 1.0,   # MATIC requires at least 1 token
-                'SOL/USD': 0.001,   # SOL requires at least 0.001 token
-                'TRX/USD': 1.0,     # TRX requires at least 1 token
-                'XRP/USD': 1.0,     # XRP requires at least 1 token
-                'default': 0.000001
+            # Also check absolute minimum amounts for specific assets on Bybit
+            min_amounts_bybit = {
+                'BTC/USDC': 0.00001,  # BTC minimum
+                'BTC/USDT': 0.00001,
+                'ETH/USDC': 0.0001,   # ETH minimum
+                'ETH/USDT': 0.0001,
+                'DOT/USDC': 1.2,      # DOT minimum - needs ~$5 USD at $4.19 = 1.2 DOT
+                'DOT/USDT': 1.2,
+                'SOL/USDC': 0.01,     # SOL minimum
+                'SOL/USDT': 0.01,
+                'AVAX/USDC': 0.1,     # AVAX minimum
+                'AVAX/USDT': 0.1,
+                'MATIC/USDC': 5.0,    # MATIC minimum for ~$5 USD
+                'MATIC/USDT': 5.0,
+                'default': 0.001      # Conservative default
             }
-            min_amount = min_amounts_crypto.get(order_request.symbol, min_amounts_crypto['default'])
+            min_amount = min_amounts_bybit.get(order_request.symbol, min_amounts_bybit['default'])
             if order_request.amount < min_amount:
                 logger.warning(f"⚠️  Dust amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
-                
-                # For sell orders, suggest dust consolidation strategies
-                if order_request.side.lower() == 'sell':
-                    if order_request.amount > 0:
-                        shortage = min_amount - order_request.amount
-                        raise HTTPException(status_code=422, 
-                            detail=f"DUST_AMOUNT: Sell amount {order_request.amount} below exchange minimum {min_amount} for {order_request.symbol}. Short by {shortage:.6f} tokens. Consider: 1) Wait to accumulate {shortage:.6f} more tokens, 2) Manual trade on exchange, or 3) Accept small loss and keep as dust.")
-                    else:
-                        raise HTTPException(status_code=422, 
-                            detail=f"DUST_AMOUNT: Cannot sell {order_request.amount} {order_request.symbol} - position too small. Consider manual trade or keep as dust.")
-                else:
-                    raise HTTPException(status_code=422, 
-                        detail=f"DUST_AMOUNT: Order amount {order_request.amount} below exchange minimum {min_amount} for {order_request.symbol}. Consider larger position size.")
+                raise HTTPException(status_code=422, 
+                    detail=f"INSUFFICIENT_BALANCE: Amount {order_request.amount} below Bybit minimum {min_amount} for {order_request.symbol}. Bybit requires minimum order values of ~$5 USD.")
         
         # Convert symbol format for different exchanges
         exchange_symbol = order_request.symbol
@@ -1681,16 +1777,180 @@ async def unsubscribe_symbols(exchange: str, payload: Dict[str, Any]):
     await handler.unsubscribe(symbols)
     return {"unsubscribed": symbols}
 
+# Health Monitoring Endpoints
+@app.get("/api/v1/health/system")
+async def get_system_health():
+    """Get comprehensive system health status"""
+    if not health_monitor:
+        raise HTTPException(status_code=503, detail="Health monitoring not initialized")
+    
+    try:
+        system_health = await health_monitor.get_current_health()
+        return system_health.to_dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting system health: {e}")
+
+@app.get("/api/v1/health/history")
+async def get_health_history(hours: int = 1):
+    """Get health history for specified number of hours"""
+    if not health_monitor:
+        raise HTTPException(status_code=503, detail="Health monitoring not initialized")
+    
+    try:
+        history = health_monitor.get_health_history(hours)
+        return {
+            'history_hours': hours,
+            'total_entries': len(history),
+            'health_history': [h.to_dict() for h in history]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting health history: {e}")
+
+@app.get("/api/v1/health/metrics")
+async def get_health_metrics():
+    """Get health monitoring metrics"""
+    if not health_monitor:
+        raise HTTPException(status_code=503, detail="Health monitoring not initialized")
+    
+    try:
+        return health_monitor.get_metrics()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting health metrics: {e}")
+
+@app.post("/api/v1/health/check")
+async def perform_immediate_health_check():
+    """Perform immediate health check (outside of monitoring loop)"""
+    if not health_monitor:
+        raise HTTPException(status_code=503, detail="Health monitoring not initialized")
+    
+    try:
+        system_health = await health_monitor.perform_health_checks()
+        return {
+            'message': 'Immediate health check completed',
+            'health_status': system_health.to_dict()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error performing health check: {e}")
+
+@app.get("/api/v1/health/websocket/detailed")
+async def get_detailed_websocket_health():
+    """Get detailed WebSocket health information"""
+    try:
+        # Get Binance WebSocket status
+        binance_status = binance_websocket.get_status()
+        
+        # Get WebSocket manager status for other exchanges
+        websocket_statuses = {}
+        for exchange_name in ['binance', 'bybit', 'cryptocom']:
+            handler = websocket_manager.get_handler(exchange_name)
+            if handler:
+                websocket_statuses[exchange_name] = {
+                    'connected': handler.is_connected,
+                    'last_update': handler.last_update,
+                    'subscribed_symbols': len(handler.subscribed_symbols)
+                }
+            else:
+                websocket_statuses[exchange_name] = {
+                    'connected': False,
+                    'handler_exists': False
+                }
+        
+        return {
+            'binance_user_data_stream': binance_status,
+            'exchange_websockets': websocket_statuses,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting WebSocket health: {e}")
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     """Initialize exchanges on startup"""
+    global health_monitor
+    
     await initialize_exchanges()
+    
+    # Initialize WebSocket integrations
+    try:
+        logger.info("🚀 Initializing Binance WebSocket integration")
+        if await binance_websocket.initialize():
+            await binance_websocket.start()
+            logger.info("✅ Binance WebSocket integration started successfully")
+        else:
+            logger.warning("⚠️ Binance WebSocket integration failed to initialize")
+    except Exception as e:
+        logger.error(f"❌ Error initializing Binance WebSocket integration: {e}")
+    
+    try:
+        logger.info("🏢 Initializing Crypto.com WebSocket integration")
+        if await cryptocom_websocket.initialize():
+            await cryptocom_websocket.start()
+            logger.info("✅ Crypto.com WebSocket integration started successfully")
+        else:
+            logger.warning("⚠️ Crypto.com WebSocket integration failed to initialize")
+    except Exception as e:
+        logger.error(f"❌ Error initializing Crypto.com WebSocket integration: {e}")
+    
+    try:
+        logger.info("🚀 Initializing Bybit WebSocket integration")
+        from bybit_websocket_integration import initialize_bybit_websocket, start_bybit_websocket_task
+        initialize_bybit_websocket()
+        await start_bybit_websocket_task()
+        logger.info("✅ Bybit WebSocket integration started successfully")
+    except Exception as e:
+        logger.error(f"❌ Error initializing Bybit WebSocket integration: {e}")
+    
+    # Initialize health monitoring
+    try:
+        logger.info("🏥 Initializing health monitoring system")
+        health_monitor = HealthMonitorService(check_interval=30)  # Check every 30 seconds
+        
+        # Register health checks
+        health_monitor.register_health_check("binance-websocket", binance_websocket_health_check)
+        health_monitor.register_health_check("cryptocom-websocket", cryptocom_websocket_health_check)
+        health_monitor.register_health_check("redis", redis_health_check)
+        
+        # Start monitoring
+        await health_monitor.start_monitoring()
+        logger.info("✅ Health monitoring system started successfully")
+    except Exception as e:
+        logger.error(f"❌ Error initializing health monitoring: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
     await websocket_manager.shutdown_all()
+    
+    # Stop health monitoring
+    if health_monitor:
+        try:
+            await health_monitor.stop_monitoring()
+            logger.info("✅ Health monitoring stopped")
+        except Exception as e:
+            logger.error(f"❌ Error stopping health monitoring: {e}")
+    
+    # Stop WebSocket integrations
+    try:
+        await binance_websocket.stop()
+        logger.info("✅ Binance WebSocket integration stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping Binance WebSocket integration: {e}")
+        
+    try:
+        await cryptocom_websocket.stop()
+        logger.info("✅ Crypto.com WebSocket integration stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping Crypto.com WebSocket integration: {e}")
+    
+    try:
+        from bybit_websocket_integration import bybit_manager
+        if bybit_manager:
+            await bybit_manager.stop()
+            logger.info("✅ Bybit WebSocket integration stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping Bybit WebSocket integration: {e}")
     
     # Close all CCXT async exchange instances
     for exchange_name, exchange_info in exchanges.items():

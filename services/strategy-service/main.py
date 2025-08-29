@@ -30,17 +30,51 @@ class NumpyJSONEncoder(json.JSONEncoder):
         if isinstance(obj, np.integer):
             return int(obj)
         elif isinstance(obj, np.floating):
-            return float(obj)
+            # CRITICAL: Check for NaN and infinity in numpy floats
+            float_val = float(obj)
+            if np.isnan(float_val) or np.isinf(float_val):
+                return 0.0  # Replace NaN/inf with 0
+            return float_val
         elif isinstance(obj, np.ndarray):
-            return obj.tolist()
+            # CRITICAL: Sanitize numpy arrays
+            cleaned_list = []
+            for val in obj.tolist():
+                if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+                    cleaned_list.append(0.0)
+                else:
+                    cleaned_list.append(val)
+            return cleaned_list
         elif isinstance(obj, np.bool_):
             return bool(obj)
         elif isinstance(obj, pd.Series):
-            return obj.tolist()
+            # CRITICAL: Sanitize pandas series
+            cleaned_list = []
+            for val in obj.tolist():
+                if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+                    cleaned_list.append(0.0)
+                else:
+                    cleaned_list.append(val)
+            return cleaned_list
         elif isinstance(obj, pd.DataFrame):
-            return obj.to_dict('records')
+            # CRITICAL: Sanitize pandas dataframes
+            df_dict = obj.to_dict('records')
+            cleaned_records = []
+            for record in df_dict:
+                cleaned_record = {}
+                for key, value in record.items():
+                    if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+                        cleaned_record[key] = 0.0
+                    else:
+                        cleaned_record[key] = value
+                cleaned_records.append(cleaned_record)
+            return cleaned_records
         elif isinstance(obj, datetime):
             return obj.isoformat()
+        # CRITICAL: Handle regular Python floats that might be NaN/inf
+        elif isinstance(obj, float):
+            if np.isnan(obj) or np.isinf(obj):
+                return 0.0
+            return obj
         return super().default(obj)
 
 # Configure logging
@@ -70,7 +104,7 @@ app.json_encoder = NumpyJSONEncoder
 from fastapi.encoders import jsonable_encoder as original_jsonable_encoder
 
 def custom_jsonable_encoder(obj, **kwargs):
-    """Custom JSON encoder that handles numpy types"""
+    """Custom JSON encoder that handles numpy types and sanitizes NaN/infinity values"""
     if isinstance(obj, dict):
         return {k: custom_jsonable_encoder(v, **kwargs) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -81,13 +115,47 @@ def custom_jsonable_encoder(obj, **kwargs):
         elif isinstance(obj, np.integer):
             return int(obj)
         elif isinstance(obj, np.floating):
-            return float(obj)
+            # CRITICAL: Sanitize numpy floating values
+            float_val = float(obj)
+            if np.isnan(float_val) or np.isinf(float_val):
+                return 0.0
+            return float_val
     elif isinstance(obj, np.ndarray):
-        return obj.tolist()
+        # CRITICAL: Sanitize numpy arrays
+        cleaned_list = []
+        for val in obj.tolist():
+            if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+                cleaned_list.append(0.0)
+            else:
+                cleaned_list.append(custom_jsonable_encoder(val, **kwargs))
+        return cleaned_list
     elif isinstance(obj, pd.Series):
-        return obj.tolist()
+        # CRITICAL: Sanitize pandas series
+        cleaned_list = []
+        for val in obj.tolist():
+            if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+                cleaned_list.append(0.0)
+            else:
+                cleaned_list.append(custom_jsonable_encoder(val, **kwargs))
+        return cleaned_list
     elif isinstance(obj, pd.DataFrame):
-        return obj.to_dict('records')
+        # CRITICAL: Sanitize pandas dataframes
+        df_dict = obj.to_dict('records')
+        cleaned_records = []
+        for record in df_dict:
+            cleaned_record = {}
+            for key, value in record.items():
+                if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+                    cleaned_record[key] = 0.0
+                else:
+                    cleaned_record[key] = custom_jsonable_encoder(value, **kwargs)
+            cleaned_records.append(cleaned_record)
+        return cleaned_records
+    elif isinstance(obj, float):
+        # CRITICAL: Handle regular Python floats
+        if np.isnan(obj) or np.isinf(obj):
+            return 0.0
+        return obj
     elif hasattr(obj, '__dict__'):
         return custom_jsonable_encoder(obj.__dict__, **kwargs)
     else:
@@ -178,11 +246,32 @@ class ExchangeAdapter:
                 response.raise_for_status()
                 
                 # Convert response to DataFrame
-                data = response.json()
-                if data:
-                    df = pd.DataFrame(data)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                response_data = response.json()
+                if response_data and 'data' in response_data:
+                    # Extract the nested data structure
+                    data = response_data['data']
+                    
+                    # Convert to DataFrame format expected by strategies
+                    df = pd.DataFrame({
+                        'timestamp': data['timestamp'],
+                        'open': data['open'],
+                        'high': data['high'],
+                        'low': data['low'],
+                        'close': data['close'],
+                        'volume': data['volume']
+                    })
+                    
+                    # Convert timestamp and set as index
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                    
+                    # Ensure numeric columns are properly typed
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    logger.info(f"✅ [DATA FETCH] Successfully converted {len(df)} {timeframe} candles for {symbol} on {exchange_name}")
                     return df
+                    
                 return None
                 
         except Exception as e:
@@ -318,7 +407,7 @@ class StrategyManager:
             else:
                 # Detect market regime
                 market_regime, regime_analysis = market_regime_detector.detect_regime(primary_ohlcv, pair)
-                applicable_strategies = market_regime_detector.get_applicable_strategies(market_regime)
+                applicable_strategies = market_regime_detector.get_applicable_strategies(market_regime, pair, exchange_name)
                 
                 # Log regime detection
                 logger.info(f"📊 [MARKET REGIME] {pair} on {exchange_name}: {market_regime.value}")
@@ -362,6 +451,9 @@ class StrategyManager:
                     logger.info(f"🔧 [STRATEGY INIT] Initializing {strategy_name} for {pair}")
                     await strategy_instance.initialize(pair)
                     
+                    # Apply pair-specific configuration overrides
+                    await self._apply_pair_specific_config(strategy_instance, strategy_name, pair, exchange_name)
+                    
                     # Update strategy with market data (use primary timeframe)
                     if primary_timeframe in market_data:
                         logger.info(f"📊 [STRATEGY DATA] Updating {strategy_name} with {primary_timeframe} data ({len(market_data[primary_timeframe])} candles)")
@@ -382,14 +474,37 @@ class StrategyManager:
                         market_data, pair=pair, timeframe=primary_timeframe, exchange_adapter=exchange_specific_adapter
                     )
                     
+                    # CRITICAL: Sanitize confidence and strength values to prevent JSON serialization errors
+                    try:
+                        # Check for NaN or infinity in confidence
+                        if isinstance(confidence, (int, float)):
+                            if np.isnan(confidence) or np.isinf(confidence):
+                                logger.warning(f"🔧 [SANITIZE] Invalid confidence value {confidence} from {strategy_name}, setting to 0.0")
+                                confidence = 0.0
+                        else:
+                            confidence = 0.0
+                            
+                        # Check for NaN or infinity in strength  
+                        if isinstance(strength, (int, float)):
+                            if np.isnan(strength) or np.isinf(strength):
+                                logger.warning(f"🔧 [SANITIZE] Invalid strength value {strength} from {strategy_name}, setting to 0.0")
+                                strength = 0.0
+                        else:
+                            strength = 0.0
+                            
+                    except Exception as sanitize_error:
+                        logger.error(f"❌ [SANITIZE] Error sanitizing values from {strategy_name}: {sanitize_error}")
+                        confidence = 0.0
+                        strength = 0.0
+                    
                     # Store results with detailed logging
                     # Clean strategy state to ensure JSON serialization
                     clean_state = self._clean_strategy_state_for_serialization(strategy_instance)
                     
                     analysis_results['strategies'][strategy_name] = {
                         'signal': signal,
-                        'confidence': confidence,
-                        'strength': strength,
+                        'confidence': float(confidence),  # Ensure it's a regular Python float
+                        'strength': float(strength),      # Ensure it's a regular Python float
                         'market_regime': clean_state['market_regime'],
                         'timestamp': datetime.utcnow().isoformat(),
                         'selected_for_regime': market_regime.value,
@@ -521,11 +636,28 @@ class StrategyManager:
             avg_confidence = weighted_confidence / total_weight if total_weight > 0 else 0
             avg_strength = weighted_strength / total_weight if total_weight > 0 else 0
             
+            # CRITICAL: Sanitize consensus values to prevent JSON serialization errors
+            try:
+                if np.isnan(avg_confidence) or np.isinf(avg_confidence):
+                    logger.warning(f"🔧 [CONSENSUS SANITIZE] Invalid avg_confidence {avg_confidence}, setting to 0.0")
+                    avg_confidence = 0.0
+                if np.isnan(avg_strength) or np.isinf(avg_strength):
+                    logger.warning(f"🔧 [CONSENSUS SANITIZE] Invalid avg_strength {avg_strength}, setting to 0.0")
+                    avg_strength = 0.0
+                if np.isnan(agreement) or np.isinf(agreement):
+                    logger.warning(f"🔧 [CONSENSUS SANITIZE] Invalid agreement {agreement}, setting to 0.0")
+                    agreement = 0.0
+            except Exception as consensus_sanitize_error:
+                logger.error(f"❌ [CONSENSUS SANITIZE] Error sanitizing consensus values: {consensus_sanitize_error}")
+                avg_confidence = 0.0
+                avg_strength = 0.0
+                agreement = 0.0
+            
             return {
                 'signal': consensus_signal,
-                'confidence': avg_confidence,
-                'strength': avg_strength,
-                'agreement': agreement,
+                'confidence': float(avg_confidence),
+                'strength': float(avg_strength),
+                'agreement': float(agreement),
                 'participating_strategies': total_strategies,
                 'signal_breakdown': signal_counts,
                 'weighted_breakdown': weighted_signal_counts  # Show regime weighting
@@ -540,6 +672,54 @@ class StrategyManager:
                 'agreement': 0,
                 'participating_strategies': 0
             }
+            
+    async def _apply_pair_specific_config(self, strategy_instance, strategy_name: str, pair: str, exchange_name: str) -> None:
+        """Apply pair-specific configuration overrides to a strategy instance"""
+        try:
+            # Get all config data first  
+            config_url = f"{config_service_url}/api/v1/config/all"
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(config_url)
+                
+                if response.status_code == 200:
+                    config_data = response.json()
+                    pair_configs = config_data.get('pair_specific_configs', {})
+                    
+                    # Check for exact pair match
+                    if pair in pair_configs:
+                        pair_config = pair_configs[pair]
+                        
+                        # Verify exchange match
+                        if exchange_name and pair_config.get('exchange') != exchange_name:
+                            logger.debug(f"Exchange mismatch for pair {pair}: expected {exchange_name}, found {pair_config.get('exchange')}")
+                            return
+                            
+                        # Get strategy-specific overrides
+                        strategy_overrides = pair_config.get('market_conditions', {}).get('strategy_overrides', {})
+                        overrides = strategy_overrides.get(strategy_name, {})
+                        
+                        if overrides:
+                            logger.info(f"🎛️ [PAIR CONFIG] Applying {len(overrides)} overrides for {strategy_name} on {pair}")
+                            
+                            # Apply overrides to strategy parameters
+                            for param_name, param_value in overrides.items():
+                                if hasattr(strategy_instance, param_name):
+                                    old_value = getattr(strategy_instance, param_name)
+                                    setattr(strategy_instance, param_name, param_value)
+                                    logger.info(f"  📝 {param_name}: {old_value} → {param_value}")
+                                else:
+                                    logger.warning(f"  ❌ Parameter {param_name} not found in {strategy_name}")
+                        else:
+                            logger.debug(f"No specific overrides for {strategy_name} on {pair}")
+                    else:
+                        logger.debug(f"No pair-specific configuration for {pair}")
+                        
+                else:
+                    logger.warning(f"Failed to get config data: {response.status_code}")
+                    
+        except Exception as e:
+            logger.error(f"Error applying pair-specific config for {pair}/{strategy_name}: {e}")
             
     async def _get_market_data_for_strategy(self, exchange_name: str, symbol: str, 
                                            timeframes: List[str] = ['1h', '15m', '5m']) -> Dict[str, pd.DataFrame]:
@@ -577,50 +757,54 @@ class StrategyManager:
                     if response.status_code == 200:
                         ohlcv_data = response.json()
                         
-                        # Handle different response formats
-                        if 'data' in ohlcv_data:
+                        # Handle nested data format from exchange service
+                        if 'data' in ohlcv_data and isinstance(ohlcv_data['data'], dict):
+                            # New format: {data: {timestamp: [], open: [], ...}}
                             data = ohlcv_data['data']
+                            df = pd.DataFrame({
+                                'timestamp': data['timestamp'],
+                                'open': data['open'],
+                                'high': data['high'],
+                                'low': data['low'],
+                                'close': data['close'],
+                                'volume': data['volume']
+                            })
+                        elif 'data' in ohlcv_data:
+                            # Fallback: data is already a list/array format
+                            df = pd.DataFrame(ohlcv_data['data'])
                         else:
-                            data = ohlcv_data
-                        
-                        # Convert to DataFrame
-                        df = pd.DataFrame(data)
+                            # Legacy format: direct data
+                            df = pd.DataFrame(ohlcv_data)
                         
                         # Validate data structure
                         if df.empty:
                             logger.warning(f"Empty OHLCV data for {symbol} on {exchange_name} {timeframe}")
                             continue
                         
-                        # Ensure we have the required columns
-                        if len(df.columns) >= 5:
-                            # Handle different column count scenarios
-                            if len(df.columns) == 5:
-                                df.columns = ['timestamp', 'open', 'high', 'low', 'close']
-                                df['volume'] = 0  # Add volume column with default value
-                            elif len(df.columns) >= 6:
-                                df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + [f'extra_{i}' for i in range(len(df.columns) - 6)]
+                        # Validate we have the required columns
+                        required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                        if not all(col in df.columns for col in required_columns):
+                            logger.warning(f"Missing required columns for {symbol} on {exchange_name} {timeframe}: {df.columns.tolist()}")
+                            continue
+                        
+                        # Handle timestamp conversion - check if it's already a datetime string
+                        try:
+                            if isinstance(df['timestamp'].iloc[0], str):
+                                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                            else:
+                                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                            df.set_index('timestamp', inplace=True)
                             
-                            # Handle timestamp conversion - check if it's already a datetime string
-                            try:
-                                if isinstance(df['timestamp'].iloc[0], str):
-                                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                                else:
-                                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                                df.set_index('timestamp', inplace=True)
-                                
-                                # Ensure numeric columns are properly typed
-                                for col in ['open', 'high', 'low', 'close', 'volume']:
-                                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                                
-                                market_data[timeframe] = df
-                                logger.info(f"Got {len(df)} {timeframe} candles for {symbol} on {exchange_name}")
-                                
-                            except Exception as timestamp_error:
-                                logger.error(f"Timestamp processing error for {symbol} on {exchange_name} {timeframe}: {timestamp_error}")
-                                continue
-                                
-                        else:
-                            logger.warning(f"Invalid OHLCV data format for {symbol} on {exchange_name} {timeframe}: expected >=5 columns, got {len(df.columns)}")
+                            # Ensure numeric columns are properly typed
+                            for col in ['open', 'high', 'low', 'close', 'volume']:
+                                df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                            market_data[timeframe] = df
+                            logger.info(f"✅ [DATA FETCH] Got {len(df)} {timeframe} candles for {symbol} on {exchange_name}")
+                            
+                        except Exception as timestamp_error:
+                            logger.error(f"❌ [DATA ERROR] Timestamp processing error for {symbol} on {exchange_name} {timeframe}: {timestamp_error}")
+                            continue
                     else:
                         logger.warning(f"Failed to get {timeframe} data for {symbol} on {exchange_name}: {response.status_code}")
                         
@@ -645,14 +829,38 @@ class StrategyManager:
             if hasattr(state, 'indicators') and state.indicators:
                 for key, value in state.indicators.items():
                     if isinstance(value, (pd.Series, pd.DataFrame)):
-                        # Convert to list of values, handling NaN
-                        clean_indicators[key] = value.tolist() if not value.empty else []
+                        # Convert to list of values, handling NaN and infinity
+                        if not value.empty:
+                            cleaned_list = []
+                            for val in value.tolist():
+                                if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+                                    cleaned_list.append(0.0)  # Replace NaN/inf with 0
+                                else:
+                                    cleaned_list.append(val)
+                            clean_indicators[key] = cleaned_list
+                        else:
+                            clean_indicators[key] = []
                     elif isinstance(value, np.ndarray):
-                        clean_indicators[key] = value.tolist()
+                        # Handle numpy arrays with NaN/inf values
+                        cleaned_list = []
+                        for val in value.tolist():
+                            if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+                                cleaned_list.append(0.0)  # Replace NaN/inf with 0
+                            else:
+                                cleaned_list.append(val)
+                        clean_indicators[key] = cleaned_list
                     elif isinstance(value, np.bool_):
                         clean_indicators[key] = bool(value)
                     elif isinstance(value, (np.integer, np.floating)):
-                        clean_indicators[key] = float(value) if isinstance(value, np.floating) else int(value)
+                        if isinstance(value, np.floating):
+                            # Check for NaN or infinity
+                            float_val = float(value)
+                            if np.isnan(float_val) or np.isinf(float_val):
+                                clean_indicators[key] = 0.0  # Replace NaN/inf with 0
+                            else:
+                                clean_indicators[key] = float_val
+                        else:
+                            clean_indicators[key] = int(value)
                     else:
                         clean_indicators[key] = value
             
@@ -666,7 +874,14 @@ class StrategyManager:
                             if isinstance(v, np.bool_):
                                 clean_patterns[key][k] = bool(v)
                             elif isinstance(v, (np.integer, np.floating)):
-                                clean_patterns[key][k] = float(v) if isinstance(v, np.floating) else int(v)
+                                if isinstance(v, np.floating):
+                                    float_val = float(v)
+                                    if np.isnan(float_val) or np.isinf(float_val):
+                                        clean_patterns[key][k] = 0.0  # Replace NaN/inf with 0
+                                    else:
+                                        clean_patterns[key][k] = float_val
+                                else:
+                                    clean_patterns[key][k] = int(v)
                             elif isinstance(v, datetime):
                                 clean_patterns[key][k] = v.isoformat()
                             else:
@@ -681,7 +896,14 @@ class StrategyManager:
                     if isinstance(value, np.bool_):
                         clean_performance[key] = bool(value)
                     elif isinstance(value, (np.integer, np.floating)):
-                        clean_performance[key] = float(value) if isinstance(value, np.floating) else int(value)
+                        if isinstance(value, np.floating):
+                            float_val = float(value)
+                            if np.isnan(float_val) or np.isinf(float_val):
+                                clean_performance[key] = 0.0  # Replace NaN/inf with 0
+                            else:
+                                clean_performance[key] = float_val
+                        else:
+                            clean_performance[key] = int(value)
                     else:
                         clean_performance[key] = value
             
