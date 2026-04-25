@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unified Trading Analytics</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .card-hover {
+            transition: transform 0.2s ease-in-out;
+        }
+        .card-hover:hover {
+            transform: translateY(-2px);
+        }
+        .metric-card {
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            border-left: 4px solid #3b82f6;
+        }
+        .success-card {
+            border-left-color: #10b981;
+        }
+        .warning-card {
+            border-left-color: #f59e0b;
+        }
+        .danger-card {
+            border-left-color: #ef4444;
+        }
+        .priority-high {
+            background-color: #fee2e2;
+            color: #dc2626;
+            border-left: 4px solid #dc2626;
+        }
+        .priority-medium {
+            background-color: #fef3c7;
+            color: #d97706;
+            border-left: 4px solid #d97706;
+        }
+        .priority-low {
+            background-color: #e0f2fe;
+            color: #0369a1;
+            border-left: 4px solid #0369a1;
+        }
+        .loading-spinner {
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #3b82f6;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin: 1rem 0;
+        }
+        .recommendation-card {
+            transition: all 0.2s ease;
+        }
+        .recommendation-card:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        .action-button {
+            transition: all 0.2s ease;
+        }
+        .action-button:hover {
+            transform: scale(1.05);
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <!-- Navigation -->
+    <nav class="gradient-bg text-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <a href="/" class="flex items-center">
+                        <i class="fas fa-chart-line text-2xl mr-3"></i>
+                        <h1 class="text-xl font-bold">Unified Trading Analytics</h1>
+                    </a>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <a href="/" class="hover:bg-white hover:bg-opacity-20 px-3 py-2 rounded-md text-sm font-medium transition-colors">
+                        <i class="fas fa-home mr-2"></i>Dashboard
+                    </a>
+                    <button id="refresh-analytics" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors action-button">
+                        <i class="fas fa-sync-alt mr-2"></i>Refresh All
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Loading State -->
+    <div id="loading-state" class="flex items-center justify-center h-64">
+        <div class="text-center">
+            <div class="loading-spinner mx-auto mb-4"></div>
+            <p class="text-gray-600">Loading comprehensive analytics...</p>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div id="main-content" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8" style="display: none;">
+        
+        <!-- Executive Summary -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-dashboard mr-2 text-blue-600"></i>Executive Summary
+            </h2>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                <div class="metric-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-gray-600">Total Recommendations</p>
+                            <p id="total-recommendations" class="text-2xl font-bold text-gray-900">-</p>
+                        </div>
+                        <i class="fas fa-lightbulb text-3xl text-yellow-500"></i>
+                    </div>
+                </div>
+                <div class="metric-card success-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-gray-600">High Priority Actions</p>
+                            <p id="high-priority-count" class="text-2xl font-bold text-gray-900">-</p>
+                        </div>
+                        <i class="fas fa-exclamation-triangle text-3xl text-red-500"></i>
+                    </div>
+                </div>
+                <div class="metric-card warning-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-gray-600">Recent Win Rate (Last 50)</p>
+                            <p id="current-win-rate" class="text-2xl font-bold text-gray-900">-</p>
+                            <p id="win-rate-comparison" class="text-xs text-gray-500 mt-1">vs Overall: -</p>
+                        </div>
+                        <i class="fas fa-percentage text-3xl text-green-500"></i>
+                    </div>
+                </div>
+                <div class="metric-card danger-card p-6 rounded-lg shadow-sm card-hover">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-gray-600">Potential Improvement</p>
+                            <p id="potential-improvement" class="text-2xl font-bold text-gray-900">-</p>
+                        </div>
+                        <i class="fas fa-arrow-up text-3xl text-blue-500"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Priority Recommendations -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-star mr-2 text-yellow-500"></i>Priority Recommendations
+            </h2>
+            <div id="priority-recommendations" class="space-y-4">
+                <!-- Dynamic content will be inserted here -->
+            </div>
+        </div>
+
+        <!-- Actionable Insights Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+            
+            <!-- Confidence Analysis -->
+            <div class="bg-white rounded-lg shadow-sm p-6">
+                <h3 class="text-lg font-bold text-gray-900 mb-4">
+                    <i class="fas fa-chart-bar mr-2 text-blue-600"></i>Confidence Correlation Analysis
+                </h3>
+                <div id="confidence-analysis" class="space-y-3">
+                    <!-- Dynamic content -->
+                </div>
+            </div>
+
+            <!-- Strategy Performance -->
+            <div class="bg-white rounded-lg shadow-sm p-6">
+                <h3 class="text-lg font-bold text-gray-900 mb-4">
+                    <i class="fas fa-cogs mr-2 text-green-600"></i>Strategy Performance
+                </h3>
+                <div id="strategy-performance" class="space-y-3">
+                    <!-- Dynamic content -->
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Market Conditions Analysis -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-clock mr-2 text-purple-600"></i>Market Conditions Analysis
+            </h2>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                
+                <!-- Best Trading Hours -->
+                <div class="bg-white rounded-lg shadow-sm p-6">
+                    <h3 class="text-lg font-bold text-gray-900 mb-4">Best Trading Hours</h3>
+                    <div id="best-hours" class="space-y-2">
+                        <!-- Dynamic content -->
+                    </div>
+                </div>
+
+                <!-- Daily Performance -->
+                <div class="bg-white rounded-lg shadow-sm p-6">
+                    <h3 class="text-lg font-bold text-gray-900 mb-4">Day of Week Performance</h3>
+                    <div id="daily-performance" class="space-y-2">
+                        <!-- Dynamic content -->
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- Parameter Optimization Suggestions -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-sliders-h mr-2 text-orange-600"></i>Parameter Optimization
+            </h2>
+            <div id="parameter-suggestions" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <!-- Dynamic content -->
+            </div>
+        </div>
+
+        <!-- All Recommendations Table -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-900 mb-4">
+                <i class="fas fa-list mr-2 text-gray-600"></i>All Recommendations
+            </h2>
+            <div class="bg-white rounded-lg shadow-sm overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Priority</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Current</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Recommended</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Impact</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Config Path</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recommendations-table" class="bg-white divide-y divide-gray-200">
+                            <!-- Dynamic content -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        let chartInstances = {};
+
+        // Main function to fetch all analytics
+        async function fetchAllAnalytics() {
+            document.getElementById('loading-state').style.display = 'flex';
+            document.getElementById('main-content').style.display = 'none';
+
+            try {
+                // Fetch all analytics endpoints in parallel
+                const [actionableResponse, marketResponse, parameterResponse] = await Promise.all([
+                    fetch('/api/v1/analytics/actionable'),
+                    fetch('/api/v1/analytics/market-conditions'),
+                    fetch('/api/v1/analytics/parameter-optimization')
+                ]);
+
+                const actionableData = await actionableResponse.json();
+                const marketData = await marketResponse.json();
+                const parameterData = await parameterResponse.json();
+
+                // Update executive summary
+                updateExecutiveSummary(actionableData, marketData, parameterData);
+
+                // Update priority recommendations
+                updatePriorityRecommendations(actionableData, parameterData);
+
+                // Update confidence analysis
+                updateConfidenceAnalysis(actionableData);
+
+                // Update strategy performance
+                updateStrategyPerformance(actionableData);
+
+                // Update market conditions
+                updateMarketConditions(marketData);
+
+                // Update parameter suggestions
+                updateParameterSuggestions(parameterData);
+
+                // Update recommendations table
+                updateRecommendationsTable(actionableData, parameterData);
+
+                document.getElementById('loading-state').style.display = 'none';
+                document.getElementById('main-content').style.display = 'block';
+
+            } catch (error) {
+                console.error('Error fetching analytics:', error);
+                document.getElementById('loading-state').innerHTML = `
+                    <div class="text-center">
+                        <i class="fas fa-exclamation-triangle text-red-500 text-4xl mb-4"></i>
+                        <p class="text-red-600">Error loading analytics: ${error.message}</p>
+                        <button onclick="fetchAllAnalytics()" class="mt-4 bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+                            Try Again
+                        </button>
+                    </div>
+                `;
+            }
+        }
+
+        function updateExecutiveSummary(actionableData, marketData, parameterData) {
+            const totalRecs = (actionableData.recommendations?.length || 0) + (parameterData.suggestions?.length || 0);
+            const highPriority = (actionableData.recommendations?.filter(r => r.priority === 'high')?.length || 0) + 
+                               (parameterData.suggestions?.filter(s => s.priority === 'high')?.length || 0);
+            
+            document.getElementById('total-recommendations').textContent = totalRecs;
+            document.getElementById('high-priority-count').textContent = highPriority;
+            
+            // Update win rate with comparison
+            const recentWinRate = actionableData.insights?.recent_win_rate;
+            const overallWinRate = actionableData.insights?.overall_win_rate;
+            
+            if (recentWinRate !== undefined) {
+                document.getElementById('current-win-rate').textContent = `${(recentWinRate * 100).toFixed(1)}%`;
+                
+                if (overallWinRate !== undefined) {
+                    const trend = recentWinRate < overallWinRate ? '📉' : '📈';
+                    const trendColor = recentWinRate < overallWinRate ? 'text-red-600' : 'text-green-600';
+                    document.getElementById('win-rate-comparison').innerHTML = 
+                        `<span class="${trendColor}">vs Overall: ${(overallWinRate * 100).toFixed(1)}% ${trend}</span>`;
+                }
+            } else {
+                document.getElementById('current-win-rate').textContent = 'N/A';
+            }
+            
+            document.getElementById('potential-improvement').textContent = actionableData.insights?.potential_improvement ? 
+                `$${actionableData.insights.potential_improvement.toFixed(2)}` : 'N/A';
+        }
+
+        function updatePriorityRecommendations(actionableData, parameterData) {
+            const container = document.getElementById('priority-recommendations');
+            const allRecs = [
+                ...(actionableData.recommendations || []).map(r => ({...r, source: 'actionable'})),
+                ...(parameterData.suggestions || []).map(s => ({...s, source: 'parameter', type: s.parameter}))
+            ];
+
+            const highPriorityRecs = allRecs.filter(r => r.priority === 'high').slice(0, 3);
+
+            if (highPriorityRecs.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 text-center py-8">No high priority recommendations at this time.</p>';
+                return;
+            }
+
+            container.innerHTML = highPriorityRecs.map(rec => `
+                <div class="recommendation-card priority-${rec.priority} p-4 rounded-lg">
+                    <div class="flex items-start justify-between">
+                        <div class="flex-1">
+                            <h4 class="font-semibold text-lg mb-2">
+                                <i class="fas fa-exclamation-circle mr-2"></i>
+                                ${rec.type.replace(/_/g, ' ').toUpperCase()}
+                            </h4>
+                            <p class="text-sm mb-2">${rec.reason || rec.description || 'No reason provided'}</p>
+                            <div class="flex items-center space-x-4 text-sm">
+                                <span><strong>Current:</strong> ${rec.current_value}</span>
+                                <span><strong>Recommended:</strong> ${rec.recommended_value || rec.suggested_value}</span>
+                                <span><strong>Impact:</strong> ${rec.impact || rec.expected_impact}</span>
+                            </div>
+                        </div>
+                        <button onclick="applyRecommendation('${rec.config_path || rec.config_location}', '${rec.recommended_value || rec.suggested_value}', '${rec.type}')" 
+                                class="action-button bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm">
+                            Apply
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateConfidenceAnalysis(actionableData) {
+            const container = document.getElementById('confidence-analysis');
+            const confidenceData = actionableData.confidence_analysis || {};
+
+            if (Object.keys(confidenceData).length === 0) {
+                container.innerHTML = '<p class="text-gray-500">No confidence data available</p>';
+                return;
+            }
+
+            const confidenceEntries = Object.entries(confidenceData)
+                .sort(([a], [b]) => parseFloat(b) - parseFloat(a))
+                .slice(0, 5);
+
+            container.innerHTML = confidenceEntries.map(([confidence, stats]) => {
+                const winRate = stats.wins / stats.count;
+                const avgPnl = stats.total_pnl / stats.count;
+                return `
+                    <div class="flex items-center justify-between p-3 bg-gray-50 rounded">
+                        <div>
+                            <span class="font-semibold">${(parseFloat(confidence) * 100).toFixed(0)}% Confidence</span>
+                            <span class="text-sm text-gray-600 ml-2">(${stats.count} trades)</span>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-sm font-medium ${winRate > 0.6 ? 'text-green-600' : 'text-red-600'}">
+                                ${(winRate * 100).toFixed(1)}% Win Rate
+                            </div>
+                            <div class="text-xs text-gray-500">
+                                Avg: $${avgPnl.toFixed(2)}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateStrategyPerformance(actionableData) {
+            const container = document.getElementById('strategy-performance');
+            const strategyData = actionableData.strategy_performance || {};
+
+            if (Object.keys(strategyData).length === 0) {
+                container.innerHTML = '<p class="text-gray-500">No strategy data available</p>';
+                return;
+            }
+
+            const strategies = Object.entries(strategyData)
+                .map(([name, stats]) => ({
+                    name,
+                    winRate: stats.wins / stats.count,
+                    avgPnl: stats.total_pnl / stats.count,
+                    count: stats.count
+                }))
+                .sort((a, b) => b.winRate - a.winRate);
+
+            container.innerHTML = strategies.map(strategy => `
+                <div class="flex items-center justify-between p-3 bg-gray-50 rounded">
+                    <div>
+                        <span class="font-semibold">${strategy.name.replace(/_/g, ' ')}</span>
+                        <span class="text-sm text-gray-600 ml-2">(${strategy.count} trades)</span>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm font-medium ${strategy.winRate > 0.5 ? 'text-green-600' : 'text-red-600'}">
+                            ${(strategy.winRate * 100).toFixed(1)}% Win Rate
+                        </div>
+                        <div class="text-xs text-gray-500">
+                            Avg: $${strategy.avgPnl.toFixed(2)}
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateMarketConditions(marketData) {
+            // Update best hours
+            const bestHoursContainer = document.getElementById('best-hours');
+            const bestHours = marketData.best_trading_hours || [];
+
+            if (bestHours.length === 0) {
+                bestHoursContainer.innerHTML = '<p class="text-gray-500">No optimal hours identified</p>';
+            } else {
+                bestHoursContainer.innerHTML = bestHours.slice(0, 5).map(hour => `
+                    <div class="flex items-center justify-between p-2 bg-green-50 rounded">
+                        <span class="font-medium">${hour.hour}:00 UTC</span>
+                        <div class="text-right text-sm">
+                            <div class="text-green-600 font-medium">${(hour.win_rate * 100).toFixed(1)}%</div>
+                            <div class="text-gray-500">$${hour.avg_pnl.toFixed(2)} avg</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            // Update daily performance
+            const dailyContainer = document.getElementById('daily-performance');
+            const dailyInsights = marketData.daily_insights || [];
+
+            if (dailyInsights.length === 0) {
+                dailyContainer.innerHTML = '<p class="text-gray-500">No daily insights available</p>';
+            } else {
+                dailyContainer.innerHTML = dailyInsights.slice(0, 7).map(day => `
+                    <div class="flex items-center justify-between p-2 bg-gray-50 rounded">
+                        <span class="font-medium">${day.day}</span>
+                        <div class="text-right text-sm">
+                            <div class="${day.win_rate > 0.5 ? 'text-green-600' : 'text-red-600'} font-medium">
+                                ${(day.win_rate * 100).toFixed(1)}%
+                            </div>
+                            <div class="text-gray-500">$${day.avg_pnl.toFixed(2)} avg</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function updateParameterSuggestions(parameterData) {
+            const container = document.getElementById('parameter-suggestions');
+            const suggestions = parameterData.suggestions || [];
+
+            if (suggestions.length === 0) {
+                container.innerHTML = '<div class="col-span-full text-center text-gray-500 py-8">No parameter optimization suggestions available</div>';
+                return;
+            }
+
+            container.innerHTML = suggestions.slice(0, 6).map(suggestion => `
+                <div class="bg-white p-6 rounded-lg shadow-sm card-hover priority-${suggestion.priority}">
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="font-semibold text-lg">${suggestion.parameter.replace(/_/g, ' ').toUpperCase()}</h4>
+                        <span class="px-2 py-1 rounded text-xs font-medium priority-${suggestion.priority}">
+                            ${suggestion.priority.toUpperCase()}
+                        </span>
+                    </div>
+                    <p class="text-sm text-gray-600 mb-3">${suggestion.reason}</p>
+                    <div class="space-y-2 text-sm">
+                        <div><strong>Current:</strong> ${suggestion.current_value}</div>
+                        <div><strong>Suggested:</strong> ${suggestion.suggested_value}</div>
+                        <div><strong>Impact:</strong> ${suggestion.expected_impact}</div>
+                    </div>
+                    <button onclick="applyRecommendation('${suggestion.config_location}', '${suggestion.suggested_value}', '${suggestion.parameter}')" 
+                            class="mt-4 w-full action-button bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm">
+                        Apply Change
+                    </button>
+                </div>
+            `).join('');
+        }
+
+        function updateRecommendationsTable(actionableData, parameterData) {
+            const tbody = document.getElementById('recommendations-table');
+            
+            const allRecs = [
+                ...(actionableData.recommendations || []).map(r => ({...r, source: 'actionable'})),
+                ...(parameterData.suggestions || []).map(s => ({...s, source: 'parameter', type: s.parameter}))
+            ];
+
+            if (allRecs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-500">No recommendations available</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = allRecs.map(rec => `
+                <tr class="hover:bg-gray-50">
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        <span class="px-2 py-1 rounded text-xs font-medium priority-${rec.priority}">
+                            ${rec.priority.toUpperCase()}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                        ${rec.type.replace(/_/g, ' ')}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        ${rec.current_value}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        ${rec.recommended_value || rec.suggested_value}
+                    </td>
+                    <td class="px-6 py-4 text-sm text-gray-500">
+                        ${rec.impact || rec.expected_impact}
+                    </td>
+                    <td class="px-6 py-4 text-sm text-gray-500 font-mono">
+                        ${rec.config_path || rec.config_location}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                        <button onclick="applyRecommendation('${rec.config_path || rec.config_location}', '${rec.recommended_value || rec.suggested_value}', '${rec.type}')" 
+                                class="action-button bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 text-xs">
+                            Apply
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function applyRecommendation(configPath, value, type) {
+            if (!confirm(`Apply this recommendation?\n\nConfig: ${configPath}\nValue: ${value}\n\nThis will update your config.yaml file and create a backup.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/v1/config/apply-recommendation', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        config_path: configPath,
+                        value: value,
+                        type: type
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    alert(`✅ Successfully applied!\n\n${result.message}\n\nBackup created: ${result.backup_created.split('/').pop()}`);
+                    
+                    // Refresh analytics to show updated state
+                    fetchAllAnalytics();
+                } else {
+                    alert(`❌ Failed to apply:\n\n${result.message}`);
+                }
+            } catch (error) {
+                alert(`❌ Error applying recommendation:\n\n${error.message}`);
+            }
+        }
+
+        // Event listeners
+        document.getElementById('refresh-analytics').addEventListener('click', fetchAllAnalytics);
+
+        // Auto-refresh every 5 minutes
+        setInterval(fetchAllAnalytics, 5 * 60 * 1000);
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', fetchAllAnalytics);
+    </script>
+</body>
+</html>

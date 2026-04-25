@@ -1,0 +1,147 @@
+# Bybit WebSocket Test Configuration - Version 2.6.0
+# Configuration for comprehensive Bybit WebSocket integration tests
+
+test_configuration:
+  # Test execution settings
+  timeout_seconds: 30
+  max_retries: 3
+  parallel_tests: false
+  
+  # Service URLs for testing
+  services:
+    exchange_service: "http://exchange-service:8003"
+    web_dashboard: "http://web-dashboard-service:8006"
+    fill_detection: "http://fill-detection-service:8007"
+    database_service: "http://database-service:8002"
+  
+  # Test data
+  test_data:
+    api_key: "test_api_key_12345"
+    api_secret: "test_api_secret_67890"
+    websocket_url: "wss://test.bybit.com/v5/private"
+    
+    # Test order data
+    test_order:
+      order_id: "test_order_123"
+      symbol: "BTCUSDT"
+      side: "Buy"
+      order_type: "Limit"
+      price: "50000"
+      qty: "0.001"
+      order_status: "Filled"
+    
+    # Test execution data
+    test_execution:
+      order_id: "test_order_123"
+      exec_id: "exec_123"
+      symbol: "BTCUSDT"
+      side: "Buy"
+      price: "50000"
+      qty: "0.001"
+      exec_fee: "0.000001"
+    
+    # Test position data
+    test_position:
+      symbol: "BTCUSDT"
+      side: "Buy"
+      size: "0.001"
+      avg_price: "50000"
+    
+    # Test wallet data
+    test_wallet:
+      coin: "USDT"
+      wallet_balance: "1000.00"
+      available_balance: "950.00"
+
+# Test categories and their settings
+test_categories:
+  authentication_manager:
+    enabled: true
+    timeout: 10
+    description: "Test Bybit authentication manager functionality"
+    
+  connection_manager:
+    enabled: true
+    timeout: 15
+    description: "Test Bybit connection manager functionality"
+    
+  event_processors:
+    enabled: true
+    timeout: 20
+    description: "Test Bybit event processors functionality"
+    
+  health_monitor:
+    enabled: true
+    timeout: 10
+    description: "Test Bybit health monitor functionality"
+    
+  websocket_integration:
+    enabled: true
+    timeout: 30
+    description: "Test Bybit WebSocket integration endpoints"
+    
+  fill_detection_integration:
+    enabled: true
+    timeout: 25
+    description: "Test Bybit WebSocket integration with fill detection service"
+    
+  dashboard_integration:
+    enabled: true
+    timeout: 20
+    description: "Test Bybit WebSocket integration with web dashboard"
+    
+  error_handling:
+    enabled: true
+    timeout: 15
+    description: "Test error handling and recovery mechanisms"
+    
+  recovery_mechanisms:
+    enabled: true
+    timeout: 20
+    description: "Test recovery manager functionality"
+    
+  database_integration:
+    enabled: true
+    timeout: 15
+    description: "Test database integration for Bybit data"
+
+# Success criteria
+success_criteria:
+  minimum_success_rate: 80.0  # Percentage
+  critical_tests:
+    - authentication_manager
+    - connection_manager
+    - websocket_integration
+    - error_handling
+  
+  # Test result thresholds
+  thresholds:
+    excellent: 90.0
+    good: 80.0
+    fair: 70.0
+    poor: 60.0
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "bybit_websocket_tests.log"
+  
+# Mock settings for testing
+mock_settings:
+  enable_mocks: true
+  mock_responses:
+    authentication:
+      success: {"retCode": 0, "retMsg": "OK"}
+      failure: {"retCode": 10001, "retMsg": "Authentication failed"}
+    
+    websocket_connection:
+      success: {"op": "auth", "args": ["test_key", "1234567890", "signature"]}
+      failure: {"op": "auth", "args": [], "error": "Connection failed"}
+
+# Performance benchmarks
+performance_benchmarks:
+  authentication_timeout: 5.0  # seconds
+  connection_timeout: 10.0     # seconds
+  event_processing_timeout: 2.0  # seconds
+  health_check_timeout: 3.0    # seconds

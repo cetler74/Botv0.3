@@ -1,42 +1,64 @@
 """
-Multi-Timeframe Engulfing Pattern Strategy for Trading ML Bot.
+Engulfing-Hybrid v1 — Multi-Timeframe Engulfing Pattern Strategy.
 
-Overview:
-    - Identifies bullish/bearish engulfing patterns across 4h, 1h, 15m, 5m timeframes with indicator and volume confirmation.
-    - Optimized for spot trading (long positions only).
-    - Configurable via config.yaml under strategy.engulfing_multi_tf.
-    - Handles both simulation/backtest and live trading modes.
-    - Designed for robust error handling and graceful degradation.
+Design:
+    This file is a HYBRID. It preserves the production-hardened
+    "engulfing pullback continuation" engine (hard vetos: ADX, ATR/price,
+    1.5x volume spike, macro 4h EMA9>EMA21 + close>SMA50) AND additively
+    layers the textbook spec features:
 
-Configuration:
-    - target_timeframes: List of timeframes to use (default: ['4h', '1h', '15m', '5m'])
-    - sma_period: Period for SMA (default: 50)
-    - adx_period: Period for ADX (default: 14)
-    - adx_entry_threshold: ADX threshold for entry (default: 25)
-    - volume_avg_period: Rolling window for volume average (default: 10)
-    - min_engulfing_size: Minimum body size ratio for engulfing (default: 0.6)
-    - confirmation_timeframes: Number of timeframes to confirm (default: 2)
-    - use_volume_confirmation: Use volume confirmation (default: True)
-    - cooldown_minutes: Cooldown period after entry (default: 60)
-    - min_confidence: Minimum confidence for entry/exit (default: 0.6)
+      * Real per-timeframe engulfing scan with weighted confluence
+        (the legacy `tf_confirmations` was a broadcast hack: it copied
+        the same pattern result across all TFs).
+      * Optional "break of engulfing high" entry confirmation
+        (require_engulfing_break_high=True).
+      * Optional pattern-based stop hint (engulfing low - buffer*ATR)
+        published in the indicators dict for the orchestrator
+        (use_pattern_stop=True).
+      * Opt-in `reversal_mode` that flips the macro check from
+        "continuation of an established trend" to "exhaustion of an
+        opposing trend" — the textbook spec interpretation.
+      * Bearish-engulfing reversal wired into `should_exit()` so it
+        actually fires through the orchestrator path
+        (exit_on_bearish_engulfing=True).
 
-Usage Example:
-    from strategy.engulfing_multi_tf import EngulfingMultiTimeframeStrategy
-    strategy = EngulfingMultiTimeframeStrategy(config, logger, exchange_handler)
-    signals = strategy.generate_signals(dataframes)
-    # ...
+    Continuation defaults are unchanged (catching falling knives is
+    expensive on a spot-only book) — the new features are off by default
+    or layer in as soft confluence boosts. Flip the flags in
+    `config.yaml` to opt into the textbook reversal behavior.
 
-Limitations:
-    - Requires sufficient historical data for all timeframes.
-    - Only supports long positions (spot trading).
-    - Relies on DB handler for cooldown and logging; falls back to local logging if unavailable.
-    - Performance may degrade with very large DataFrames.
+Bug fixes vs prior version:
+    - `analyze_pair()` referenced a non-existent `self.adx_threshold`
+      and ignored the engulfing pattern; now uses adx_entry_threshold
+      and the real pattern + macro pipeline.
+    - `calculate_indicators()` called `talib.ATR` without importing
+      talib at module level (NameError); now uses `pandas_ta.atr`.
+    - `check_entry_signals()` hard-coded ADX=15 and volume=0.5x,
+      bypassing config; now reads from `self.adx_entry_threshold` and
+      `volume_threshold_multiplier`. Cooldown placeholder replaced with
+      a real check against `self.cooldown_until`.
+    - `check_exit_signals()` mislabeled the bearish-engulfing reversal
+      exit as `take_profit` / `stop_loss`; now labels it
+      `bearish_engulfing_exit` so downstream analytics aren't poisoned.
+    - Duplicate sync legacy stubs for `update`, `generate_signals` and
+      `calculate_position_size` removed.
 
-Improvements:
-    - Add support for short positions.
-    - Optimize for memory usage in large backtests.
-    - Add more advanced confidence scoring.
-    - Integrate with additional dashboard metrics.
+Configuration (full list now lives in config.yaml under
+strategies.engulfing_multi_tf.parameters; only highlights here):
+    - target_timeframes:        ['4h','1h','15m']  - real multi-TF hierarchy
+    - confirmation_timeframes:  2                  - min agreeing TFs
+    - timeframe_weights:        {4h:0.5, 1h:0.3, 15m:0.2}
+    - enable_real_multi_tf:     true               - per-TF engulfing scan
+    - multi_tf_confluence_boost: 0.10              - confidence nudge
+    - require_engulfing_break_high: false          - spec entry trigger
+    - use_pattern_stop:         false              - spec stop placement
+    - reversal_mode:            false              - spec philosophy toggle
+    - exit_on_bearish_engulfing: true              - wire reversal exit
+
+Notes:
+    - Spot/long-only by design (no shorts).
+    - All hard vetos remain hard; new layers nudge confidence/strength
+      or add opt-in gates. They never relax the existing safety rails.
 """
 import logging
 import pandas as pd
@@ -53,6 +75,14 @@ from strategy.condition_logger import ConditionLogger
 
 class EngulfingMultiTimeframeStrategy(BaseStrategy):
     STRATEGY_NAME = "Engulfing Multi-Timeframe"
+
+    # OPTION-A: regime_overrides keys are matched against ``self.<attr>``
+    # by default. This map lets config use the original parameter names
+    # even when they differ from the attribute (e.g. ``volume_avg_period``
+    # is stored as ``self.volume_lookback``).
+    _regime_param_alias_map = {
+        "volume_avg_period": "volume_lookback",
+    }
 
     def __init__(self, config=None, exchange=None, database=None, redis_client=None, logger_instance=None, exchange_handler=None):
         """
@@ -157,6 +187,39 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         # Strategy Behavior
         self.regime_aware = params.get('regime_aware', True)
 
+        # --- Hybrid v1: spec-compliant additive layers (off / soft by default) ---
+        # Real per-timeframe engulfing scan (replaces the broadcast hack in
+        # check_entry_signals). Adds a confluence-weighted boost.
+        self.enable_real_multi_tf = params.get('enable_real_multi_tf', True)
+        self.multi_tf_confluence_boost = params.get('multi_tf_confluence_boost', 0.10)
+        # Volume threshold multiplier for the legacy check_entry_signals path
+        # (was hard-coded to 0.5 before; production gen_signal still requires 1.5x).
+        self.volume_threshold_multiplier = params.get('volume_threshold_multiplier', 1.0)
+
+        # Spec entry trigger: only enter when next bar BREAKS the engulfing
+        # candle's high (vs entering at engulfing close as today). Off by default
+        # so existing live behavior is unchanged.
+        self.require_engulfing_break_high = params.get('require_engulfing_break_high', False)
+        self.break_buffer_atr = params.get('break_buffer_atr', 0.10)  # 10% of ATR
+
+        # Spec stop placement: stop = engulfing_low - buffer*ATR. Published as a
+        # hint in the indicators dict so the orchestrator can use it instead of
+        # (or alongside) the ATR-derived stop. Off by default.
+        self.use_pattern_stop = params.get('use_pattern_stop', False)
+        self.pattern_stop_buffer_atr = params.get('pattern_stop_buffer_atr', 0.25)
+
+        # Spec philosophy: reversal mode flips the macro check from
+        # "continuation of an established uptrend" to "exhaustion of a downtrend"
+        # (RSI < oversold OR price stretched below SMA50). Off by default — the
+        # production engine is built for continuation pullbacks on spot.
+        self.reversal_mode = params.get('reversal_mode', False)
+        self.reversal_rsi_oversold = params.get('reversal_rsi_oversold', 35.0)
+        self.reversal_stretch_pct = params.get('reversal_stretch_pct', 0.03)  # 3% below SMA50
+
+        # Wire the existing bearish-engulfing reversal exit (already in
+        # check_exit_signals) into should_exit() so the orchestrator path fires.
+        self.exit_on_bearish_engulfing = params.get('exit_on_bearish_engulfing', True)
+
         # --- Data Containers ---
         self.indicators = {tf: {} for tf in self.target_timeframes}
         self.signals = {tf: {} for tf in self.target_timeframes}
@@ -184,6 +247,15 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         self.logger.info(f"  - Min Confidence: {self.min_confidence}, Cooldown: {self.cooldown_minutes}min")
         self.logger.info(f"  - Regime Aware: {self.regime_aware}, Use ATR Exits: {self.use_atr_for_exits}")
         self.logger.info(f"  - Timeframe Weights: {self.timeframe_weights}")
+        self.logger.info(
+            f"  - [Hybrid] real_multi_tf={self.enable_real_multi_tf} "
+            f"conf_boost={self.multi_tf_confluence_boost} "
+            f"break_high={self.require_engulfing_break_high} "
+            f"pattern_stop={self.use_pattern_stop} "
+            f"reversal_mode={self.reversal_mode} "
+            f"exit_on_bearish_engulf={self.exit_on_bearish_engulfing} "
+            f"vol_mult={self.volume_threshold_multiplier}"
+        )
 
     def _get_trading_config_value(self, key: str, default: Any = None) -> Any:
         """Safely get a value from the trading config, handling Pydantic objects."""
@@ -273,7 +345,133 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         except Exception as e:
             self.logger.error(f"[{self.STRATEGY_NAME}] Error detecting engulfing pattern: {e}")
             return None
-            
+
+    # ------------------------------------------------------------------
+    # Hybrid v1 helpers — spec-compliant additive layers.
+    # Kept side-effect free so they can be safely composed with the
+    # existing engine without disturbing the hard vetos.
+    # ------------------------------------------------------------------
+
+    def _scan_engulfing_per_timeframe(
+        self, tf_data: Dict[str, pd.DataFrame]
+    ) -> Tuple[Dict[str, Optional[str]], int, float]:
+        """Run the real engulfing scan on every available timeframe.
+
+        Replaces the legacy "broadcast" hack in check_entry_signals which
+        copied a single TF's pattern across the rest. Returns:
+          - per_tf:    {tf: 'bullish'|'bearish'|None}
+          - bull_count: number of TFs reporting bullish engulfing
+          - weighted:   confluence score in [0, 1] using
+                        ``self.timeframe_weights``.
+        """
+        per_tf: Dict[str, Optional[str]] = {}
+        for tf in self.target_timeframes:
+            df = tf_data.get(tf)
+            if df is None or df.empty or len(df) < 3:
+                per_tf[tf] = None
+                continue
+            try:
+                per_tf[tf] = self.detect_engulfing_pattern(df)
+            except Exception as e:
+                self.logger.debug(
+                    f"[{self.STRATEGY_NAME}] per-TF scan failed for {tf}: {e}"
+                )
+                per_tf[tf] = None
+
+        bull_count = sum(1 for v in per_tf.values() if v == 'bullish')
+        weights = self.timeframe_weights or {}
+        total_w = sum(float(weights.get(tf, 0.0)) for tf in self.target_timeframes)
+        if total_w <= 0:
+            # Fallback: equal weighting across known TFs
+            total_w = float(len(self.target_timeframes)) or 1.0
+            weighted = bull_count / total_w
+        else:
+            weighted = sum(
+                float(weights.get(tf, 0.0))
+                for tf, v in per_tf.items() if v == 'bullish'
+            ) / total_w
+        return per_tf, bull_count, float(min(max(weighted, 0.0), 1.0))
+
+    def _check_engulfing_break_high(
+        self, ohlcv: pd.DataFrame, atr: float
+    ) -> Tuple[bool, Optional[float]]:
+        """Spec entry trigger: confirm break of the engulfing candle's high.
+
+        Looks at the most recent closed bar; if it is a bullish engulfing,
+        the trigger is the engulfing high + ``break_buffer_atr * atr``.
+        We require the *current* close to have already exceeded the trigger
+        (live bars on the execution TF arrive frequently enough that this
+        is a reasonable proxy for an intra-bar break-and-hold).
+        Returns (broken, trigger_price).
+        """
+        try:
+            if ohlcv is None or len(ohlcv) < 3:
+                return False, None
+            engulf_high = float(ohlcv['high'].iloc[-1])
+            engulf_close = float(ohlcv['close'].iloc[-1])
+            buffer = max(0.0, float(atr) * float(self.break_buffer_atr))
+            trigger = engulf_high + buffer
+            broken = engulf_close >= trigger
+            return broken, trigger
+        except Exception as e:
+            self.logger.debug(
+                f"[{self.STRATEGY_NAME}] _check_engulfing_break_high error: {e}"
+            )
+            return False, None
+
+    def _compute_pattern_stop_hint(
+        self, ohlcv: pd.DataFrame, atr: float
+    ) -> Optional[float]:
+        """Spec stop placement: ``engulfing_low - buffer*ATR``.
+
+        Published as a hint via the indicators dict; the orchestrator can
+        use it instead of (or as a tighter floor under) the ATR-derived
+        stop. Returns ``None`` if we can't compute it safely.
+        """
+        try:
+            if ohlcv is None or len(ohlcv) < 2:
+                return None
+            engulf_low = float(ohlcv['low'].iloc[-1])
+            buffer = max(0.0, float(atr) * float(self.pattern_stop_buffer_atr))
+            stop = engulf_low - buffer
+            return stop if stop > 0 else None
+        except Exception as e:
+            self.logger.debug(
+                f"[{self.STRATEGY_NAME}] _compute_pattern_stop_hint error: {e}"
+            )
+            return None
+
+    def _check_reversal_macro(
+        self, ohlcv_macro: Optional[pd.DataFrame]
+    ) -> bool:
+        """Spec philosophy: macro check for a stretched/exhausted downtrend.
+
+        True when the macro TF shows oversold conditions OR price is
+        materially below SMA50 (``reversal_stretch_pct``). Used only when
+        ``self.reversal_mode`` is enabled — it intentionally INVERTS the
+        production "macro must be bullish" guard so we can catch knife
+        bottoms when configured to do so.
+        """
+        try:
+            if ohlcv_macro is None or ohlcv_macro.empty or len(ohlcv_macro) < 50:
+                return False
+            close = ohlcv_macro['close']
+            sma50 = ta.sma(close, length=50)
+            rsi = ta.rsi(close, length=14)
+            if sma50 is None or rsi is None or pd.isna(sma50.iloc[-1]) or pd.isna(rsi.iloc[-1]):
+                return False
+            cur = float(close.iloc[-1])
+            sma_v = float(sma50.iloc[-1])
+            rsi_v = float(rsi.iloc[-1])
+            stretched_below = (sma_v - cur) / max(sma_v, 1e-9) >= float(self.reversal_stretch_pct)
+            oversold = rsi_v <= float(self.reversal_rsi_oversold)
+            return bool(stretched_below or oversold)
+        except Exception as e:
+            self.logger.debug(
+                f"[{self.STRATEGY_NAME}] _check_reversal_macro error: {e}"
+            )
+            return False
+
     def _validate_dataframe(self, df: Optional[pd.DataFrame], required_cols: list, tf: str) -> bool:
         """
         Helper to check if DataFrame is valid and has required columns.
@@ -318,12 +516,12 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                 if indicators_cache is not None:
                     indicators_cache[cache_key_adx] = adx
                     self.logger.debug(f"[CACHE STORE] ADX for {pair} {tf} (period={self.adx_period})")
-            # ATR
+            # ATR — use pandas_ta (talib was previously referenced without import → NameError)
             if indicators_cache is not None and cache_key_atr in indicators_cache:
                 self.logger.debug(f"[CACHE HIT] ATR for {pair} {tf} (period={self.atr_period})")
                 atr = indicators_cache[cache_key_atr]
             else:
-                atr = talib.ATR(df['high'].to_numpy(), df['low'].to_numpy(), df['close'].to_numpy(), timeperiod=self.atr_period)
+                atr = ta.atr(df['high'], df['low'], df['close'], length=self.atr_period)
                 if indicators_cache is not None:
                     indicators_cache[cache_key_atr] = atr
                     self.logger.debug(f"[CACHE STORE] ATR for {pair} {tf} (period={self.atr_period})")
@@ -388,12 +586,34 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                         'multiplier': self.min_engulfing_size_multiplier
                     }
 
-                    # Multi-timeframe confirmation (placeholder logic)
-                    tf_confirmations = {tf: ('bullish' if pattern == 'bullish' else 'none') for tf in self.target_timeframes}
+                    # --- Multi-timeframe confirmation (hybrid v1) ---
+                    # Previously this was a "broadcast" hack: it copied the
+                    # current TF's pattern across every target TF, so the
+                    # confirmation count was always either N or 0 and the
+                    # weighted confidence was always 0 or 1. We now run a
+                    # real per-TF scan when the caller supplies multi-TF data.
                     tf_weights = self.timeframe_weights
-                    confirmed_timeframes = sum(1 for v in tf_confirmations.values() if v == 'bullish')
+                    if self.enable_real_multi_tf and isinstance(tf_data, dict) and len(tf_data) > 1:
+                        try:
+                            tf_confirmations, confirmed_timeframes, weighted_confidence = (
+                                self._scan_engulfing_per_timeframe(tf_data)
+                            )
+                        except Exception as _scan_err:
+                            self.logger.debug(
+                                f"[{self.STRATEGY_NAME}] real multi-TF scan failed in "
+                                f"check_entry_signals: {_scan_err}"
+                            )
+                            tf_confirmations = {tf: ('bullish' if pattern == 'bullish' else None) for tf in self.target_timeframes}
+                            confirmed_timeframes = sum(1 for v in tf_confirmations.values() if v == 'bullish')
+                            total_w = sum(float(tf_weights.values())) if isinstance(tf_weights, dict) else 0.0
+                            weighted_confidence = (1.0 if pattern == 'bullish' else 0.0)
+                    else:
+                        # Single-TF caller: fall back to the legacy semantics
+                        # but make it explicit instead of hidden.
+                        tf_confirmations = {tf: ('bullish' if pattern == 'bullish' else None) for tf in self.target_timeframes}
+                        confirmed_timeframes = sum(1 for v in tf_confirmations.values() if v == 'bullish')
+                        weighted_confidence = (1.0 if pattern == 'bullish' else 0.0)
                     required_confirmations = self.confirmation_timeframes
-                    weighted_confidence = sum(tf_weights.get(tf, 1.0) for tf, v in tf_confirmations.items() if v == 'bullish') / sum(tf_weights.values())
 
                     # Technical indicators (proper calculation instead of placeholders)
                     indicators = {
@@ -423,25 +643,38 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                         self.logger.error(f"Error calculating ATR: {e}")
                         indicators['atr'] = 0.0  # Fallback value
 
-                    # Condition checks - Fixed volume validation logic
-                    # Use a more reasonable volume threshold (50% of average instead of 100%)
-                    volume_threshold_multiplier = 0.5  # 50% of average volume
+                    # --- Condition checks (hybrid v1: respect config) ---
+                    # Volume / ADX thresholds were hard-coded (0.5x and 15)
+                    # which silently bypassed the configured values. Now we
+                    # read them from the configurable parameters and the real
+                    # cooldown_until map.
+                    vol_mult = float(self.volume_threshold_multiplier)
                     volume_confirmation = (
-                        volume is not None and 
-                        indicators['avg_volume'] > 0 and 
-                        volume > (indicators['avg_volume'] * volume_threshold_multiplier)
+                        volume is not None and
+                        indicators['avg_volume'] > 0 and
+                        volume > (indicators['avg_volume'] * vol_mult)
                     )
-                    
+
+                    cooldown_until = self.cooldown_until.get(pair) if isinstance(self.cooldown_until, dict) else None
+                    not_in_cooldown = True
+                    if cooldown_until is not None:
+                        try:
+                            now = datetime.now(timezone.utc) if cooldown_until.tzinfo else datetime.now()
+                            not_in_cooldown = now >= cooldown_until
+                        except Exception:
+                            not_in_cooldown = True
+
                     conditions = {
-                        'adx_threshold': 15,  # Lowered from 25 for low-volatility markets
-                        'min_confidence': 0.6,
+                        'adx_threshold': float(self.adx_entry_threshold),
+                        'min_confidence': float(self.min_confidence),
+                        'volume_threshold_multiplier': vol_mult,
                         'checks': {
                             'Engulfing Pattern Present': pattern == 'bullish',
                             'Required Timeframe Confirmations': confirmed_timeframes >= required_confirmations,
-                            'ADX Above Threshold': indicators['adx'] > 15,  # Lowered from 25
+                            'ADX Above Threshold': indicators['adx'] > float(self.adx_entry_threshold),
                             'Volume Confirmation': volume_confirmation,
-                            'Not In Cooldown Period': True,  # Placeholder
-                            'Minimum Confidence Met': weighted_confidence >= 0.6
+                            'Not In Cooldown Period': bool(not_in_cooldown),
+                            'Minimum Confidence Met': weighted_confidence >= float(self.min_confidence)
                         }
                     }
 
@@ -565,36 +798,37 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                         condition_type="exit"
                     )
                     self.logger.info(f"[{self.STRATEGY_NAME}] CONDITION VERIFICATION for {pair}: Condition1: {cond1}, Condition2: {cond2}, All: {all_conditions_met}")
-                    # Only trigger exit if all_conditions_met and there is profit (current_price > entry_price)
-                    if all_conditions_met and entry_price is not None and current_price > entry_price:
+                    # --- Hybrid v1: exit reason is the actual cause ---
+                    # Previously labeled bearish-engulfing reversal exits as
+                    # ``take_profit`` or ``stop_loss`` based on whether the
+                    # trade was up or down. That poisoned downstream PnL
+                    # analytics (those buckets should mean SL/TP triggers
+                    # exclusively). Now both branches emit the correct
+                    # ``bearish_engulfing_exit`` reason, with profit/loss
+                    # carried in details.in_profit for analytics.
+                    if all_conditions_met and entry_price is not None:
+                        in_profit = current_price > entry_price
                         exit_signals.append({
                             'pair': pair,
                             'signal': 'exit',
                             'strategy': 'engulfing_multi_tf',
-                            'reason': 'take_profit',
-                            'details': {'pattern': pattern, 'conditions': {'cond1': cond1, 'cond2': cond2}}
+                            'reason': 'bearish_engulfing_exit',
+                            'details': {
+                                'pattern': pattern,
+                                'conditions': {'cond1': cond1, 'cond2': cond2},
+                                'in_profit': in_profit,
+                                'entry_price': entry_price,
+                                'current_price': current_price,
+                            }
                         })
-                        self.logger.info(f"[{self.STRATEGY_NAME}] SIGNAL GENERATION for {pair}: Exit Signal: YES (reason: take_profit)")
-                        condition_logger.log_condition(
-                            name="SignalGeneration",
-                            value="exit",
-                            description="All exit conditions met (take profit)",
-                            result=True,
-                            condition_type="signal"
+                        self.logger.info(
+                            f"[{self.STRATEGY_NAME}] SIGNAL GENERATION for {pair}: "
+                            f"Exit Signal: YES (reason: bearish_engulfing_exit, in_profit={in_profit})"
                         )
-                    elif all_conditions_met and entry_price is not None and current_price <= entry_price:
-                        exit_signals.append({
-                            'pair': pair,
-                            'signal': 'exit',
-                            'strategy': 'engulfing_multi_tf',
-                            'reason': 'stop_loss',
-                            'details': {'pattern': pattern, 'conditions': {'cond1': cond1, 'cond2': cond2}}
-                        })
-                        self.logger.info(f"[{self.STRATEGY_NAME}] SIGNAL GENERATION for {pair}: Exit Signal: YES (reason: stop_loss)")
                         condition_logger.log_condition(
                             name="SignalGeneration",
                             value="exit",
-                            description="All exit conditions met (stop loss)",
+                            description=f"Bearish engulfing reversal exit (in_profit={in_profit})",
                             result=True,
                             condition_type="signal"
                         )
@@ -635,52 +869,205 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
         )
         return self._condition_logger 
 
-    # --- Add required abstract method stubs for integration testing ---
-    async def calculate_position_size(self, *args, **kwargs):
-        """Stub for abstract method."""
-        pass
-
-    def generate_signals(self, dataframes: Dict[str, pd.DataFrame], indicators_cache: Optional[dict] = None, pair: Optional[str] = None) -> Dict[str, Any]:
-        """Generate signals using indicator cache if provided."""
-        indicators = asyncio.run(self.calculate_indicators(dataframes, indicators_cache, pair))
-        # ... rest of the logic unchanged ...
-        return {'signals': indicators}
+    # NOTE: hybrid v1 — early `calculate_position_size` and `generate_signals`
+    # stubs were removed here. Python kept only the *last* definitions in the
+    # class anyway (the real async ones below), so the stubs were dead code
+    # that confused readers. The real async ``calculate_position_size`` lives
+    # near the bottom of the class alongside ``update`` and ``should_exit``.
 
     async def generate_signal(self, market_data, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None, exchange_adapter=None) -> Tuple[str, float, float]:
-        """Generate trading signal with optimizer integration and enhanced logging, using indicator cache if provided."""
+        """
+        PnL-FIX v3: Real implementation with hard vetos + multi-TF confluence.
+
+        Previous version was a placeholder that always returned 'hold'. This
+        replacement mirrors the heikin_ashi fix:
+          - Detect bullish engulfing on the execution timeframe (15m)
+          - Require bullish macro trend on 4h (EMA fast > slow, price > SMA50)
+          - Hard vetos: ADX >= 22, volume >= 1.5× avg, ATR > 0 (real volatility)
+          - No signal if any hard veto fails (no majority vote)
+        """
         try:
-            # Handle different market_data formats
+            import pandas_ta as ta
+            # OPTION-A: apply regime-driven parameter overrides. Safe no-op
+            # if no regime_overrides block is configured for this strategy.
+            try:
+                self._apply_regime_overrides(getattr(self.state, 'market_regime', None))
+            except Exception as _ra_err:
+                self.logger.debug(
+                    f"[EngulfingMultiTF] regime-override apply failed: {_ra_err}"
+                )
+
+            # Normalise market_data to a dict of {timeframe: DataFrame}
             if isinstance(market_data, dict):
-                # Multi-timeframe data - use primary timeframe or first available
-                primary_tf = timeframe or self.target_timeframes[0]
-                if primary_tf in market_data:
-                    ohlcv = market_data[primary_tf]
-                else:
-                    # Use first available timeframe
-                    ohlcv = next(iter(market_data.values()))
+                tf_data = market_data
             else:
-                # Single DataFrame
-                ohlcv = market_data
-            
-            if ohlcv is None or ohlcv.empty:
-                self.logger.warning(f"[{self.STRATEGY_NAME}] No market data available for {pair}")
+                # Single DataFrame: treat as the execution timeframe only
+                tf_data = {timeframe or '15m': market_data}
+
+            # Pick the execution (entry) timeframe and macro (trend) timeframe.
+            exec_tf = '15m' if '15m' in tf_data else (timeframe or next(iter(tf_data.keys()), None))
+            macro_tf = '4h' if '4h' in tf_data else ('1h' if '1h' in tf_data else exec_tf)
+
+            ohlcv = tf_data.get(exec_tf)
+            ohlcv_macro = tf_data.get(macro_tf)
+
+            if ohlcv is None or ohlcv.empty or len(ohlcv) < max(self.sma_period, self.adx_period, 30):
                 return 'hold', 0.0, 0.0
-            
-            # Use exchange_adapter if provided, otherwise use self.exchange
-            exchange_to_use = exchange_adapter or self.exchange
-            
-            # For now, return a basic signal while the full implementation is being worked on
-            # TODO: Implement full engulfing pattern detection logic
-            pattern = 'none'  # placeholder
-            adx_strong = False    # placeholder
-            price_above_sma = False  # placeholder
-            volume_spike = False     # placeholder
-            
-            confidence = self._calculate_signal_confidence(pattern, price_above_sma, adx_strong, volume_spike)
-            
-            # Return 3-tuple as expected by the interface
-            return 'hold', confidence, 0.0
-            
+
+            # --- Execution timeframe: engulfing pattern + ADX + volume ---
+            pattern = self.detect_engulfing_pattern(ohlcv)
+            if pattern != 'bullish':
+                return 'hold', 0.0, 0.0
+
+            close = ohlcv['close'].to_numpy(dtype=float)
+            volume = ohlcv['volume'].to_numpy(dtype=float) if 'volume' in ohlcv.columns else np.zeros_like(close)
+
+            try:
+                adx_df = ta.adx(
+                    high=ohlcv['high'], low=ohlcv['low'], close=ohlcv['close'], length=self.adx_period
+                )
+                atr_series = ta.atr(
+                    high=ohlcv['high'], low=ohlcv['low'], close=ohlcv['close'], length=self.atr_period
+                )
+                if adx_df is not None and not adx_df.empty:
+                    adx_col = next((c for c in adx_df.columns if c.startswith('ADX')), None)
+                    adx = float(adx_df[adx_col].iloc[-1]) if adx_col and not pd.isna(adx_df[adx_col].iloc[-1]) else 0.0
+                else:
+                    adx = 0.0
+                atr = float(atr_series.iloc[-1]) if atr_series is not None and not atr_series.empty and not pd.isna(atr_series.iloc[-1]) else 0.0
+            except Exception as e:
+                self.logger.warning(f"[{self.STRATEGY_NAME}] pandas_ta error for {pair}: {e}")
+                return 'hold', 0.0, 0.0
+
+            avg_volume = float(np.mean(volume[-self.volume_lookback:])) if len(volume) >= self.volume_lookback else 0.0
+            cur_volume = float(volume[-1]) if len(volume) else 0.0
+            cur_price = float(close[-1])
+
+            # --- HARD VETOS (all must pass) ---
+            veto_adx = adx >= max(22.0, float(self.adx_entry_threshold))
+            veto_atr = atr > 0.0 and (atr / cur_price) > 0.001  # at least 0.1% ATR/price
+            veto_vol = avg_volume > 0 and cur_volume >= 1.5 * avg_volume
+            veto_macro = True  # computed below only if macro data present
+
+            # --- Macro trend confirmation (4h preferred) ---
+            macro_trend_bullish = False
+            macro_exhausted = False
+            if ohlcv_macro is not None and not ohlcv_macro.empty and len(ohlcv_macro) >= 50:
+                try:
+                    ema_fast_m = ta.ema(ohlcv_macro['close'], length=9)
+                    ema_slow_m = ta.ema(ohlcv_macro['close'], length=21)
+                    sma50_m = ta.sma(ohlcv_macro['close'], length=50)
+                    if (ema_fast_m is not None and ema_slow_m is not None and sma50_m is not None
+                            and not pd.isna(ema_fast_m.iloc[-1])
+                            and not pd.isna(ema_slow_m.iloc[-1])
+                            and not pd.isna(sma50_m.iloc[-1])):
+                        macro_trend_bullish = (
+                            ema_fast_m.iloc[-1] > ema_slow_m.iloc[-1]
+                            and ohlcv_macro['close'].iloc[-1] > sma50_m.iloc[-1]
+                        )
+                except Exception:
+                    macro_trend_bullish = False
+
+                # Hybrid v1: optional reversal-mode macro check (textbook spec).
+                # When enabled, accept either continuation (production default)
+                # OR exhaustion of an opposing trend.
+                if self.reversal_mode:
+                    macro_exhausted = self._check_reversal_macro(ohlcv_macro)
+                    veto_macro = macro_trend_bullish or macro_exhausted
+                else:
+                    veto_macro = macro_trend_bullish
+            else:
+                # If macro data unavailable, be conservative and refuse the entry.
+                veto_macro = False
+
+            hard_vetos = veto_adx and veto_atr and veto_vol and veto_macro
+            if not hard_vetos:
+                self.logger.info(
+                    f"[{self.STRATEGY_NAME}] {pair} HOLD — vetos adx={veto_adx} "
+                    f"atr={veto_atr} vol={veto_vol} macro={veto_macro} "
+                    f"(adx={adx:.1f} atr/price={atr/max(cur_price,1e-9):.4f} "
+                    f"vol/avg={cur_volume/max(avg_volume,1e-9):.2f} "
+                    f"macro_bullish={macro_trend_bullish} macro_exhausted={macro_exhausted})"
+                )
+                return 'hold', 0.0, 0.0
+
+            # --- Hybrid v1 layer: real per-TF engulfing confluence ---
+            mtf_boost = 0.0
+            mtf_bull = 0
+            mtf_per_tf: Dict[str, Optional[str]] = {}
+            mtf_weighted = 0.0
+            if self.enable_real_multi_tf and isinstance(tf_data, dict) and len(tf_data) > 1:
+                try:
+                    mtf_per_tf, mtf_bull, mtf_weighted = self._scan_engulfing_per_timeframe(tf_data)
+                    if mtf_bull >= int(self.confirmation_timeframes):
+                        mtf_boost = float(self.multi_tf_confluence_boost) * float(mtf_weighted)
+                except Exception as _mtf_err:
+                    self.logger.debug(
+                        f"[{self.STRATEGY_NAME}] real multi-TF scan failed: {_mtf_err}"
+                    )
+
+            # --- Hybrid v1 layer: optional break-of-engulfing-high gate ---
+            broke_high = True
+            break_trigger: Optional[float] = None
+            if self.require_engulfing_break_high:
+                broke_high, break_trigger = self._check_engulfing_break_high(ohlcv, atr)
+                if not broke_high:
+                    self.logger.info(
+                        f"[{self.STRATEGY_NAME}] {pair} HOLD — break-of-high gate "
+                        f"unmet (close={cur_price:.6f} trigger={break_trigger})"
+                    )
+                    return 'hold', 0.0, 0.0
+
+            # --- Hybrid v1 layer: pattern-based stop hint (published) ---
+            pattern_stop_hint = None
+            if self.use_pattern_stop:
+                pattern_stop_hint = self._compute_pattern_stop_hint(ohlcv, atr)
+
+            # All hard vetos passed AND bullish engulfing detected.
+            # Confidence scales with ADX strength + macro-trend alignment +
+            # multi-TF confluence boost (capped at 1.0).
+            confidence = min(
+                1.0,
+                0.60
+                + (adx - 22.0) / 100.0
+                + (0.10 if macro_trend_bullish else 0.0)
+                + mtf_boost,
+            )
+            strength = min(1.0, (adx / 60.0) * (cur_volume / max(avg_volume, 1e-9)) / 2.0)
+
+            # Publish hybrid metadata so the orchestrator can consume the
+            # stop hint and analytics can audit the new signals.
+            try:
+                if not isinstance(getattr(self.state, 'indicators', None), dict):
+                    self.state.indicators = {}
+                self.state.indicators.update({
+                    'engulfing_pattern': 'bullish',
+                    'engulfing_break_high_trigger': break_trigger,
+                    'pattern_stop_hint': pattern_stop_hint,
+                    'multi_tf_per_tf': mtf_per_tf,
+                    'multi_tf_bull_count': mtf_bull,
+                    'multi_tf_weighted_score': mtf_weighted,
+                    'macro_trend_bullish': macro_trend_bullish,
+                    'macro_exhausted': macro_exhausted,
+                    'reversal_mode': self.reversal_mode,
+                    'last_atr': atr,
+                    'last_adx': adx,
+                })
+            except Exception:
+                pass
+
+            self.logger.info(
+                f"[{self.STRATEGY_NAME}] {pair} BUY — engulfing+vetos passed: "
+                f"adx={adx:.1f} vol={cur_volume:.0f}/{avg_volume:.0f} "
+                f"atr/price={atr/cur_price:.4f} macro_bullish={macro_trend_bullish} "
+                f"reversal_mode={self.reversal_mode} macro_exhausted={macro_exhausted} "
+                f"mtf_bull={mtf_bull}/{len(self.target_timeframes)} "
+                f"mtf_weighted={mtf_weighted:.2f} mtf_boost={mtf_boost:.3f} "
+                f"break_high={broke_high} pattern_stop={pattern_stop_hint} "
+                f"confidence={confidence:.2f} strength={strength:.2f}"
+            )
+            return 'buy', float(confidence), float(strength)
+
         except Exception as e:
             self.logger.error(f"[{self.STRATEGY_NAME}] Error in generate_signal for {pair}: {e}", exc_info=True)
             return 'hold', 0.0, 0.0
@@ -791,11 +1178,10 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
             self.logger.error(f"Error applying strategy parameters: {str(e)}")
             return False
 
-    def update(self, *args, **kwargs):
-        """Legacy method stub."""
-        self.logger.warning("update is deprecated, use async update method instead")
-        # Do nothing for backward compatibility
-        return None
+    # NOTE: hybrid v1 — removed sync ``update`` stub here. The async
+    # ``update`` defined below was already shadowing it (Python keeps the
+    # last definition), so the stub was dead code. Kept this comment so
+    # nobody re-adds it thinking it's missing.
 
     def _get_decimal_precision(self, pair: str) -> int:
         """Get decimal precision for a trading pair."""
@@ -927,6 +1313,43 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
                 )
                 self.logger.info(f"[{self.STRATEGY_NAME}] Exiting due to take profit")
                 return True, 'take_profit'
+
+            # --- Hybrid v1: bearish engulfing reversal exit ---
+            # Mirrors the spec's "exit on opposite pattern" rule. Wired here
+            # so the orchestrator-facing should_exit() actually fires it
+            # (previously only check_exit_signals() acted on it, and it was
+            # mislabeled as take_profit/stop_loss).
+            if self.state.position == 'long' and self.exit_on_bearish_engulfing:
+                try:
+                    pattern = self.detect_engulfing_pattern(self._current_ohlcv)
+                    if pattern == 'bearish':
+                        try:
+                            open_last = float(self._current_ohlcv['open'].iloc[-1])
+                        except Exception:
+                            open_last = current_price
+                        if current_price < open_last:
+                            entry_price = getattr(self.state, 'entry_price', None)
+                            in_profit = (
+                                entry_price is not None and current_price > entry_price
+                            )
+                            await self.log_condition_outcome(
+                                'exit_signal', 'bearish_engulfing_exit', True,
+                                {
+                                    'current_price': current_price,
+                                    'entry_price': entry_price,
+                                    'in_profit': in_profit,
+                                    'pattern': pattern,
+                                }
+                            )
+                            self.logger.info(
+                                f"[{self.STRATEGY_NAME}] Exiting on bearish engulfing "
+                                f"reversal (in_profit={in_profit})"
+                            )
+                            return True, 'bearish_engulfing_exit'
+                except Exception as _be_err:
+                    self.logger.debug(
+                        f"[{self.STRATEGY_NAME}] bearish-engulfing exit check failed: {_be_err}"
+                    )
             return False, None
         except Exception as e:
             self.logger.error(f"[{self.STRATEGY_NAME}] Error in should_exit: {e}")
@@ -973,11 +1396,17 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
             self.logger.error(f"Error checking exit signal for {pair}: {str(e)}")
             return False, "error", {'error': str(e)}
 
-    # Legacy method stubs for backward compatibility
     def generate_signals(self, *args, **kwargs):
-        """Legacy method stub."""
+        """Legacy sync stub kept for backward compatibility.
+
+        This is the only ``generate_signals`` definition in the class
+        (hybrid v1 cleanup removed an earlier duplicate that ran a
+        dataframe scan via ``asyncio.run`` — it was being shadowed by
+        this stub anyway). New callers should use the async
+        ``generate_signal`` (singular) above.
+        """
         self.logger.warning("generate_signals is deprecated, use generate_signal instead")
-        return [] 
+        return []
 
     async def _log_condition(self, name, value, description, result, condition_type, pair, reason=None, market_regime=None, volatility=None, context=None):
         desc = description or name
@@ -1004,45 +1433,72 @@ class EngulfingMultiTimeframeStrategy(BaseStrategy):
             return False 
 
     async def analyze_pair(self, pair, min_candles=None):
+        """
+        Per-timeframe analysis used by the strategy-service caller.
+
+        Hybrid v1 fixes:
+          - Replaced ``self.adx_threshold`` (undefined) with the real
+            configured attribute ``self.adx_entry_threshold``.
+          - Switched from talib to pandas_ta to match the rest of the
+            module (and remove the only remaining talib dependency here).
+          - Added the engulfing pattern check so the result actually
+            reflects this strategy's edge instead of a generic ADX/RSI
+            scan that ignored the pattern entirely.
+          - NaN-guarded all indicator reads.
+        """
         timeframes = ['1h', '15m']
         results = {}
+        min_n = min_candles or 50
         for timeframe in timeframes:
             self.logger.info(f"[EngulfingMultiTF] Analyzing {pair} on {timeframe}")
-            df = await self.exchange.get_ohlcv(self.exchange_name, pair, timeframe, limit=min_candles or 50)
-            if df is None or len(df) < (min_candles or 50):
+            try:
+                df = await self.exchange.get_ohlcv(self.exchange_name, pair, timeframe, limit=min_n)
+            except Exception as e:
+                self.logger.error(f"[EngulfingMultiTF] OHLCV fetch failed for {pair} {timeframe}: {e}")
+                results[timeframe] = ('hold', 0, {})
+                continue
+
+            if df is None or len(df) < min_n:
                 self.logger.warning(f"Not enough data for {pair} on {timeframe}")
                 results[timeframe] = ('hold', 0, {})
                 continue
-            # Example indicator calculation and checks
-            import talib
-            indicators = {}
+
+            indicators: Dict[str, Any] = {}
             try:
-                adx = talib.ADX(df['high'].to_numpy(), df['low'].to_numpy(), df['close'].to_numpy(), timeperiod=14)
-                rsi = talib.RSI(df['close'].to_numpy(), timeperiod=14)
-                indicators = {
-                    'adx': adx[-1],
-                    'rsi': rsi[-1],
-                }
+                adx_df = ta.adx(df['high'], df['low'], df['close'], length=self.adx_period)
+                rsi_series = ta.rsi(df['close'], length=14)
+                adx_col = next((c for c in adx_df.columns if c.startswith('ADX')), None) if adx_df is not None else None
+                indicators['adx'] = float(adx_df[adx_col].iloc[-1]) if adx_col and adx_df is not None and not pd.isna(adx_df[adx_col].iloc[-1]) else float('nan')
+                indicators['rsi'] = float(rsi_series.iloc[-1]) if rsi_series is not None and not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else float('nan')
             except Exception as e:
                 self.logger.error(f"[EngulfingMultiTF] Indicator calculation error for {pair} on {timeframe}: {e}")
                 results[timeframe] = ('hold', 0, {})
                 continue
+
+            try:
+                pattern = self.detect_engulfing_pattern(df)
+            except Exception as e:
+                self.logger.warning(f"[EngulfingMultiTF] Pattern detection failed for {pair} {timeframe}: {e}")
+                pattern = None
+            indicators['pattern'] = pattern
+
             self.logger.info(f"[EngulfingMultiTF] {pair} {timeframe} indicators: {indicators}")
-            for name, value in indicators.items():
-                if pd.isna(value):
-                    self.logger.warning(f"[EngulfingMultiTF] Indicator {name} is NaN for {pair} on {timeframe}, holding.")
-                    results[timeframe] = ('hold', 0, indicators)
-                    break
+            if any(pd.isna(v) for k, v in indicators.items() if k != 'pattern'):
+                self.logger.warning(f"[EngulfingMultiTF] NaN indicator(s) for {pair} on {timeframe}, holding.")
+                results[timeframe] = ('hold', 0, indicators)
+                continue
+
+            adx_pass = indicators['adx'] > float(self.adx_entry_threshold)
+            self.logger.info(f"[EngulfingMultiTF] ADX check: current={indicators['adx']:.2f}, target>{self.adx_entry_threshold}, result={'PASS' if adx_pass else 'FAIL'}")
+            rsi_pass = indicators['rsi'] > 50
+            self.logger.info(f"[EngulfingMultiTF] RSI check: current={indicators['rsi']:.2f}, target>50, result={'PASS' if rsi_pass else 'FAIL'}")
+            pattern_pass = (pattern == 'bullish')
+            self.logger.info(f"[EngulfingMultiTF] Pattern check: pattern={pattern}, result={'PASS' if pattern_pass else 'FAIL'}")
+
+            if adx_pass and rsi_pass and pattern_pass:
+                self.logger.info(f"[EngulfingMultiTF] Signal for {pair} on {timeframe}: BUY (all conditions met)")
+                results[timeframe] = ('buy', 1, indicators)
             else:
-                adx_pass = indicators['adx'] > self.adx_threshold
-                self.logger.info(f"[EngulfingMultiTF] ADX check: current={indicators['adx']}, target>{self.adx_threshold}, result={'PASS' if adx_pass else 'FAIL'}")
-                rsi_pass = indicators['rsi'] > 50
-                self.logger.info(f"[EngulfingMultiTF] RSI check: current={indicators['rsi']}, target>50, result={'PASS' if rsi_pass else 'FAIL'}")
-                checks = [adx_pass, rsi_pass]
-                if all(checks):
-                    self.logger.info(f"[EngulfingMultiTF] Signal for {pair} on {timeframe}: BUY (all conditions met)")
-                    results[timeframe] = ('buy', 1, indicators)
-                else:
-                    self.logger.info(f"[EngulfingMultiTF] Signal for {pair} on {timeframe}: HOLD (not all conditions met)")
-                    results[timeframe] = ('hold', 0, indicators)
-        return results 
+                self.logger.info(f"[EngulfingMultiTF] Signal for {pair} on {timeframe}: HOLD (not all conditions met)")
+                results[timeframe] = ('hold', 0, indicators)
+        return results

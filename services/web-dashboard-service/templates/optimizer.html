@@ -2,10 +2,11 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Strategy Optimizer - Trading Bot Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     
     <style>
@@ -32,38 +33,25 @@
 </head>
 <body class="bg-gray-100">
     <!-- Navigation -->
-    <nav class="gradient-bg text-white shadow-lg">
-        <div class="w-full px-4 sm:px-6 lg:px-8">
-            <div class="flex justify-between h-16">
-                <div class="flex items-center">
-                    <h1 class="text-xl font-bold">
-                        <i class="fas fa-chart-line mr-2"></i>
-                        Strategy Optimizer
-                    </h1>
-                </div>
-                <div class="flex items-center space-x-4">
-                    <a href="/" class="hover:text-gray-300">
-                        <i class="fas fa-home mr-1"></i>Dashboard
-                    </a>
-                    <div class="flex items-center">
-                        <span class="status-indicator status-online" id="connection-status"></span>
-                        <span class="text-sm">Connected</span>
-                    </div>
-                </div>
-            </div>
+    {% set page_title = "Strategy Optimizer" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
+    <div class="bg-gray-800 text-gray-100 px-4 sm:px-6 lg:px-8 py-2 flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-2 text-sm">
+            <span class="status-indicator status-online" id="connection-status"></span>
+            <span>Connected</span>
         </div>
-    </nav>
+    </div>
 
     <!-- Main Content -->
     <div class="container mx-auto px-4 py-8">
         <!-- Header Section -->
         <div class="bg-white rounded-lg shadow-md p-6 mb-6">
-            <div class="flex justify-between items-center">
+            <div class="flex flex-col gap-4 lg:flex-row lg:justify-between lg:items-center">
                 <div>
                     <h2 class="text-2xl font-bold text-gray-800">Enhanced Strategy Optimizer</h2>
                     <p class="text-gray-600 mt-2">Analyze performance and get intelligent recommendations to improve your trading strategies</p>
                 </div>
-                <button id="runOptimization" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors duration-200">
+                <button id="runOptimization" type="button" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors duration-200 w-full lg:w-auto min-h-[44px]">
                     <i class="fas fa-play mr-2"></i>Run Optimization
                 </button>
             </div>
@@ -885,5 +873,6 @@ strategies:
 `;
         }
     </script>
+    <script src="/static/js/mobile-nav.js"></script>
 </body>
 </html>

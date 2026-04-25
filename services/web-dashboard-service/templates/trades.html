@@ -1,0 +1,12 @@
+{% extends "base_app.html" %}
+{% block title %}Trades · Trading Bot{% endblock %}
+{% block nav_brand %}Trades{% endblock %}
+{% block content %}
+<div class="bg-white rounded-lg shadow p-6 max-w-4xl">
+    <p class="text-gray-600 mb-4">
+        Trade history and open positions are summarized on the <a href="/" class="text-indigo-600 hover:underline">main dashboard</a>
+        and in <a href="/orders" class="text-indigo-600 hover:underline">Orders</a>. Use those views for live status and fills.
+    </p>
+    <p class="text-sm text-gray-500">This page is a hub for future trade-specific tools.</p>
+</div>
+{% endblock %}

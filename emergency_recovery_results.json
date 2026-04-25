@@ -1,0 +1,71 @@
+{
+  "recovered": 0,
+  "failed": 16,
+  "recovered_orders": [],
+  "failures": [
+    {
+      "order_id": "141242031",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "141243277",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "141243829",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "141247802",
+      "reason": "not_filled"
+    },
+    {
+      "order_id": "141252234",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "496762342",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584096551927",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584096611243",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584096681743",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584096754348",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584096889061",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584096941072",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584097005764",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584097070408",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584097125730",
+      "reason": "order_creation_failed"
+    },
+    {
+      "order_id": "6530219584097188967",
+      "reason": "order_creation_failed"
+    }
+  ]
+}

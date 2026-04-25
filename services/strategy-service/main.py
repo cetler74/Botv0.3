@@ -205,10 +205,21 @@ class StrategyPerformance(BaseModel):
     period: str
 
 class AnalysisRequest(BaseModel):
-    exchange: str
-    pair: str
-    timeframes: List[str] = ['1h', '15m', '5m']
+    # PnL-FIX v4: Default timeframes updated to the union of all strategies'
+    # declared target_timeframes in config.yaml:
+    #   - heikin_ashi:          [4h, 1h, 15m]
+    #   - engulfing_multi_tf:   [4h, 1h, 15m]
+    #   - vwma_hull:            [4h, 1h, 15m]
+    #   - multi_timeframe_confluence: [1h, 15m]
+    # The previous default ['1h', '15m', '5m'] never fetched 4h, which meant
+    # vwma_hull silently skipped its 4h macro-bullish HARD VETO (PnL-FIX v3)
+    # and engulfing_multi_tf fell back to using 1h as a pseudo-macro. ``5m``
+    # wasn't declared by any strategy — dropping it removes one wasted call.
+    # Order matters: ``timeframes[0]`` is the "primary" used for market-regime
+    # detection, so keep 1h first (4h regimes would react too slowly).
+    timeframes: List[str] = ['1h', '4h', '15m']
     strategies: Optional[List[str]] = None
+    include_indicators: bool = True
 
 class HealthResponse(BaseModel):
     status: str
@@ -221,6 +232,10 @@ class HealthResponse(BaseModel):
 strategies = {}
 strategy_instances = {}
 signal_cache = {}
+# Last strategy evaluation per exchange → pair (for dashboard Exchange Status)
+pair_last_snapshots: Dict[str, Dict[str, Any]] = {}
+# Align with orchestrator default entry bar (see trading.min_confidence_threshold in config)
+SNAPSHOT_ENTRY_CONFIDENCE = 0.3
 strategy_manager = None
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
 exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
@@ -305,22 +320,257 @@ exchange_adapter = ExchangeAdapter(exchange_service_url)
 # Global market regime detector
 market_regime_detector = MarketRegimeDetector()
 
+
+def _record_pair_strategy_snapshot(
+    exchange_name: str,
+    pair: str,
+    results: Optional[Dict[str, Any]] = None,
+    *,
+    analysis_status: str = "success",
+    detail: Optional[str] = None,
+) -> None:
+    """Persist last strategy run summary for dashboard (per exchange / pair)."""
+    global pair_last_snapshots
+    ex = (exchange_name or "").lower()
+    if ex not in pair_last_snapshots:
+        pair_last_snapshots[ex] = {}
+    now = datetime.utcnow().isoformat() + "Z"
+    if analysis_status != "success" or not results:
+        pair_last_snapshots[ex][pair] = {
+            "timestamp": now,
+            "analysis_status": analysis_status,
+            "summary": detail or "No analysis data",
+            "market_regime": None,
+            "consensus": {},
+            "strategies": [],
+        }
+        return
+
+    strategies_out: List[Dict[str, Any]] = []
+    for name, sr in results.get("strategies", {}).items():
+        if "error" in sr:
+            strategies_out.append(
+                {
+                    "strategy": name,
+                    "signal": None,
+                    "confidence": 0.0,
+                    "strength": 0.0,
+                    "outcome": "failed",
+                    "reason": f"Strategy error: {sr['error']}",
+                }
+            )
+            continue
+        sig = (sr.get("signal") or "hold").lower()
+        try:
+            conf = float(sr.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        try:
+            strength = float(sr.get("strength", 0) or 0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        if sig == "buy" and conf >= SNAPSHOT_ENTRY_CONFIDENCE:
+            outcome = "buy_signal"
+            reason = (
+                f"BUY at or above entry-confidence bar ({conf:.2f} ≥ {SNAPSHOT_ENTRY_CONFIDENCE}); "
+                "counts toward long bias."
+            )
+        elif sig == "sell" and conf >= SNAPSHOT_ENTRY_CONFIDENCE:
+            outcome = "sell_signal"
+            reason = (
+                f"SELL at or above confidence bar ({conf:.2f} ≥ {SNAPSHOT_ENTRY_CONFIDENCE})."
+            )
+        elif sig == "hold":
+            outcome = "hold"
+            reason = "HOLD — no directional entry from this strategy."
+            if name == "rsi_oversold_checklist":
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                checklist_buy = bool(indicators.get("checklist_buy", False))
+                if not checklist_buy and isinstance(indicators, dict):
+                    failed_checks = []
+                    if indicators.get("rsi_reclaimed_30") is False:
+                        failed_checks.append("rsi_reclaim_30")
+                    if indicators.get("price_above_ema20") is False:
+                        failed_checks.append("price_above_ema20")
+                    if indicators.get("macro_trend_ok") is False:
+                        failed_checks.append("ema50_above_ema200")
+                    if indicators.get("volume_ok") is False:
+                        failed_checks.append("volume_spike")
+                    if indicators.get("support_bounce") is False:
+                        failed_checks.append("support_bounce")
+                    if indicators.get("bullish_divergence") is False:
+                        failed_checks.append("bullish_divergence")
+                    if failed_checks:
+                        exec_rsi = indicators.get("exec_rsi_15m")
+                        trend_rsi = indicators.get("trend_rsi_1h")
+                        reason = (
+                            "HOLD — checklist not satisfied: "
+                            + ", ".join(failed_checks)
+                            + (
+                                f" (rsi15={float(exec_rsi):.2f}, rsi1h={float(trend_rsi):.2f})"
+                                if exec_rsi is not None and trend_rsi is not None
+                                else ""
+                            )
+                        )
+        elif sig == "buy":
+            outcome = "weak_buy"
+            reason = (
+                f"BUY below entry-confidence bar ({conf:.2f} < {SNAPSHOT_ENTRY_CONFIDENCE}); "
+                "treated as weak / no standalone entry."
+            )
+        elif sig == "sell":
+            outcome = "weak_sell"
+            reason = (
+                f"SELL below confidence bar ({conf:.2f} < {SNAPSHOT_ENTRY_CONFIDENCE})."
+            )
+        else:
+            outcome = "neutral"
+            reason = f"{sig.upper()} confidence {conf:.2f}."
+        strategies_out.append(
+            {
+                "strategy": name,
+                "signal": sig,
+                "confidence": round(conf, 4),
+                "strength": round(strength, 4),
+                "outcome": outcome,
+                "reason": reason,
+            }
+        )
+
+    cons = results.get("consensus") or {}
+    cs = (cons.get("signal") or "hold").lower()
+    try:
+        cc = float(cons.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        cc = 0.0
+    try:
+        agr = float(cons.get("agreement", 0) or 0)
+    except (TypeError, ValueError):
+        agr = 0.0
+    parts = [
+        f"Market regime: {results.get('market_regime', 'unknown')}.",
+        (
+            f"Consensus {cs.upper()} @ {cc:.2f}, agreement {agr:.1f}%, "
+            f"participating: {cons.get('participating_strategies', 0)}."
+        ),
+    ]
+    for s in strategies_out:
+        parts.append(
+            f"{s['strategy']}: {s['signal']} ({s['confidence']:.2f}) — {s['reason']}"
+        )
+
+    pair_last_snapshots[ex][pair] = {
+        "timestamp": now,
+        "analysis_status": "success",
+        "summary": " ".join(parts),
+        "market_regime": results.get("market_regime"),
+        "applicable_strategies": list(results.get("applicable_strategies") or []),
+        "consensus": {
+            "signal": cs,
+            "confidence": round(cc, 4),
+            "agreement": round(agr, 2),
+            "participating_strategies": cons.get("participating_strategies", 0),
+        },
+        "strategies": strategies_out,
+    }
+
+
 class StrategyManager:
     """Manages all trading strategies and coordinates analysis"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self._regime_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._regime_stability_cfg: Dict[str, Any] = {
+            "enabled": True,
+            "min_dwell_seconds": 180,
+            "hysteresis_delta": 0.08,
+            "emergency_volatility_score": 0.92,
+        }
         self._initialize_strategies()
+        self._load_regime_stability_config()
+
+    def _load_regime_stability_config(self) -> None:
+        """Load optional regime stability tuning from strategy config."""
+        try:
+            cfg = self.config.get("regime_stability")
+            if isinstance(cfg, dict):
+                self._regime_stability_cfg.update(cfg)
+        except Exception as e:
+            logger.warning(f"Failed to load regime stability config; using defaults: {e}")
+
+    def _resolve_stable_regime(
+        self,
+        exchange_name: str,
+        pair: str,
+        detected_regime: str,
+        regime_score: float,
+        runner_up_score: float,
+    ) -> Dict[str, Any]:
+        """Apply hysteresis+dwell to avoid noisy regime flip-flops."""
+        key = (exchange_name, pair)
+        now = datetime.utcnow()
+        prev_state = self._regime_state.get(key, {})
+        previous_regime = str(prev_state.get("stable_regime") or detected_regime)
+        changed_at = prev_state.get("changed_at", now)
+        if not isinstance(changed_at, datetime):
+            changed_at = now
+        regime_age_seconds = max(0.0, (now - changed_at).total_seconds())
+
+        if not bool(self._regime_stability_cfg.get("enabled", True)):
+            next_regime = detected_regime
+        else:
+            min_dwell_seconds = float(self._regime_stability_cfg.get("min_dwell_seconds", 180) or 180)
+            hysteresis_delta = float(self._regime_stability_cfg.get("hysteresis_delta", 0.08) or 0.08)
+            emergency_score = float(self._regime_stability_cfg.get("emergency_volatility_score", 0.92) or 0.92)
+            emergency_override = regime_score >= emergency_score
+            score_delta = regime_score - float(runner_up_score or 0.0)
+            if detected_regime == previous_regime:
+                next_regime = previous_regime
+            elif emergency_override or (regime_age_seconds >= min_dwell_seconds and score_delta >= hysteresis_delta):
+                next_regime = detected_regime
+            else:
+                next_regime = previous_regime
+
+        if next_regime != previous_regime:
+            changed_at = now
+            regime_age_seconds = 0.0
+
+        self._regime_state[key] = {
+            "stable_regime": next_regime,
+            "changed_at": changed_at,
+            "latest_regime_score": regime_score,
+            "latest_detected_regime": detected_regime,
+        }
+        return {
+            "stable_regime": next_regime,
+            "previous_regime": previous_regime,
+            "regime_age_seconds": float(regime_age_seconds),
+        }
         
     def _initialize_strategies(self) -> None:
         """Initialize all enabled strategies"""
-        strategies_config = self.config.get('strategies', {})
+        self.strategies = {}
+        # Config service returns strategies directly, not wrapped in 'strategies' key
+        strategies_config = self.config
         
         # Strategy class mapping with actual module names
         strategy_mapping = {
             'vwma_hull': {
                 'module': 'vwma_hull_strategy',
                 'class': 'VWMAHullStrategy'
+            },
+            'rsi_oversold_checklist': {
+                'module': 'rsi_oversold_checklist_strategy',
+                'class': 'RSIOversoldChecklistStrategy'
+            },
+            'rsi_oversold_override': {
+                'module': 'rsi_oversold_override_strategy',
+                'class': 'RSIOversoldOverrideStrategy'
+            },
+            'macd_momentum': {
+                'module': 'macd_momentum_strategy',
+                'class': 'MACDMomentumStrategy'
             },
             'heikin_ashi': {
                 'module': 'heikin_ashi_strategy', 
@@ -368,12 +618,15 @@ class StrategyManager:
                     # Set exchange_name attribute for proper logging
                     strategy_instance.exchange_name = None  # Will be set per analysis
                     
-                    strategies[strategy_name] = {
+                    self.strategies[strategy_name] = {
                         'instance': strategy_instance,
                         'config': strategy_config,
                         'enabled': True,
                         'last_analysis': None
                     }
+                    
+                    # Also add to global strategies for backward compatibility
+                    strategies[strategy_name] = self.strategies[strategy_name]
                     
                     logger.info(f"Initialized strategy: {strategy_name}")
                     
@@ -381,9 +634,20 @@ class StrategyManager:
                 logger.error(f"Failed to initialize strategy {strategy_name}: {e}")
                 continue
                 
-    async def analyze_pair(self, exchange_name: str, pair: str, 
-                          timeframes: List[str] = ['1h', '15m', '5m']) -> Dict[str, Any]:
-        """Analyze a trading pair using market regime-based strategy selection"""
+    async def analyze_pair(self, exchange_name: str, pair: str,
+                          timeframes: List[str] = ['1h', '4h', '15m'],
+                          strategy_allowlist: Optional[List[str]] = None) -> Dict[str, Any]:  # PnL-FIX v4 / v6
+        """Analyze a trading pair using market regime-based strategy selection.
+
+        Args:
+            strategy_allowlist: optional per-call allowlist. When provided,
+                only strategies in this list are run for THIS analysis (in
+                addition to passing the regime/enabled checks). When None,
+                all enabled & regime-applicable strategies run. PnL-FIX v6
+                replaces the previous pattern of mutating
+                ``strategies[name]['enabled']`` globally, which was racy
+                across concurrent analyses.
+        """
         try:
             # Get market data for all timeframes
             market_data = await self._get_market_data_for_strategy(
@@ -392,6 +656,13 @@ class StrategyManager:
             
             if not market_data:
                 logger.warning(f"No market data available for {pair} on {exchange_name}")
+                _record_pair_strategy_snapshot(
+                    exchange_name,
+                    pair,
+                    None,
+                    analysis_status="no_market_data",
+                    detail=f"No OHLCV / market data for {pair} on {exchange_name}",
+                )
                 return {}
             
             # STEP 1: Detect Market Regime using primary timeframe
@@ -407,17 +678,55 @@ class StrategyManager:
             else:
                 # Detect market regime
                 market_regime, regime_analysis = market_regime_detector.detect_regime(primary_ohlcv, pair)
+                detected_regime = market_regime.value
+                regime_score = float(regime_analysis.get("regime_score", 0.0) or 0.0)
+                runner_up_score = float(regime_analysis.get("runner_up_score", 0.0) or 0.0)
+                stable_meta = self._resolve_stable_regime(
+                    exchange_name=exchange_name,
+                    pair=pair,
+                    detected_regime=detected_regime,
+                    regime_score=regime_score,
+                    runner_up_score=runner_up_score,
+                )
+                stable_regime_value = stable_meta["stable_regime"]
+                market_regime = MarketRegime(stable_regime_value)
                 applicable_strategies = market_regime_detector.get_applicable_strategies(market_regime, pair, exchange_name)
+                # Independent strategy: always evaluate when enabled, outside regime routing.
+                if (
+                    "rsi_oversold_override" in strategies
+                    and strategies["rsi_oversold_override"].get("enabled", False)
+                    and "rsi_oversold_override" not in applicable_strategies
+                ):
+                    applicable_strategies.append("rsi_oversold_override")
+                if (
+                    "rsi_oversold_checklist" in strategies
+                    and strategies["rsi_oversold_checklist"].get("enabled", False)
+                    and "rsi_oversold_checklist" not in applicable_strategies
+                ):
+                    applicable_strategies.append("rsi_oversold_checklist")
                 
                 # Log regime detection
-                logger.info(f"📊 [MARKET REGIME] {pair} on {exchange_name}: {market_regime.value}")
+                logger.info(
+                    f"📊 [MARKET REGIME] {pair} on {exchange_name}: "
+                    f"detected={detected_regime} stable={stable_regime_value} "
+                    f"score={regime_score:.3f} age={stable_meta['regime_age_seconds']:.0f}s"
+                )
                 logger.info(f"🎯 [STRATEGY SELECTION] Applicable strategies: {applicable_strategies}")
+                regime_analysis["stable_regime"] = stable_regime_value
+                regime_analysis["previous_regime"] = stable_meta["previous_regime"]
+                regime_analysis["regime_age_seconds"] = stable_meta["regime_age_seconds"]
+                regime_analysis["detected_regime"] = detected_regime
             
             analysis_results = {
                 'pair': pair,
                 'exchange': exchange_name,
                 'timestamp': datetime.utcnow().isoformat(),
                 'market_regime': market_regime.value,
+                'stable_regime': regime_analysis.get("stable_regime", market_regime.value),
+                'detected_regime': regime_analysis.get("detected_regime", market_regime.value),
+                'previous_regime': regime_analysis.get("previous_regime", market_regime.value),
+                'regime_score': float(regime_analysis.get("regime_score", 0.0) or 0.0),
+                'regime_age_seconds': float(regime_analysis.get("regime_age_seconds", 0.0) or 0.0),
                 'regime_analysis': regime_analysis,
                 'applicable_strategies': applicable_strategies,
                 'strategies': {},
@@ -425,15 +734,24 @@ class StrategyManager:
             }
             
             # STEP 2: Run analysis only for applicable strategies
+            allowlist_set = set(strategy_allowlist) if strategy_allowlist else None
             strategies_analyzed = 0
             for strategy_name in applicable_strategies:
                 if strategy_name not in strategies:
                     logger.warning(f"Strategy {strategy_name} not available, skipping")
                     continue
-                    
+
                 strategy_data = strategies[strategy_name]
                 if not strategy_data['enabled']:
                     logger.info(f"Strategy {strategy_name} disabled, skipping")
+                    continue
+
+                # PnL-FIX v6: per-call allowlist replaces the old global toggle
+                # in analyze_pair_internal which mutated strategies[name]['enabled'].
+                if allowlist_set is not None and strategy_name not in allowlist_set:
+                    logger.debug(
+                        f"Strategy {strategy_name} not in per-call allowlist, skipping"
+                    )
                     continue
                     
                 try:
@@ -532,7 +850,42 @@ class StrategyManager:
             # Calculate consensus with detailed logging
             logger.info(f"🤝 [CONSENSUS] Calculating consensus from {strategies_analyzed} regime-selected strategies "
                        f"(regime: {market_regime.value})")
-            analysis_results['consensus'] = self._calculate_consensus(analysis_results['strategies'])
+            analysis_results['consensus'] = self._calculate_consensus(
+                analysis_results['strategies'],
+                regime_context={
+                    "market_regime": analysis_results.get("market_regime"),
+                    "stable_regime": analysis_results.get("stable_regime"),
+                    "regime_score": analysis_results.get("regime_score"),
+                    "rsi_15m_value": float(
+                        (
+                            (
+                                analysis_results.get("strategies", {})
+                                .get("rsi_oversold_override", {})
+                                .get("state", {})
+                                .get("indicators", {})
+                            ).get("rsi_15m", 50.0)
+                        ) or 50.0
+                    ),
+                    "rsi_15m_oversold_buy_override": bool(
+                        str(
+                            (
+                                analysis_results.get("strategies", {})
+                                .get("rsi_oversold_override", {})
+                                .get("signal", "hold")
+                            )
+                        ).lower() == "buy"
+                    ),
+                    "rsi_checklist_buy_override": bool(
+                        str(
+                            (
+                                analysis_results.get("strategies", {})
+                                .get("rsi_oversold_checklist", {})
+                                .get("signal", "hold")
+                            )
+                        ).lower() == "buy"
+                    ),
+                },
+            )
             
             consensus = analysis_results['consensus']
             consensus_emoji = "🟢" if consensus['signal'] == "buy" else "🔴" if consensus['signal'] == "sell" else "⚪"
@@ -543,100 +896,265 @@ class StrategyManager:
             # Cache results
             cache_key = f"{exchange_name}_{pair}_{int(datetime.utcnow().timestamp() / 300)}"  # 5-minute cache
             signal_cache[cache_key] = analysis_results
-            
+
+            _record_pair_strategy_snapshot(exchange_name, pair, analysis_results)
+
             return analysis_results
-            
+
         except Exception as e:
             logger.error(f"Error analyzing pair {pair} on {exchange_name}: {e}")
+            _record_pair_strategy_snapshot(
+                exchange_name,
+                pair,
+                None,
+                analysis_status="error",
+                detail=str(e),
+            )
             return {}
             
-    def _calculate_consensus(self, strategy_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate regime-aware consensus with strategy weighting"""
+    # SPOT day-trading consensus thresholds (PnL-FIX v7).
+    # These live as class-level constants so they're easy to discover/tune.
+    PRIMARY_OVERRIDE_THRESHOLD = 0.58   # Calibrated: primary strategy can lead in its regime
+    SELL_VETO_THRESHOLD = 0.60          # Calibrated: only strong SELL blocks new BUY consensus
+
+    def _calculate_consensus(
+        self,
+        strategy_results: Dict[str, Any],
+        regime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Calculate regime-aware consensus with strategy weighting.
+
+        PnL-FIX v7 — SPOT day-trading hardening:
+          A) HOLDs no longer dilute the directional confidence/strength
+             average. Previously a PRIMARY BUY @ 0.60 averaged with a
+             SECONDARY HOLD @ 0.0 produced 0.35 → below
+             min_confidence_threshold → no trade. HOLDs still count toward
+             the agreement % and the unweighted breakdown for visibility.
+          B) Primary-override: if the regime PRIMARY (weight 1.0) emits a
+             BUY with confidence >= PRIMARY_OVERRIDE_THRESHOLD AND no other
+             strategy is voting SELL above the veto threshold, we promote
+             the primary's BUY to consensus even when secondaries HOLD.
+             Spot-only design choice: secondaries can confirm but should
+             not be able to silently veto the regime specialist.
+          D) SELL-veto: any strategy emitting SELL with confidence
+             >= SELL_VETO_THRESHOLD blocks a BUY consensus and forces HOLD.
+             SPOT semantics: we never open shorts, so "veto" only means
+             "do not enter a new long" — exit-side logic is handled by the
+             orchestrator/strategy SL/TP/trailing rules.
+        """
         try:
+            ctx = regime_context or {}
+            stable_regime = str(ctx.get("stable_regime") or ctx.get("market_regime") or "unknown")
+            regime_score = float(ctx.get("regime_score", 0.0) or 0.0)
             valid_signals = []
-            weighted_confidence = 0
-            weighted_strength = 0
-            weighted_signal_counts = {'buy': 0, 'sell': 0, 'hold': 0}
-            signal_counts = {'buy': 0, 'sell': 0, 'hold': 0}  # Fix: Initialize signal_counts
-            total_weight = 0
-            
+            weighted_confidence_directional = 0.0   # Fix A: excludes HOLDs
+            weighted_strength_directional = 0.0
+            directional_weight = 0.0
+            weighted_signal_counts = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
+            signal_counts = {'buy': 0, 'sell': 0, 'hold': 0}
+            total_weight = 0.0
+
+            primary_buy_signal = None               # Fix B
+            max_sell_confidence = 0.0               # Fix D
+            sell_veto_strategy = None               # for logging
+
             # Define strategy weights based on regime appropriateness
-            # First strategy in regime mapping gets highest weight
             regime_weights = {
                 'primary': 1.0,    # First strategy for this regime
                 'secondary': 0.7,  # Supporting strategies
                 'fallback': 0.5    # Available but not optimal
             }
-            
+
             for strategy_name, result in strategy_results.items():
                 if 'error' in result:
                     continue
-                    
+
                 signal = result.get('signal', 'hold')
-                confidence = result.get('confidence', 0)
-                strength = result.get('strength', 0)
+                if signal not in ('buy', 'sell', 'hold'):
+                    continue
+
+                confidence = float(result.get('confidence', 0) or 0)
+                strength = float(result.get('strength', 0) or 0)
                 selected_for_regime = result.get('selected_for_regime', 'unknown')
-                
-                if signal in ['buy', 'sell', 'hold']:
-                    # Determine strategy weight based on regime mapping position
-                    # This maintains regime-appropriate strategy prioritization
-                    strategy_weight = regime_weights.get('secondary', 0.7)  # Default weight
-                    
-                    # Primary strategies get higher weight (position 0 in regime mapping)
-                    if strategy_name == 'heikin_ashi' and selected_for_regime in ['trending_up', 'trending_down', 'high_volatility']:
-                        strategy_weight = regime_weights['primary']
-                    elif strategy_name == 'vwma_hull' and selected_for_regime in ['breakout']:
-                        strategy_weight = regime_weights['primary'] 
-                    elif strategy_name == 'multi_timeframe_confluence' and selected_for_regime in ['sideways', 'low_volatility']:
-                        strategy_weight = regime_weights['primary']
-                    elif strategy_name == 'engulfing_multi_tf' and selected_for_regime in ['reversal_zone']:
-                        strategy_weight = regime_weights['primary']
-                    
+
+                # Independent override strategy does not contribute to weighted
+                # consensus voting. It is handled by explicit RSI override logic.
+                if strategy_name == "rsi_oversold_override":
                     valid_signals.append({
                         'strategy': strategy_name,
                         'signal': signal,
                         'confidence': confidence,
                         'strength': strength,
-                        'weight': strategy_weight,
-                        'regime': selected_for_regime
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
                     })
-                    
-                    # Apply weighted counting for regime-appropriate consensus
-                    weighted_signal_counts[signal] += strategy_weight
-                    weighted_confidence += confidence * strategy_weight
-                    weighted_strength += strength * strategy_weight
-                    total_weight += strategy_weight
-                    
-                    # Keep unweighted counts for compatibility
-                    signal_counts[signal] += 1
-                    
+                    continue
+                if strategy_name == "rsi_oversold_checklist":
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
+
+                # Determine strategy weight + primary flag based on regime
+                strategy_weight = regime_weights['secondary']
+                is_primary = False
+                if strategy_name == 'heikin_ashi' and selected_for_regime in (
+                    'trending_up', 'trending_down', 'high_volatility'
+                ):
+                    strategy_weight = regime_weights['primary']
+                    is_primary = True
+                elif strategy_name == 'vwma_hull' and selected_for_regime in ('breakout',):
+                    strategy_weight = regime_weights['primary']
+                    is_primary = True
+                elif strategy_name == 'macd_momentum' and selected_for_regime in (
+                    'trending_up', 'breakout', 'high_volatility'
+                ):
+                    strategy_weight = regime_weights['primary']
+                    is_primary = True
+                elif strategy_name == 'multi_timeframe_confluence' and selected_for_regime in (
+                    'sideways', 'low_volatility'
+                ):
+                    strategy_weight = regime_weights['primary']
+                    is_primary = True
+                elif strategy_name == 'engulfing_multi_tf' and selected_for_regime in (
+                    'reversal_zone',
+                ):
+                    strategy_weight = regime_weights['primary']
+                    is_primary = True
+
+                valid_signals.append({
+                    'strategy': strategy_name,
+                    'signal': signal,
+                    'confidence': confidence,
+                    'strength': strength,
+                    'weight': strategy_weight,
+                    'regime': selected_for_regime,
+                    'is_primary': is_primary,
+                })
+
+                weighted_signal_counts[signal] += strategy_weight
+                signal_counts[signal] += 1
+                total_weight += strategy_weight
+
+                # Fix A: only BUY/SELL contribute to the confidence average
+                if signal in ('buy', 'sell'):
+                    weighted_confidence_directional += confidence * strategy_weight
+                    weighted_strength_directional += strength * strategy_weight
+                    directional_weight += strategy_weight
+
+                # Fix D: track strongest SELL across all strategies (veto)
+                if signal == 'sell' and confidence > max_sell_confidence:
+                    max_sell_confidence = confidence
+                    sell_veto_strategy = strategy_name
+
+                # Fix B: track strongest PRIMARY BUY (override candidate)
+                if (
+                    is_primary
+                    and signal == 'buy'
+                    and confidence >= self.PRIMARY_OVERRIDE_THRESHOLD
+                ):
+                    if (primary_buy_signal is None
+                            or confidence > primary_buy_signal['confidence']):
+                        primary_buy_signal = {
+                            'strategy': strategy_name,
+                            'confidence': confidence,
+                            'strength': strength,
+                        }
+
             if not valid_signals:
                 return {
                     'signal': 'hold',
                     'confidence': 0,
                     'strength': 0,
                     'agreement': 0,
-                    'participating_strategies': 0
+                    'participating_strategies': 0,
+                    'signal_breakdown': signal_counts,
                 }
-                
-            # Determine consensus signal using WEIGHTED votes (regime-aware)
+
+            # ---------- Step 1: weighted-majority consensus (existing behavior) ----------
             max_weighted_count = max(weighted_signal_counts.values())
             consensus_signal = 'hold'
-            
             if weighted_signal_counts['buy'] == max_weighted_count and weighted_signal_counts['buy'] > 0:
                 consensus_signal = 'buy'
             elif weighted_signal_counts['sell'] == max_weighted_count and weighted_signal_counts['sell'] > 0:
                 consensus_signal = 'sell'
-                
-            # Calculate agreement percentage (weighted)
+
+            # ---------- Step 2 (Fix B): primary-override ---------------------------------
+            primary_overrode = False
+            if (
+                primary_buy_signal is not None
+                and consensus_signal != 'buy'
+                and max_sell_confidence < self.SELL_VETO_THRESHOLD
+            ):
+                consensus_signal = 'buy'
+                primary_overrode = True
+                logger.info(
+                    f"🎯 [PRIMARY OVERRIDE] {primary_buy_signal['strategy']} "
+                    f"BUY @ {primary_buy_signal['confidence']:.2f} promoted to consensus "
+                    f"(no SELL veto — max_sell={max_sell_confidence:.2f})"
+                )
+
+            # ---------- Step 3 (Fix D): SELL-veto on BUY consensus -----------------------
+            if consensus_signal == 'buy' and max_sell_confidence >= self.SELL_VETO_THRESHOLD:
+                logger.info(
+                    f"🛑 [SELL VETO] BUY consensus blocked: {sell_veto_strategy} "
+                    f"SELL @ {max_sell_confidence:.2f} >= {self.SELL_VETO_THRESHOLD}"
+                )
+                consensus_signal = 'hold'
+                primary_overrode = False
+
+            # ---------- Step 4: RSI 15m oversold override --------------------------------
+            rsi_oversold_override = bool(ctx.get("rsi_15m_oversold_buy_override", False))
+            rsi_checklist_override = bool(ctx.get("rsi_checklist_buy_override", False))
+            rsi_15m_value = float(ctx.get("rsi_15m_value", 50.0) or 50.0)
+            if rsi_oversold_override:
+                consensus_signal = 'buy'
+                logger.info(
+                    f"🟢 [RSI OVERRIDE] Forcing BUY consensus: 15m RSI={rsi_15m_value:.2f} < 30.00"
+                )
+            if rsi_checklist_override:
+                consensus_signal = 'buy'
+                logger.info("🟢 [RSI CHECKLIST OVERRIDE] Forcing BUY consensus from checklist strategy")
+
+            # ---------- Confidence / agreement / sanitize -------------------------------
             total_strategies = len(valid_signals)
-            agreement = (max_weighted_count / total_weight) * 100 if total_weight > 0 else 0
-            
-            # Calculate weighted average confidence and strength (regime-aware)
-            avg_confidence = weighted_confidence / total_weight if total_weight > 0 else 0
-            avg_strength = weighted_strength / total_weight if total_weight > 0 else 0
-            
-            # CRITICAL: Sanitize consensus values to prevent JSON serialization errors
+            agreement = (max_weighted_count / total_weight) * 100 if total_weight > 0 else 0.0
+
+            # Fix A: average over directional weight only
+            if directional_weight > 0:
+                avg_confidence = weighted_confidence_directional / directional_weight
+                avg_strength = weighted_strength_directional / directional_weight
+            else:
+                avg_confidence = 0.0
+                avg_strength = 0.0
+
+            # If consensus is HOLD (e.g. all HOLDs or vetoed), confidence is 0
+            if consensus_signal == 'hold':
+                avg_confidence = 0.0
+                avg_strength = 0.0
+
+            # If primary-override fired, the consensus confidence is at least
+            # the primary's own confidence (don't average it down with other
+            # non-directional voters that didn't see the setup).
+            if primary_overrode and primary_buy_signal is not None:
+                avg_confidence = max(avg_confidence, primary_buy_signal['confidence'])
+                avg_strength = max(avg_strength, primary_buy_signal['strength'])
+
+            # Independent RSI override sets a high-confidence BUY floor.
+            if rsi_oversold_override:
+                avg_confidence = max(avg_confidence, 0.95)
+                avg_strength = max(avg_strength, 0.90)
+            if rsi_checklist_override:
+                avg_confidence = max(avg_confidence, 0.97)
+                avg_strength = max(avg_strength, 0.92)
+
             try:
                 if np.isnan(avg_confidence) or np.isinf(avg_confidence):
                     logger.warning(f"🔧 [CONSENSUS SANITIZE] Invalid avg_confidence {avg_confidence}, setting to 0.0")
@@ -652,7 +1170,7 @@ class StrategyManager:
                 avg_confidence = 0.0
                 avg_strength = 0.0
                 agreement = 0.0
-            
+
             return {
                 'signal': consensus_signal,
                 'confidence': float(avg_confidence),
@@ -660,9 +1178,17 @@ class StrategyManager:
                 'agreement': float(agreement),
                 'participating_strategies': total_strategies,
                 'signal_breakdown': signal_counts,
-                'weighted_breakdown': weighted_signal_counts  # Show regime weighting
+                'weighted_breakdown': weighted_signal_counts,
+                'primary_override': primary_overrode,
+                'sell_veto_max': float(max_sell_confidence),
+                'rsi_15m_value': rsi_15m_value,
+                'rsi_15m_oversold_buy_override': bool(rsi_oversold_override),
+                'rsi_checklist_buy_override': bool(rsi_checklist_override),
+                'market_regime': str(ctx.get("market_regime") or stable_regime),
+                'stable_regime': stable_regime,
+                'regime_score': regime_score,
             }
-            
+
         except Exception as e:
             logger.error(f"Error calculating consensus: {e}")
             return {
@@ -721,8 +1247,8 @@ class StrategyManager:
         except Exception as e:
             logger.error(f"Error applying pair-specific config for {pair}/{strategy_name}: {e}")
             
-    async def _get_market_data_for_strategy(self, exchange_name: str, symbol: str, 
-                                           timeframes: List[str] = ['1h', '15m', '5m']) -> Dict[str, pd.DataFrame]:
+    async def _get_market_data_for_strategy(self, exchange_name: str, symbol: str,
+                                           timeframes: List[str] = ['1h', '4h', '15m']) -> Dict[str, pd.DataFrame]:  # PnL-FIX v4
         """Get market data for strategy analysis"""
         try:
             market_data = {}
@@ -730,12 +1256,22 @@ class StrategyManager:
             for timeframe in timeframes:
                 # Retry logic for handling temporary timeout errors
                 max_retries = 3
+                response: Optional[httpx.Response] = None
+
+                # PnL-FIX v4: Per-timeframe candle limits.
+                # heikin_ashi gates on ``min_candles_tf >= 100`` and we drop
+                # the in-progress bar below — so we must request at least 110
+                # to land on 100+ closed candles. 4h → 150 gives ≈25 days.
+                # Fast TFs → 110 keeps Bybit REST throttle pressure low while
+                # clearing the 100-candle gate after the partial-bar drop.
+                ohlcv_limit = 150 if timeframe in ('4h', '1d') else 110
+
                 for retry in range(max_retries):
                     try:
                         async with httpx.AsyncClient(timeout=30.0) as client:
                             response = await client.get(
                                 f"{exchange_service_url}/api/v1/market/ohlcv/{exchange_name}/{symbol}",
-                                params={'timeframe': timeframe, 'limit': 100}
+                                params={'timeframe': timeframe, 'limit': ohlcv_limit}
                             )
                             
                             # If successful, break out of retry loop
@@ -748,10 +1284,15 @@ class StrategyManager:
                             continue
                         else:
                             logger.error(f"Failed to get {timeframe} data for {symbol} on {exchange_name} after {max_retries} retries: {type(timeout_error).__name__}")
+                            response = None
                             break
                     except Exception as e:
                         logger.error(f"Failed to get {timeframe} data for {symbol} on {exchange_name}: {type(e).__name__}: {str(e)}")
+                        response = None
                         break
+
+                if response is None:
+                    continue
                 
                 try:
                     if response.status_code == 200:
@@ -794,11 +1335,31 @@ class StrategyManager:
                             else:
                                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                             df.set_index('timestamp', inplace=True)
-                            
+
                             # Ensure numeric columns are properly typed
                             for col in ['open', 'high', 'low', 'close', 'volume']:
                                 df[col] = pd.to_numeric(df[col], errors='coerce')
-                            
+
+                            # PnL-FIX v4: Drop the in-progress (unclosed) last candle.
+                            # Evidence from live logs: on 15m/1h pairs the last row
+                            # was consistently showing the *same* tiny volume across
+                            # both TFs (e.g. BTC 1h=15m=0.009) — proof the exchange
+                            # returns the currently-building bar. That partial bar
+                            # poisons `df['volume'].iloc[-1]` and makes every
+                            # volume veto fail, forcing HOLD across the bot.
+                            tf_seconds = {
+                                '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
+                                '1h': 3600, '2h': 7200, '4h': 14400,
+                                '6h': 21600, '12h': 43200, '1d': 86400,
+                            }.get(timeframe, 0)
+                            if tf_seconds and len(df) >= 2:
+                                last_ts = df.index[-1]
+                                now_utc = pd.Timestamp.utcnow().tz_localize(None) if last_ts.tzinfo is None else pd.Timestamp.utcnow()
+                                # If the bar's close time (open + tf) is in the future,
+                                # the last row is still being built — drop it.
+                                if (last_ts + pd.Timedelta(seconds=tf_seconds)) > now_utc:
+                                    df = df.iloc[:-1]
+
                             market_data[timeframe] = df
                             logger.info(f"✅ [DATA FETCH] Got {len(df)} {timeframe} candles for {symbol} on {exchange_name}")
                             
@@ -952,11 +1513,98 @@ async def initialize_strategies():
     global strategy_manager
     try:
         config = await get_config_from_service()
-        strategy_manager = StrategyManager({'strategies': config})
+        # FIXED: Pass config directly instead of wrapping in 'strategies' key
+        strategy_manager = StrategyManager(config)
         logger.info("Strategy service initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize strategy service: {e}")
         raise
+
+async def continuous_strategy_analysis():
+    """Continuous strategy analysis loop"""
+    logger.info("🔄 Starting continuous strategy analysis loop")
+    
+    # Define exchanges to analyze
+    exchanges = ['binance', 'bybit', 'cryptocom']
+    
+    while True:
+        try:
+            all_trading_pairs = []
+            
+            # Get trading pairs from database for each exchange
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                for exchange in exchanges:
+                    try:
+                        response = await client.get(f"{database_service_url}/api/v1/pairs/{exchange}")
+                        if response.status_code == 200:
+                            pairs_data = response.json()
+                            pairs = pairs_data.get('pairs', [])
+                            
+                            # Convert to the expected format
+                            for pair in pairs:
+                                all_trading_pairs.append({
+                                    'exchange': exchange,
+                                    'pair': pair
+                                })
+                            
+                            logger.info(f"📊 Retrieved {len(pairs)} pairs for {exchange}")
+                        else:
+                            logger.warning(f"⚠️ Failed to get pairs for {exchange}: {response.status_code}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Error getting pairs for {exchange}: {e}")
+                        continue
+            
+            if not all_trading_pairs:
+                logger.warning("⚠️ No trading pairs configured for analysis")
+                await asyncio.sleep(60)  # Wait 1 minute before retrying
+                continue
+            
+            logger.info(f"📊 Analyzing {len(all_trading_pairs)} trading pairs across {len(exchanges)} exchanges...")
+            
+            for pair_data in all_trading_pairs:
+                try:
+                    exchange = pair_data.get('exchange', 'binance')
+                    pair = pair_data.get('pair', 'BTC/USDC')
+                    
+                    # Create analysis request.
+                    # PnL-FIX v4: include 4h so vwma_hull's macro HARD VETO and
+                    # heikin_ashi's 4h hierarchy level actually receive data.
+                    # PnL-FIX v6: do NOT pass an explicit `strategies` whitelist
+                    # here. Previously this hard-coded ['vwma_hull','heikin_ashi']
+                    # silently flipped `enabled=False` on every other strategy
+                    # via analyze_pair_internal's per-call toggle, so
+                    # multi_timeframe_confluence (PRIMARY for sideways /
+                    # low_volatility) and engulfing_multi_tf (PRIMARY for
+                    # reversal_zone) never participated in consensus —
+                    # explaining the dashboard's "participating: 2" everywhere.
+                    # The market regime detector already filters to the
+                    # applicable strategies per pair; let it decide.
+                    analysis_request = AnalysisRequest(
+                        strategies=None,
+                        timeframes=['1h', '4h', '15m'],
+                        include_indicators=True
+                    )
+                    
+                    # Run analysis
+                    result = await analyze_pair_internal(exchange, pair, analysis_request)
+                    
+                    if result and result.get('consensus'):
+                        consensus = result['consensus']
+                        signal = consensus.get('signal', 'HOLD')
+                        confidence = consensus.get('confidence', 0.0)
+                        
+                        logger.info(f"🎯 [{exchange.upper()}] {pair}: {signal} | Confidence: {confidence:.2f} | Regime: {consensus.get('regime', 'unknown')}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error analyzing {pair} on {exchange}: {e}")
+                    continue
+            
+            # Wait before next analysis cycle
+            await asyncio.sleep(30)  # Analyze every 30 seconds
+            
+        except Exception as e:
+            logger.error(f"❌ Error in continuous strategy analysis: {e}")
+            await asyncio.sleep(60)  # Wait longer on error
 
 # API Endpoints
 @app.get("/metrics")
@@ -1042,6 +1690,42 @@ async def disable_strategy(strategy_name: str):
     return {"message": f"Strategy {strategy_name} disabled"}
 
 # Signal Generation Endpoints
+async def analyze_pair_internal(exchange: str, pair: str, request: AnalysisRequest):
+    """Internal function to analyze a trading pair"""
+    try:
+        # Convert pair format: Add slash if missing (ACXUSD -> ACX/USD)
+        formatted_pair = pair
+        if '/' not in pair:
+            # Handle common patterns like ACXUSD -> ACX/USD, BTCUSD -> BTC/USD
+            if len(pair) >= 6 and pair.endswith('USD'):
+                base = pair[:-3]
+                formatted_pair = f"{base}/USD"
+            elif len(pair) >= 7 and pair.endswith('USDC'):
+                base = pair[:-4] 
+                formatted_pair = f"{base}/USDC"
+            else:
+                raise ValueError(f"Unsupported pair format: {pair}")
+
+        # PnL-FIX v6: per-call allowlist instead of mutating
+        # strategies[name]['enabled']. The previous pattern was racy under
+        # concurrent calls and was the root cause of multi_timeframe_confluence
+        # being silently disabled across the bot.
+        analysis_results = await strategy_manager.analyze_pair(
+            exchange,
+            formatted_pair,
+            request.timeframes,
+            strategy_allowlist=request.strategies,
+        )
+
+        if not analysis_results:
+            raise ValueError("Analysis failed - no results")
+
+        return analysis_results
+
+    except Exception as e:
+        logger.error(f"Error in analyze_pair_internal for {exchange}/{pair}: {e}")
+        raise
+
 @app.post("/api/v1/analysis/{exchange}/{pair}")
 async def analyze_pair(exchange: str, pair: str, request: AnalysisRequest):
     """Analyze a trading pair"""
@@ -1063,27 +1747,17 @@ async def analyze_pair(exchange: str, pair: str, request: AnalysisRequest):
                 # For other formats, return 404
                 raise HTTPException(status_code=404, detail=f"Unsupported pair format: {pair}")
         
-        # Filter strategies if specified
-        if request.strategies:
-            # Temporarily disable non-requested strategies
-            original_states = {}
-            for strategy_name in strategies:
-                original_states[strategy_name] = strategies[strategy_name]['enabled']
-                strategies[strategy_name]['enabled'] = strategy_name in request.strategies
-        
-        # Perform analysis with formatted pair
+        # PnL-FIX v6: per-call allowlist (no global mutation).
         analysis_results = await strategy_manager.analyze_pair(
-            exchange, formatted_pair, request.timeframes
+            exchange,
+            formatted_pair,
+            request.timeframes,
+            strategy_allowlist=request.strategies,
         )
-        
-        # Restore original strategy states
-        if request.strategies:
-            for strategy_name, original_state in original_states.items():
-                strategies[strategy_name]['enabled'] = original_state
-        
+
         if not analysis_results:
             raise HTTPException(status_code=404, detail="Analysis failed - no results")
-        
+
         return analysis_results
         
     except HTTPException:
@@ -1320,10 +1994,11 @@ async def backtest_strategy(strategy_name: str, backtest_params: Dict[str, Any])
 @app.delete("/api/v1/cache/clear")
 async def clear_cache():
     """Clear signal cache"""
-    global signal_cache
+    global signal_cache, pair_last_snapshots
     cache_size = len(signal_cache)
     signal_cache.clear()
-    logger.info(f"Cleared signal cache ({cache_size} entries)")
+    pair_last_snapshots.clear()
+    logger.info(f"Cleared signal cache ({cache_size} entries) and pair snapshots")
     return {"message": f"Cache cleared ({cache_size} entries)"}
 
 @app.get("/api/v1/cache/stats")
@@ -1335,12 +2010,23 @@ async def get_cache_stats():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+
+@app.get("/api/v1/pair-snapshots")
+async def get_pair_snapshots():
+    """Latest strategy evaluation per exchange and pair (for dashboard Exchange Status)."""
+    return pair_last_snapshots
+
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     """Initialize strategies on startup"""
     logger.info("Starting Strategy Service...")
     await initialize_strategies()
+    
+    # Start continuous strategy analysis in background
+    asyncio.create_task(continuous_strategy_analysis())
+    
     logger.info("Strategy Service started successfully")
 
 @app.on_event("shutdown")
@@ -1349,6 +2035,7 @@ async def shutdown_event():
     logger.info("Shutting down Strategy Service...")
     # Clear any cached data
     signal_cache.clear()
+    pair_last_snapshots.clear()
     strategies.clear()
     strategy_instances.clear()
     logger.info("Strategy Service shutdown complete")
@@ -1358,6 +2045,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8004,
-        reload=True,
+        reload=False,
         log_level="info"
     ) 

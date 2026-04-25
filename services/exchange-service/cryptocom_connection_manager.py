@@ -224,7 +224,7 @@ class CryptocomConnectionManager:
         self.message_callbacks: List[Callable] = []
         self.error_callbacks: List[Callable] = []
         
-        # Metrics
+        # Metrics with error rate limiting
         self.connection_metrics = {
             "total_connections": 0,
             "total_disconnections": 0,
@@ -234,6 +234,13 @@ class CryptocomConnectionManager:
             "total_errors": 0,
             "average_connection_duration": 0.0,
             "uptime_percentage": 0.0
+        }
+        
+        # Error rate limiting to prevent accumulation
+        self.error_rate_limit = {
+            "max_errors_per_minute": 60,  # Max 60 errors per minute
+            "error_window": [],  # Rolling window of error timestamps
+            "last_cleanup": datetime.utcnow()
         }
         
         # Setup error handling
@@ -262,7 +269,7 @@ class CryptocomConnectionManager:
     
     async def _on_error_occurred(self, error):
         """Track error metrics"""
-        self.connection_metrics["total_errors"] += 1
+        self._record_error()
     
     # Callback management
     def add_connection_callback(self, callback: Callable):
@@ -397,6 +404,58 @@ class CryptocomConnectionManager:
         except Exception as e:
             await self.error_handler.handle_error(e, "send_message")
             return False
+    
+    def _should_record_error(self) -> bool:
+        """Check if error should be recorded based on rate limiting"""
+        now = datetime.utcnow()
+        
+        # Clean old errors (older than 1 minute)
+        if (now - self.error_rate_limit["last_cleanup"]).total_seconds() > 60:
+            cutoff = now - timedelta(minutes=1)
+            self.error_rate_limit["error_window"] = [
+                ts for ts in self.error_rate_limit["error_window"] 
+                if ts > cutoff
+            ]
+            self.error_rate_limit["last_cleanup"] = now
+        
+        # Check if we're under the rate limit
+        if len(self.error_rate_limit["error_window"]) >= self.error_rate_limit["max_errors_per_minute"]:
+            logger.warning(f"⚠️ Error rate limit exceeded ({self.error_rate_limit['max_errors_per_minute']}/min) - suppressing error recording")
+            return False
+            
+        # Record this error
+        self.error_rate_limit["error_window"].append(now)
+        return True
+    
+    def _record_error(self):
+        """Record error with rate limiting"""
+        if self._should_record_error():
+            self._record_error()
+            
+            # Auto-restart if error accumulation is excessive
+            if self.connection_metrics["total_errors"] > 1000:
+                logger.critical(f"🚨 Excessive error accumulation ({self.connection_metrics['total_errors']}) - triggering auto-restart")
+                asyncio.create_task(self._emergency_restart())
+    
+    async def _emergency_restart(self):
+        """Emergency restart to prevent error accumulation"""
+        try:
+            logger.warning("🔧 Performing emergency restart due to error accumulation")
+            await self.disconnect()
+            await asyncio.sleep(5)  # Wait before reconnecting
+            
+            # Reset error metrics
+            self.connection_metrics["total_errors"] = 0
+            self.error_rate_limit["error_window"] = []
+            
+            # Reconnect
+            success = await self.connect()
+            if success:
+                logger.info("✅ Emergency restart completed successfully")
+            else:
+                logger.error("❌ Emergency restart failed")
+        except Exception as e:
+            logger.error(f"❌ Emergency restart error: {e}")
     
     async def start_auto_reconnect(self):
         """Start automatic reconnection management"""

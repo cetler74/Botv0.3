@@ -2,40 +2,22 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Order Management Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
 </head>
 <body class="bg-gray-100">
     <div class="min-h-screen">
-        <!-- Navigation -->
-        <nav class="bg-white shadow-sm border-b">
-            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                <div class="flex justify-between h-16">
-                    <div class="flex items-center">
-                        <h1 class="text-xl font-semibold text-gray-900">Order Management Dashboard</h1>
-                    </div>
-                    <div class="flex items-center space-x-4">
-                        <a href="/" class="text-gray-500 hover:text-gray-700">
-                            <i class="fas fa-home"></i> Home
-                        </a>
-                        <a href="/orders" class="text-blue-600 hover:text-blue-800">
-                            <i class="fas fa-list"></i> Orders
-                        </a>
-                        <a href="/profitability" class="text-gray-500 hover:text-gray-700">
-                            <i class="fas fa-chart-line"></i> Profitability
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </nav>
+        {% set page_title = "Order Management" %}
+        {% include 'partials/app_nav_bar_standalone.html' %}
 
-        <div class="w-full mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        <div class="w-full mx-auto py-6 px-4 sm:px-6 lg:px-8 app-main-safe">
             <!-- WebSocket Connection Status -->
             <div class="bg-white rounded-lg shadow p-6 mb-8">
-                <div class="flex items-center justify-between">
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                     <h2 class="text-lg font-semibold text-gray-900">Real-time Connection Status</h2>
                     <div class="flex items-center space-x-2">
                         <div id="websocket-indicator" class="w-3 h-3 rounded-full bg-gray-400"></div>
@@ -135,9 +117,9 @@
 
             <!-- Orders Table -->
             <div class="bg-white rounded-lg shadow p-6 mb-8">
-                <div class="flex items-center justify-between mb-4">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
                     <h2 class="text-lg font-semibold text-gray-900">Orders</h2>
-                    <div class="flex items-center space-x-4">
+                    <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:space-x-4">
                         <span id="orders-count" class="text-sm text-gray-600">Loading orders...</span>
                         <div class="flex items-center space-x-2">
                             <label class="text-sm text-gray-600">Show:</label>
@@ -151,7 +133,7 @@
                     </div>
                 </div>
 
-                <div class="overflow-x-auto">
+                <div class="overflow-x-auto table-scroll">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
                             <tr>
@@ -197,8 +179,8 @@
                 </div>
 
                 <!-- Pagination -->
-                <div class="flex items-center justify-between mt-4">
-                    <div class="flex items-center space-x-2">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mt-4">
+                    <div class="flex flex-wrap items-center gap-2">
                         <span class="text-sm text-gray-700">Showing</span>
                         <span id="showing-start" class="text-sm font-medium">1</span>
                         <span class="text-sm text-gray-700">to</span>
@@ -207,7 +189,7 @@
                         <span id="total-orders" class="text-sm font-medium">0</span>
                         <span class="text-sm text-gray-700">results</span>
                     </div>
-                    <div class="flex items-center space-x-2">
+                    <div class="flex flex-wrap items-center gap-2">
                         <button id="prev-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">
                             Previous
                         </button>
@@ -220,7 +202,7 @@
             </div>
 
             <!-- Performance Analytics -->
-            <div class="bg-white rounded-lg shadow p-6 mb-8">
+            <div class="bg-white rounded-lg shadow p-6 mb-8 chart-wrap">
                 <h2 class="text-lg font-semibold text-gray-900 mb-6">Performance Analytics</h2>
                 
                 <!-- Order Request & Outcome Summary -->
@@ -1594,5 +1576,6 @@
             loadOrdersData();
         });
     </script>
+    <script src="/static/js/mobile-nav.js"></script>
 </body>
 </html> 

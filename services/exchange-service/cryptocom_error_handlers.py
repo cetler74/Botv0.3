@@ -98,6 +98,10 @@ class CryptocomErrorClassifier:
         self.error_patterns = {
             # Connection patterns
             "Connection refused": (CryptocomErrorType.WEBSOCKET_CONNECTION_FAILED, CryptocomErrorSeverity.HIGH),
+            "connection reset": (CryptocomErrorType.WEBSOCKET_DISCONNECTED, CryptocomErrorSeverity.MEDIUM),
+            "connection closed": (CryptocomErrorType.WEBSOCKET_DISCONNECTED, CryptocomErrorSeverity.LOW),
+            "connection timeout": (CryptocomErrorType.NETWORK_TIMEOUT, CryptocomErrorSeverity.MEDIUM),
+            "timeout": (CryptocomErrorType.NETWORK_TIMEOUT, CryptocomErrorSeverity.MEDIUM),
             "Connection closed": (CryptocomErrorType.WEBSOCKET_DISCONNECTED, CryptocomErrorSeverity.MEDIUM),
             "timeout": (CryptocomErrorType.NETWORK_TIMEOUT, CryptocomErrorSeverity.MEDIUM),
             "Name resolution failed": (CryptocomErrorType.DNS_RESOLUTION_FAILED, CryptocomErrorSeverity.HIGH),

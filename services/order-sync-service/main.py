@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from enum import Enum
 import json
+import uuid
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -76,7 +77,6 @@ class ReconcilerV2:
     async def emit_corrective_event(self, event_type: str, aggregate_id: str, payload: dict, correlation_id: str = None) -> bool:
         """Emit a corrective event instead of direct database mutation"""
         try:
-            import uuid
             event_data = {
                 'aggregate_id': aggregate_id if aggregate_id else str(uuid.uuid4()),
                 'aggregate_type': 'order',
@@ -126,8 +126,8 @@ class ReconcilerV2:
                     local_response.raise_for_status()
                     local_orders = local_response.json().get('order_mappings', [])
                 
-                # Get exchange orders snapshot
-                exchange_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/{exchange}")
+                # Get exchange orders snapshot (including filled orders)
+                exchange_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/history/{exchange}")
                 exchange_response.raise_for_status()
                 exchange_orders = exchange_response.json().get('orders', [])
                 
@@ -273,7 +273,6 @@ class ReconcilerV2:
     
     async def emit_orphaned_order_import_event(self, exchange_order: dict, exchange: str):
         """Emit event to import orphaned exchange order"""
-        import uuid
         local_order_id = str(uuid.uuid4())
         client_order_id = f"reconciler-import-{exchange_order['id']}"
         
@@ -395,7 +394,16 @@ class ReconcilerV2:
                 await asyncio.sleep(120)  # Wait longer on error
 
 class OrderSyncService:
-    """Legacy order synchronization service (kept for backward compatibility)"""
+    """DEPRECATED: Legacy order synchronization service (replaced by ReconcilerV2)
+    
+    This class has been deprecated as part of the consolidation effort.
+    All order synchronization is now handled by ReconcilerV2 using event-driven reconciliation.
+    
+    CONSOLIDATION CHANGES:
+    - Legacy timeout handling removed (ReconcilerV2 uses event-driven approach)
+    - Direct database mutations removed (ReconcilerV2 uses corrective events)
+    - Polling-based sync removed (ReconcilerV2 uses periodic reconciliation)
+    """
     
     def __init__(self):
         self.sync_interval = 30  # seconds
@@ -405,6 +413,8 @@ class OrderSyncService:
         self.cancellation_retry_delay = 5
         self.is_running = False
         self.config = None
+        
+        logger.info("⚠️ DEPRECATION: OrderSyncService is deprecated - using ReconcilerV2 instead")
         
     async def load_config(self):
         """Load configuration from config service"""
@@ -482,7 +492,7 @@ class OrderSyncService:
             logger.info(f"📊 Found {len(db_orders)} pending {exchange} orders in database")
             
             # Get current orders from exchange
-            exchange_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/{exchange}")
+            exchange_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/history/{exchange}")
             if exchange_response.status_code != 200:
                 logger.warning(f"⚠️  Failed to get {exchange} orders from exchange: {exchange_response.status_code}")
                 return
@@ -744,7 +754,7 @@ class OrderSyncService:
                 try:
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         # Get current order status from exchange
-                        status_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/{exchange}")
+                        status_response = await client.get(f"{exchange_service_url}/api/v1/trading/orders/history/{exchange}")
                         if status_response.status_code == 200:
                             exchange_orders = status_response.json().get('orders', [])
                             current_order = None

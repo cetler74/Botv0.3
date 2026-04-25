@@ -9,14 +9,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY services/config-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY main.py .
-
-# Create config directory
+# Copy application code and bundled config (avoids broken bind mounts with paths that contain spaces)
+COPY services/config-service/main.py .
 RUN mkdir -p /app/config
+COPY config/config.yaml /app/config/config.yaml
 
 # Expose port
 EXPOSE 8001

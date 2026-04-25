@@ -173,6 +173,157 @@ class BaseStrategy(ABC):
         """Generate trading signal based on current state, using indicator cache if provided."""
         raise NotImplementedError("generate_signal must be implemented by subclasses")
 
+    # ------------------------------------------------------------------ #
+    # OPTION-A: Regime-driven parameter overrides                        #
+    # ------------------------------------------------------------------ #
+    # The detector already classifies each pair into a MarketRegime       #
+    # (trending_up / trending_down / sideways / reversal_zone / breakout  #
+    # / high_volatility / low_volatility). Until now that value was only  #
+    # used for *routing* (which strategies run in which regime). These    #
+    # helpers also use it for *tuning* — per-regime parameter overrides   #
+    # defined in config.yaml under each strategy's ``regime_overrides``   #
+    # block.                                                              #
+    #                                                                     #
+    # Design goals:                                                       #
+    #   • Fully backward compatible: strategies without overrides behave  #
+    #     exactly like before.                                            #
+    #   • Zero per-strategy wiring of individual parameter names — we     #
+    #     reflect on ``self`` and only overwrite attributes the strategy  #
+    #     actually exposes. Unknown keys are logged and ignored.          #
+    #   • Works for both dict and SimpleNamespace-style ``self.config``.  #
+    #                                                                     #
+    # Contract for strategies:                                            #
+    #   At the top of ``generate_signal()`` (or ``analyze_pair()``) call  #
+    #   ``self._apply_regime_overrides(self.state.market_regime)``.       #
+    # ------------------------------------------------------------------ #
+
+    # Subclasses can override this to map a config key to a differently
+    # named attribute (e.g. engulfing_multi_tf stores
+    # ``volume_avg_period`` in ``self.volume_lookback``).
+    _regime_param_alias_map: Dict[str, str] = {}
+
+    def _get_strategy_config_block(self) -> Dict[str, Any]:
+        """Return the strategy-specific config block ({'parameters': {...}, ...}).
+
+        Handles all nesting shapes observed across services:
+          - dict with 'parameters' / 'regime_overrides' keys at top level
+          - dict nested under ``strategies.<name>``
+          - SimpleNamespace / attribute-style config
+        """
+        cfg = self.config
+        # Direct dict shape first — most common in strategy-service.
+        try:
+            if isinstance(cfg, dict):
+                if 'parameters' in cfg or 'regime_overrides' in cfg:
+                    return cfg
+                # Look under strategies.<strategy_name>
+                strategies = cfg.get('strategies') if isinstance(cfg, dict) else None
+                if isinstance(strategies, dict):
+                    name_key = self.__class__.__name__.lower().replace('strategy', '')
+                    block = strategies.get(name_key)
+                    if isinstance(block, dict):
+                        return block
+        except Exception:
+            pass
+        # Attribute-style (SimpleNamespace, dataclass)
+        if hasattr(cfg, 'parameters') or hasattr(cfg, 'regime_overrides'):
+            return {
+                'parameters': getattr(cfg, 'parameters', {}) or {},
+                'regime_overrides': getattr(cfg, 'regime_overrides', {}) or {},
+            }
+        return {}
+
+    def _get_regime_overrides(self) -> Dict[str, Dict[str, Any]]:
+        """Return the ``regime_overrides`` dict for this strategy, or {}."""
+        block = self._get_strategy_config_block()
+        if not isinstance(block, dict):
+            return {}
+        overrides = block.get('regime_overrides')
+        if not overrides:
+            return {}
+        # Accept both attribute-style and dict-style
+        if not isinstance(overrides, dict):
+            try:
+                overrides = vars(overrides)
+            except Exception:
+                return {}
+        # Normalise regime keys to lower-case strings
+        return {
+            (str(k).lower() if not isinstance(k, str) else k.lower()): (
+                v if isinstance(v, dict) else (vars(v) if hasattr(v, '__dict__') else {})
+            )
+            for k, v in overrides.items()
+        }
+
+    def get_resolved_params(self, market_regime: Optional[str] = None) -> Dict[str, Any]:
+        """Return base parameters merged with the current regime's overrides."""
+        block = self._get_strategy_config_block()
+        base = block.get('parameters', {}) if isinstance(block, dict) else {}
+        if not isinstance(base, dict):
+            try:
+                base = vars(base)
+            except Exception:
+                base = {}
+        merged = dict(base)
+        regime = (market_regime or getattr(self.state, 'market_regime', None) or 'unknown')
+        regime = str(regime).lower()
+        overrides = self._get_regime_overrides().get(regime, {})
+        if overrides:
+            merged.update(overrides)
+        return merged
+
+    def _apply_regime_overrides(self, market_regime: Optional[str] = None) -> Dict[str, Any]:
+        """Re-assign ``self.<attr>`` for every override key matching an
+        existing attribute (or its alias). Safe to call on every
+        ``generate_signal()``; does nothing if no overrides are configured.
+
+        Returns the set of overrides that were actually applied (key -> value).
+        """
+        regime = (market_regime or getattr(self.state, 'market_regime', None) or 'unknown')
+        regime = str(regime).lower()
+        overrides = self._get_regime_overrides().get(regime)
+        if not overrides:
+            return {}
+        applied: Dict[str, Any] = {}
+        skipped: Dict[str, Any] = {}
+        for key, value in overrides.items():
+            target_attr = key
+            if not hasattr(self, target_attr):
+                alias = self._regime_param_alias_map.get(key)
+                if alias and hasattr(self, alias):
+                    target_attr = alias
+                else:
+                    skipped[key] = value
+                    continue
+            try:
+                setattr(self, target_attr, value)
+                applied[key] = value
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning(
+                    f"[{self.__class__.__name__}] regime_override {key}={value} failed: {e}"
+                )
+                skipped[key] = value
+        if applied:
+            logger.info(
+                f"[{self.__class__.__name__}] 🎛️  regime={regime} applied overrides: "
+                f"{applied}"
+            )
+        if skipped:
+            logger.debug(
+                f"[{self.__class__.__name__}] regime={regime} skipped overrides "
+                f"(attr missing): {skipped}"
+            )
+        # Persist a snapshot on state for observability / dashboard surfacing
+        try:
+            self.state.current_parameters = {
+                **self.state.current_parameters,
+                **applied,
+            }
+            self.state.parameter_cache_time = datetime.utcnow()
+        except Exception:
+            pass
+        return applied
+
     @abstractmethod
     async def calculate_position_size(self, signal_type: str) -> float:
         """Calculate position size based on risk management rules."""

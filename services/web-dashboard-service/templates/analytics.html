@@ -2,10 +2,11 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Unified Trading Analytics</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         .gradient-bg {
@@ -61,6 +62,9 @@
             position: relative;
             height: 300px;
             margin: 1rem 0;
+            max-width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
         }
         .recommendation-card {
             transition: all 0.2s ease;
@@ -78,27 +82,13 @@
     </style>
 </head>
 <body class="bg-gray-100">
-    <!-- Navigation -->
-    <nav class="gradient-bg text-white shadow-lg">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex justify-between h-16">
-                <div class="flex items-center">
-                    <a href="/" class="flex items-center">
-                        <i class="fas fa-chart-line text-2xl mr-3"></i>
-                        <h1 class="text-xl font-bold">Unified Trading Analytics</h1>
-                    </a>
-                </div>
-                <div class="flex items-center space-x-4">
-                    <a href="/" class="hover:bg-white hover:bg-opacity-20 px-3 py-2 rounded-md text-sm font-medium transition-colors">
-                        <i class="fas fa-home mr-2"></i>Dashboard
-                    </a>
-                    <button id="refresh-analytics" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors action-button">
-                        <i class="fas fa-sync-alt mr-2"></i>Refresh All
-                    </button>
-                </div>
-            </div>
-        </div>
-    </nav>
+    {% set page_title = "Unified Trading Analytics" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
+    <div class="bg-gray-100 border-b border-gray-200 px-4 sm:px-6 lg:px-8 py-2 flex justify-end">
+        <button id="refresh-analytics" type="button" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors action-button min-h-[44px]">
+            <i class="fas fa-sync-alt mr-2"></i>Refresh All
+        </button>
+    </div>
 
     <!-- Loading State -->
     <div id="loading-state" class="flex items-center justify-center h-64">
@@ -429,9 +419,9 @@
             const strategies = Object.entries(strategyData)
                 .map(([name, stats]) => ({
                     name,
-                    winRate: stats.wins / stats.count,
-                    avgPnl: stats.total_pnl / stats.count,
-                    count: stats.count
+                    winRate: (stats.count && stats.count > 0) ? (stats.wins / stats.count) : 0,
+                    avgPnl: (stats.count && stats.count > 0) ? (stats.total_pnl / stats.count) : 0,
+                    count: stats.count || 0
                 }))
                 .sort((a, b) => b.winRate - a.winRate);
 
@@ -611,5 +601,6 @@
         // Initialize
         document.addEventListener('DOMContentLoaded', fetchAllAnalytics);
     </script>
+    <script src="/static/js/mobile-nav.js"></script>
 </body>
 </html>

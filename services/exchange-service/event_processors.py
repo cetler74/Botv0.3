@@ -17,8 +17,8 @@ class ExecutionReportProcessor:
     Handles order fills, status updates, and fee information
     """
     
-    def __init__(self, fill_detection_service_url: str = "http://fill-detection-service:8008"):
-        self.fill_detection_url = fill_detection_service_url
+    def __init__(self, orchestrator_service_url: str = "http://orchestrator-service:8005"):
+        self.orchestrator_url = orchestrator_service_url
         
         # Metrics
         self.metrics = {
@@ -64,8 +64,8 @@ class ExecutionReportProcessor:
         logger.info(f"📝 New order: {execution_report.order_id} {execution_report.symbol} "
                    f"{execution_report.side} {execution_report.order_quantity}")
         
-        # Send order creation event to fill detection service
-        await self._send_to_fill_detection({
+        # Send order creation event to orchestrator
+        await self._send_to_orchestrator({
             'event_type': 'order_created',
             'exchange': 'binance',
             'order_id': str(execution_report.order_id),
@@ -123,8 +123,8 @@ class ExecutionReportProcessor:
             'order_creation_time': execution_report.order_creation_time
         }
         
-        # Send to fill detection service
-        await self._send_to_fill_detection(fill_event)
+        # Send to orchestrator service
+        await self._send_to_orchestrator(fill_event)
     
     async def _handle_order_cancellation(self, execution_report: ExecutionReport):
         """Handle order cancellation"""
@@ -132,7 +132,7 @@ class ExecutionReportProcessor:
         
         logger.info(f"❌ Order cancelled: {execution_report.order_id} {execution_report.symbol}")
         
-        await self._send_to_fill_detection({
+        await self._send_to_orchestrator({
             'event_type': 'order_cancelled',
             'exchange': 'binance',
             'order_id': str(execution_report.order_id),
@@ -148,7 +148,7 @@ class ExecutionReportProcessor:
         """Handle order rejection"""
         logger.warning(f"⚠️ Order rejected: {execution_report.order_id} {execution_report.symbol}")
         
-        await self._send_to_fill_detection({
+        await self._send_to_orchestrator({
             'event_type': 'order_rejected',
             'exchange': 'binance',
             'order_id': str(execution_report.order_id),
@@ -162,7 +162,7 @@ class ExecutionReportProcessor:
         """Handle order expiration"""
         logger.info(f"⏰ Order expired: {execution_report.order_id} {execution_report.symbol}")
         
-        await self._send_to_fill_detection({
+        await self._send_to_orchestrator({
             'event_type': 'order_expired',
             'exchange': 'binance',
             'order_id': str(execution_report.order_id),
@@ -173,23 +173,23 @@ class ExecutionReportProcessor:
             'timestamp': execution_report.event_time
         })
     
-    async def _send_to_fill_detection(self, event_data: Dict[str, Any]):
-        """Send event data to fill detection service"""
+    async def _send_to_orchestrator(self, event_data: Dict[str, Any]):
+        """Send event data to orchestrator service for WebSocket callback processing"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{self.fill_detection_url}/api/v1/events/execution",
+                    f"{self.orchestrator_url}/api/v1/websocket/callback/binance",
                     json=event_data,
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as response:
                     if response.status == 200:
-                        logger.debug(f"✅ Event sent to fill detection: {event_data['event_type']}")
+                        logger.info(f"✅ Event sent to orchestrator: {event_data['event_type']} - {event_data.get('order_id', 'N/A')}")
                     else:
                         error_text = await response.text()
-                        logger.error(f"❌ Failed to send event to fill detection: {response.status} - {error_text}")
+                        logger.error(f"❌ Failed to send event to orchestrator: {response.status} - {error_text}")
                         
         except Exception as e:
-            logger.error(f"❌ Error sending event to fill detection service: {e}")
+            logger.error(f"❌ Error sending event to orchestrator service: {e}")
             self.metrics['callback_errors'] += 1
     
     def _get_fee_precision(self, fee_amount: float) -> int:

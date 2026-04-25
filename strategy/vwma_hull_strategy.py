@@ -1,8 +1,44 @@
-from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
+# Remove problematic import that doesn't exist
+# from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
 
 """
 VWMA Hull strategy implementation for the crypto trading bot.
-Uses Volume Weighted Moving Average and Hull Moving Average for trend following.
+
+Design (VWMA-Hull-Hybrid v1):
+  • Core engine = battle-tested VWMA-vs-Hull(VWMA) cross with hard vetos
+    (volume validation, ADX>=22, 4h macro EMA9>EMA21). All production-hardened
+    paths (regime overrides, volume methods, SL/TP, profit protection) preserved.
+
+  • Canonical VWMAHull line (NEW) = single indicator built from Hull's formula
+    applied to volume-weighted prices:
+        vwma_half = VWMA(close, volume, n/2)
+        vwma_full = VWMA(close, volume, n)
+        raw       = 2 * vwma_half - vwma_full
+        vwma_hull = WMA(raw, int(sqrt(n)))    # one line
+    Used as a SOFT CONFIRMATION boost for entries when `close > vwma_hull`,
+    matching the spec's primary entry rule. Never replaces the existing
+    crossover engine — it nudges signal_strength up.
+
+  • Hull MA bug fix = `_calculate_hull_ma` now uses real linearly-WEIGHTED
+    moving averages (WMAs), not SMAs. The previous SMA implementation
+    destroyed the low-lag advantage that HMA promises.
+
+  • Soft confirmations (NEW):
+      - close > vwma_hull line       (+vwma_hull_boost)
+      - HMA slope up (last vs prev)  (+hma_slope_boost)
+      - RSI(14) > rsi_long_floor     (+rsi_boost)
+    Each is configurable; bearish counterparts apply symmetric penalties.
+
+  • Bug fixes (NEW):
+      - should_exit() crossover-back exit: the dead-code `'VWMA'/'Hull'`
+        keys (indicators stored as lowercase scalars) are replaced with
+        a live recomputation from `_current_ohlcv`.
+      - calculate_position_size() ATR access: now computed live from
+        `_current_ohlcv` (was reading the never-set `'ATR'` key and
+        always returning 0).
+      - analyze_pair(): replaced AttributeError on `self.adx_threshold`
+        and the broken `adx[-1]` indexing with the same canonical
+        VWMAHull + ADX + RSI logic used in generate_signal.
 """
 from typing import Dict, List, Optional, Any, Union, Tuple
 import pandas as pd
@@ -57,9 +93,29 @@ class VWMAHullStrategy(BaseStrategy):
         self.crossover_confidence_boost = parameters.get('crossover_confidence_boost', 0.8)
         self.trend_confidence_boost = parameters.get('trend_confidence_boost', 0.7)
         self.strength_multiplier = parameters.get('strength_multiplier', 10)
+
+        # PnL-FIX v3 hard veto used by generate_signal (was hard-coded to 22).
+        self.adx_threshold = float(parameters.get('adx_threshold', 22.0))
+        self.adx_period = int(parameters.get('adx_period', 14))
+
+        # VWMA-Hull-Hybrid v1: canonical single-line VWMAHull + soft confirmations.
+        # All boosts are additive nudges to confidence/strength — never vetos.
+        self.enable_canonical_vwma_hull = parameters.get('enable_canonical_vwma_hull', True)
+        self.vwma_hull_boost = float(parameters.get('vwma_hull_boost', 0.10))      # close > VWMAHull
+        self.hma_slope_boost = float(parameters.get('hma_slope_boost', 0.05))      # HMA slope up
+        self.rsi_long_floor = float(parameters.get('rsi_long_floor', 50.0))         # spec: RSI(14)>50 for longs
+        self.rsi_short_ceiling = float(parameters.get('rsi_short_ceiling', 50.0))   # symmetric for shorts
+        self.rsi_period_long = int(parameters.get('rsi_period_long', 14))           # spec defaults to 14
+        self.rsi_boost = float(parameters.get('rsi_boost', 0.05))
         
         # Debug log the loaded parameters
         self.logger.info(f"VWMA Hull Strategy initialized with volume_method: {self.volume_method}, scalping_enabled: {self.scalping_enabled}")
+        self.logger.info(
+            f"VWMA-Hull-Hybrid v1: canonical_vwma_hull={self.enable_canonical_vwma_hull}, "
+            f"boosts (vwma_hull=+{self.vwma_hull_boost:.2f}, hma_slope=+{self.hma_slope_boost:.2f}, "
+            f"rsi=+{self.rsi_boost:.2f}), rsi_long_floor={self.rsi_long_floor:.0f}, "
+            f"adx_threshold={self.adx_threshold:.1f}"
+        )
         self.logger.debug(f"All parameters: vwma_period={self.vwma_period}, hull_period={self.hull_period}, "
                          f"volume_method={self.volume_method}, volume_percentile={self.volume_percentile}, "
                          f"min_absolute_volume={self.min_absolute_volume}, trend_threshold={self.trend_threshold}, "
@@ -108,6 +164,13 @@ class VWMAHullStrategy(BaseStrategy):
             # Check for negative volume
             if (ohlcv['volume'] < 0).any():
                 self.logger.error("Negative volume found")
+                return False
+                
+            # Data quality validation - check for sufficient price movement
+            price_range = (ohlcv['high'].max() - ohlcv['low'].min()) / ohlcv['close'].mean() if ohlcv['close'].mean() > 0 else 0
+            avg_volume = ohlcv['volume'].mean()
+            if price_range < 0.001 or avg_volume < 1.0:  # Less than 0.1% price range or minimal volume
+                self.logger.warning(f"[VWMAHullStrategy] Insufficient price movement ({price_range:.6f}) or volume ({avg_volume:.1f}) for {self.state.pair}")
                 return False
                 
             return True
@@ -296,8 +359,38 @@ class VWMAHullStrategy(BaseStrategy):
             self.logger.debug(f"[CACHE STORE] VWMA for {pair} {timeframe} (period={self.vwma_period})")
         return vwma
 
+    @staticmethod
+    def _wma(series: pd.Series, length: int) -> pd.Series:
+        """
+        Linearly-weighted moving average (WMA).
+
+        WMA gives the most recent value the highest weight (proportional to
+        position). This is the *correct* MA for Hull's formula. Previously
+        this strategy used .rolling().mean() (SMA), destroying HMA's low-lag
+        property entirely.
+        """
+        if series is None or len(series) == 0 or length <= 0:
+            return pd.Series([], dtype=float)
+        if not isinstance(series, pd.Series):
+            series = pd.Series(series)
+        weights = np.arange(1, length + 1, dtype=float)
+        wsum = weights.sum()
+
+        def _w(window):
+            return float(np.dot(window, weights) / wsum)
+
+        return series.rolling(window=length, min_periods=length).apply(_w, raw=True)
+
     def _calculate_hull_ma(self, data: Union[pd.Series, pd.DataFrame, np.ndarray], indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> pd.Series:
-        """Calculate Hull MA, using cache if provided."""
+        """
+        Canonical Hull Moving Average (HMA).
+
+        HMA = WMA( 2 * WMA(price, n/2) - WMA(price, n), int(sqrt(n)) )
+
+        VWMA-Hull-Hybrid v1 BUG FIX: previously used SMA (`.rolling().mean()`)
+        for all three legs which gave the indicator the same lag as a regular
+        SMA — defeating the entire reason HMA exists. Now uses real WMAs.
+        """
         cache_key = None
         if indicators_cache is not None and pair and timeframe:
             cache_key = f"HULL_{pair}_{timeframe}_{self.hull_period}"
@@ -311,50 +404,75 @@ class VWMAHullStrategy(BaseStrategy):
             data = data['close'] if 'close' in data else pd.Series(data.iloc[:, 0])
         elif not isinstance(data, pd.Series):
             data = pd.Series(data)
-        
-        # Ensure data is a pandas Series before using rolling
-        if not isinstance(data, pd.Series):
-            data = pd.Series(data)
-            
+
         # Validate sufficient data for Hull MA calculation
-        required_periods = max(self.hull_period, int(np.sqrt(self.hull_period)))
+        required_periods = self.hull_period + max(int(np.sqrt(self.hull_period)), 1)
         if len(data) < required_periods:
-            self.logger.warning(f"❌ [HULL MA] Insufficient data for Hull MA: {len(data)} < {required_periods} required")
-            # Return NaN series with same index as input
+            self.logger.warning(f"[HULL MA] Insufficient data for Hull MA: {len(data)} < {required_periods} required")
             return pd.Series([np.nan] * len(data), index=data.index if hasattr(data, 'index') else None)
-        
-        half_length = int(self.hull_period / 2)
-        sqrt_length = int(np.sqrt(self.hull_period))
-        
-        # Calculate WMAs with validation
-        wma_half = data.rolling(half_length, min_periods=half_length).mean()
-        wma_full = data.rolling(self.hull_period, min_periods=self.hull_period).mean()
-        
-        # Ensure rolling results are pandas Series
-        if isinstance(wma_half, np.ndarray):
-            wma_half = pd.Series(wma_half, index=data.index if hasattr(data, 'index') else None)
-        if isinstance(wma_full, np.ndarray):
-            wma_full = pd.Series(wma_full, index=data.index if hasattr(data, 'index') else None)
-        
-        # Calculate Hull MA
+
+        half_length = max(int(self.hull_period / 2), 1)
+        sqrt_length = max(int(np.sqrt(self.hull_period)), 1)
+
+        wma_half = self._wma(data, half_length)
+        wma_full = self._wma(data, self.hull_period)
         hull_raw = 2 * wma_half - wma_full
-        hull = hull_raw.rolling(sqrt_length, min_periods=sqrt_length).mean()
-        
-        # Ensure final result is pandas Series
-        if isinstance(hull, np.ndarray):
-            hull = pd.Series(hull, index=data.index if hasattr(data, 'index') else None)
-        
-        # Log calculation status
+        hull = self._wma(hull_raw, sqrt_length)
+
         valid_values = hull.dropna()
-        self.logger.debug(f"✅ [HULL MA] Calculated Hull MA: {len(valid_values)} valid values out of {len(hull)} (period={self.hull_period})")
-        
+        self.logger.debug(
+            f"[HULL MA] WMA-based Hull MA computed: {len(valid_values)} valid out of {len(hull)} "
+            f"(period={self.hull_period}, half={half_length}, sqrt={sqrt_length})"
+        )
         if len(valid_values) == 0:
-            self.logger.warning(f"⚠️ [HULL MA] All Hull MA values are NaN (period={self.hull_period}, data_len={len(data)})")
-            
+            self.logger.warning(f"[HULL MA] All Hull MA values are NaN (period={self.hull_period}, data_len={len(data)})")
+
         if indicators_cache is not None and cache_key:
             indicators_cache[cache_key] = hull
             self.logger.debug(f"[CACHE STORE] Hull MA for {pair} {timeframe} (period={self.hull_period})")
         return hull
+
+    def _calculate_vwma_hull(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> pd.Series:
+        """
+        Canonical single-line VWMAHull indicator.
+
+        Substitutes volume-weighted prices into Hull's formula:
+            vwma_half = VWMA(close, volume, n/2)
+            vwma_full = VWMA(close, volume, n)
+            raw       = 2 * vwma_half - vwma_full
+            vwma_hull = WMA(raw, int(sqrt(n)))
+
+        The result is ONE line that the spec compares against `close`:
+        long when `close > vwma_hull`, short when `close < vwma_hull`.
+        """
+        cache_key = None
+        if indicators_cache is not None and pair and timeframe:
+            cache_key = f"VWMAHULL_{pair}_{timeframe}_{self.vwma_period}"
+            if cache_key in indicators_cache:
+                self.logger.debug(f"[CACHE HIT] VWMAHull for {pair} {timeframe} (period={self.vwma_period})")
+                return indicators_cache[cache_key]
+
+        if ohlcv is None or len(ohlcv) == 0:
+            return pd.Series([], dtype=float)
+        n = max(int(self.vwma_period), 2)
+        half_n = max(int(n / 2), 1)
+        sqrt_n = max(int(np.sqrt(n)), 1)
+        if len(ohlcv) < n + sqrt_n:
+            return pd.Series([np.nan] * len(ohlcv), index=ohlcv.index)
+
+        close = ohlcv['close'].astype(float)
+        volume = ohlcv['volume'].astype(float)
+        vol_close = close * volume
+
+        vwma_half = vol_close.rolling(half_n).sum() / volume.rolling(half_n).sum()
+        vwma_full = vol_close.rolling(n).sum() / volume.rolling(n).sum()
+        raw = 2 * vwma_half - vwma_full
+        vwma_hull = self._wma(raw, sqrt_n)
+
+        if indicators_cache is not None and cache_key:
+            indicators_cache[cache_key] = vwma_hull
+            self.logger.debug(f"[CACHE STORE] VWMAHull for {pair} {timeframe} (period={self.vwma_period})")
+        return vwma_hull
 
     def _calculate_atr(self, ohlcv: pd.DataFrame, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None) -> pd.Series:
         """Calculate Average True Range (ATR) for volatility measurement."""
@@ -548,7 +666,8 @@ class VWMAHullStrategy(BaseStrategy):
                 # Calculate unrealized PnL
                 self.logger.info(f"[DEBUG] PnL calc: trade_id={self.trade_id}, entry_price={self.state.entry_price}, current_price={current_price}, position_size={self.state.position_size}, position={self.state.position}")
                 if self.state.position == 'long':
-                    unrealized_pnl = calculate_unrealized_pnl_with_fees(self.state.entry_price, current_price, self.state.position_size)
+                    # Calculate unrealized PnL with estimated fees (0.1% trading fee)
+                    unrealized_pnl = ((current_price - self.state.entry_price) * self.state.position_size) - (self.state.position_size * current_price * 0.001)
                 else:
                     unrealized_pnl = (self.state.entry_price - current_price) * self.state.position_size
                 # Update performance
@@ -613,27 +732,41 @@ class VWMAHullStrategy(BaseStrategy):
         self.trend_threshold = float(params.get('trend_threshold', self.trend_threshold))
 
     async def generate_signal(self, market_data, indicators_cache: Optional[dict] = None, pair: Optional[str] = None, timeframe: Optional[str] = None, exchange_adapter=None) -> Tuple[str, float, float]:
-        """Generate trading signal based on VWMA and Hull MA analysis with scalping conditions."""
+        """Generate trading signal based on VWMA and Hull MA analysis with scalping conditions.
+
+        PnL-FIX v3:
+          - Added ADX >= 22 as a HARD VETO (was not checked at all in prior version).
+          - Added 4h macro-trend alignment check (reject longs when 4h EMA9<EMA21).
+          - Keeps existing volume/volatility checks (already hard vetos).
+        """
         try:
+            import pandas_ta as ta
             # Use exchange_adapter if provided to override self.exchange
             if exchange_adapter is not None:
                 self.exchange = exchange_adapter
-            
+
+            # OPTION-A: apply regime-driven parameter overrides before any
+            # downstream condition reads self.<attr>. Safe no-op if no
+            # regime_overrides block is configured for this strategy.
+            try:
+                self._apply_regime_overrides(getattr(self.state, 'market_regime', None))
+            except Exception as _ra_err:
+                self.logger.debug(f"[VWMAHullStrategy] regime-override apply failed: {_ra_err}")
+
             # Handle both DataFrame and dict market_data formats
             if isinstance(market_data, dict):
-                # If market_data is a dict with timeframes, use the primary timeframe
+                tf_data = market_data
                 if timeframe and timeframe in market_data:
                     ohlcv = market_data[timeframe]
                 elif '1h' in market_data:
                     ohlcv = market_data['1h']
                 else:
-                    # Use the first available timeframe
                     first_tf = list(market_data.keys())[0]
                     ohlcv = market_data[first_tf]
             else:
-                # If market_data is already a DataFrame
+                tf_data = {}
                 ohlcv = market_data
-            
+
             # Validate input data
             min_period = max(self.vwma_period, self.hull_period)
             if ohlcv is None or ohlcv.empty or len(ohlcv) < min_period:
@@ -655,9 +788,60 @@ class VWMAHullStrategy(BaseStrategy):
             if pd.isna(current_vwma) or pd.isna(current_hull) or pd.isna(prev_vwma) or pd.isna(prev_hull):
                 return 'hold', 0.0, 0.0
 
-            # Volume validation (simplified for speed)
+            # HARD VETO #1: Volume
             volume_valid, volume_message = self._validate_volume_conditions(ohlcv)
             if not volume_valid:
+                return 'hold', 0.0, 0.0
+
+            # HARD VETO #2: ADX >= adx_threshold (filter chop). PnL-FIX v3 default 22.
+            try:
+                adx_df = ta.adx(
+                    high=ohlcv['high'], low=ohlcv['low'], close=ohlcv['close'], length=self.adx_period
+                )
+                if adx_df is not None and not adx_df.empty:
+                    # pandas_ta returns ADX_14, DMP_14, DMN_14
+                    adx_col = next((c for c in adx_df.columns if c.startswith('ADX')), None)
+                    adx_now = float(adx_df[adx_col].iloc[-1]) if adx_col and not pd.isna(adx_df[adx_col].iloc[-1]) else 0.0
+                else:
+                    adx_now = 0.0
+            except Exception as e:
+                self.logger.debug(f"[VWMAHullStrategy] ADX calc failed for {pair}: {e}")
+                adx_now = 0.0
+            if adx_now < self.adx_threshold:
+                self.logger.info(
+                    f"[VWMAHullStrategy] {pair} HOLD — ADX veto: {adx_now:.1f} < {self.adx_threshold:.1f} (chop)"
+                )
+                return 'hold', 0.0, 0.0
+
+            # HARD VETO #3: 4h macro trend must be bullish for long entries.
+            # PnL-FIX v4: Previously when 4h data was missing (strategy-service
+            # used to fetch only ['1h', '15m', '5m']) this veto was silently
+            # skipped, defeating the PnL-FIX v3 safeguard. Now the upstream
+            # default includes 4h; if it's still absent we treat it as a
+            # veto — refusing the entry is safer than trading blind.
+            macro_bullish: Optional[bool] = None
+            if isinstance(tf_data, dict) and '4h' in tf_data:
+                m = tf_data['4h']
+                if m is not None and not m.empty and len(m) >= 30:
+                    try:
+                        ef = ta.ema(m['close'], length=9)
+                        es = ta.ema(m['close'], length=21)
+                        if ef is not None and es is not None and not pd.isna(ef.iloc[-1]) and not pd.isna(es.iloc[-1]):
+                            macro_bullish = bool(ef.iloc[-1] > es.iloc[-1])
+                    except Exception:
+                        macro_bullish = None
+
+            require_mtf = bool(self.config.get('require_multi_timeframe_confirmation', True))
+            if macro_bullish is False:
+                self.logger.info(
+                    f"[VWMAHullStrategy] {pair} HOLD — macro veto: 4h EMA9 < EMA21"
+                )
+                return 'hold', 0.0, 0.0
+            if macro_bullish is None and require_mtf:
+                self.logger.info(
+                    f"[VWMAHullStrategy] {pair} HOLD — macro data unavailable (4h) "
+                    f"and require_multi_timeframe_confirmation=true"
+                )
                 return 'hold', 0.0, 0.0
 
             # Trend and crossover
@@ -692,7 +876,76 @@ class VWMAHullStrategy(BaseStrategy):
                 strength = min(trend_strength * 8, 1.0)
                 reason.append('vwma_below_hull')
 
-            reason_str = '+'.join(reason) if reason else 'no_signal'
+            # VWMA-Hull-Hybrid v1: SOFT CONFIRMATIONS.
+            # Each layer either nudges the existing signal up (if it agrees)
+            # or applies a symmetric penalty (if it disagrees). They never
+            # promote 'hold' to 'buy' on their own — they refine confidence
+            # of an already-fired signal.
+            try:
+                # 1) Canonical single-line VWMAHull (close vs vwma_hull line).
+                vwma_hull_line = None
+                vwma_hull_now = float('nan')
+                close_above_vwma_hull = False
+                if self.enable_canonical_vwma_hull:
+                    vwma_hull_line = self._calculate_vwma_hull(
+                        ohlcv, indicators_cache, pair, timeframe
+                    )
+                    if vwma_hull_line is not None and len(vwma_hull_line) > 0:
+                        vwma_hull_now = float(vwma_hull_line.iloc[-1])
+                        if not pd.isna(vwma_hull_now):
+                            close_above_vwma_hull = current_price > vwma_hull_now
+                            if signal == 'buy' and close_above_vwma_hull:
+                                confidence = min(1.0, confidence + self.vwma_hull_boost)
+                                strength = min(1.0, strength + self.vwma_hull_boost)
+                                reason.append('close>vwma_hull')
+                            elif signal == 'buy' and not close_above_vwma_hull:
+                                confidence = max(0.0, confidence - self.vwma_hull_boost)
+                                strength = max(0.0, strength - self.vwma_hull_boost)
+                                reason.append('close<vwma_hull')
+                            elif signal == 'sell' and not close_above_vwma_hull:
+                                confidence = min(1.0, confidence + self.vwma_hull_boost)
+                                strength = min(1.0, strength + self.vwma_hull_boost)
+                                reason.append('close<vwma_hull')
+
+                # 2) HMA slope confirmation (slope = sign of last - prev).
+                hma_slope_up = current_hull > prev_hull
+                if signal == 'buy' and hma_slope_up:
+                    confidence = min(1.0, confidence + self.hma_slope_boost)
+                    strength = min(1.0, strength + self.hma_slope_boost)
+                    reason.append('hma_slope_up')
+                elif signal == 'buy' and not hma_slope_up:
+                    confidence = max(0.0, confidence - self.hma_slope_boost)
+                    strength = max(0.0, strength - self.hma_slope_boost)
+                    reason.append('hma_slope_down')
+                elif signal == 'sell' and not hma_slope_up:
+                    confidence = min(1.0, confidence + self.hma_slope_boost)
+                    strength = min(1.0, strength + self.hma_slope_boost)
+                    reason.append('hma_slope_down')
+
+                # 3) RSI(14) > rsi_long_floor (default 50) for longs (spec).
+                rsi_now = float('nan')
+                try:
+                    rsi_series = ta.rsi(ohlcv['close'], length=self.rsi_period_long)
+                    if rsi_series is not None and len(rsi_series) > 0 and not pd.isna(rsi_series.iloc[-1]):
+                        rsi_now = float(rsi_series.iloc[-1])
+                        if signal == 'buy' and rsi_now > self.rsi_long_floor:
+                            confidence = min(1.0, confidence + self.rsi_boost)
+                            strength = min(1.0, strength + self.rsi_boost)
+                            reason.append(f'rsi>{self.rsi_long_floor:.0f}')
+                        elif signal == 'buy' and rsi_now <= self.rsi_long_floor:
+                            confidence = max(0.0, confidence - self.rsi_boost)
+                            strength = max(0.0, strength - self.rsi_boost)
+                            reason.append(f'rsi<={self.rsi_long_floor:.0f}')
+                        elif signal == 'sell' and rsi_now < self.rsi_short_ceiling:
+                            confidence = min(1.0, confidence + self.rsi_boost)
+                            strength = min(1.0, strength + self.rsi_boost)
+                            reason.append(f'rsi<{self.rsi_short_ceiling:.0f}')
+                except Exception as _rsi_err:
+                    self.logger.debug(f"[VWMAHullStrategy] RSI soft-confirm failed for {pair}: {_rsi_err}")
+            except Exception as _soft_err:
+                self.logger.debug(f"[VWMAHullStrategy] Soft-confirmation layer failed for {pair}: {_soft_err}")
+
+            reason_str = '+'.join(reason) + f'|adx={adx_now:.1f}' if reason else 'no_signal'
             self.logger.info(f"[VWMAHullStrategy] Generated {signal.upper()} signal for {pair or self.state.pair}: "
                              f"trend={trend}, crossover={crossover}, strength={strength:.3f}, confidence={confidence:.2f}, reason={reason_str}")
             # Enhanced condition logging with detailed values
@@ -709,41 +962,62 @@ class VWMAHullStrategy(BaseStrategy):
             return 'hold', 0.0, 0.0
 
     async def calculate_position_size(self, signal_type: str) -> float:
-        """Calculate position size based on risk management rules."""
+        """
+        Calculate position size based on ATR-anchored risk management.
+
+        VWMA-Hull-Hybrid v1 BUG FIX: previously read `self.state.indicators.get('ATR')`
+        which was never populated AND treated as a Series with `.values[-1]`. Both
+        bugs combined to silently return 0 for every call → no orders ever sized
+        through this method. We now compute ATR live from `_current_ohlcv`
+        (already maintained by `update()`), with a fallback to a fixed ~1% risk
+        sizing if ATR is unavailable so we never silently emit zero-size orders.
+        """
         try:
-            # Check if exchange is available
             if not self.exchange:
                 self.logger.debug("[VWMAHullStrategy] Exchange not available for position size calculation")
                 return 0.0
-                
-            # Get account balance
+
             balance = await self.exchange.get_balance()
             available_balance = balance.get('free', 0.0)
-            
-            # Calculate risk per trade (1% of available balance)
+
+            # 1% of available balance is the risk budget per trade.
             risk_amount = available_balance * 0.01
-            
-            # Get current price and ATR
+
             ticker = await self.exchange.get_ticker(self.state.pair, self.exchange_name)
             if not ticker or 'last' not in ticker:
-                self.logger.warning(f"[VWMAHullStrategy] Could not fetch ticker for {self.state.pair} on {self.exchange_name}")
+                self.logger.warning(
+                    f"[VWMAHullStrategy] Could not fetch ticker for {self.state.pair} on {self.exchange_name}"
+                )
                 return 0.0
-            current_price = ticker['last']
-            atr = self.state.indicators.get('ATR', None)
-            
-            if atr is None:
+            current_price = float(ticker['last'])
+            if current_price <= 0:
                 return 0.0
-            
-            atr_value = atr.values[-1]
-            
-            # Calculate position size based on risk
-            position_size = risk_amount / (2 * atr_value)
-            
-            # SPOT TRADING: No leverage adjustment needed
-            # Leverage is only used in futures/margin trading
-            
-            return position_size
-            
+
+            # Live ATR from the most recent OHLCV snapshot maintained by update().
+            atr_value: Optional[float] = None
+            ohlcv = getattr(self, '_current_ohlcv', None)
+            if ohlcv is not None and isinstance(ohlcv, pd.DataFrame) and len(ohlcv) >= self.atr_period + 1:
+                try:
+                    atr_series = self._calculate_atr(ohlcv)
+                    if atr_series is not None and len(atr_series) > 0 and not pd.isna(atr_series.iloc[-1]):
+                        atr_value = float(atr_series.iloc[-1])
+                except Exception as _atr_err:
+                    self.logger.debug(f"[VWMAHullStrategy] Live ATR calc failed: {_atr_err}")
+
+            if atr_value and atr_value > 0:
+                # Position size = risk / (stop_distance), stop_distance ≈ 2 * ATR.
+                position_size = risk_amount / (2.0 * atr_value)
+            else:
+                # Fallback: assume 1% stop distance — never emit a zero-size order
+                # silently. This mirrors the orchestrator's default trading.stop_loss_percentage.
+                self.logger.warning(
+                    f"[VWMAHullStrategy] ATR unavailable for {self.state.pair}; "
+                    "falling back to fixed-percentage sizing (1% stop)."
+                )
+                position_size = risk_amount / (current_price * 0.01)
+
+            return float(position_size)
+
         except Exception as e:
             self.logger.error(f"Error calculating position size: {str(e)}")
             return 0.0
@@ -777,17 +1051,64 @@ class VWMAHullStrategy(BaseStrategy):
                 await self._log_condition('exit_signal', 'take_profit', 'Take profit triggered', True, 'exit', pair, reason='take_profit', context={'current_price': current_price, 'take_profit': self.state.take_profit})
                 return True, 'take_profit'
 
-            # 3. VWMA/Hull crossover (technical exit)
-            vwma = self.state.indicators.get('VWMA')
-            hull = self.state.indicators.get('Hull')
-            if vwma is not None and hull is not None and len(vwma) > 1 and len(hull) > 1:
-                prev_vwma, prev_hull = vwma[-2], hull[-2]
-                curr_vwma, curr_hull = vwma[-1], hull[-1]
-                # Exit if VWMA crosses below Hull (trend reversal)
-                if prev_vwma > prev_hull and curr_vwma < curr_hull:
-                    self.logger.info(f"[VWMAHullStrategy] Exiting {pair} due to VWMA/Hull crossover: {prev_vwma:.2f}->{curr_vwma:.2f} crossed {prev_hull:.2f}->{curr_hull:.2f}")
-                    await self._log_condition('exit_signal', 'crossover', 'VWMA/Hull crossover exit', True, 'exit', pair, reason='crossover', context={'prev_vwma': prev_vwma, 'prev_hull': prev_hull, 'curr_vwma': curr_vwma, 'curr_hull': curr_hull})
-                    return True, 'crossover'
+            # 3. VWMA/Hull crossover (technical exit) — VWMA-Hull-Hybrid v1 BUG FIX.
+            # Previously this branch was dead code: it read 'VWMA'/'Hull' (uppercase)
+            # from self.state.indicators which only stores 'vwma'/'hull' (lowercase)
+            # AS SCALARS (`float(...)`). Both the key mismatch AND the scalar-vs-series
+            # mismatch meant the spec's "crossover-back" exit NEVER fired. We now
+            # recompute both lines fresh from `_current_ohlcv` (cheap on the
+            # execution timeframe) and additionally check `close < vwma_hull` if
+            # the canonical indicator is enabled.
+            try:
+                if len(ohlcv) >= max(self.vwma_period, self.hull_period) + 2:
+                    vwma_series = self._calculate_vwma(ohlcv)
+                    hull_series = self._calculate_hull_ma(vwma_series)
+                    if (
+                        vwma_series is not None and hull_series is not None
+                        and len(vwma_series) >= 2 and len(hull_series) >= 2
+                        and not pd.isna(vwma_series.iloc[-1]) and not pd.isna(hull_series.iloc[-1])
+                        and not pd.isna(vwma_series.iloc[-2]) and not pd.isna(hull_series.iloc[-2])
+                    ):
+                        prev_vwma = float(vwma_series.iloc[-2])
+                        prev_hull = float(hull_series.iloc[-2])
+                        curr_vwma = float(vwma_series.iloc[-1])
+                        curr_hull = float(hull_series.iloc[-1])
+                        if prev_vwma > prev_hull and curr_vwma < curr_hull:
+                            self.logger.info(
+                                f"[VWMAHullStrategy] Exiting {pair} due to VWMA/Hull crossover: "
+                                f"{prev_vwma:.6f}->{curr_vwma:.6f} crossed {prev_hull:.6f}->{curr_hull:.6f}"
+                            )
+                            await self._log_condition(
+                                'exit_signal', 'crossover', 'VWMA/Hull crossover exit', True, 'exit', pair,
+                                reason='crossover',
+                                context={'prev_vwma': prev_vwma, 'prev_hull': prev_hull,
+                                         'curr_vwma': curr_vwma, 'curr_hull': curr_hull},
+                            )
+                            return True, 'crossover'
+
+                    # 3b. Canonical VWMAHull line break — close drops below the
+                    # single VWMAHull line (spec's primary technical exit).
+                    if self.enable_canonical_vwma_hull:
+                        vh = self._calculate_vwma_hull(ohlcv)
+                        if vh is not None and len(vh) >= 2 and not pd.isna(vh.iloc[-1]) and not pd.isna(vh.iloc[-2]):
+                            prev_close = float(ohlcv['close'].iloc[-2])
+                            curr_close = float(current_price)
+                            prev_vh = float(vh.iloc[-2])
+                            curr_vh = float(vh.iloc[-1])
+                            if prev_close >= prev_vh and curr_close < curr_vh:
+                                self.logger.info(
+                                    f"[VWMAHullStrategy] Exiting {pair} on close<VWMAHull: "
+                                    f"close {prev_close:.6f}->{curr_close:.6f} crossed VH {prev_vh:.6f}->{curr_vh:.6f}"
+                                )
+                                await self._log_condition(
+                                    'exit_signal', 'vwma_hull_break', 'Close dropped below VWMAHull',
+                                    True, 'exit', pair, reason='vwma_hull_break',
+                                    context={'prev_close': prev_close, 'curr_close': curr_close,
+                                             'prev_vwma_hull': prev_vh, 'curr_vwma_hull': curr_vh},
+                                )
+                                return True, 'vwma_hull_break'
+            except Exception as _x_err:
+                self.logger.debug(f"[VWMAHullStrategy] Crossover-back exit check failed for {pair}: {_x_err}")
 
             # 4. Fallback: time-based exit (e.g., 48h max hold)
             if self.state.entry_time:
@@ -904,47 +1225,98 @@ class VWMAHullStrategy(BaseStrategy):
             self.logger.info(line)
 
     async def analyze_pair(self, pair, min_candles=None, exchange_name=None):
+        """
+        Per-timeframe quick analysis used by the orchestrator's bulk scan.
+
+        VWMA-Hull-Hybrid v1 BUG FIX: this method previously crashed on
+        `self.adx_threshold` (only added in __init__ as part of this fix)
+        and used `adx[-1]` against a pandas_ta DataFrame (TypeError). It
+        now mirrors the canonical signal pipeline used by generate_signal:
+        ADX gate, VWMA/Hull cross check, canonical VWMAHull confirmation,
+        and an RSI(14)>floor check for longs.
+        """
         timeframes = ['1h', '15m']
-        results = {}
+        results: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}
+        ex_name = exchange_name or self.exchange_name
+        limit = min_candles or 50
         for timeframe in timeframes:
             logger.info(f"[VWMAHullStrategy] Analyzing {pair} on {timeframe}")
-            df = await self.exchange.get_ohlcv(exchange_name, pair, timeframe, limit=min_candles or 50)
-            if df is None or len(df) < (min_candles or 50):
-                logger.warning(f"Not enough data for {pair} on {timeframe}")
-                results[timeframe] = ('hold', 0, {})
-                continue
-            # Example indicator calculation and checks
-            import pandas_ta as ta
-            indicators = {}
             try:
-                adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-                rsi = ta.rsi(df['close'], length=14)
-                indicators = {
-                    'adx': adx[-1],
-                    'rsi': rsi[-1],
-                }
+                df = await self.exchange.get_ohlcv(ex_name, pair, timeframe, limit=limit)
+            except Exception as e:
+                logger.error(f"[VWMAHullStrategy] OHLCV fetch failed for {pair} on {timeframe}: {e}")
+                results[timeframe] = ('hold', 0.0, {})
+                continue
+
+            if df is None or len(df) < limit:
+                logger.warning(f"[VWMAHullStrategy] Not enough data for {pair} on {timeframe}")
+                results[timeframe] = ('hold', 0.0, {})
+                continue
+
+            try:
+                import pandas_ta as ta
+                indicators: Dict[str, Any] = {}
+
+                # ADX (gate).
+                adx_df = ta.adx(df['high'], df['low'], df['close'], length=self.adx_period)
+                adx_now = float('nan')
+                if adx_df is not None and not adx_df.empty:
+                    adx_col = next((c for c in adx_df.columns if c.startswith('ADX')), None)
+                    if adx_col and not pd.isna(adx_df[adx_col].iloc[-1]):
+                        adx_now = float(adx_df[adx_col].iloc[-1])
+                indicators['adx'] = adx_now
+
+                # RSI (long-floor confirmation).
+                rsi_series = ta.rsi(df['close'], length=self.rsi_period_long)
+                rsi_now = float(rsi_series.iloc[-1]) if rsi_series is not None and len(rsi_series) > 0 and not pd.isna(rsi_series.iloc[-1]) else float('nan')
+                indicators['rsi'] = rsi_now
+
+                # VWMA / Hull(VWMA) for crossover.
+                vwma_series = self._calculate_vwma(df)
+                hull_series = self._calculate_hull_ma(vwma_series)
+                indicators['vwma'] = float(vwma_series.iloc[-1]) if not pd.isna(vwma_series.iloc[-1]) else float('nan')
+                indicators['hull'] = float(hull_series.iloc[-1]) if not pd.isna(hull_series.iloc[-1]) else float('nan')
+
+                # Canonical single-line VWMAHull (close vs vwma_hull).
+                close_above_vh: Optional[bool] = None
+                if self.enable_canonical_vwma_hull:
+                    vh = self._calculate_vwma_hull(df)
+                    if vh is not None and len(vh) > 0 and not pd.isna(vh.iloc[-1]):
+                        indicators['vwma_hull'] = float(vh.iloc[-1])
+                        close_above_vh = float(df['close'].iloc[-1]) > float(vh.iloc[-1])
+
+                # NaN guard.
+                if any(pd.isna(v) for v in (adx_now, rsi_now, indicators['vwma'], indicators['hull'])):
+                    logger.warning(f"[VWMAHullStrategy] NaN core indicator for {pair} on {timeframe}, holding.")
+                    results[timeframe] = ('hold', 0.0, indicators)
+                    continue
             except Exception as e:
                 logger.error(f"[VWMAHullStrategy] Indicator calculation error for {pair} on {timeframe}: {e}")
-                results[timeframe] = ('hold', 0, indicators)
+                results[timeframe] = ('hold', 0.0, {})
                 continue
-            logger.info(f"[VWMAHullStrategy] {pair} {timeframe} indicators: {indicators}")
-            for name, value in indicators.items():
-                if pd.isna(value):
-                    logger.warning(f"[VWMAHullStrategy] Indicator {name} is NaN for {pair} on {timeframe}, holding.")
-                    results[timeframe] = ('hold', 0, indicators)
-                    break
+
+            adx_pass = adx_now > self.adx_threshold
+            rsi_pass = rsi_now > self.rsi_long_floor
+            vwma_above_hull = indicators['vwma'] > indicators['hull']
+            checks = [adx_pass, rsi_pass, vwma_above_hull]
+            if close_above_vh is not None:
+                checks.append(close_above_vh)
+
+            passed = sum(1 for c in checks if c)
+            confidence = passed / max(len(checks), 1)
+
+            if all(checks):
+                logger.info(
+                    f"[VWMAHullStrategy] {pair} {timeframe}: BUY (adx={adx_now:.1f}, rsi={rsi_now:.1f}, "
+                    f"vwma>hull={vwma_above_hull}, close>vh={close_above_vh})"
+                )
+                results[timeframe] = ('buy', confidence, indicators)
             else:
-                adx_pass = indicators['adx'] > self.adx_threshold
-                logger.info(f"[VWMAHullStrategy] ADX check: current={indicators['adx']}, target>{self.adx_threshold}, result={'PASS' if adx_pass else 'FAIL'}")
-                rsi_pass = indicators['rsi'] > 50
-                logger.info(f"[VWMAHullStrategy] RSI check: current={indicators['rsi']}, target>50, result={'PASS' if rsi_pass else 'FAIL'}")
-                checks = [adx_pass, rsi_pass]
-                if all(checks):
-                    logger.info(f"[VWMAHullStrategy] Signal for {pair} on {timeframe}: BUY (all conditions met)")
-                    results[timeframe] = ('buy', 1, indicators)
-                else:
-                    logger.info(f"[VWMAHullStrategy] Signal for {pair} on {timeframe}: HOLD (not all conditions met)")
-                    results[timeframe] = ('hold', 0, indicators)
+                logger.info(
+                    f"[VWMAHullStrategy] {pair} {timeframe}: HOLD ({passed}/{len(checks)} checks passed; "
+                    f"adx={adx_now:.1f}, rsi={rsi_now:.1f}, vwma>hull={vwma_above_hull}, close>vh={close_above_vh})"
+                )
+                results[timeframe] = ('hold', confidence, indicators)
         return results
         
     async def check_exit(self, market_data=None, predictions=None, trade_id=None):

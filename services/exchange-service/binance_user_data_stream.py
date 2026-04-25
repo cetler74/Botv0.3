@@ -125,20 +125,26 @@ class BinanceUserDataStreamManager:
         
         # Metrics and monitoring
         self.metrics = {
-            'connection_attempts': 0,
-            'successful_connections': 0,
-            'disconnections': 0,
             'messages_received': 0,
             'messages_processed': 0,
             'processing_errors': 0,
+            'connection_attempts': 0,
+            'successful_connections': 0,
+            'reconnection_attempts': 0,
             'last_message_time': None,
-            'uptime_start': None,
-            'reconnect_attempts': 0
+            'uptime_start': time.time()
         }
         
-        # Message processing queue
+        # Message queue for asynchronous processing
         self.message_queue = asyncio.Queue(maxsize=self.message_queue_size)
-        self.processing_task: Optional[asyncio.Task] = None
+        
+        # Execution processor for Redis integration
+        self.execution_processor = None
+        
+    def set_execution_processor(self, execution_processor):
+        """Set the execution processor for Redis integration"""
+        self.execution_processor = execution_processor
+        logger.info("✅ Execution processor connected to Binance WebSocket manager")
     
     def _setup_recovery_actions(self):
         """Setup recovery action handlers"""
@@ -362,7 +368,19 @@ class BinanceUserDataStreamManager:
             if event_type == 'executionReport':
                 # Process execution report
                 execution_report = ExecutionReport.from_binance_event(data)
+                
+                # Notify registered callbacks
                 await self._notify_execution_callbacks(execution_report)
+                
+                # 🔥 CRITICAL FIX: Process through execution processor for Redis integration
+                if self.execution_processor:
+                    try:
+                        await self.execution_processor.process_execution_report(execution_report)
+                        logger.info(f"✅ Execution report processed through Redis integration: {execution_report.order_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Error processing execution report through Redis: {e}")
+                else:
+                    logger.warning("⚠️ No execution processor connected - Redis integration not available")
                 
                 # Log important execution events
                 if execution_report.execution_type in ['TRADE', 'FILLED']:

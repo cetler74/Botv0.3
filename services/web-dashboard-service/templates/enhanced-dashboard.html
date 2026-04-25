@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -11,6 +11,7 @@
     <!-- External libraries -->
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
     
     <style>
         :root {
@@ -362,6 +363,13 @@
             .mobile-hidden { display: none !important; }
             .mobile-full-width { width: 100% !important; }
             .mobile-stack { flex-direction: column !important; }
+            .mobile-time-inline {
+                display: block;
+                font-size: 0.7rem;
+                color: #6b7280;
+                line-height: 1.2;
+                margin-top: 0.25rem;
+            }
         }
         
         /* Better responsive table columns for wider screens */
@@ -385,6 +393,12 @@
         @media (min-width: 1536px) {
             .mobile-hidden {
                 display: table-cell !important;
+            }
+        }
+
+        @media (min-width: 769px) {
+            .mobile-time-inline {
+                display: none;
             }
         }
         
@@ -693,27 +707,29 @@
         }
     </style>
 </head>
-<body class="bg-gray-50 min-h-screen">
+<body class="bg-gray-50 min-h-screen enhanced-dashboard-page">
     <!-- Navigation -->
-    <nav class="gradient-primary text-white shadow-lg sticky top-0 z-40">
-        <div class="max-w-full xl:max-w-screen-2xl 2xl:max-w-none mx-auto px-4 sm:px-6 lg:px-8 xl:px-12 2xl:px-16">
-            <div class="flex justify-between items-center h-16">
-                <div class="flex items-center animate-fade-in">
-                    <div class="icon-container bg-white bg-opacity-20 mr-4">
-                        <i class="fas fa-chart-line text-2xl text-white"></i>
+    <nav class="gradient-primary app-top-nav text-white shadow-lg sticky top-0 z-40">
+        <div class="max-w-full xl:max-w-screen-2xl 2xl:max-w-none mx-auto px-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-16">
+            <div class="flex justify-between items-center min-h-[3.25rem] py-2 lg:h-16 lg:py-0 gap-2">
+                <div class="flex items-center min-w-0 flex-1 animate-fade-in pr-2">
+                    <div class="icon-container bg-white bg-opacity-20 mr-2 sm:mr-4 flex-shrink-0">
+                        <i class="fas fa-chart-line text-xl sm:text-2xl text-white"></i>
                     </div>
-                    <h1 class="text-xl font-bold">Trading Bot Dashboard</h1>
+                    <h1 class="text-base sm:text-xl font-bold truncate">Trading Bot Dashboard</h1>
                 </div>
                 
                 <!-- Connection status and controls -->
-                <div class="flex items-center space-x-4 animate-fade-in" style="--delay: 0.2s">
-                    <div class="flex items-center">
+                <div class="flex items-center flex-shrink-0 space-x-2 sm:space-x-4 animate-fade-in" style="--delay: 0.2s">
+                    <div class="flex items-center min-w-0">
                         <span class="status-indicator status-online" id="connection-status"></span>
-                        <span id="connection-text" class="text-sm font-medium">Connected</span>
+                        <span id="connection-text" class="text-xs sm:text-sm font-medium whitespace-nowrap">Connected</span>
                     </div>
+
+                    <span id="websocket-summary" class="badge badge-warning text-xs px-2 py-1 rounded-full max-w-[9.5rem] sm:max-w-none truncate shrink-0" title="WebSocket summary">0/3</span>
                     
-                    <!-- WebSocket Status Indicators -->
-                    <div class="flex items-center space-x-3 text-xs">
+                    <!-- WebSocket Status Indicators (desktop / large tablet only — avoids horizontal squeeze on phones) -->
+                    <div class="hidden lg:flex items-center space-x-3 text-xs flex-wrap justify-end max-w-xl">
                         <span class="text-white opacity-75">WebSocket:</span>
                         <div class="flex items-center space-x-1">
                             <div class="websocket-indicator connected pulse" data-websocket-indicator="binance" title="Binance WebSocket: Connected"></div>
@@ -727,13 +743,10 @@
                             <div class="websocket-indicator connecting" data-websocket-indicator="cryptocom" title="Crypto.com WebSocket: Initializing"></div>
                             <span class="text-white text-xs opacity-60">Crypto.com</span>
                         </div>
-                        <div class="ml-2">
-                            <span id="websocket-summary" class="badge badge-warning text-xs px-2 py-1 rounded-full">0/3 Connected</span>
-                        </div>
                     </div>
                     
-                    <!-- Real-time Order Status Badges -->
-                    <div class="flex items-center space-x-2 text-xs">
+                    <!-- Real-time Order Status Badges (large screens — details still in mobile menu / polling) -->
+                    <div class="hidden lg:flex items-center space-x-2 text-xs flex-wrap justify-end">
                         <span class="text-white opacity-75">Orders:</span>
                         <div class="order-status-badge new" data-order-status="new" title="New Orders">0</div>
                         <div class="order-status-badge filled" data-order-status="filled" title="Filled Orders">0</div>
@@ -742,14 +755,30 @@
                     </div>
 
                     <!-- Navigation Links -->
-                    <div class="hidden lg:flex items-center space-x-4">
-                        <a href="/analytics" class="text-white hover:text-blue-200 transition-colors duration-200 text-sm font-medium flex items-center">
-                            <i class="fas fa-chart-bar mr-2"></i>
-                            <span>Analytics</span>
+                    <div class="hidden lg:flex items-center flex-wrap gap-x-3 gap-y-1 justify-end max-w-xl xl:max-w-none">
+                        <a href="/analytics" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-chart-bar mr-1"></i><span>Analytics</span>
                         </a>
-                        <a href="/orders" class="text-white hover:text-blue-200 transition-colors duration-200 text-sm font-medium flex items-center">
-                            <i class="fas fa-list-alt mr-2"></i>
-                            <span>Orders</span>
+                        <a href="/orders" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-list-alt mr-1"></i><span>Orders</span>
+                        </a>
+                        <a href="/profitability" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-chart-line mr-1"></i><span>Profit</span>
+                        </a>
+                        <a href="/performance" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-tachometer-alt mr-1"></i><span>Perf</span>
+                        </a>
+                        <a href="/exchange-info" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-network-wired mr-1"></i><span>Exchange</span>
+                        </a>
+                        <a href="/optimizer" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-sliders-h mr-1"></i><span>Optimizer</span>
+                        </a>
+                        <a href="/trades" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-exchange-alt mr-1"></i><span>Trades</span>
+                        </a>
+                        <a href="/settings" class="text-white hover:text-blue-200 transition-colors duration-200 text-xs font-medium flex items-center">
+                            <i class="fas fa-cog mr-1"></i><span>Settings</span>
                         </a>
                     </div>
                     
@@ -769,24 +798,49 @@
                         </button>
                     </div>
                     
-                    <button class="md:hidden enhanced-btn btn-primary text-sm" id="mobile-menu-toggle">
-                        <i class="fas fa-bars"></i>
+                    <button type="button" class="lg:hidden enhanced-btn btn-primary text-sm" id="mobile-menu-toggle" aria-controls="mobile-menu" aria-expanded="false" aria-label="Open menu">
+                        <i class="fas fa-bars" aria-hidden="true"></i>
                     </button>
                 </div>
             </div>
         </div>
         
         <!-- Mobile controls -->
-        <div id="mobile-menu" class="md:hidden bg-black bg-opacity-20 px-4 py-3 hidden">
+        <div id="mobile-menu" class="lg:hidden bg-black bg-opacity-20 px-4 py-3 hidden" role="region" aria-label="Mobile navigation">
             <!-- Mobile Navigation Links -->
-            <div class="flex space-x-4 mb-3 pb-3 border-b border-gray-400">
-                <a href="/analytics" class="text-white hover:text-blue-200 transition-colors duration-200 text-sm font-medium flex items-center">
-                    <i class="fas fa-chart-bar mr-2"></i>
-                    <span>Analytics</span>
+            <div class="flex flex-col space-y-1 mb-3 pb-3 border-b border-gray-400">
+                <a href="/analytics" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-chart-bar mr-2 w-6 text-center"></i><span>Analytics</span>
                 </a>
-                <a href="/orders" class="text-white hover:text-blue-200 transition-colors duration-200 text-sm font-medium flex items-center">
-                    <i class="fas fa-list-alt mr-2"></i>
-                    <span>Orders</span>
+                <a href="/orders" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-list-alt mr-2 w-6 text-center"></i><span>Orders</span>
+                </a>
+                <a href="/profitability" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-chart-line mr-2 w-6 text-center"></i><span>Profitability</span>
+                </a>
+                <a href="/performance" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-tachometer-alt mr-2 w-6 text-center"></i><span>Performance</span>
+                </a>
+                <a href="/exchange-info" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-network-wired mr-2 w-6 text-center"></i><span>Exchange Info</span>
+                </a>
+                <a href="/optimizer" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-sliders-h mr-2 w-6 text-center"></i><span>Optimizer</span>
+                </a>
+                <a href="/trades" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-exchange-alt mr-2 w-6 text-center"></i><span>Trades</span>
+                </a>
+                <a href="/portfolio" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-briefcase mr-2 w-6 text-center"></i><span>Portfolio</span>
+                </a>
+                <a href="/strategies" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-chess mr-2 w-6 text-center"></i><span>Strategies</span>
+                </a>
+                <a href="/alerts" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-bell mr-2 w-6 text-center"></i><span>Alerts</span>
+                </a>
+                <a href="/settings" class="text-white hover:text-blue-200 text-sm font-medium py-2 flex items-center">
+                    <i class="fas fa-cog mr-2 w-6 text-center"></i><span>Settings</span>
                 </a>
             </div>
             
@@ -808,7 +862,7 @@
     </nav>
 
     <!-- Main Content -->
-    <div class="max-w-full xl:max-w-screen-2xl 2xl:max-w-none mx-auto px-4 sm:px-6 lg:px-8 xl:px-12 2xl:px-16 py-8">
+    <div class="enhanced-dashboard-main max-w-full xl:max-w-screen-2xl 2xl:max-w-none mx-auto w-full min-w-0 px-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-16 py-6 sm:py-8">
         <!-- Status indicator for dashboard.js compatibility -->
         <div class="mb-6">
             <span id="status-indicator" class="enhanced-badge badge-secondary">Status</span>
@@ -819,7 +873,7 @@
             <div class="enhanced-card-content">
                 <div class="flex flex-col md:flex-row md:items-center md:justify-between">
                     <div class="mb-4 md:mb-0">
-                        <h2 class="text-xl font-bold text-gray-900 mb-3 flex items-center">
+                        <h2 class="text-lg sm:text-xl font-bold text-gray-900 mb-3 flex items-center">
                             <i class="fas fa-robot text-blue-600 mr-3"></i>
                             Bot & System Status
                         </h2>
@@ -830,9 +884,10 @@
                             <div class="text-sm text-gray-500 font-medium">Trading Status</div>
                             <div id="bot-trading-status" class="text-lg font-bold text-gray-900 font-mono">Loading...</div>
                         </div>
-                        <div>
+                        <div class="min-w-0">
                             <div class="text-sm text-gray-500 font-medium">Cycle Count</div>
                             <div id="bot-cycle-count" class="text-lg font-bold text-gray-900 font-mono">Loading...</div>
+                            <p id="bot-cycle-hint" class="text-xs text-gray-500 mt-1 leading-snug"></p>
                         </div>
                         <div>
                             <div class="text-sm text-gray-500 font-medium">Uptime</div>
@@ -907,99 +962,10 @@
         </div>
 
         <!-- Portfolio Overview Cards -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-7 gap-4 xl:gap-6 mb-8">
-            <!-- Total Balance -->
-            <div class="enhanced-card animate-in" style="--delay: 0.1s">
-                <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-blue-500 mr-4">
-                            <i class="fas fa-wallet text-xl text-white"></i>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium text-gray-600 mb-1">Total Balance</p>
-                            <p class="text-2xl font-bold text-gray-900 tooltip" id="total-balance" data-tooltip="Loading...">$0.00</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Available Balance -->
-            <div class="enhanced-card animate-in" style="--delay: 0.2s">
-                <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-cyan-500 mr-4">
-                            <i class="fas fa-coins text-xl text-white"></i>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium text-gray-600 mb-1">Available Balance</p>
-                            <p class="text-2xl font-bold text-gray-900 tooltip" id="available-balance" data-tooltip="Loading...">$0.00</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Total PnL -->
-            <div class="enhanced-card animate-in" style="--delay: 0.3s">
-                <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-green-500 mr-4">
-                            <i class="fas fa-chart-line text-xl text-white"></i>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium text-gray-600 mb-1">Total PnL</p>
-                            <p class="text-2xl font-bold tooltip" id="total-pnl" data-tooltip="Loading...">$0.00</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Daily PnL -->
-            <div class="enhanced-card animate-in" style="--delay: 0.4s">
-                <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-yellow-500 mr-4">
-                            <i class="fas fa-calendar-day text-xl text-white"></i>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium text-gray-600 mb-1">Daily PnL</p>
-                            <p class="text-2xl font-bold" id="daily-pnl">$0.00</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Open Trades -->
-            <div class="enhanced-card animate-in" style="--delay: 0.5s">
-                <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-purple-500 mr-4">
-                            <i class="fas fa-exchange-alt text-xl text-white"></i>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium text-gray-600 mb-1">Open Trades</p>
-                            <p class="text-2xl font-bold text-gray-900" id="open-trades">0</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Total Unrealized PnL -->
-            <div class="enhanced-card animate-in" style="--delay: 0.6s">
-                <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-indigo-500 mr-4">
-                            <i class="fas fa-chart-area text-xl text-white"></i>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium text-gray-600 mb-1">Unrealized PnL</p>
-                            <p class="text-2xl font-bold" id="total-unrealized-pnl">$0.00</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
+        <!-- Trading Performance Cards Row -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 xl:gap-6 mb-6">
             <!-- Win Rate -->
-            <div class="enhanced-card animate-in" style="--delay: 0.7s">
+            <div class="enhanced-card animate-in" style="--delay: 0.1s">
                 <div class="enhanced-card-content">
                     <div class="flex items-center">
                         <div class="icon-container bg-pink-500 mr-4">
@@ -1014,11 +980,11 @@
             </div>
 
             <!-- Total Trades -->
-            <div class="enhanced-card animate-in" style="--delay: 0.8s">
+            <div class="enhanced-card animate-in" style="--delay: 0.2s">
                 <div class="enhanced-card-content">
                     <div class="flex items-center">
                         <div class="icon-container bg-blue-600 mr-4">
-                            <i class="fas fa-chart-line text-xl text-white"></i>
+                            <i class="fas fa-chart-bar text-xl text-white"></i>
                         </div>
                         <div class="flex-1">
                             <p class="text-sm font-medium text-gray-600 mb-1">Total Trades</p>
@@ -1029,7 +995,7 @@
             </div>
 
             <!-- Daily Opened -->
-            <div class="enhanced-card animate-in" style="--delay: 0.9s">
+            <div class="enhanced-card animate-in" style="--delay: 0.3s">
                 <div class="enhanced-card-content">
                     <div class="flex items-center">
                         <div class="icon-container bg-green-600 mr-4">
@@ -1044,7 +1010,7 @@
             </div>
 
             <!-- Daily Closed -->
-            <div class="enhanced-card animate-in" style="--delay: 1.0s">
+            <div class="enhanced-card animate-in" style="--delay: 0.4s">
                 <div class="enhanced-card-content">
                     <div class="flex items-center">
                         <div class="icon-container bg-red-600 mr-4">
@@ -1058,6 +1024,186 @@
                 </div>
             </div>
         </div>
+
+        <!-- Balance and PnL Cards Row -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-7 gap-4 xl:gap-6 mb-8">
+            <!-- Total Portfolio -->
+            <div class="enhanced-card animate-in" style="--delay: 0.5s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-blue-500 mr-4">
+                            <i class="fas fa-wallet text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Total Portfolio</p>
+                            <p class="text-2xl font-bold text-gray-900 tooltip" id="total-balance" data-tooltip="Loading...">$0.00</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Available Balance -->
+            <div class="enhanced-card animate-in" style="--delay: 0.6s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-cyan-500 mr-4">
+                            <i class="fas fa-coins text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Available Balance</p>
+                            <p class="text-2xl font-bold text-gray-900 tooltip" id="available-balance" data-tooltip="Loading...">$0.00</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Invested Amount -->
+            <div class="enhanced-card animate-in" style="--delay: 0.7s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-green-500 mr-4">
+                            <i class="fas fa-chart-line text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Invested Amount</p>
+                            <p class="text-2xl font-bold text-gray-900 tooltip" id="invested-amount" data-tooltip="Loading...">$0.00</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Total PnL (realized, closed trades) -->
+            <div class="enhanced-card animate-in" style="--delay: 0.75s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-emerald-600 mr-4">
+                            <i class="fas fa-piggy-bank text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Total PnL</p>
+                            <p class="text-2xl font-bold tooltip" id="total-pnl" data-tooltip="Loading...">$0.00</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Daily PnL -->
+            <div class="enhanced-card animate-in" style="--delay: 0.8s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-yellow-500 mr-4">
+                            <i class="fas fa-calendar-day text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Daily PnL</p>
+                            <p class="text-2xl font-bold" id="daily-pnl">$0.00</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Open Trades -->
+            <div class="enhanced-card animate-in" style="--delay: 0.9s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-purple-500 mr-4">
+                            <i class="fas fa-exchange-alt text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Open Trades</p>
+                            <p class="text-2xl font-bold text-gray-900" id="open-trades">0</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Total Unrealized PnL -->
+            <div class="enhanced-card animate-in" style="--delay: 1.0s">
+                <div class="enhanced-card-content">
+                    <div class="flex items-center">
+                        <div class="icon-container bg-indigo-500 mr-4">
+                            <i class="fas fa-chart-area text-xl text-white"></i>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-sm font-medium text-gray-600 mb-1">Unrealized PnL</p>
+                            <p class="text-2xl font-bold" id="total-unrealized-pnl">$0.00</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Performance Analytics Section -->
+        <div id="performance-analytics-section" class="enhanced-card animate-in mb-8" style="--delay: 0.7s">
+            <div class="enhanced-card-content">
+                <h3 class="text-xl font-bold text-gray-900 mb-6 flex items-center">
+                    <i class="fas fa-chart-bar text-purple-600 mr-3"></i>
+                    Performance Analytics
+                </h3>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <!-- Trailing Stops Analytics -->
+                    <div class="bg-gray-50 p-6 rounded-lg">
+                        <h4 class="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                            <i class="fas fa-chart-line text-blue-600 mr-2"></i>
+                            🎯 Trailing Stops
+                        </h4>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <p class="text-sm text-gray-600">Activations Today:</p>
+                                <p class="text-lg font-bold text-gray-900" id="trailing-activations">N/A</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-600">Success Rate:</p>
+                                <p class="text-lg font-bold text-gray-900" id="trailing-success-rate">N/A</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-600">Trail Distance:</p>
+                                <p class="text-lg font-bold text-gray-900" id="trailing-distance">0.25%</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-600">PnL Improvement:</p>
+                                <p class="text-lg font-bold text-gray-900" id="pnl-improvement">N/A</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- System Performance -->
+                    <div class="bg-gray-50 p-6 rounded-lg">
+                        <h4 class="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                            <i class="fas fa-tachometer-alt text-green-600 mr-2"></i>
+                            ⚡ System Performance
+                        </h4>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <p class="text-sm text-gray-600">WebSocket Latency:</p>
+                                <p class="text-lg font-bold text-gray-900" id="websocket-latency">N/A</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-600">API Error Rate:</p>
+                                <p class="text-lg font-bold text-gray-900" id="api-error-rate">N/A</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-600">System Uptime:</p>
+                                <p class="text-lg font-bold text-gray-900" id="system-uptime">100%</p>
+                            </div>
+                            <div>
+                                <p class="text-sm text-gray-600">Health Score:</p>
+                                <p class="text-lg font-bold text-gray-900" id="health-score">N/A</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Performance Status Message -->
+                <div class="mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                    <p class="text-sm text-blue-800" id="performance-status">
+                        Performance analytics initializing. Full metrics will be available shortly.
+                    </p>
+                </div>
+            </div>
+        </div>
+
 
         <!-- Per-Exchange Balances Toggle Button -->
         <div class="mb-6 animate-in" style="--delay: 0.8s">
@@ -1077,7 +1223,7 @@
                     <h3 class="text-xl font-bold text-gray-900">Per-Exchange Balances</h3>
                 </div>
 
-                <div class="table-container custom-scrollbar">
+                <div class="table-container table-scroll custom-scrollbar">
                     <table class="enhanced-table w-full">
                         <thead>
                             <tr>
@@ -1170,20 +1316,21 @@
                 </div>
 
                 <!-- Recent Trades Table -->
-                <div class="table-container custom-scrollbar">
+                <div class="table-container table-scroll custom-scrollbar">
                     <table class="enhanced-table w-full">
                         <thead>
                             <tr>
                                 <th>Trade ID</th>
                                 <th>Pair</th>
                                 <th class="mobile-hidden">Exchange</th>
-                                <th class="sortable mobile-hidden cursor-pointer hover:bg-gray-100" data-sort="entry_time">
+                                <th class="sortable cursor-pointer hover:bg-gray-100" data-sort="entry_time">
                                     Entry Time <i class="fas fa-sort ml-1"></i>
                                 </th>
-                                <th class="sortable mobile-hidden cursor-pointer hover:bg-gray-100" data-sort="exit_time">
+                                <th class="sortable cursor-pointer hover:bg-gray-100" data-sort="exit_time">
                                     Exit Time <i class="fas fa-sort ml-1"></i>
                                 </th>
                                 <th>Entry Price</th>
+                                <th>Exit Price</th>
                                 <th>Current Price</th>
                                 <th>Amount (units)</th>
                                 <th>Notional Value ($)</th>
@@ -1202,7 +1349,7 @@
                         </thead>
                         <tbody id="trades-table-body" class="loading">
                             <tr>
-                                <td colspan="17" class="text-center py-8">
+                                <td colspan="18" class="text-center py-8">
                                     <div class="flex items-center justify-center">
                                         <i class="fas fa-spinner spinner text-blue-500 mr-2"></i>
                                         Loading recent trades...
@@ -1268,7 +1415,8 @@
     </div>
 
     <!-- Include enhanced dashboard JavaScript -->
-    <script src="/static/js/enhanced-dashboard.js"></script>
+    <script src="/static/js/enhanced-dashboard.js?v=20260421b"></script>
+    <script src="/static/js/performance-analytics.js"></script>
     <script>
         // Add test data for sorting when backend is not available
         window.addEventListener('load', function() {

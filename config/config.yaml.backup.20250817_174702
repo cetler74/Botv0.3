@@ -1,0 +1,415 @@
+alerts:
+  channels:
+    database: true
+    email: false
+    webhook: false
+  enabled: true
+  thresholds:
+    api_error: 5
+    balance_low: 50
+    daily_loss: 0.05
+    trade_failure: 3
+balance_manager:
+  check_interval_seconds: 30
+  max_balance_usage: 0.9
+  min_balance_threshold: 10
+database:
+  host: postgres
+  max_overflow: 20
+  name: trading_bot_futures
+  options: -c search_path=trading,public
+  password: mypassword
+  pool_size: 10
+  port: 5432
+  user: carloslarramba
+database_manager:
+  backup_interval_hours: 24
+  connection_timeout: 30
+  max_retries: 3
+  query_timeout: 60
+exchange_manager:
+  max_retries: 3
+  rate_limit_delay: 0.1
+  request_timeout: 30
+  retry_delay: 1
+exchanges:
+  binance:
+    base_currency: USDC
+    market_type: spot
+    max_pairs: 15
+    min_volatility: 0.02
+    min_volume_24h: 1000000
+    sandbox: false
+    websocket_url: wss://stream.binance.com:9443/ws/!ticker@arr
+    websocket_private: wss://stream.binance.com:9443/ws
+  bybit:
+    base_currency: USDC
+    market_type: spot
+    max_pairs: 15
+    min_volatility: 0.015
+    min_volume_24h: 500000
+    sandbox: false
+    websocket_url: wss://stream.bybit.com/v5/public/spot
+    websocket_private: wss://stream.bybit.com/v5/private
+  cryptocom:
+    base_currency: USD
+    market_type: spot
+    max_pairs: 15
+    min_volatility: 0.005
+    min_volume_24h: 500000
+    sandbox: false
+    websocket_url: wss://stream.crypto.com/v2/market
+    websocket_private: wss://stream.crypto.com/v2/user
+invalid:
+  path: test
+logging:
+  backup_count: 5
+  file: logs/trading_bot.log
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  level: INFO
+  max_file_size: 10485760
+mcp:
+  enabled: true
+  perplexity:
+    api_key: ''
+    base_url: https://api.perplexity.ai
+    cache:
+      enabled: true
+      max_size: 1000
+      ttl_seconds: 3600
+    enabled: true
+    features:
+      news_analysis: true
+      real_time_data: true
+      web_scraping: true
+      web_search: true
+    max_retries: 3
+    rate_limit_delay: 1.0
+    scraping_settings:
+      include_images: false
+      include_links: true
+      max_content_length: 50000
+      timeout: 15
+    search_settings:
+      exclude_domains: []
+      include_domains: []
+      max_results: 10
+      search_type: web
+    timeout: 30
+pair_selector:
+  scoring_weights:
+    market_cap: 0.2
+    spread: 0.1
+    volatility: 0.3
+    volume_24h: 0.4
+  selection_criteria:
+    max_spread_percentage: 0.5
+    max_volatility: 0.1
+    min_market_cap: 100000000
+    min_volatility: 0.01
+    min_volume_24h: 1000000
+  blacklisted_pairs:
+  - ACH/USD
+  - 1INCH/USD
+  - AAVE/USD
+  auto_blacklist:
+    enabled: true
+    min_trades_threshold: 10
+    max_win_rate_threshold: 0.45
+    max_avg_pnl_threshold: -0.1
+    cooling_period_hours: 24
+    max_consecutive_losses: 5
+  replacement_selection:
+    enabled: true
+    min_volume_24h_multiplier: 1.5
+    min_market_cap_multiplier: 1.2
+    exclude_new_listings_days: 7
+  update_interval_minutes: 60
+redis:
+  db: 0
+  host: localhost
+  max_connections: 20
+  password: ''
+  port: 6379
+strategies:
+  engulfing_multi_tf:
+    enabled: true
+    parameters:
+      adx_entry_threshold: 25
+      adx_period: 14
+      atr_multiplier_sl: 1.5
+      atr_multiplier_tp: 2.0
+      atr_period: 14
+      confirmation_timeframes: 0
+      cooldown_minutes: 60
+      fixed_sl_pct: 0.02
+      fixed_tp_pct: 0.08
+      max_trade_duration_hours: 18
+      min_bearish_engulfing: 1.2
+      min_confidence: 0.8
+      profit_lock_percentage: 0.015
+      trailing_stop_trigger: 0.02
+      min_engulfing_size_multiplier: 0.6
+      regime_aware: true
+      require_adx_and_volume_confirmation: true
+      min_volume_multiplier: 2.0
+      min_rsi_range: 20
+      sma_period: 50
+      stop_loss_pct: 0.8
+      strict_volume_adx: false
+      take_profit_pct: 1.5
+      target_timeframes:
+      - 4h
+      - 1h
+      - 15m
+      - 5m
+      timeframe_weights:
+        15m: 0.2
+        1h: 0.3
+        4h: 0.4
+        5m: 0.1
+      use_atr_for_exits: true
+      use_atr_levels: true
+      use_volume_confirmation: true
+      volume_avg_period: 10
+  heikin_ashi:
+    enabled: false
+    parameters:
+      adx_period: 14
+      adx_threshold: 35
+      atr_period: 14
+      atr_threshold: 0.001
+      ema_fast_period: 12
+      ema_slow_period: 26
+      max_hold_time_hours: 24
+      min_candle_size: 0.004
+      min_candles: 50
+      min_trend_strength: 0.003
+      min_volume: 1000
+      primary_timeframe: 1h
+      require_ema_confluence: true
+      risk_per_trade: 0.01
+      rsi_buy_threshold: 40
+      rsi_confluence_threshold: 40
+      rsi_overbought: 75
+      rsi_oversold: 25
+      rsi_period: 14
+      rsi_uptrend_max: 70
+      rsi_uptrend_min: 35
+      trend_period: 14
+      volume_sma_period: 20
+      volume_spike_multiplier: 2.0
+      volume_quality_filter: true
+      volume_threshold: 1.5
+      volume_threshold_percentage: 0.5
+      min_confidence_score: 0.7
+      require_trend_confirmation: true
+      avoid_consolidation: true
+      min_momentum_strength: 0.6
+      max_drawdown_entry: 0.02
+      cooldown_after_loss: 2
+    target_timeframes:
+    - 1h
+    - 15m
+  multi_timeframe_confluence:
+    enabled: true
+    parameters:
+      adx_threshold: 15
+      trending_adx_threshold: 25
+      bb_period: 20
+      bb_std: 2
+      confluence_threshold: 0.9
+      smart_exit_enabled: true
+      long_period: 30
+      max_price_range_pct: 35.0
+      max_daily_volatility_pct: 5.0
+      entry_confirmation_required: false
+      max_volume_ratio: 2.0
+      medium_period: 15
+      min_confluence: 3
+      required_timeframe_agreement: 3
+      min_confidence: 0.8
+      profit_protection_enabled: true
+      dynamic_stop_loss: true
+      min_sideways_periods: 5
+      rsi_overbought: 70
+      rsi_oversold: 30
+      short_period: 5
+      stop_loss_pct: 0.02
+      take_profit_pct: 0.08
+      vwap_period: 20
+      atr_stop_loss_multiplier: 1.5
+      position_size_percentage: 0.15
+      max_position_size_usd: 200
+      position_size_multiplier: 2.5
+      enable_trending_trades: true
+      min_market_stability: 0.8
+      avoid_high_volatility: true
+      max_daily_range: 0.15
+      require_volume_confirmation: true
+      min_rsi_divergence: 5
+      cooldown_after_loss_hours: 4
+    target_timeframes:
+    - 1h
+    - 15m
+  strategy_pnl_enhanced:
+    enabled: true
+    parameters:
+      atr_period: 14
+      dynamic_stop_loss: true
+      volatility_multiplier: 1.2
+      min_confidence: 0.8
+    target_timeframes:
+    - 1h
+    - 15m
+  vwma_hull:
+    enabled: false
+    parameters:
+      atr_period: 7
+      atr_threshold: 0.0006
+      crossover_confidence_boost: 0.95
+      hull_period: 21
+      min_absolute_volume: 800
+      min_price_move: 0.0008
+      min_volatility_threshold: 0.002
+      scalping_enabled: false
+      strength_multiplier: 20
+      trend_confidence_boost: 0.85
+      trend_threshold: 0.004
+      volatility_adjustment: true
+      volume_method: percentile
+      volume_percentile: 0.4
+      volume_threshold: 0.6
+      profit_target_multiplier: 2.5
+      volume_window: 50
+      vwma_period: 20
+      min_confidence_score: 0.75
+      require_volume_breakout: true
+      avoid_range_bound_markets: true
+      min_trend_duration: 3
+      max_rsi_entry: 65
+      min_rsi_entry: 35
+      require_price_momentum: true
+      stop_loss_atr_multiplier: 1.5
+    target_timeframes:
+    - 1h
+    - 15m
+strategy_manager:
+  analysis_timeout: 30
+  max_concurrent_analyses: 10
+  signal_cache_duration: 300
+trading:
+  max_concurrent_trades: 6
+  max_daily_loss: 0.015
+  max_daily_trades: 15
+  win_rate_threshold: 0.7
+  consecutive_loss_limit: 2
+  max_total_loss: 0.15
+  max_trades_per_exchange: 100
+  min_exchange_balance: 50.0
+  min_order_size_usd:
+    cryptocom: 50.0
+    binance: 50.0
+    bybit: 50.0
+    default: 50.0
+  risk_reward_minimum: 2.0
+  mode: live
+  position_size_percentage: 0.1
+  strategy_position_sizing:
+    enabled: true
+    multi_timeframe_confluence:
+      position_size_percentage: 0.25
+      max_position_usd: 1000
+      priority: high
+    engulfing_multi_tf:
+      position_size_percentage: 0.08
+      max_position_usd: 400
+      priority: medium
+    heikin_ashi:
+      position_size_percentage: 0.06
+      max_position_usd: 300
+      priority: medium
+    vwma_hull:
+      position_size_percentage: 0.07
+      max_position_usd: 350
+      priority: medium
+    default:
+      position_size_percentage: 0.05
+      max_position_usd: 200
+      priority: low
+  profit_protection:
+    enabled: true
+    lock_percentage: 0.025
+    trigger_percentage: 0.02
+    partial_exit_percentage: 50
+    activation_threshold: 0.015
+    max_drawdown: 0.25
+    consecutive_threshold: 6
+    significant_decrease_multiplier: 0.0015
+  stop_loss_percentage: 0.02
+  take_profit_percentage: 0.08
+  max_daily_loss_per_exchange: 0.05
+  dynamic_stop_loss_enabled: true
+  trailing_stop:
+    enabled: true
+    step_percentage: 0.005
+    trigger_percentage: 0.015
+    max_trail_distance: 0.025
+    activation_threshold: 0.015
+    base_trailing_distance: 0.12
+  fee_optimization:
+    use_limit_orders: true
+    max_taker_fee: 0.0015
+    prefer_maker_orders: true
+    limit_order_spread: 0.0002
+    fee_alert_threshold: 0.002
+    fee_to_pnl_ratio_limit: 0.25
+    order_timeout_seconds: 300
+    max_retry_attempts: 2
+    min_spread_for_limit: 1.0e-06
+    volatility_threshold: 0.015
+  order_management:
+    limit_order_timeout_seconds: 300
+    order_sync_interval_seconds: 30
+    max_cancellation_retries: 3
+    cancellation_retry_delay: 5
+    competitive_pricing_enabled: true
+    competitive_pricing_buffer: 0.0001
+    stale_order_cleanup_hours: 24
+    order_status_cache_seconds: 60
+    performance_calculation_interval: 300
+    performance_history_days: 30
+    alert_on_low_success_rate: true
+    low_success_rate_threshold: 0.2
+    alert_on_high_timeout_rate: true
+    high_timeout_rate_threshold: 0.6
+trading_manager:
+  cycle_interval_seconds: 60
+  exit_cycle_first: true
+  max_cycle_duration: 300
+web_ui:
+  debug: false
+  host: 0.0.0.0
+  port: 8000
+  refresh_interval_seconds: 5
+realtime:
+  enable_websocket_prices: false
+  stale_price_threshold_seconds: 30
+  rest_poll_interval_seconds: 1
+  ws:
+    reconnect_backoff_seconds:
+    - 1
+    - 2
+    - 5
+    - 10
+    - 30
+    heartbeat_interval_seconds: 20
+    max_concurrent_subscriptions_per_exchange: 50
+    subscribe_only_for_open_trades: true
+    exchanges:
+      binance:
+        enable: true
+      bybit:
+        enable: true
+      cryptocom:
+        enable: true

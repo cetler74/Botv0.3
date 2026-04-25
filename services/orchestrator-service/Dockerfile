@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -12,11 +12,14 @@ RUN apt-get update && apt-get install -y \
 COPY services/orchestrator-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY services/orchestrator-service/main.py .
-COPY services/orchestrator-service/redis_order_manager.py .
-# Copy core module needed for pair selection
+# Copy orchestrator modules (skip backup copies and local docker test script)
+COPY services/orchestrator-service/ /tmp/orchestrator-src/
+RUN find /tmp/orchestrator-src -maxdepth 1 -type f -name '*.py' \
+      ! -name '*backup*' ! -name 'test_docker_order_book.py' \
+      -exec cp {} /app/ \; \
+    && rm -rf /tmp/orchestrator-src
 COPY core ./core
+COPY strategy ./strategy
 
 # Expose port
 EXPOSE 8005

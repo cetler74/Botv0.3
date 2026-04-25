@@ -8785,6 +8785,176 @@ async def get_cycle_stats():
         "uptime": str(datetime.utcnow() - start_time) if start_time else "0:00:00"
     }
 
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_usd(value: Any) -> str:
+    return f"${_safe_float(value):.2f}"
+
+
+telegram_hourly_report_task: Optional[asyncio.Task] = None
+
+
+async def _build_telegram_stats_message(last_day_trade_limit: int = 15) -> Tuple[str, int]:
+    """Build Telegram message with portfolio stats + last 24h closed trades."""
+    now_utc = datetime.utcnow()
+    start_24h = now_utc - timedelta(hours=24)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        summary_resp = await client.get(f"{database_service_url}/api/v1/portfolio/summary")
+        summary_resp.raise_for_status()
+        summary = summary_resp.json()
+
+        history_resp = await client.get(
+            f"{database_service_url}/api/v1/trades/closed/history",
+            params={
+                "page": 1,
+                "limit": max(1, min(last_day_trade_limit, 50)),
+                "status": "CLOSED",
+                "start_date": start_24h.isoformat()
+            },
+        )
+        history_resp.raise_for_status()
+        history_data = history_resp.json()
+        trades_24h = history_data.get("trades", []) or []
+
+    total_balance = _safe_float(summary.get("total_balance"))
+    available_balance = _safe_float(summary.get("available_balance"))
+    invested_amount = total_balance - available_balance
+
+    header_lines = [
+        "📊 <b>Trading Statistics</b>",
+        "",
+        f"🎯 <b>Win Rate:</b> {_safe_float(summary.get('win_rate')):.1f}%",
+        f"📈 <b>Total Trades:</b> {int(summary.get('total_trades') or 0)}",
+        f"🕒 <b>Daily Opened:</b> {int(summary.get('daily_total_trades') or 0)}",
+        f"✅ <b>Daily Closed:</b> {int(summary.get('daily_closed_trades') or 0)}",
+        "",
+        f"💼 <b>Total Portfolio:</b> {_format_usd(total_balance)}",
+        f"💵 <b>Available Balance:</b> {_format_usd(available_balance)}",
+        f"📌 <b>Invested Amount:</b> {_format_usd(invested_amount)}",
+        "",
+        f"💹 <b>Total PnL:</b> {_format_usd(summary.get('total_pnl'))}",
+        f"📆 <b>Daily PnL:</b> {_format_usd(summary.get('daily_pnl'))}",
+        f"📂 <b>Open Trades:</b> {int(summary.get('active_trades') or 0)}",
+        f"🔄 <b>Unrealized PnL:</b> {_format_usd(summary.get('total_unrealized_pnl'))}",
+        "",
+        f"🧾 <b>Last 24h Closed Trades ({len(trades_24h)}):</b>",
+    ]
+
+    if not trades_24h:
+        header_lines.append("No closed trades in the last 24 hours.")
+    else:
+        for trade in trades_24h:
+            pair = str(trade.get("pair") or "N/A")
+            exchange = str(trade.get("exchange") or "N/A")
+            realized_pnl = _safe_float(trade.get("realized_pnl"))
+            pnl_sign = "🟢" if realized_pnl >= 0 else "🔴"
+            pnl_str = f"{realized_pnl:+.2f}"
+            header_lines.append(f"{pnl_sign} {pair} ({exchange})  {pnl_str} USD")
+
+    header_lines.append("")
+    header_lines.append(f"⏱️ <i>Generated: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
+    return "\n".join(header_lines), len(trades_24h)
+
+
+async def _send_telegram_stats_report(last_day_trade_limit: int = 15) -> Dict[str, Any]:
+    """Send Telegram stats report and return structured result."""
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not telegram_bot_token or not telegram_chat_id:
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+
+    message, last_day_trade_count = await _build_telegram_stats_message(
+        last_day_trade_limit=last_day_trade_limit
+    )
+    telegram_url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            telegram_url,
+            json={
+                "chat_id": telegram_chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+        )
+        response.raise_for_status()
+        response_data = response.json()
+
+    if not response_data.get("ok"):
+        raise RuntimeError(f"Telegram API returned error: {response_data}")
+
+    return {
+        "status": "sent",
+        "message": "Telegram statistics report sent successfully.",
+        "last_day_trade_count": last_day_trade_count,
+    }
+
+
+async def _telegram_hourly_report_loop() -> None:
+    """Background loop that sends Telegram stats on a fixed interval."""
+    interval_seconds = int(os.getenv("TELEGRAM_REPORT_INTERVAL_SECONDS", "3600") or "3600")
+    if interval_seconds < 60:
+        interval_seconds = 60
+
+    trade_limit = int(os.getenv("TELEGRAM_LAST_DAY_TRADE_LIMIT", "15") or "15")
+    trade_limit = max(1, min(trade_limit, 50))
+
+    logger.info(
+        "📨 Telegram hourly report loop started (interval=%ss, last_day_trade_limit=%s)",
+        interval_seconds,
+        trade_limit,
+    )
+
+    while True:
+        try:
+            await _send_telegram_stats_report(last_day_trade_limit=trade_limit)
+            logger.info("✅ Telegram scheduled stats report sent")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Telegram scheduled report failed: {e}")
+
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+
+@app.post("/api/v1/notifications/telegram/stats")
+async def send_telegram_stats(last_day_trade_limit: int = 15):
+    """
+    Publish portfolio statistics and last 24h closed trades to Telegram.
+    Uses TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.
+    """
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not telegram_bot_token or not telegram_chat_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing Telegram configuration. "
+                "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+            ),
+        )
+
+    try:
+        return await _send_telegram_stats_report(last_day_trade_limit=last_day_trade_limit)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending Telegram stats report: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send Telegram report: {str(e)}")
+
 # Risk Management Endpoints
 @app.get("/api/v1/risk/limits")
 async def get_risk_limits():
@@ -9096,6 +9266,7 @@ async def websocket_orders(websocket: WebSocket):
 @app.on_event("startup")
 async def startup_event():
     """Initialize orchestrator and start trading loop on startup"""
+    global telegram_hourly_report_task
     logger.info(f"🚀 Orchestrator Service v{ORCHESTRATOR_VERSION} ({VERSION_DATE}) starting up")
     logger.info(f"🛡️ Enhanced Risk Management v{RISK_MANAGEMENT_VERSION} - Multi-layered protection active")
     await orchestrator.initialize()
@@ -9110,14 +9281,31 @@ async def startup_event():
     # Start trading in background to avoid blocking startup
     asyncio.create_task(orchestrator.start_trading())
     asyncio.create_task(hybrid_order_tracker.start_background_tasks())
+
+    telegram_auto_enabled = os.getenv("TELEGRAM_AUTO_REPORT_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if telegram_auto_enabled:
+        telegram_hourly_report_task = asyncio.create_task(_telegram_hourly_report_loop())
+        logger.info("✅ Telegram auto report scheduler enabled")
+    else:
+        logger.info("ℹ️ Telegram auto report scheduler disabled")
     
     logger.info("✅ Orchestrator startup complete - trading loop starting in background")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
+    global telegram_hourly_report_task
     if orchestrator.running:
         await orchestrator.stop_trading()
+    if telegram_hourly_report_task:
+        telegram_hourly_report_task.cancel()
+        try:
+            await telegram_hourly_report_task
+        except asyncio.CancelledError:
+            pass
+        telegram_hourly_report_task = None
     await hybrid_order_tracker.stop_background_tasks()
     await redis_realtime_manager.close()
     logger.info("Orchestrator service shutdown complete")

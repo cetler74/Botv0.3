@@ -1,0 +1,241 @@
+{
+  "timestamp": "2025-08-30T09:47:26.266417",
+  "summary": {
+    "total_tests": 8,
+    "passed_tests": 7,
+    "failed_tests": 1,
+    "success_rate": 87.5
+  },
+  "results": {
+    "Service Connectivity": {
+      "success": true,
+      "details": {
+        "database_service": "\u2705 Connected",
+        "exchange_service": "\u2705 Connected"
+      }
+    },
+    "Database Integration": {
+      "success": true,
+      "details": {
+        "open_trades_count": 1,
+        "open_trades_endpoint": "\u2705 Working",
+        "trades_without_exit_id": 0,
+        "trade_update_endpoint": "\u2705 Available"
+      }
+    },
+    "Exchange Integration": {
+      "success": false,
+      "details": {
+        "exchanges_endpoint": "\u274c HTTP 404",
+        "binance_ticker": "\u2705 Price: $108499.38",
+        "crypto.com_ticker": "\u274c HTTP 404",
+        "bybit_ticker": "\u2705 Price: $108519.1"
+      }
+    },
+    "WebSocket Price Feed": {
+      "success": true,
+      "details": {
+        "websocket_creation": "\u2705 Created successfully",
+        "websocket_status": {
+          "status": "disconnected",
+          "active_subscriptions": 0,
+          "active_trades": 0,
+          "last_health_check": null,
+          "metrics": {
+            "price_updates_received": 0,
+            "price_updates_processed": 0,
+            "websocket_errors": 0,
+            "fallback_requests": 0,
+            "active_subscriptions": 0
+          },
+          "subscriptions": {}
+        },
+        "subscription_methods": "\u2705 Methods available",
+        "callback_system": "\u2705 Callbacks working"
+      }
+    },
+    "Order Lifecycle Manager": {
+      "success": true,
+      "details": {
+        "manager_creation": "\u2705 Created successfully",
+        "manager_stats": {
+          "stops_activated": 0,
+          "orders_created": 0,
+          "orders_updated": 0,
+          "orders_filled": 0,
+          "errors": 0,
+          "active_stops": 0,
+          "states": {
+            "inactive": 0,
+            "active": 0,
+            "updating": 0,
+            "filled": 0,
+            "cancelled": 0,
+            "error": 0
+          },
+          "integration": {
+            "database_url": "http://database-service:8002",
+            "exchange_url": "http://exchange-service:8003",
+            "integration_active": true,
+            "websocket_price_feed": {
+              "status": "disconnected",
+              "active_subscriptions": 0,
+              "active_trades": 0,
+              "last_health_check": null,
+              "metrics": {
+                "price_updates_received": 0,
+                "price_updates_processed": 0,
+                "websocket_errors": 0,
+                "fallback_requests": 0,
+                "active_subscriptions": 0
+              },
+              "subscriptions": {}
+            }
+          }
+        },
+        "database_url": "http://database-service:8002",
+        "exchange_url": "http://exchange-service:8003",
+        "active_stops_count": 0
+      }
+    },
+    "Trailing Stop Manager": {
+      "success": true,
+      "details": {
+        "trailing_manager_creation": "\u2705 Created successfully",
+        "activation_threshold": "0.700%",
+        "trail_distance": "0.250%",
+        "check_interval": "5s",
+        "trailing_stats": {
+          "stops_activated": 0,
+          "orders_created": 0,
+          "orders_updated": 0,
+          "orders_filled": 0,
+          "errors": 0,
+          "active_stops": 0,
+          "states": {
+            "inactive": 0,
+            "active": 0,
+            "updating": 0,
+            "filled": 0,
+            "cancelled": 0,
+            "error": 0
+          }
+        },
+        "available_states": [
+          "inactive",
+          "active",
+          "updating",
+          "filled",
+          "cancelled",
+          "error"
+        ]
+      }
+    },
+    "Race Condition Handling": {
+      "success": true,
+      "details": {
+        "test_data_creation": "\u2705 Test data created",
+        "critical_methods": {
+          "update_trailing_order": "\u2705",
+          "get_order_status": "\u2705",
+          "handle_order_fill": "\u2705"
+        }
+      }
+    },
+    "System Integration": {
+      "success": true,
+      "details": {
+        "trigger_system_creation": "\u2705 Created successfully",
+        "system_status": {
+          "system_active": false,
+          "initialization_complete": false,
+          "activation_threshold": 0.007,
+          "activation_threshold_pct": "0.7%",
+          "activated_trades_count": 0,
+          "uptime_seconds": null,
+          "metrics": {
+            "trades_monitored": 0,
+            "activations_triggered": 0,
+            "orders_created": 0,
+            "orders_filled": 0,
+            "price_updates_processed": 0,
+            "errors": 0,
+            "system_uptime_start": null
+          },
+          "lifecycle_manager_stats": {
+            "stops_activated": 0,
+            "orders_created": 0,
+            "orders_updated": 0,
+            "orders_filled": 0,
+            "errors": 0,
+            "active_stops": 0,
+            "states": {
+              "inactive": 0,
+              "active": 0,
+              "updating": 0,
+              "filled": 0,
+              "cancelled": 0,
+              "error": 0
+            },
+            "integration": {
+              "database_url": "http://database-service:8002",
+              "exchange_url": "http://exchange-service:8003",
+              "integration_active": true,
+              "websocket_price_feed": {
+                "status": "disconnected",
+                "active_subscriptions": 0,
+                "active_trades": 0,
+                "last_health_check": null,
+                "metrics": {
+                  "price_updates_received": 0,
+                  "price_updates_processed": 0,
+                  "websocket_errors": 0,
+                  "fallback_requests": 0,
+                  "active_subscriptions": 0
+                },
+                "subscriptions": {}
+              }
+            }
+          },
+          "price_feed_status": {
+            "status": "disconnected",
+            "active_subscriptions": 0,
+            "active_trades": 0,
+            "last_health_check": null,
+            "metrics": {
+              "price_updates_received": 0,
+              "price_updates_processed": 0,
+              "websocket_errors": 0,
+              "fallback_requests": 0,
+              "active_subscriptions": 0
+            },
+            "subscriptions": {}
+          },
+          "trailing_manager_stats": {
+            "stops_activated": 0,
+            "orders_created": 0,
+            "orders_updated": 0,
+            "orders_filled": 0,
+            "errors": 0,
+            "active_stops": 0,
+            "states": {
+              "inactive": 0,
+              "active": 0,
+              "updating": 0,
+              "filled": 0,
+              "cancelled": 0,
+              "error": 0
+            }
+          },
+          "activated_trades": {}
+        },
+        "integration_components": {
+          "order_manager": "\u2705",
+          "activation_monitor": "\u2705",
+          "start_method": "\u2705"
+        },
+        "activation_threshold_config": "\u2705 Correct: 0.700%"
+      }
+    }
+  }
+}

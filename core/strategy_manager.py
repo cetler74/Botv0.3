@@ -1,4 +1,5 @@
-from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
+# Remove problematic import that doesn't exist
+# from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
 
 """
 Strategy Manager for the Multi-Exchange Trading Bot
@@ -39,8 +40,8 @@ class StrategyManager:
             'vwma_hull': 'VWMAHullStrategy',
             'heikin_ashi': 'HeikinAshiStrategy', 
             'multi_timeframe_confluence': 'MultiTimeframeConfluenceStrategy',
-            'engulfing_multi_tf': 'EngulfingMultiTimeframeStrategy',
-            'strategy_pnl_enhanced': 'StrategyPnLEnhanced'
+            'engulfing_multi_tf': 'EngulfingMultiTimeframeStrategy'
+            # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
         # Explicit module mapping to match actual filenames
@@ -48,7 +49,8 @@ class StrategyManager:
             'vwma_hull': 'strategy.vwma_hull_strategy',
             'heikin_ashi': 'strategy.heikin_ashi_strategy',
             'multi_timeframe_confluence': 'strategy.multi_timeframe_confluence_strategy',
-            'engulfing_multi_tf': 'strategy.engulfing_multi_tf',
+            'engulfing_multi_tf': 'strategy.engulfing_multi_tf'
+            # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         for strategy_name, strategy_config in strategies_config.items():
             if not strategy_config.get('enabled', False):
@@ -372,7 +374,8 @@ class StrategyManager:
             if entry_price <= 0 or position_size <= 0:
                 logger.error(f"[ProfitProtection] Trade {trade_data.get('trade_id')} entry_price or position_size <= 0. Skipping.")
                 return False, None
-            unrealized_pnl = calculate_unrealized_pnl_with_fees(entry_price, current_price, position_size)
+            # Calculate unrealized PnL with estimated fees (0.1% trading fee)
+            unrealized_pnl = ((current_price - entry_price) * position_size) - (position_size * current_price * 0.001)
             should_exit, reason, risk_data = check_profit_protection_enhanced(
                 state=state,
                 unrealized_pnl=unrealized_pnl,

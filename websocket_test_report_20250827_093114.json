@@ -1,0 +1,1003 @@
+{
+  "test_summary": {
+    "total_tests": 20,
+    "passed_tests": 19,
+    "failed_tests": 1,
+    "success_rate": 95.0,
+    "total_duration_seconds": 0.781142,
+    "average_test_duration_ms": 38.46989870071411
+  },
+  "categories": {
+    "exchange": {
+      "passed": 2,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "exchange_service_health",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 10.830163955688477,
+          "details": {
+            "healthy": true,
+            "status_code": 200,
+            "response_data": {
+              "status": "healthy",
+              "timestamp": "2025-08-27T08:31:14.159488",
+              "version": "1.0.0",
+              "exchanges_connected": 3,
+              "total_exchanges": 3
+            }
+          }
+        },
+        {
+          "name": "exchange_api_fallback",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 648.4012603759766,
+          "details": {
+            "fallback_api_available": true,
+            "status_code": 200
+          }
+        }
+      ]
+    },
+    "fill": {
+      "passed": 3,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "fill_detection_service_health",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 7.73310661315918,
+          "details": {
+            "healthy": true,
+            "status_code": 200,
+            "response_data": {
+              "status": "healthy",
+              "service": "fill-detection-service",
+              "websocket_consumer": true
+            }
+          }
+        },
+        {
+          "name": "fill_detection_websocket_consumer",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 4.965066909790039,
+          "details": {
+            "consumer_available": true,
+            "consumer_status": {
+              "status": "active",
+              "healthy": true,
+              "metrics": {
+                "events_received": 1,
+                "execution_events": 1,
+                "order_events": 0,
+                "processing_errors": 0,
+                "stream_emits": 0,
+                "processing_rate": 1.0
+              }
+            }
+          }
+        },
+        {
+          "name": "fill_detection_fallback",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 9.77325439453125,
+          "details": {
+            "healthy": true,
+            "status_code": 200,
+            "response_data": {
+              "status": "healthy",
+              "service": "fill-detection-service",
+              "websocket_consumer": true
+            }
+          }
+        }
+      ]
+    },
+    "database": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "database_service_health",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 6.670951843261719,
+          "details": {
+            "healthy": true,
+            "status_code": 200,
+            "response_data": {
+              "status": "healthy",
+              "timestamp": "2025-08-27T08:31:14.174396",
+              "version": "1.0.0",
+              "database_connected": true,
+              "pool_size": 10,
+              "active_connections": 9
+            }
+          }
+        }
+      ]
+    },
+    "redis": {
+      "passed": 1,
+      "failed": 1,
+      "tests": [
+        {
+          "name": "redis_health",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 1.7070770263671875,
+          "details": {
+            "healthy": true,
+            "ping_successful": true,
+            "set_get_test": true
+          }
+        },
+        {
+          "name": "redis_stream_integration",
+          "passed": false,
+          "message": "Test completed",
+          "duration_ms": 3.910064697265625,
+          "details": {
+            "redis_stream_available": false,
+            "error": "no such key"
+          }
+        }
+      ]
+    },
+    "binance": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "binance_websocket_status",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 5.017995834350586,
+          "details": {
+            "status_available": true,
+            "status_data": {
+              "enabled": false,
+              "status": "disabled"
+            }
+          }
+        }
+      ]
+    },
+    "websocket": {
+      "passed": 2,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "websocket_event_processing",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 8.304119110107422,
+          "details": {
+            "event_processed": true,
+            "response_data": {
+              "status": "error",
+              "error": "Invalid input of type: 'NoneType'. Convert to a bytes, string, int or float first."
+            }
+          }
+        },
+        {
+          "name": "websocket_detailed_health",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 5.50079345703125,
+          "details": {
+            "detailed_websocket_health_available": true,
+            "websocket_health_data": {
+              "binance_user_data_stream": {
+                "enabled": false,
+                "status": "disabled"
+              },
+              "exchange_websockets": {
+                "binance": {
+                  "connected": true,
+                  "last_update": "2025-08-27T08:31:14.566184",
+                  "subscribed_symbols": 15
+                },
+                "bybit": {
+                  "connected": true,
+                  "last_update": "2025-08-27T08:31:14.850164",
+                  "subscribed_symbols": 15
+                },
+                "cryptocom": {
+                  "connected": true,
+                  "last_update": "2025-08-27T08:30:38.477114",
+                  "subscribed_symbols": 15
+                }
+              },
+              "timestamp": "2025-08-27T08:31:14.896530"
+            }
+          }
+        }
+      ]
+    },
+    "listen": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "listen_key_management",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 5.085945129394531,
+          "details": {
+            "metrics_available": true,
+            "status_code": 200
+          }
+        }
+      ]
+    },
+    "connection": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "connection_manager_status",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 4.68897819519043,
+          "details": {
+            "connection_manager_available": false,
+            "status_data": {
+              "enabled": false,
+              "status": "disabled"
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "error_handler_statistics",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 4.151105880737305,
+          "details": {
+            "error_metrics_available": false,
+            "metrics_data": {
+              "enabled": false
+            }
+          }
+        }
+      ]
+    },
+    "recovery": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "recovery_manager_status",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 4.452943801879883,
+          "details": {
+            "error_metrics_available": false,
+            "metrics_data": {
+              "enabled": false
+            }
+          }
+        }
+      ]
+    },
+    "system": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "system_health_monitoring",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 7.362842559814453,
+          "details": {
+            "system_health_available": true,
+            "health_data": {
+              "status": "unhealthy",
+              "healthy_services": 1,
+              "total_services": 2,
+              "health_percentage": 50.0,
+              "checks": [
+                {
+                  "name": "binance-websocket",
+                  "status": "healthy",
+                  "response_time_ms": 1.232,
+                  "message": "Binance WebSocket integration healthy",
+                  "details": {
+                    "status": "disabled",
+                    "healthy": true
+                  },
+                  "timestamp": "2025-08-27T08:31:14.879145"
+                },
+                {
+                  "name": "redis",
+                  "status": "unhealthy",
+                  "response_time_ms": 0.118,
+                  "message": "Redis health check failed: No module named 'redis'",
+                  "details": {
+                    "error": "No module named 'redis'"
+                  },
+                  "timestamp": "2025-08-27T08:31:14.879266"
+                }
+              ],
+              "timestamp": "2025-08-27T08:31:14.879280",
+              "uptime_seconds": 98.356549
+            }
+          }
+        }
+      ]
+    },
+    "health": {
+      "passed": 2,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "health_metrics",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 6.370067596435547,
+          "details": {
+            "health_metrics_available": true,
+            "metrics_data": {
+              "total_checks": 4,
+              "healthy_checks": 0,
+              "degraded_checks": 0,
+              "unhealthy_checks": 4,
+              "alerts_sent": 1,
+              "average_response_time": 16.350511,
+              "monitoring_active": true,
+              "registered_checks": 2,
+              "check_interval": 30,
+              "history_size": 4,
+              "uptime_seconds": 98.362924
+            }
+          }
+        },
+        {
+          "name": "health_history",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 5.188226699829102,
+          "details": {
+            "health_history_available": true,
+            "history_data": {
+              "history_hours": 1,
+              "total_entries": 4,
+              "health_history": [
+                {
+                  "status": "unhealthy",
+                  "healthy_services": 1,
+                  "total_services": 2,
+                  "health_percentage": 50.0,
+                  "checks": [
+                    {
+                      "name": "binance-websocket",
+                      "status": "healthy",
+                      "response_time_ms": 42.181999999999995,
+                      "message": "Binance WebSocket integration healthy",
+                      "details": {
+                        "status": "disabled",
+                        "healthy": true
+                      },
+                      "timestamp": "2025-08-27T08:29:36.579139"
+                    },
+                    {
+                      "name": "redis",
+                      "status": "unhealthy",
+                      "response_time_ms": 0.114,
+                      "message": "Redis health check failed: No module named 'redis'",
+                      "details": {
+                        "error": "No module named 'redis'"
+                      },
+                      "timestamp": "2025-08-27T08:29:36.579256"
+                    }
+                  ],
+                  "timestamp": "2025-08-27T08:29:36.579264",
+                  "uptime_seconds": 0.056533
+                },
+                {
+                  "status": "unhealthy",
+                  "healthy_services": 1,
+                  "total_services": 2,
+                  "health_percentage": 50.0,
+                  "checks": [
+                    {
+                      "name": "binance-websocket",
+                      "status": "healthy",
+                      "response_time_ms": 6.043,
+                      "message": "Binance WebSocket integration healthy",
+                      "details": {
+                        "status": "disabled",
+                        "healthy": true
+                      },
+                      "timestamp": "2025-08-27T08:30:06.583664"
+                    },
+                    {
+                      "name": "redis",
+                      "status": "unhealthy",
+                      "response_time_ms": 1.535,
+                      "message": "Redis health check failed: No module named 'redis'",
+                      "details": {
+                        "error": "No module named 'redis'"
+                      },
+                      "timestamp": "2025-08-27T08:30:06.585212"
+                    }
+                  ],
+                  "timestamp": "2025-08-27T08:30:06.585255",
+                  "uptime_seconds": 30.062515
+                },
+                {
+                  "status": "unhealthy",
+                  "healthy_services": 1,
+                  "total_services": 2,
+                  "health_percentage": 50.0,
+                  "checks": [
+                    {
+                      "name": "binance-websocket",
+                      "status": "healthy",
+                      "response_time_ms": 3.198,
+                      "message": "Binance WebSocket integration healthy",
+                      "details": {
+                        "status": "disabled",
+                        "healthy": true
+                      },
+                      "timestamp": "2025-08-27T08:30:36.590681"
+                    },
+                    {
+                      "name": "redis",
+                      "status": "unhealthy",
+                      "response_time_ms": 0.69,
+                      "message": "Redis health check failed: No module named 'redis'",
+                      "details": {
+                        "error": "No module named 'redis'"
+                      },
+                      "timestamp": "2025-08-27T08:30:36.591378"
+                    }
+                  ],
+                  "timestamp": "2025-08-27T08:30:36.591390",
+                  "uptime_seconds": 60.068659
+                },
+                {
+                  "status": "unhealthy",
+                  "healthy_services": 1,
+                  "total_services": 2,
+                  "health_percentage": 50.0,
+                  "checks": [
+                    {
+                      "name": "binance-websocket",
+                      "status": "healthy",
+                      "response_time_ms": 2.872,
+                      "message": "Binance WebSocket integration healthy",
+                      "details": {
+                        "status": "disabled",
+                        "healthy": true
+                      },
+                      "timestamp": "2025-08-27T08:31:06.594668"
+                    },
+                    {
+                      "name": "redis",
+                      "status": "unhealthy",
+                      "response_time_ms": 6.163,
+                      "message": "Redis health check failed: No module named 'redis'",
+                      "details": {
+                        "error": "No module named 'redis'"
+                      },
+                      "timestamp": "2025-08-27T08:31:06.600844"
+                    }
+                  ],
+                  "timestamp": "2025-08-27T08:31:06.600877",
+                  "uptime_seconds": 90.078146
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "mock": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "mock_fill_event_processing",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 8.01396369934082,
+          "details": {
+            "mock_fill_processed": true,
+            "response_data": {
+              "message_id": "1756283474903-0",
+              "status": "emitted"
+            }
+          }
+        }
+      ]
+    },
+    "complete": {
+      "passed": 1,
+      "failed": 0,
+      "tests": [
+        {
+          "name": "complete_order_flow_simulation",
+          "passed": true,
+          "message": "Test completed",
+          "duration_ms": 11.27004623413086,
+          "details": {
+            "fill_emission": true,
+            "stream_updated": false,
+            "stream_info_available": true
+          }
+        }
+      ]
+    }
+  },
+  "test_results": [
+    {
+      "name": "exchange_service_health",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 10.830163955688477,
+      "details": {
+        "healthy": true,
+        "status_code": 200,
+        "response_data": {
+          "status": "healthy",
+          "timestamp": "2025-08-27T08:31:14.159488",
+          "version": "1.0.0",
+          "exchanges_connected": 3,
+          "total_exchanges": 3
+        }
+      }
+    },
+    {
+      "name": "fill_detection_service_health",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 7.73310661315918,
+      "details": {
+        "healthy": true,
+        "status_code": 200,
+        "response_data": {
+          "status": "healthy",
+          "service": "fill-detection-service",
+          "websocket_consumer": true
+        }
+      }
+    },
+    {
+      "name": "database_service_health",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 6.670951843261719,
+      "details": {
+        "healthy": true,
+        "status_code": 200,
+        "response_data": {
+          "status": "healthy",
+          "timestamp": "2025-08-27T08:31:14.174396",
+          "version": "1.0.0",
+          "database_connected": true,
+          "pool_size": 10,
+          "active_connections": 9
+        }
+      }
+    },
+    {
+      "name": "redis_health",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 1.7070770263671875,
+      "details": {
+        "healthy": true,
+        "ping_successful": true,
+        "set_get_test": true
+      }
+    },
+    {
+      "name": "binance_websocket_status",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 5.017995834350586,
+      "details": {
+        "status_available": true,
+        "status_data": {
+          "enabled": false,
+          "status": "disabled"
+        }
+      }
+    },
+    {
+      "name": "fill_detection_websocket_consumer",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 4.965066909790039,
+      "details": {
+        "consumer_available": true,
+        "consumer_status": {
+          "status": "active",
+          "healthy": true,
+          "metrics": {
+            "events_received": 1,
+            "execution_events": 1,
+            "order_events": 0,
+            "processing_errors": 0,
+            "stream_emits": 0,
+            "processing_rate": 1.0
+          }
+        }
+      }
+    },
+    {
+      "name": "websocket_event_processing",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 8.304119110107422,
+      "details": {
+        "event_processed": true,
+        "response_data": {
+          "status": "error",
+          "error": "Invalid input of type: 'NoneType'. Convert to a bytes, string, int or float first."
+        }
+      }
+    },
+    {
+      "name": "listen_key_management",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 5.085945129394531,
+      "details": {
+        "metrics_available": true,
+        "status_code": 200
+      }
+    },
+    {
+      "name": "connection_manager_status",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 4.68897819519043,
+      "details": {
+        "connection_manager_available": false,
+        "status_data": {
+          "enabled": false,
+          "status": "disabled"
+        }
+      }
+    },
+    {
+      "name": "error_handler_statistics",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 4.151105880737305,
+      "details": {
+        "error_metrics_available": false,
+        "metrics_data": {
+          "enabled": false
+        }
+      }
+    },
+    {
+      "name": "recovery_manager_status",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 4.452943801879883,
+      "details": {
+        "error_metrics_available": false,
+        "metrics_data": {
+          "enabled": false
+        }
+      }
+    },
+    {
+      "name": "exchange_api_fallback",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 648.4012603759766,
+      "details": {
+        "fallback_api_available": true,
+        "status_code": 200
+      }
+    },
+    {
+      "name": "fill_detection_fallback",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 9.77325439453125,
+      "details": {
+        "healthy": true,
+        "status_code": 200,
+        "response_data": {
+          "status": "healthy",
+          "service": "fill-detection-service",
+          "websocket_consumer": true
+        }
+      }
+    },
+    {
+      "name": "system_health_monitoring",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 7.362842559814453,
+      "details": {
+        "system_health_available": true,
+        "health_data": {
+          "status": "unhealthy",
+          "healthy_services": 1,
+          "total_services": 2,
+          "health_percentage": 50.0,
+          "checks": [
+            {
+              "name": "binance-websocket",
+              "status": "healthy",
+              "response_time_ms": 1.232,
+              "message": "Binance WebSocket integration healthy",
+              "details": {
+                "status": "disabled",
+                "healthy": true
+              },
+              "timestamp": "2025-08-27T08:31:14.879145"
+            },
+            {
+              "name": "redis",
+              "status": "unhealthy",
+              "response_time_ms": 0.118,
+              "message": "Redis health check failed: No module named 'redis'",
+              "details": {
+                "error": "No module named 'redis'"
+              },
+              "timestamp": "2025-08-27T08:31:14.879266"
+            }
+          ],
+          "timestamp": "2025-08-27T08:31:14.879280",
+          "uptime_seconds": 98.356549
+        }
+      }
+    },
+    {
+      "name": "health_metrics",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 6.370067596435547,
+      "details": {
+        "health_metrics_available": true,
+        "metrics_data": {
+          "total_checks": 4,
+          "healthy_checks": 0,
+          "degraded_checks": 0,
+          "unhealthy_checks": 4,
+          "alerts_sent": 1,
+          "average_response_time": 16.350511,
+          "monitoring_active": true,
+          "registered_checks": 2,
+          "check_interval": 30,
+          "history_size": 4,
+          "uptime_seconds": 98.362924
+        }
+      }
+    },
+    {
+      "name": "health_history",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 5.188226699829102,
+      "details": {
+        "health_history_available": true,
+        "history_data": {
+          "history_hours": 1,
+          "total_entries": 4,
+          "health_history": [
+            {
+              "status": "unhealthy",
+              "healthy_services": 1,
+              "total_services": 2,
+              "health_percentage": 50.0,
+              "checks": [
+                {
+                  "name": "binance-websocket",
+                  "status": "healthy",
+                  "response_time_ms": 42.181999999999995,
+                  "message": "Binance WebSocket integration healthy",
+                  "details": {
+                    "status": "disabled",
+                    "healthy": true
+                  },
+                  "timestamp": "2025-08-27T08:29:36.579139"
+                },
+                {
+                  "name": "redis",
+                  "status": "unhealthy",
+                  "response_time_ms": 0.114,
+                  "message": "Redis health check failed: No module named 'redis'",
+                  "details": {
+                    "error": "No module named 'redis'"
+                  },
+                  "timestamp": "2025-08-27T08:29:36.579256"
+                }
+              ],
+              "timestamp": "2025-08-27T08:29:36.579264",
+              "uptime_seconds": 0.056533
+            },
+            {
+              "status": "unhealthy",
+              "healthy_services": 1,
+              "total_services": 2,
+              "health_percentage": 50.0,
+              "checks": [
+                {
+                  "name": "binance-websocket",
+                  "status": "healthy",
+                  "response_time_ms": 6.043,
+                  "message": "Binance WebSocket integration healthy",
+                  "details": {
+                    "status": "disabled",
+                    "healthy": true
+                  },
+                  "timestamp": "2025-08-27T08:30:06.583664"
+                },
+                {
+                  "name": "redis",
+                  "status": "unhealthy",
+                  "response_time_ms": 1.535,
+                  "message": "Redis health check failed: No module named 'redis'",
+                  "details": {
+                    "error": "No module named 'redis'"
+                  },
+                  "timestamp": "2025-08-27T08:30:06.585212"
+                }
+              ],
+              "timestamp": "2025-08-27T08:30:06.585255",
+              "uptime_seconds": 30.062515
+            },
+            {
+              "status": "unhealthy",
+              "healthy_services": 1,
+              "total_services": 2,
+              "health_percentage": 50.0,
+              "checks": [
+                {
+                  "name": "binance-websocket",
+                  "status": "healthy",
+                  "response_time_ms": 3.198,
+                  "message": "Binance WebSocket integration healthy",
+                  "details": {
+                    "status": "disabled",
+                    "healthy": true
+                  },
+                  "timestamp": "2025-08-27T08:30:36.590681"
+                },
+                {
+                  "name": "redis",
+                  "status": "unhealthy",
+                  "response_time_ms": 0.69,
+                  "message": "Redis health check failed: No module named 'redis'",
+                  "details": {
+                    "error": "No module named 'redis'"
+                  },
+                  "timestamp": "2025-08-27T08:30:36.591378"
+                }
+              ],
+              "timestamp": "2025-08-27T08:30:36.591390",
+              "uptime_seconds": 60.068659
+            },
+            {
+              "status": "unhealthy",
+              "healthy_services": 1,
+              "total_services": 2,
+              "health_percentage": 50.0,
+              "checks": [
+                {
+                  "name": "binance-websocket",
+                  "status": "healthy",
+                  "response_time_ms": 2.872,
+                  "message": "Binance WebSocket integration healthy",
+                  "details": {
+                    "status": "disabled",
+                    "healthy": true
+                  },
+                  "timestamp": "2025-08-27T08:31:06.594668"
+                },
+                {
+                  "name": "redis",
+                  "status": "unhealthy",
+                  "response_time_ms": 6.163,
+                  "message": "Redis health check failed: No module named 'redis'",
+                  "details": {
+                    "error": "No module named 'redis'"
+                  },
+                  "timestamp": "2025-08-27T08:31:06.600844"
+                }
+              ],
+              "timestamp": "2025-08-27T08:31:06.600877",
+              "uptime_seconds": 90.078146
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "websocket_detailed_health",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 5.50079345703125,
+      "details": {
+        "detailed_websocket_health_available": true,
+        "websocket_health_data": {
+          "binance_user_data_stream": {
+            "enabled": false,
+            "status": "disabled"
+          },
+          "exchange_websockets": {
+            "binance": {
+              "connected": true,
+              "last_update": "2025-08-27T08:31:14.566184",
+              "subscribed_symbols": 15
+            },
+            "bybit": {
+              "connected": true,
+              "last_update": "2025-08-27T08:31:14.850164",
+              "subscribed_symbols": 15
+            },
+            "cryptocom": {
+              "connected": true,
+              "last_update": "2025-08-27T08:30:38.477114",
+              "subscribed_symbols": 15
+            }
+          },
+          "timestamp": "2025-08-27T08:31:14.896530"
+        }
+      }
+    },
+    {
+      "name": "mock_fill_event_processing",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 8.01396369934082,
+      "details": {
+        "mock_fill_processed": true,
+        "response_data": {
+          "message_id": "1756283474903-0",
+          "status": "emitted"
+        }
+      }
+    },
+    {
+      "name": "redis_stream_integration",
+      "passed": false,
+      "message": "Test completed",
+      "duration_ms": 3.910064697265625,
+      "details": {
+        "redis_stream_available": false,
+        "error": "no such key"
+      }
+    },
+    {
+      "name": "complete_order_flow_simulation",
+      "passed": true,
+      "message": "Test completed",
+      "duration_ms": 11.27004623413086,
+      "details": {
+        "fill_emission": true,
+        "stream_updated": false,
+        "stream_info_available": true
+      }
+    }
+  ],
+  "timestamp": "2025-08-27T09:31:14.921424",
+  "environment": {
+    "services": {
+      "exchange": "http://localhost:8003",
+      "fill_detection": "http://localhost:8012",
+      "database": "http://localhost:8002"
+    },
+    "test_runner": "WebSocketTestSuite v1.0"
+  }
+}

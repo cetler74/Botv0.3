@@ -2,37 +2,19 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Order Management Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
 </head>
 <body class="bg-gray-100">
     <div class="min-h-screen">
-        <!-- Navigation -->
-        <nav class="bg-white shadow-sm border-b">
-            <div class="max-w-full mx-auto px-4 sm:px-6 lg:px-8">
-                <div class="flex justify-between h-16">
-                    <div class="flex items-center">
-                        <h1 class="text-xl font-semibold text-gray-900">Order Management Dashboard</h1>
-                    </div>
-                    <div class="flex items-center space-x-4">
-                        <a href="/" class="text-gray-500 hover:text-gray-700">
-                            <i class="fas fa-home"></i> Home
-                        </a>
-                        <a href="/orders" class="text-blue-600 hover:text-blue-800">
-                            <i class="fas fa-list"></i> Orders
-                        </a>
-                        <a href="/profitability" class="text-gray-500 hover:text-gray-700">
-                            <i class="fas fa-chart-line"></i> Profitability
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </nav>
+        {% set page_title = "Order Management" %}
+        {% include 'partials/app_nav_bar_standalone.html' %}
 
         <!-- Main Content - Full Width -->
-        <div class="w-full mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        <div class="w-full mx-auto py-6 px-4 sm:px-6 lg:px-8 app-main-safe">
             
             <!-- Performance Analytics - Full Width -->
             <div class="bg-white rounded-lg shadow p-6 mb-8 w-full">
@@ -290,5 +272,6 @@
             </div>
         </div>
     </div>
+    <script src="/static/js/mobile-nav.js"></script>
 </body>
 </html>

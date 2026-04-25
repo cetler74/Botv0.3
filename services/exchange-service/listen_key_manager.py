@@ -16,6 +16,10 @@ import json
 
 logger = logging.getLogger(__name__)
 
+# Prevent startup / refresh from hanging forever if Binance is slow or unroutable
+_AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=12, sock_read=20)
+
+
 class ListenKeyManager:
     """
     Manages Binance User Data Stream listen keys with automatic refresh
@@ -112,7 +116,7 @@ class ListenKeyManager:
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=_AIOHTTP_TIMEOUT) as session:
                 async with session.post(
                     f"{self.base_url}/api/v3/userDataStream",
                     headers=headers
@@ -153,7 +157,7 @@ class ListenKeyManager:
             
             data = f"listenKey={self.listen_key}"
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=_AIOHTTP_TIMEOUT) as session:
                 async with session.put(
                     f"{self.base_url}/api/v3/userDataStream",
                     headers=headers,
@@ -199,7 +203,7 @@ class ListenKeyManager:
             
             data = f"listenKey={self.listen_key}"
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=_AIOHTTP_TIMEOUT) as session:
                 async with session.delete(
                     f"{self.base_url}/api/v3/userDataStream",
                     headers=headers,

@@ -6,6 +6,7 @@ Integrates Binance User Data Stream with the existing exchange service
 import asyncio
 import logging
 import os
+import sys
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException
 from binance_user_data_stream import BinanceUserDataStreamManager, ExecutionReport
@@ -58,6 +59,9 @@ class BinanceWebSocketIntegration:
             # Create processors
             self.execution_processor = ExecutionReportProcessor()
             self.account_processor = AccountUpdateProcessor()
+            
+            # 🔥 CRITICAL FIX: Connect execution processor to WebSocket manager for Redis integration
+            self.stream_manager.set_execution_processor(self.execution_processor)
             
             # Register event callbacks
             self.stream_manager.add_execution_callback(self._handle_execution_report)
@@ -203,13 +207,66 @@ class BinanceWebSocketIntegration:
 # Global instance
 binance_websocket = BinanceWebSocketIntegration()
 
+
+def _get_binance_market_websocket_handler():
+    """
+    Exchange service runs as `python main.py`, so `__main__` holds the live
+    websocket_manager. Importing `main` again would create a second module copy
+    with an empty handler dict.
+    """
+    main_mod = sys.modules.get("__main__")
+    if main_mod is not None and hasattr(main_mod, "websocket_manager"):
+        return main_mod.websocket_manager.get_handler("binance")
+    try:
+        import main as exchange_main
+
+        return exchange_main.websocket_manager.get_handler("binance")
+    except Exception:
+        return None
+
+
 # FastAPI router for WebSocket endpoints
 router = APIRouter(prefix="/api/v1/websocket/binance", tags=["binance-websocket"])
 
 @router.get("/status")
 async def get_binance_websocket_status():
-    """Get Binance WebSocket integration status"""
-    return binance_websocket.get_status()
+    """
+    Status for dashboards/orchestrator.
+
+    The User Data Stream (private orders) is optional (BINANCE_ENABLE_USER_DATA_STREAM).
+    Public market tickers use WebSocketExchangeHandler on websocket_manager. Both routes
+    share this path, so we merge: connected if either stream is up — otherwise the UI
+    shows Disconnected while !ticker@arr is actually working.
+    """
+    data = dict(binance_websocket.get_status())
+    market_connected = False
+    last_update = None
+    registered_callbacks = 0
+    try:
+        handler = _get_binance_market_websocket_handler()
+        if handler:
+            market_connected = bool(handler.is_connected)
+            last_update = handler.last_update
+            registered_callbacks = len(handler.order_callbacks)
+    except Exception as e:
+        logger.debug("Binance /status: market WebSocket handler unavailable: %s", e)
+
+    user_enabled = bool(data.get("enabled"))
+    user_stream_connected = bool(data.get("connected"))
+
+    if user_enabled and user_stream_connected:
+        data["connected"] = True
+    elif market_connected:
+        data["connected"] = True
+    else:
+        data["connected"] = False
+
+    data["user_stream_connected"] = user_stream_connected
+    data["market_stream_connected"] = market_connected
+    if last_update is not None:
+        data["last_update"] = last_update
+    data["registered_callbacks"] = registered_callbacks
+    return data
 
 @router.get("/metrics")
 async def get_binance_websocket_metrics():

@@ -324,10 +324,17 @@ class Dashboard {
         }
         tbody.innerHTML = trades.map(trade => `
             <tr>
-                <td class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle" title="${trade.trade_id || 'N/A'}">${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle" title="${trade.trade_id || 'N/A'}">
+                    ${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}
+                    <div class="mobile-only">
+                        <div>E: ${this.formatDateTime(trade.entry_time)}</div>
+                        <div>X: ${trade.exit_time ? this.formatDateTime(trade.exit_time) : '—'}</div>
+                    </div>
+                </td>
                 <td class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exchange || 'N/A'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-text-xs whitespace-nowrap" title="${trade.entry_time || ''}">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-text-xs whitespace-nowrap" title="${trade.exit_time || ''}">${trade.exit_time ? this.formatDateTime(trade.exit_time) : '—'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
                 <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>

@@ -12,7 +12,13 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 
 from bybit_auth_manager import BybitAuthManager
-from bybit_connection_manager import BybitConnectionManager
+# PnL-FIX v3: Use the Bybit-specific connection manager, which has the full auth /
+# heartbeat / subscription / reconnect flow. The previous code imported the
+# generic ``connection_manager.ConnectionManager`` whose API is incompatible
+# (no ``is_running`` / ``add_connection_callback`` / etc.), leaving
+# ``bybit_manager`` None and causing every
+# ``/api/v1/websocket/bybit/status`` call to 503.
+from bybit_connection_manager import BybitConnectionManager, ConnectionState
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +73,23 @@ class BybitUserDataStreamManager:
         self.api_key = api_key
         self.api_secret = api_secret
         self.websocket_url = websocket_url
-        
-        # Connection manager
+
+        # PnL-FIX v3: BybitConnectionManager handles auth + heartbeat + channel
+        # subscription internally. Previously this wrapper tried to reimplement
+        # that on top of the generic ConnectionManager and failed.
         self.connection_manager = BybitConnectionManager(
             websocket_url=websocket_url,
             api_key=api_key,
             api_secret=api_secret,
             max_reconnect_attempts=max_reconnect_attempts,
             reconnect_delay=reconnect_delay,
-            heartbeat_interval=heartbeat_interval
+            heartbeat_interval=heartbeat_interval,
         )
+
+        # Store connection parameters for later use
+        self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_delay = reconnect_delay
+        self.heartbeat_interval = heartbeat_interval
         
         # Event callbacks
         self.event_callbacks: Dict[str, List[Callable]] = {
@@ -111,37 +124,36 @@ class BybitUserDataStreamManager:
         logger.info("🏢 Bybit User Data Stream Manager initialized")
     
     def _setup_callbacks(self):
-        """Setup connection and message callbacks"""
-        # Connection callbacks
+        """Setup connection and message callbacks on the BybitConnectionManager.
+
+        PnL-FIX v3: Uses ``BybitConnectionManager``'s native
+        ``add_connection_callback`` (signature ``callback(connected: bool)``),
+        which matches our ``_on_connection_change`` handler exactly — no lambda
+        wrapping or dual (connected/disconnected) registration needed.
+        """
         self.connection_manager.add_connection_callback(self._on_connection_change)
         self.connection_manager.add_error_callback(self._on_error)
-        
-        # Message callbacks
         self.connection_manager.add_message_callback(self._on_message)
-    
+
     async def start(self) -> bool:
-        """
-        Start the WebSocket connection and event processing
-        
-        Returns:
-            True if started successfully, False otherwise
+        """Start the WebSocket connection and event processing.
+
+        PnL-FIX v3: ``BybitConnectionManager.connect()`` takes no arguments and
+        runs the full auth + subscribe + heartbeat flow in background tasks.
+        Previously this wrapper passed a ``connect_func`` intended for the
+        generic ConnectionManager, which no longer applies.
         """
         try:
             logger.info("🚀 Starting Bybit User Data Stream")
-            
-            # Connect to WebSocket
+
             success = await self.connection_manager.connect()
             if not success:
                 logger.error("❌ Failed to start Bybit User Data Stream")
                 return False
-            
-            # Force correct state - we know authentication works from testing
-            self.connection_manager.is_running = True
-            self.connection_manager.state = self.connection_manager.state.__class__.READY
-            
+
             logger.info("✅ Bybit User Data Stream started successfully")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ Error starting Bybit User Data Stream: {e}")
             return False

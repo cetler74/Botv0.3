@@ -8,11 +8,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY services/mcp-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy service code
-COPY main.py .
+# Copy service code and bundled config
+COPY services/mcp-service/main.py .
+RUN mkdir -p /app/config
+COPY config/config.yaml /app/config/config.yaml
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash app \

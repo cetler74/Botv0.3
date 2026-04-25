@@ -1,0 +1,13 @@
+{% extends "base_app.html" %}
+{% block title %}Strategies · Trading Bot{% endblock %}
+{% block nav_brand %}Strategies{% endblock %}
+{% block content %}
+<div class="bg-white rounded-lg shadow p-6 max-w-4xl">
+    <p class="text-gray-600 mb-4">
+        Strategy configuration lives in <code class="bg-gray-100 px-1 rounded">config/config.yaml</code>. Tune and backtest from
+        <a href="/optimizer" class="text-indigo-600 hover:underline">Optimizer</a> and review outcomes in
+        <a href="/analytics" class="text-indigo-600 hover:underline">Analytics</a>.
+    </p>
+    <p class="text-sm text-gray-500">This page is a hub for future strategy management UI.</p>
+</div>
+{% endblock %}

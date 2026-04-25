@@ -2,16 +2,61 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Performance Monitoring - Trading Bot</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/dashboard.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/mobile.css">
     <style>
         .performance-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
             gap: 20px;
             margin: 20px 0;
+        }
+
+        @media (max-width: 640px) {
+            .performance-grid {
+                grid-template-columns: 1fr;
+                gap: 12px;
+                margin: 12px 0;
+            }
+            .metric-card {
+                padding: 14px;
+            }
+            .metric-value {
+                font-size: 22px;
+            }
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 16px;
+        }
+
+        .header {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.35rem;
+        }
+
+        @media (max-width: 640px) {
+            .container {
+                padding: 10px;
+            }
+            .header h1 {
+                font-size: 1.15rem;
+            }
         }
         
         .metric-card {
@@ -169,21 +214,14 @@
         }
     </style>
 </head>
-<body>
-    <nav class="navbar">
-        <div class="nav-brand">Trading Bot - Performance Monitor</div>
-        <div class="nav-links">
-            <a href="/dashboard">Dashboard</a>
-            <a href="/orders">Orders</a>
-            <a href="/performance" class="active">Performance</a>
-            <a href="/profitability">Profitability</a>
-        </div>
-    </nav>
+<body class="bg-gray-50">
+    {% set page_title = "Performance Monitor" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
 
     <div class="container">
         <div class="header">
             <h1><i class="fas fa-chart-line"></i> Performance Monitoring</h1>
-            <button class="refresh-button" onclick="refreshMetrics()">
+            <button type="button" class="refresh-button" onclick="refreshMetrics()">
                 <i class="fas fa-sync-alt"></i> Refresh
             </button>
         </div>
@@ -411,5 +449,6 @@
         // Initial load
         refreshMetrics();
     </script>
+    <script src="/static/js/mobile-nav.js"></script>
 </body>
 </html>

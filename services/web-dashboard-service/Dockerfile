@@ -9,17 +9,19 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY services/web-dashboard-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code and templates
-COPY main.py .
-COPY strategy_optimizer.py .
-COPY enhanced_strategy_optimizer.py .
-COPY test_connections.py .
-COPY test_endpoints.py .
-COPY templates/ templates/
-COPY static/ static/
+# Copy application code, templates, and bundled config
+COPY services/web-dashboard-service/main.py .
+COPY services/web-dashboard-service/strategy_optimizer.py .
+COPY services/web-dashboard-service/enhanced_strategy_optimizer.py .
+COPY services/web-dashboard-service/test_connections.py .
+COPY services/web-dashboard-service/test_endpoints.py .
+COPY services/web-dashboard-service/templates/ templates/
+COPY services/web-dashboard-service/static/ static/
+RUN mkdir -p /app/config
+COPY config/config.yaml /app/config/config.yaml
 
 # Expose port
 EXPOSE 8006

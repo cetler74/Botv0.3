@@ -4,10 +4,10 @@
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Set search path to trading schema
-SET search_path TO trading;
-
 CREATE SCHEMA IF NOT EXISTS trading;
+
+-- Set search path after schema exists
+SET search_path TO trading;
 
 -- Balance table to track account balances per exchange
 CREATE TABLE IF NOT EXISTS trading.balance (
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS trading.trades (
     exit_time TIMESTAMP WITH TIME ZONE,
     unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
     realized_pnl DECIMAL(20, 8) DEFAULT 0,
+    current_price DECIMAL(20, 8),
     highest_price DECIMAL(20, 8),
     profit_protection VARCHAR(20) DEFAULT 'inactive', -- active, inactive
     profit_protection_trigger DECIMAL(10, 4), -- Configured value to trigger profit protection
@@ -59,6 +60,12 @@ CREATE TABLE IF NOT EXISTS trading.trades (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Live mark for open trades (dashboard / PnL); safe on re-run for existing DBs
+ALTER TABLE trading.trades ADD COLUMN IF NOT EXISTS current_price DECIMAL(20, 8);
+
+-- Required for orders.trade_id foreign key
+ALTER TABLE trading.trades ADD CONSTRAINT trades_trade_id_key UNIQUE (trade_id);
 
 -- Orders table to track individual order details and status
 CREATE TABLE IF NOT EXISTS trading.orders (
@@ -230,10 +237,10 @@ ADD COLUMN IF NOT EXISTS entry_time TIMESTAMP;
 
 -- Insert initial data
 INSERT INTO trading.balance (exchange, balance, available_balance, total_pnl, daily_pnl)
-VALUES 
-    ('binance', 0, 0, 0, 0),
-    ('cryptocom', 0, 0, 0, 0),
-    ('bybit', 0, 0, 0, 0)
+VALUES
+    ('binance', 10000, 10000, 0, 0),
+    ('cryptocom', 10000, 10000, 0, 0),
+    ('bybit', 10000, 10000, 0, 0)
 ON CONFLICT (exchange) DO NOTHING;
 
 -- Grant permissions (adjust as needed for your setup)

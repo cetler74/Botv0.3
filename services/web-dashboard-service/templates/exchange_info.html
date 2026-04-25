@@ -1,0 +1,47 @@
+{% extends "base_app.html" %}
+{% block title %}Exchange Info · Trading Bot{% endblock %}
+{% block nav_brand %}Exchange Information{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <div class="bg-white rounded-lg shadow p-5">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+                <h2 class="text-xl font-semibold text-gray-900">Exchange Information</h2>
+                <p class="text-sm text-gray-600 mt-1">
+                    Live exchange health, websocket connectivity, and selected trading pairs with selection timestamp.
+                </p>
+            </div>
+            <div class="text-sm text-gray-600">
+                Last refresh:
+                <span id="exchange-info-last-refresh" class="font-medium text-gray-800">--</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-5">
+        <h3 class="text-lg font-semibold text-gray-900 mb-3">Exchange Status</h3>
+        <div id="exchange-status-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            <div class="text-sm text-gray-500">Loading exchange status...</div>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-5">
+        <h3 class="text-lg font-semibold text-gray-900 mb-3">WebSocket Connections</h3>
+        <div id="websocket-status-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            <div class="text-sm text-gray-500">Loading websocket connections...</div>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-5">
+        <h3 class="text-lg font-semibold text-gray-900 mb-3">Selected Trading Pairs</h3>
+        <div id="pairs-selection-grid" class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div class="text-sm text-gray-500">Loading selected pairs...</div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/exchange-info.js"></script>
+{% endblock %}

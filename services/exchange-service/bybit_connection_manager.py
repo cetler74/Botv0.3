@@ -135,20 +135,33 @@ class BybitConnectionManager:
             
             # Set running state immediately (like Binance approach)
             self.is_running = True
-            self.state = ConnectionState.READY
             self.metrics.successful_connections += 1
             self.reconnect_attempts = 0
             
-            # Start background connection task
+            # PnL-FIX v3: _connection_loop() handles websocket connect + auth +
+            # subscribe + starting the heartbeat and message-processor tasks.
+            # The previous code ALSO started heartbeat_task and
+            # message_processor_task here, resulting in two concurrent
+            # ``async for message in self.websocket`` loops and this error:
+            # ``cannot call recv while another coroutine is already waiting
+            # for the next message``. Only launch the connection loop here.
             self.connection_task = asyncio.create_task(self._connection_loop())
-            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            self.message_processor_task = asyncio.create_task(self._message_processor_loop())
-            
-            # Notify connection callbacks
-            await self._notify_connection_callbacks(True)
-            
-            logger.info("✅ Bybit WebSocket Manager started successfully (background connection)")
-            return True
+
+            # Small yield so _connection_loop can advance past the initial
+            # websocket connect; the rest (auth/subscribe/tasks) is handled
+            # inside the loop itself.
+            await asyncio.sleep(1)
+
+            # Report success if the websocket handshake completed. State
+            # transitions to READY inside _connection_loop once subscriptions
+            # are confirmed.
+            if self.websocket is not None:
+                logger.info("✅ Bybit WebSocket Manager started (background connection)")
+                return True
+            else:
+                logger.warning("⚠️ WebSocket connection not established, will retry in background")
+                self.state = ConnectionState.CONNECTING
+                return True
             
         except Exception as e:
             self.state = ConnectionState.ERROR
@@ -197,6 +210,7 @@ class BybitConnectionManager:
         try:
             self.state = ConnectionState.SUBSCRIBING
             logger.info(f"📡 Subscribing to channels: {self.target_channels}")
+            logger.info(f"📊 Subscription state: {self.state.value}")
             
             # Subscribe to all channels in one request
             subscribe_payload = {
@@ -204,30 +218,40 @@ class BybitConnectionManager:
                 "args": self.target_channels
             }
             
+            logger.info(f"📤 Sending subscription payload: {subscribe_payload}")
             await self.websocket.send(json.dumps(subscribe_payload))
+            logger.info("📤 Subscription request sent successfully")
             
             # Wait for subscription response
+            logger.info("⏳ Waiting for subscription response...")
             response = await asyncio.wait_for(self.websocket.recv(), timeout=10.0)
             response_data = json.loads(response)
+            
+            logger.info(f"📨 Received subscription response: {response_data}")
             
             if response_data.get("success") is True:
                 self.subscribed_channels = self.target_channels.copy()
                 logger.info(f"✅ Subscribed to channels: {self.subscribed_channels}")
+                logger.info(f"📊 Final subscription state: {self.state.value}")
                 return True
             else:
                 logger.error(f"❌ Subscription failed: {response_data}")
+                logger.error(f"📊 Failed subscription state: {self.state.value}")
                 return False
                 
         except Exception as e:
             logger.error(f"❌ Subscription error: {e}")
+            logger.error(f"📊 Error subscription state: {self.state.value}")
             return False
     
     async def _connection_loop(self):
         """Background WebSocket connection loop (like Binance pattern)"""
         try:
             logger.info(f"🔌 Background connecting to Bybit WebSocket: {self.websocket_url}")
+            logger.info(f"📊 Initial connection state: {self.state.value}")
             
             # Establish WebSocket connection
+            logger.info("🔗 Establishing WebSocket connection...")
             self.websocket = await websockets.connect(
                 self.websocket_url,
                 ping_interval=20,
@@ -237,8 +261,10 @@ class BybitConnectionManager:
             
             self.is_connected = True
             logger.info("✅ WebSocket connection established in background")
+            logger.info(f"🔗 WebSocket object created: {self.websocket}")
             
             # Authenticate
+            logger.info("🔐 Starting authentication process...")
             auth_success = await self._authenticate()
             if auth_success:
                 logger.info("✅ Background authentication successful")
@@ -246,16 +272,33 @@ class BybitConnectionManager:
                 logger.warning("⚠️ Background authentication failed, continuing with fallback")
             
             # Subscribe to channels
+            logger.info("📡 Starting channel subscription process...")
             try:
                 await self._subscribe_to_channels()
                 logger.info("✅ Background channel subscription successful")
+                logger.info(f"📡 Subscribed channels: {self.subscribed_channels}")
             except Exception as e:
                 logger.warning(f"⚠️ Background subscription error: {e}, continuing")
+                logger.warning(f"📊 Current subscribed channels: {self.subscribed_channels}")
             
-            logger.info("🎉 Bybit WebSocket fully connected in background")
+            # Start heartbeat and message processor tasks after connection is established
+            logger.info("🔄 Starting background tasks...")
+            if self.websocket is not None and self.is_running:
+                if self.heartbeat_task is None or self.heartbeat_task.done():
+                    self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                    logger.info("💓 Heartbeat task started")
+                if self.message_processor_task is None or self.message_processor_task.done():
+                    self.message_processor_task = asyncio.create_task(self._message_processor_loop())
+                    logger.info("📨 Message processor task started")
+                
+                self.state = ConnectionState.READY
+                await self._notify_connection_callbacks(True)
+                logger.info("🎉 Bybit WebSocket fully connected in background")
+                logger.info(f"📊 Final connection state: {self.state.value}")
             
         except Exception as e:
             logger.error(f"❌ Background connection error: {e}")
+            logger.error(f"📊 Connection state at failure: {self.state.value}")
             self.is_connected = False
 
     async def _heartbeat_loop(self):
@@ -264,6 +307,11 @@ class BybitConnectionManager:
         
         while self.is_running and self.is_connected:
             try:
+                # Check websocket is still valid
+                if self.websocket is None:
+                    logger.warning("💓 Heartbeat loop stopped - WebSocket is None")
+                    break
+                    
                 heartbeat_payload = {"op": "ping"}
                 await self.websocket.send(json.dumps(heartbeat_payload))
                 
@@ -283,8 +331,27 @@ class BybitConnectionManager:
     async def _message_processor_loop(self):
         """Process incoming WebSocket messages"""
         logger.info("📨 Starting message processor loop")
+        logger.info(f"📊 Message processor state: is_running={self.is_running}, websocket={self.websocket is not None}")
         
+        # Wait for WebSocket connection to be established
+        wait_count = 0
+        while self.is_running and self.websocket is None:
+            await asyncio.sleep(0.1)
+            wait_count += 1
+            if wait_count % 50 == 0:  # Log every 5 seconds
+                logger.info(f"⏳ Message processor waiting for WebSocket connection... (waited {wait_count/10:.1f}s)")
+        
+        if not self.is_running or self.websocket is None:
+            logger.warning("📨 Message processor loop stopped - no WebSocket connection")
+            return
+        
+        logger.info("📨 WebSocket connection ready, starting message processing...")
         try:
+            # Double-check websocket is still valid before starting async for loop
+            if self.websocket is None:
+                logger.error("📨 WebSocket became None before starting message processing")
+                return
+                
             async for message in self.websocket:
                 if not self.is_running:
                     break

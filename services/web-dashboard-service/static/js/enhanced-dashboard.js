@@ -28,12 +28,13 @@ class EnhancedDashboard {
         // Trading configuration
         this.tradingConfig = {
             profit_protection: {
-                trigger_percentage: 0.01,
-                activation_threshold: 0.008
+                trigger_percentage: 0.007,
+                activation_threshold: 0.007
             },
             trailing_stop: {
-                trigger_percentage: 0.04,
-                activation_threshold: 0.005
+                trigger_percentage: 0.005,
+                activation_threshold: 0.005,
+                step_percentage: 0.003
             }
         };
         
@@ -48,6 +49,7 @@ class EnhancedDashboard {
         this.setupTableSorting();
         this.setupColumnToggles();
         this.setupRecentTradesControls();
+        this.setupPerformanceAnalytics();
         this.startPeriodicUpdates();
         
         // Immediate data loading
@@ -155,10 +157,11 @@ class EnhancedDashboard {
             if (btn) btn.addEventListener('click', () => this.showEmergencyModal());
         });
 
-        // Mobile menu toggle
+        // Mobile menu toggle (arrow fn preserves `this`; handler must not throw or menu never binds)
         const mobileMenuToggle = document.getElementById('mobile-menu-toggle');
         if (mobileMenuToggle) {
-            mobileMenuToggle.addEventListener('click', this.toggleMobileMenu);
+            mobileMenuToggle.type = 'button';
+            mobileMenuToggle.addEventListener('click', () => this.toggleMobileMenu());
         }
 
         // Emergency modal
@@ -548,8 +551,9 @@ const bText = (bCells[columnIndex] && bCells[columnIndex].textContent ? bCells[c
 
     updatePortfolioUI(data) {
         const elements = {
-            'total-balance': data.total_balance || 0,
+            'total-balance': this.calculateTotalPortfolio(data),
             'available-balance': this.calculateAvailableBalance(data),
+            'invested-amount': this.calculateInvestedAmount(data),
             'total-pnl': data.total_pnl || 0,
             'daily-pnl': data.daily_pnl || 0,
             'open-trades': data.active_trades || 0,
@@ -631,44 +635,46 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
         if (!websocketStatus || !websocketStatus.connections) return;
         
         Object.entries(websocketStatus.connections).forEach(([exchange, status]) => {
-            const indicator = document.querySelector(`[data-websocket-indicator="${exchange}"]`);
-            if (indicator) {
-                const isConnected = status.connected || false;
-                const connectionStatus = status.status || 'unknown';
-                
-                // Enhanced status classification
-                let statusClass = 'disconnected';
-                let statusText = 'Disconnected';
-                
-                if (isConnected) {
-                    statusClass = 'connected';
-                    statusText = 'Connected';
-                } else if (connectionStatus === 'connecting' || connectionStatus === 'initializing') {
-                    statusClass = 'connecting';
-                    statusText = 'Connecting';
-                } else if (connectionStatus === 'error') {
-                    statusClass = 'error';
-                    statusText = 'Error';
-                } else if (connectionStatus === 'not_implemented') {
-                    statusClass = 'not-implemented';
-                    statusText = 'Not Implemented';
-                }
-                
+            const indicators = document.querySelectorAll(`[data-websocket-indicator="${exchange}"]`);
+            if (!indicators.length) return;
+
+            const isConnected = status.connected || false;
+            const connectionStatus = status.status || 'unknown';
+            
+            // Enhanced status classification
+            let statusClass = 'disconnected';
+            let statusText = 'Disconnected';
+            
+            if (isConnected) {
+                statusClass = 'connected';
+                statusText = 'Connected';
+            } else if (connectionStatus === 'connecting' || connectionStatus === 'initializing') {
+                statusClass = 'connecting';
+                statusText = 'Connecting';
+            } else if (connectionStatus === 'error') {
+                statusClass = 'error';
+                statusText = 'Error';
+            } else if (connectionStatus === 'not_implemented') {
+                statusClass = 'not-implemented';
+                statusText = 'Not Implemented';
+            }
+            
+            // Enhanced tooltip with more information
+            let tooltipText = `${exchange.charAt(0).toUpperCase() + exchange.slice(1)} WebSocket: ${statusText}`;
+            if (status.last_update) {
+                const lastUpdate = new Date(status.last_update);
+                tooltipText += `\nLast Update: ${lastUpdate.toLocaleTimeString()}`;
+            }
+            if (status.error) {
+                tooltipText += `\nError: ${status.error}`;
+            }
+            if (status.registered_callbacks) {
+                tooltipText += `\nCallbacks: ${status.registered_callbacks}`;
+            }
+
+            // Update ALL indicators for this exchange (cards + header widgets)
+            indicators.forEach((indicator) => {
                 indicator.className = `websocket-indicator ${statusClass}`;
-                
-                // Enhanced tooltip with more information
-                let tooltipText = `${exchange.charAt(0).toUpperCase() + exchange.slice(1)} WebSocket: ${statusText}`;
-                if (status.last_update) {
-                    const lastUpdate = new Date(status.last_update);
-                    tooltipText += `\nLast Update: ${lastUpdate.toLocaleTimeString()}`;
-                }
-                if (status.error) {
-                    tooltipText += `\nError: ${status.error}`;
-                }
-                if (status.registered_callbacks) {
-                    tooltipText += `\nCallbacks: ${status.registered_callbacks}`;
-                }
-                
                 indicator.title = tooltipText;
                 
                 // Add visual effects based on status
@@ -680,7 +686,7 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
                 } else if (connectionStatus === 'error') {
                     indicator.classList.add('fade');
                 }
-            }
+            });
         });
         
         // Update global WebSocket status summary
@@ -720,7 +726,8 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
             }
             
             summaryElement.textContent = summaryText;
-            summaryElement.className = `badge badge-${summaryClass}`;
+            summaryElement.className =
+                `badge badge-${summaryClass} text-xs px-2 py-1 rounded-full max-w-[9.5rem] sm:max-w-none truncate shrink-0`;
         }
         
         // Update detailed WebSocket monitoring cards
@@ -874,11 +881,23 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
         }, 0);
     }
 
+    calculateTotalPortfolio(data) {
+        return this.calculateAvailableBalance(data) + this.calculateInvestedAmount(data);
+    }
+
+    calculateInvestedAmount(data) {
+        if (!data.exchanges) return 0;
+        return Object.values(data.exchanges).reduce((sum, ex) => {
+            return sum + (ex.invested_amount || 0);
+        }, 0);
+    }
+
     updateTooltips(data) {
         if (!data.exchanges) return;
 
         const totalBalance = document.getElementById('total-balance');
         const availableBalance = document.getElementById('available-balance');
+        const investedAmount = document.getElementById('invested-amount');
         const totalPnl = document.getElementById('total-pnl');
 
         if (totalBalance) {
@@ -887,17 +906,22 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
         if (availableBalance) {
             availableBalance.setAttribute('data-tooltip', this.generateBalanceTooltip(data.exchanges, 'available_balance'));
         }
+        if (investedAmount) {
+            investedAmount.setAttribute('data-tooltip', this.generateInvestedTooltip(data.exchanges));
+        }
         if (totalPnl) {
             totalPnl.setAttribute('data-tooltip', this.generatePnLTooltip(data.exchanges));
         }
     }
 
     generateBalanceTooltip(exchanges, balanceType) {
-        const title = balanceType === 'balance' ? 'Total Balance by Exchange:' : 'Available Balance by Exchange:';
+        const title = balanceType === 'balance' ? 'Total Portfolio by Exchange:' : 'Available Balance by Exchange:';
         let tooltip = title + '\\n';
         
         Object.entries(exchanges).forEach(([exchangeName, data]) => {
-            const value = balanceType === 'balance' ? data.balance : (data.available_balance || data.available);
+            const available = data.available_balance || data.available || 0;
+            const invested = data.invested_amount || 0;
+            const value = balanceType === 'balance' ? (available + invested) : available;
             const exchangeDisplayName = exchangeName.charAt(0).toUpperCase() + exchangeName.slice(1);
             tooltip += `${exchangeDisplayName}: ${this.formatCurrency(value || 0)}\\n`;
         });
@@ -914,6 +938,18 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
             tooltip += `${exchangeDisplayName}: ${this.formatCurrency(value)}\\n`;
         });
         
+        return tooltip.trim();
+    }
+
+    generateInvestedTooltip(exchanges) {
+        let tooltip = 'Invested Amount by Exchange:\\n';
+
+        Object.entries(exchanges).forEach(([exchangeName, data]) => {
+            const value = data.invested_amount || 0;
+            const exchangeDisplayName = exchangeName.charAt(0).toUpperCase() + exchangeName.slice(1);
+            tooltip += `${exchangeDisplayName}: ${this.formatCurrency(value)}\\n`;
+        });
+
         return tooltip.trim();
     }
 
@@ -974,6 +1010,19 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
                 element.classList.remove('loading');
             }
         });
+
+        const cycleHint = document.getElementById('bot-cycle-hint');
+        if (cycleHint) {
+            const lastSec = trading.last_loop_duration_seconds;
+            const base =
+                'Each count is one full loop: exit check → entry scan → maintenance (not a 60s “tick”).';
+            if (typeof lastSec === 'number' && Number.isFinite(lastSec) && lastSec > 0) {
+                const rounded = lastSec >= 120 ? `${(lastSec / 60).toFixed(1)} min` : `${Math.round(lastSec)}s`;
+                cycleHint.textContent = `${base} Last loop took ~${rounded}.`;
+            } else {
+                cycleHint.textContent = base;
+            }
+        }
     }
 
     updateBotStatusError() {
@@ -989,23 +1038,90 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
                 element.classList.remove('loading');
             }
         });
+        const cycleHint = document.getElementById('bot-cycle-hint');
+        if (cycleHint) cycleHint.textContent = '';
     }
 
     formatUptime(uptime) {
-        if (uptime === undefined) return 'N/A';
-        
-        const seconds = parseInt(uptime);
+        if (uptime === undefined || uptime === null) return 'N/A';
+
+        const total = this._uptimeToTotalSeconds(uptime);
+        if (total === null || !Number.isFinite(total) || total < 0) return 'N/A';
+
+        return this._formatSeconds(Math.floor(total));
+    }
+
+    _uptimeToTotalSeconds(uptime) {
+        if (typeof uptime === 'number' && Number.isFinite(uptime)) return uptime;
+
+        if (typeof uptime === 'string') {
+            const t = uptime.trim();
+            if (!t) return null;
+            if (/^\d+(\.\d+)?$/.test(t)) return parseFloat(t);
+            const iso = this._parseIso8601Duration(t);
+            if (iso !== null) return iso;
+            const py = this._parsePythonTimedeltaString(t);
+            if (py !== null) return py;
+            return null;
+        }
+
+        if (typeof uptime === 'object') {
+            if (Array.isArray(uptime)) return null;
+            if (typeof uptime.secs === 'number') return uptime.secs;
+            if (typeof uptime.seconds === 'number') {
+                const days = typeof uptime.days === 'number' ? uptime.days : 0;
+                return days * 86400 + uptime.seconds;
+            }
+            if (typeof uptime.total_seconds === 'number') return uptime.total_seconds;
+        }
+
+        return null;
+    }
+
+    _parseIso8601Duration(s) {
+        const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i.exec(s);
+        if (!m) return null;
+        const days = parseInt(m[1] || '0', 10) || 0;
+        const hours = parseInt(m[2] || '0', 10) || 0;
+        const minutes = parseInt(m[3] || '0', 10) || 0;
+        const secPart = parseFloat(m[4] || '0') || 0;
+        return days * 86400 + hours * 3600 + minutes * 60 + secPart;
+    }
+
+    _parsePythonTimedeltaString(s) {
+        let days = 0;
+        let rest = s;
+        const dayMatch = /^(\d+)\s+day[s]?,?\s*/i.exec(rest);
+        if (dayMatch) {
+            days = parseInt(dayMatch[1], 10) || 0;
+            rest = rest.slice(dayMatch[0].length);
+        }
+        const parts = rest.split(':').map((p) => p.trim());
+        if (parts.length === 3) {
+            const h = parseInt(parts[0], 10) || 0;
+            const m = parseInt(parts[1], 10) || 0;
+            const sec = parseFloat(parts[2]) || 0;
+            return days * 86400 + h * 3600 + m * 60 + sec;
+        }
+        if (parts.length === 2) {
+            const m = parseInt(parts[0], 10) || 0;
+            const sec = parseFloat(parts[1]) || 0;
+            return days * 86400 + m * 60 + sec;
+        }
+        return null;
+    }
+
+    _formatSeconds(seconds) {
         const d = Math.floor(seconds / (3600 * 24));
         const h = Math.floor((seconds % (3600 * 24)) / 3600);
         const m = Math.floor((seconds % 3600) / 60);
         const s = Math.floor(seconds % 60);
-        
+
         let uptimeStr = '';
         if (d > 0) uptimeStr += `${d}d `;
         if (h > 0 || uptimeStr) uptimeStr += `${h}h `;
         if (m > 0 || uptimeStr) uptimeStr += `${m}m `;
         uptimeStr += `${s}s`;
-        
         return uptimeStr;
     }
 
@@ -1108,13 +1224,17 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
             <tr class="enhanced-table-row">
                 <td class="font-mono text-sm" title="${trade.trade_id || 'N/A'}">
                     ${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}
+                    <div class="mobile-time-inline">
+                        <div>E: ${this.formatDateTime(trade.entry_time)}</div>
+                        <div>X: ${this.formatDateTime(trade.exit_time)}</div>
+                    </div>
                 </td>
                 <td class="font-semibold">${trade.pair || 'N/A'}</td>
                 <td class="mobile-hidden">${trade.exchange || 'N/A'}</td>
-                <td class="mobile-hidden text-sm">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="text-sm">${this.formatDateTime(trade.entry_time)}</td>
                 <td class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
                 <td class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
-                <td class="mobile-hidden text-sm">${this.formatDateTime(trade.exit_time)}</td>
+                <td class="text-sm">${this.formatDateTime(trade.exit_time)}</td>
                 <td class="text-right font-mono">${this.formatCurrency(trade.exit_price, 4)}</td>
                 <td class="mobile-hidden text-sm" title="${trade.entry_reason || 'N/A'}">
                     ${this.truncateText(trade.entry_reason || 'N/A', 30)}
@@ -1261,8 +1381,12 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
 
     toggleMobileMenu() {
         const menu = document.getElementById('mobile-menu');
-        if (menu) {
-            menu.classList.toggle('hidden');
+        const btn = document.getElementById('mobile-menu-toggle');
+        if (!menu) return;
+        const isOpen = !menu.classList.contains('hidden');
+        menu.classList.toggle('hidden', isOpen);
+        if (btn) {
+            btn.setAttribute('aria-expanded', isOpen ? 'false' : 'true');
         }
     }
 
@@ -1326,7 +1450,7 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
             tbody.classList.add('loading');
             tbody.innerHTML = `
                 <tr>
-                    <td colspan="16" class="text-center py-8">
+                    <td colspan="18" class="text-center py-8">
                         <div class="flex items-center justify-center">
                             <i class="fas fa-spinner spinner text-blue-500 mr-2"></i>
                             Loading recent trades...
@@ -1487,7 +1611,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         }
 
         if (filteredTrades.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="16" class="text-center py-8 text-gray-500">No trades found</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="18" class="text-center py-8 text-gray-500">No trades found</td></tr>';
             return;
         }
 
@@ -1519,12 +1643,17 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
             <tr class="enhanced-table-row ${rowClass}">
                 <td class="font-mono text-sm" title="${trade.trade_id || 'N/A'}">
                     ${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}
+                    <div class="mobile-time-inline">
+                        <div>E: ${this.formatDateTime(trade.entry_time)}</div>
+                        <div>X: ${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</div>
+                    </div>
                 </td>
                 <td class="font-semibold">${trade.pair || 'N/A'}</td>
                 <td class="mobile-hidden">${trade.exchange || 'N/A'}</td>
-                <td class="mobile-hidden text-sm">${this.formatDateTime(trade.entry_time)}</td>
-                <td class="mobile-hidden text-sm">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
+                <td class="text-sm">${this.formatDateTime(trade.entry_time)}</td>
+                <td class="text-sm">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
                 <td class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
+                <td class="text-right font-mono">${trade.exit_price ? this.formatCurrency(trade.exit_price, 4) : 'N/A'}</td>
                 <td class="text-right font-mono">${this.formatCurrency(trade.current_price, 4)}</td>
                 <td class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
                 <td class="text-right font-mono" id="notional-value-${trade.trade_id || 'N/A'}">
@@ -1559,9 +1688,9 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                         <div class="text-xs text-gray-500 mt-1">
                             Exit: ${this.formatCurrency(trade.profit_protection_trigger, 4)}
                         </div>
-                    ` : trade.profit_protection === 'inactive' && trade.current_price ? `
+                    ` : trade.profit_protection === 'inactive' && trade.entry_price ? `
                         <div class="text-xs text-gray-600 mt-1">
-                            Activates: ${this.formatCurrency(trade.current_price * (1 + this.tradingConfig.profit_protection.trigger_percentage), 4)} (+${(this.tradingConfig.profit_protection.trigger_percentage * 100).toFixed(1)}%)
+                            Activates: ${this.formatCurrency(trade.entry_price * (1 + this.tradingConfig.profit_protection.trigger_percentage), 4)} (+${(this.tradingConfig.profit_protection.trigger_percentage * 100).toFixed(1)}%)
                         </div>
                     ` : ''}
                 </td>
@@ -1576,9 +1705,9 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                         <div class="text-xs text-blue-500 mt-1">
                             Trailing: ${(this.tradingConfig.trailing_stop.step_percentage * 100).toFixed(2)}% distance
                         </div>
-                    ` : trade.trail_stop === 'inactive' && trade.current_price ? `
+                    ` : trade.trail_stop === 'inactive' && trade.entry_price ? `
                         <div class="text-xs text-gray-600 mt-1">
-                            Activates: ${this.formatCurrency(trade.current_price * (1 + this.tradingConfig.trailing_stop.activation_threshold), 4)} (+${(this.tradingConfig.trailing_stop.activation_threshold * 100).toFixed(1)}%)
+                            Activates: ${this.formatCurrency(trade.entry_price * (1 + this.tradingConfig.trailing_stop.activation_threshold), 4)} (+${(this.tradingConfig.trailing_stop.activation_threshold * 100).toFixed(1)}%)
                         </div>
                     ` : ''}
                 </td>
@@ -1650,7 +1779,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         if (tbody) {
             tbody.innerHTML = `
                 <tr>
-                    <td colspan="14" class="text-center py-8 text-red-500">
+                    <td colspan="18" class="text-center py-8 text-red-500">
                         <div class="flex items-center justify-center">
                             <i class="fas fa-exclamation-triangle mr-2"></i>
                             Error loading recent trades
@@ -1743,6 +1872,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
             this.updateExchangeStatus();
             this.updateBybitWebSocketStatus();
             this.updateStrategyPerformance();
+            this.updatePerformanceAnalytics();
         }, 30000);
         
         // Initial updates
@@ -1880,6 +2010,131 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         return text.substring(0, length) + '...';
     }
 
+    escapeHtml(s) {
+        if (s === null || s === undefined) return '';
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    formatStrategyName(name) {
+        const key = String(name || '').toLowerCase();
+        const labels = {
+            rsi_oversold_override: 'RSI Oversold Override',
+            rsi_oversold_checklist: 'RSI Oversold Checklist',
+            macd_momentum: 'MACD Momentum',
+            vwma_hull: 'VWMA Hull',
+            heikin_ashi: 'Heikin Ashi',
+            multi_timeframe_confluence: 'Multi Timeframe Confluence',
+            engulfing_multi_tf: 'Engulfing Multi TF'
+        };
+        return labels[key] || String(name || '').replace(/_/g, ' ');
+    }
+
+    /**
+     * Renders one pair row: last strategy run time, consensus, per-strategy pass/fail reasons.
+     */
+    /** Resolve snapshot whether API pair uses BASE/QUOTE or concatenated form. */
+    getPairSnapshot(exSnaps, pair) {
+        if (!exSnaps || !pair) return null;
+        if (exSnaps[pair]) return exSnaps[pair];
+        const compact = String(pair).replace('/', '');
+        if (compact !== pair && exSnaps[compact]) return exSnaps[compact];
+        return null;
+    }
+
+    renderPairSnapshotHtml(pair, snap) {
+        const esc = (x) => this.escapeHtml(x);
+        if (!snap) {
+            return `<div class="pair-snap border-b border-gray-100 py-1.5 text-left">
+                <span class="font-medium text-gray-800">${esc(pair)}</span>
+                <span class="text-gray-400 text-xs"> — no strategy run recorded yet</span>
+            </div>`;
+        }
+        const ts = snap.timestamp ? new Date(snap.timestamp).toLocaleString() : '—';
+        let statusClass = 'text-amber-700';
+        if (snap.analysis_status === 'success') statusClass = 'text-green-700';
+        if (snap.analysis_status === 'error') statusClass = 'text-red-600';
+        if (snap.analysis_status === 'no_market_data') statusClass = 'text-orange-600';
+        const cons = snap.consensus || {};
+        const macdResult = Array.isArray(snap.strategies)
+            ? snap.strategies.find((s) => (s && s.strategy) === 'macd_momentum')
+            : null;
+        const rsiOverrideResult = Array.isArray(snap.strategies)
+            ? snap.strategies.find((s) => (s && s.strategy) === 'rsi_oversold_override')
+            : null;
+        const rsiChecklistResult = Array.isArray(snap.strategies)
+            ? snap.strategies.find((s) => (s && s.strategy) === 'rsi_oversold_checklist')
+            : null;
+        const macdIsBuy = macdResult && String(macdResult.signal || '').toLowerCase() === 'buy';
+        const rsiOverrideIsBuy = rsiOverrideResult && String(rsiOverrideResult.signal || '').toLowerCase() === 'buy';
+        const rsiChecklistIsBuy = rsiChecklistResult && String(rsiChecklistResult.signal || '').toLowerCase() === 'buy';
+        const consRsiOverride = Boolean(cons.rsi_15m_oversold_buy_override);
+        const consRsiChecklistOverride = Boolean(cons.rsi_checklist_buy_override);
+        const consLine =
+            snap.analysis_status === 'success' && (cons.signal != null || cons.confidence != null)
+                ? `<div class="text-xs text-gray-800 mt-1 font-medium">
+                    Strategy consensus snapshot: ${esc((cons.signal || '—').toString().toUpperCase())}
+                    @ ${cons.confidence != null ? esc(String(cons.confidence)) : '—'},
+                    agreement ${cons.agreement != null ? esc(String(cons.agreement)) : '—'}%,
+                    strategies ${cons.participating_strategies != null ? esc(String(cons.participating_strategies)) : '—'}
+                </div>`
+                : '';
+        let executionHint = `<div class="text-xs text-gray-500 mt-0.5">
+                This section shows strategy-stage snapshots; final execution uses orchestrator entry gates/overrides.
+               </div>`;
+        if (consRsiChecklistOverride || rsiChecklistIsBuy) {
+            executionHint = `<div class="text-xs text-emerald-700 mt-0.5 font-medium">
+                rsi_oversold_checklist BUY detected: orchestrator can prioritize Checklist override and use it as entry strategy.
+               </div>`;
+        } else if (consRsiOverride || rsiOverrideIsBuy) {
+            executionHint = `<div class="text-xs text-emerald-700 mt-0.5 font-medium">
+                rsi_oversold_override BUY detected: orchestrator may force BUY on 15m RSI oversold override.
+               </div>`;
+        } else if (macdIsBuy) {
+            executionHint = `<div class="text-xs text-emerald-700 mt-0.5 font-medium">
+                macd_momentum BUY detected: orchestrator may execute via MACD override even when consensus is HOLD.
+               </div>`;
+        }
+        const appStrats =
+            snap.applicable_strategies && snap.applicable_strategies.length
+                ? `<div class="text-xs text-gray-600 mt-0.5">Applied to regime: ${esc(snap.applicable_strategies.map((s) => this.formatStrategyName(s)).join(', '))}</div>`
+                : '';
+        let stratHtml = '';
+        if (snap.strategies && snap.strategies.length) {
+            stratHtml = '<ul class="list-none ml-0 mt-1 space-y-1 text-xs">';
+            snap.strategies.forEach((s) => {
+                let oc = 'text-gray-600';
+                if (s.outcome === 'failed') oc = 'text-red-600';
+                else if (s.outcome === 'buy_signal' || s.outcome === 'sell_signal') oc = 'text-green-700';
+                else if (s.outcome === 'weak_buy' || s.outcome === 'weak_sell') oc = 'text-amber-700';
+                stratHtml += `<li class="border-l-2 border-gray-200 pl-2">
+                    <span class="font-medium text-gray-800">${esc(this.formatStrategyName(s.strategy))}</span>
+                    <span class="text-gray-600"> ${esc(s.signal)}</span>
+                    <span class="text-gray-500"> conf ${s.confidence != null ? s.confidence : '—'}</span>
+                    <span class="${oc} font-medium"> (${esc(s.outcome)})</span>
+                    <div class="text-gray-600 mt-0.5">${esc(s.reason)}</div>
+                </li>`;
+            });
+            stratHtml += '</ul>';
+        }
+        const fullSummary = snap.summary || '';
+        return `<div class="pair-snap border-b border-gray-100 py-2 text-left">
+            <div class="flex flex-wrap justify-between gap-1 items-baseline">
+                <span class="font-semibold text-gray-900 text-sm">${esc(pair)}</span>
+                <span class="text-xs text-gray-500 whitespace-nowrap">${esc(ts)}</span>
+            </div>
+            <div class="text-xs font-medium ${statusClass} mt-0.5">${esc(snap.analysis_status || 'unknown')}</div>
+            ${consLine}
+            ${executionHint}
+            ${appStrats}
+            <p class="text-xs text-gray-700 mt-1 leading-snug" title="${esc(fullSummary)}">${esc(this.truncateText(fullSummary, 240))}</p>
+            ${stratHtml}
+        </div>`;
+    }
+
     async updateExchangeStatus() {
         try {
             // Get exchange performance data
@@ -1891,6 +2146,16 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
             const portfolioResponse = await fetch('/api/portfolio');
             if (!portfolioResponse.ok) return;
             const portfolioData = await portfolioResponse.json();
+
+            let snapData = {};
+            try {
+                const snapResponse = await fetch('/api/v1/strategy/pair-snapshots');
+                if (snapResponse.ok) {
+                    snapData = await snapResponse.json();
+                }
+            } catch (e) {
+                console.warn('pair-snapshots fetch failed', e);
+            }
 
             // Get trading pairs for each exchange
             const exchangePairs = {};
@@ -1950,15 +2215,29 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                     statusText = 'No Data';
                 }
 
-                // Format pairs display - show all pairs
+                // Format pairs display - show all pairs (summary line)
                 const pairsDisplay = pairs.length > 0 
                     ? pairs.join(', ')
                     : 'No pairs selected';
 
+                const exKey = (exchange || '').toLowerCase();
+                const exSnaps = snapData[exKey] || {};
+                const perPairDetails = pairs.length
+                    ? `<details class="mt-3 text-left group">
+                        <summary class="text-xs text-blue-600 cursor-pointer font-medium list-none flex items-center gap-1">
+                            <span class="group-open:rotate-90 inline-block transition-transform">▸</span>
+                            Per-pair strategy status (${pairs.length}) — last run, consensus, pass/fail by strategy
+                        </summary>
+                        <div class="max-h-80 overflow-y-auto pr-1 mt-2 border border-gray-100 rounded-md p-2 bg-gray-50 text-left">
+                            ${pairs.map((p) => this.renderPairSnapshotHtml(p, this.getPairSnapshot(exSnaps, p))).join('')}
+                        </div>
+                    </details>`
+                    : '';
+
                 return `
                     <div class="enhanced-metric-card bg-white border-l-4 border-${statusColor}-500 p-4 rounded-r-lg shadow-sm">
                         <div class="flex items-center justify-between">
-                            <div>
+                            <div class="min-w-0 flex-1">
                                 <h4 class="font-semibold text-gray-900 capitalize">${exchange}</h4>
                                 <p class="text-2xl font-bold text-gray-900">${this.formatCurrency(balance.available_balance || balance.available || 0, 2)}</p>
                                 <div class="flex items-center text-sm text-gray-600 mt-1">
@@ -1968,8 +2247,9 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                                 <div class="text-xs text-gray-500 mt-1" title="${pairs.join(', ')}">
                                     ${pairs.length} pairs: ${pairsDisplay}
                                 </div>
+                                ${perPairDetails}
                             </div>
-                            <div class="text-right text-sm">
+                            <div class="text-right text-sm flex-shrink-0 ml-2">
                                 <div class="text-gray-600">Orders: ${totalOrders}</div>
                                 <div class="text-gray-600">Filled: ${filledOrders} (${successRate > 0 ? successRate.toFixed(1) : '0.0'}%)</div>
                                 <div class="text-gray-500 mt-1">${new Date(balance.timestamp).toLocaleTimeString()}</div>
@@ -2001,14 +2281,21 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
     async updateBybitWebSocketStatus() {
         try {
             const response = await fetch('/api/v1/websocket/bybit/status');
+            const data = await response.json().catch(() => ({}));
             if (response.ok) {
-                const data = await response.json();
                 this.updateBybitWebSocketDisplay(data);
             } else {
-                console.error('Failed to fetch Bybit WebSocket status');
+                this.updateBybitWebSocketDisplay({
+                    manager_status: { connected: false, running: false, state: 'unavailable' },
+                    message: data.detail || data.message || `HTTP ${response.status}`,
+                });
             }
         } catch (error) {
             console.error('Error updating Bybit WebSocket status:', error);
+            this.updateBybitWebSocketDisplay({
+                manager_status: { connected: false, running: false, state: 'unavailable' },
+                message: String(error),
+            });
         }
     }
 
@@ -2034,8 +2321,11 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         
         let statusText = 'Disconnected';
         let statusClass = 'text-red-600';
-        
-        if (connected && running) {
+
+        if (state === 'unavailable') {
+            statusText = 'Not available';
+            statusClass = 'text-amber-600';
+        } else if (connected && running) {
             statusText = 'Connected';
             statusClass = 'text-green-600';
         } else if (connected && state === 'authenticating') {
@@ -2146,7 +2436,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                 return `
                     <div class="enhanced-metric-card bg-white border-l-4 border-${performanceColor}-500 p-4 rounded-r-lg shadow-sm">
                         <div class="mb-2">
-                            <h4 class="font-semibold text-gray-900 text-sm capitalize">${strategyName.replace(/_/g, ' ')}</h4>
+                            <h4 class="font-semibold text-gray-900 text-sm">${this.formatStrategyName(strategyName)}</h4>
                         </div>
                         <div class="space-y-1">
                             <div class="flex justify-between text-sm">
@@ -2156,6 +2446,10 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">Open:</span>
                                 <span class="font-medium">${stats.open_trades}</span>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Analyzed:</span>
+                                <span class="font-medium">${stats.analysis_runs || 0}</span>
                             </div>
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">Win Rate:</span>

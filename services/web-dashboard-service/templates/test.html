@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>JavaScript Test</title>
+    <link rel="stylesheet" href="/static/css/mobile.css">
+    <style>
+        body { font-family: system-ui, sans-serif; padding: 1rem; max-width: 40rem; margin: 0 auto; }
+        a { color: #4f46e5; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <p><a href="/">Home</a></p>
+    <h1>Testing JavaScript</h1>
+    <p id="test-element">This should change if JavaScript works</p>
+    
+    <script>
+        console.log('Inline JavaScript is working');
+        document.getElementById('test-element').textContent = 'JavaScript is working!';
+        
+        // Test API call
+        fetch('/api/v1/market/sentiment')
+            .then(response => response.json())
+            .then(data => {
+                console.log('API data:', data);
+                document.getElementById('test-element').textContent = 'API works! Sentiment: ' + data.overall_trend;
+            })
+            .catch(error => {
+                console.error('API error:', error);
+                document.getElementById('test-element').textContent = 'API failed: ' + error.message;
+            });
+    </script>
+</body>
+</html>

@@ -21,7 +21,8 @@ class RedisOrderManager:
         self.redis_url = redis_url
         self.redis_client: Optional[redis.Redis] = None
         self.order_queue_service_url = "http://order-queue-service:8007"
-        self.fill_detection_service_url = "http://fill-detection-service:8008"
+        # 🔥 FIX: Use orchestrator service instead of non-existent fill-detection-service
+        self.orchestrator_service_url = "http://orchestrator-service:8005"
         
     async def initialize(self):
         """Initialize Redis connection"""
@@ -85,6 +86,9 @@ class RedisOrderManager:
             if order_id:
                 logger.info(f"✅ Order {order_id} submitted to queue for {pair} on {exchange_name}")
                 
+                # Store full order data in Redis for WebSocket fill detection
+                await self.store_order_data_in_redis(order_id, order_request, exchange_name, pair)
+                
                 # Emit order state change event
                 await self.emit_order_state_change(
                     order_id, 
@@ -129,7 +133,14 @@ class RedisOrderManager:
             return False
     
     async def submit_order_to_queue(self, order_request: Dict[str, Any]) -> Optional[str]:
-        """Submit order to Redis processing queue"""
+        """Submit order to Redis processing queue with critical safety checks"""
+        
+        # CRITICAL SAFETY: Verify tracking system health before ANY order submission
+        if not await self.check_redis_services_health():
+            logger.error(f"🚨 CRITICAL ABORT: Order tracking system unhealthy - REFUSING order submission")
+            logger.error(f"🚨 Order details: {order_request.get('pair')} {order_request.get('side')} on {order_request.get('exchange')}")
+            raise Exception("CRITICAL_SAFETY: Order tracking system unavailable - cannot create untracked orders")
+        
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
@@ -140,14 +151,16 @@ class RedisOrderManager:
                 if response.status_code in [200, 201]:
                     result = response.json()
                     order_id = result.get("order_id")
-                    logger.info(f"📋 Order {order_id} queued successfully")
+                    logger.info(f"✅ Order {order_id} submitted to queue with tracking verified")
                     return order_id
                 else:
-                    logger.error(f"❌ Queue submission failed: {response.status_code} - {response.text}")
+                    logger.error(f"🚨 CRITICAL: Failed to submit order to queue: {response.status_code} - {response.text}")
+                    logger.error(f"🚨 SAFETY ABORT: Cannot proceed without confirmed order tracking")
                     return None
                     
         except Exception as e:
-            logger.error(f"❌ Error submitting order to queue: {e}")
+            logger.error(f"🚨 CRITICAL: Exception submitting order to queue: {e}")
+            logger.error(f"🚨 SAFETY ABORT: Order tracking system failure")
             return None
     
     async def monitor_order_progress(self, order_id: str, trade_id: str):
@@ -291,24 +304,57 @@ class RedisOrderManager:
             logger.error(f"❌ Error getting queue stats: {e}")
             return {"error": str(e)}
     
-    async def emit_fill_event(self, fill_data: Dict[str, Any]) -> bool:
-        """Emit a fill event to the fill detection service"""
+    async def store_order_data_in_redis(self, order_id: str, order_request: Dict[str, Any], exchange_name: str, pair: str):
+        """Store full order data in Redis for WebSocket fill detection to retrieve strategy information"""
         try:
+            if not self.redis_client:
+                logger.warning("⚠️ Redis client not initialized, cannot store order data")
+                return
+                
+            # Store order data in format expected by redis_realtime_order_manager
+            order_data = {
+                "order_id": order_id,
+                "exchange": exchange_name, 
+                "symbol": pair,
+                "side": order_request.get("side", "buy"),
+                "order_type": "limit",  # Default to limit order
+                "amount": str(order_request.get("amount", 0)),
+                "price": "0",  # Will be updated when order is processed
+                "trade_id": order_request.get("trade_id", ""),
+                "status": "QUEUED",
+                "strategy": order_request.get("strategy", "unknown"),
+                "entry_reason": order_request.get("entry_reason", "Strategy signal")
+            }
+            
+            # Store in Redis with the key format expected by fill detection
+            await self.redis_client.hset(f"orders:{order_id}", mapping=order_data)
+            # Set expiration to 24 hours
+            await self.redis_client.expire(f"orders:{order_id}", 86400)
+            
+            logger.info(f"✅ Stored order data for {order_id} with strategy: {order_data['strategy']}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to store order data in Redis: {e}")
+    
+    async def emit_fill_event(self, fill_data: Dict[str, Any]) -> bool:
+        """Emit a fill event to the orchestrator service for Redis processing"""
+        try:
+            # 🔥 FIX: Send to orchestrator service instead of fill-detection-service
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(
-                    f"{self.fill_detection_service_url}/api/v1/fills/emit",
+                    f"{self.orchestrator_service_url}/api/v1/websocket/callback/binance",
                     json=fill_data
                 )
                 
                 if response.status_code in [200, 201]:
-                    logger.info(f"📡 Fill event emitted successfully")
+                    logger.info(f"📡 Fill event sent to orchestrator successfully")
                     return True
                 else:
-                    logger.error(f"❌ Fill emission failed: {response.status_code}")
+                    logger.error(f"❌ Fill event failed: {response.status_code}")
                     return False
                     
         except Exception as e:
-            logger.error(f"❌ Error emitting fill event: {e}")
+            logger.error(f"❌ Error sending fill event to orchestrator: {e}")
             return False
     
     async def emit_order_state_change(
@@ -386,9 +432,23 @@ class RedisOrderManager:
                 "status": "PENDING", 
                 "entry_time": datetime.utcnow().isoformat(),
                 "exchange": exchange_name,
-                "entry_reason": f"Queue-based {strategy_name} strategy signal",
+                "entry_reason": (
+                    f"Queue-based {strategy_name} strategy signal "
+                    f"[stable_regime={signal.get('stable_regime', 'unknown')}, "
+                    f"policy={signal.get('policy_version', 'unversioned')}]"
+                ),
                 "position_size": position_size,
-                "strategy": strategy_name
+                "strategy": strategy_name,
+                "metadata": {
+                    "market_regime": signal.get("market_regime"),
+                    "stable_regime": signal.get("stable_regime"),
+                    "regime_score": signal.get("regime_score"),
+                    "policy_version": signal.get("policy_version"),
+                    "policy_mode": signal.get("policy_mode"),
+                    "entry_gate_reason": signal.get("entry_gate_reason", "consensus_buy_pass"),
+                    "consensus_confidence": signal.get("consensus_confidence"),
+                    "consensus_agreement": signal.get("consensus_agreement"),
+                },
             }
             
             database_service_url = "http://database-service:8002"
@@ -409,23 +469,46 @@ class RedisOrderManager:
             logger.error(f"❌ Error creating PENDING trade: {e}")
             return False
     
+    async def check_redis_services_health(self) -> bool:
+        """Check if Redis order management system is healthy"""
+        return await self.is_healthy()
+    
     async def is_healthy(self) -> bool:
         """Check if Redis order management system is healthy"""
         try:
             if not self.redis_client:
+                logger.warning("⚠️ Redis client not initialized - Redis order processing disabled")
                 return False
                 
             # Check Redis connectivity
             await self.redis_client.ping()
+            logger.debug("✅ Redis connection healthy")
             
-            # Check queue service health
+            # CRITICAL SAFETY: Check queue service health - REQUIRED for safe order tracking
             async with httpx.AsyncClient(timeout=5.0) as client:
-                queue_response = await client.get(f"{self.order_queue_service_url}/health")
-                fill_response = await client.get(f"{self.fill_detection_service_url}/health")
-                
-                return (queue_response.status_code == 200 and 
-                       fill_response.status_code == 200)
-                
+                try:
+                    queue_response = await client.get(f"{self.order_queue_service_url}/health")
+                    if queue_response.status_code != 200:
+                        logger.error(f"🚨 CRITICAL: order-queue-service unhealthy (status {queue_response.status_code})")
+                        logger.error(f"🚨 ABORTING: Cannot create orders without tracking system")
+                        return False
+                    
+                    # Check Redis connection
+                    redis_ping = await self.redis_client.ping()
+                    if not redis_ping:
+                        logger.error(f"🚨 CRITICAL: Redis connection failed")
+                        logger.error(f"🚨 ABORTING: Cannot create orders without event tracking")
+                        return False
+                        
+                    logger.info("✅ SAFETY CHECK PASSED: Queue service and Redis available")
+                    return True
+                    
+                except Exception as health_error:
+                    logger.error(f"🚨 CRITICAL: Cannot verify order tracking system health: {health_error}")
+                    logger.error(f"🚨 ABORTING: Will not create untracked orders")
+                    return False
+            
         except Exception as e:
-            logger.error(f"❌ Health check failed: {e}")
-            return False
+            logger.error(f"🚨 CRITICAL: Redis services check failed: {e}")
+            logger.error(f"🚨 SAFETY ABORT: Cannot create orders without verified tracking system")
+            return False  # FAIL SAFE: No orders without tracking

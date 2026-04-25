@@ -597,10 +597,23 @@ class ModernDashboard {
         
         if (strategies && Array.isArray(strategies.enabled_strategies)) {
             strategies.enabled_strategies.forEach((strategy, index) => {
+                const formatStrategyName = (name) => {
+                    const key = String(name || '').toLowerCase();
+                    const labels = {
+                        rsi_oversold_override: 'RSI Oversold Override',
+                        rsi_oversold_checklist: 'RSI Oversold Checklist',
+                        macd_momentum: 'MACD Momentum',
+                        vwma_hull: 'VWMA Hull',
+                        heikin_ashi: 'Heikin Ashi',
+                        multi_timeframe_confluence: 'Multi Timeframe Confluence',
+                        engulfing_multi_tf: 'Engulfing Multi TF'
+                    };
+                    return labels[key] || String(name || '').replace(/_/g, ' ');
+                };
                 const strategyDiv = document.createElement('div');
                 strategyDiv.className = 'modern-card p-4';
                 strategyDiv.innerHTML = `
-                    <h4 class="font-medium text-gray-900">${strategy}</h4>
+                    <h4 class="font-medium text-gray-900">${formatStrategyName(strategy)}</h4>
                     <p class="text-sm text-gray-500">Enabled</p>
                 `;
                 

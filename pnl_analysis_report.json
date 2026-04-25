@@ -1,0 +1,24 @@
+{
+  "today": {
+    "total_trades": 0,
+    "total_unrealized_pnl": "0",
+    "total_realized_pnl": "0",
+    "total_combined_pnl": "0"
+  },
+  "overall": {
+    "total_trades": 6,
+    "total_unrealized_pnl": "32634.00000000",
+    "total_realized_pnl": "0E-8",
+    "total_combined_pnl": "32634.00000000"
+  },
+  "today_by_status": [],
+  "overall_by_status": [
+    {
+      "status": "OPEN",
+      "trade_count": 6,
+      "total_unrealized_pnl": "32634.00000000",
+      "total_realized_pnl": "0E-8",
+      "total_combined_pnl": "32634.00000000"
+    }
+  ]
+}

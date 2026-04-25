@@ -1,0 +1,47 @@
+{# Desktop links + hamburger (mobile panel is in app_nav_mobile_panel.html) #}
+<div class="hidden md:flex items-center flex-wrap gap-1 lg:gap-2 justify-end flex-shrink-0">
+    <a href="/" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-home mr-1"></i>Home
+    </a>
+    <a href="/trades" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-exchange-alt mr-1"></i>Trades
+    </a>
+    <a href="/orders" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-list-alt mr-1"></i>Orders
+    </a>
+    <a href="/portfolio" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-briefcase mr-1"></i>Portfolio
+    </a>
+    <a href="/strategies" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-chess mr-1"></i>Strategies
+    </a>
+    <a href="/profitability" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-chart-line mr-1"></i>Profitability
+    </a>
+    <a href="/analytics" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-chart-bar mr-1"></i>Analytics
+    </a>
+    <a href="/performance" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-tachometer-alt mr-1"></i>Performance
+    </a>
+    <a href="/exchange-info" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-network-wired mr-1"></i>Exchange Info
+    </a>
+    <a href="/optimizer" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-sliders-h mr-1"></i>Optimizer
+    </a>
+    <a href="/alerts" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-bell mr-1"></i>Alerts
+    </a>
+    <a href="/settings" class="app-nav-link text-white hover:text-blue-200 text-sm font-medium whitespace-nowrap">
+        <i class="fas fa-cog mr-1"></i>Settings
+    </a>
+</div>
+<button type="button"
+        class="app-nav-toggle md:hidden text-white bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg flex-shrink-0"
+        data-app-nav-toggle
+        aria-expanded="false"
+        aria-controls="app-shared-nav-panel"
+        aria-label="Open menu">
+    <i class="fas fa-bars text-lg px-3 py-2"></i>
+</button>

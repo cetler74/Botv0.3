@@ -53,16 +53,20 @@ class BybitAuthManager:
     
     def generate_signature(self, timestamp: str) -> str:
         """
-        Generate HMAC-SHA256 signature for Bybit WebSocket authentication
-        
+        Generate HMAC-SHA256 signature for Bybit WebSocket authentication.
+
+        NOTE: In Bybit v5 private WS the second arg of the auth payload is
+        ``expires`` (a FUTURE millisecond timestamp at which the auth message
+        expires), not the current time. The signature is
+        ``HMAC_SHA256(secret, "GET/realtime" + expires)``.
+
         Args:
-            timestamp: Current timestamp in milliseconds
-            
+            timestamp: The ``expires`` value (ms since epoch, must be > now)
+
         Returns:
             HMAC-SHA256 signature as hex string
         """
         try:
-            # Bybit signature format: GET/realtime{timestamp}
             message = f"GET/realtime{timestamp}"
             
             signature = hmac.new(
@@ -89,13 +93,15 @@ class BybitAuthManager:
             Authentication payload dictionary
         """
         try:
-            # Generate current timestamp in milliseconds
-            timestamp = str(int(time.time() * 1000))
-            
-            # Generate signature
+            # PnL-FIX v3: Bybit's auth arg #2 is ``expires`` (a FUTURE timestamp),
+            # not the current time. Using ``now()`` causes
+            # ``{"success": False, "ret_msg": "Params Error"}`` because the auth
+            # message is already expired on arrival. Use now + 10s.
+            expires = int(time.time() * 1000) + 10_000
+            timestamp = str(expires)
+
             signature = self.generate_signature(timestamp)
-            
-            # Create authentication payload
+
             auth_payload = {
                 "op": "auth",
                 "args": [self.api_key, timestamp, signature]
@@ -140,14 +146,18 @@ class BybitAuthManager:
         """
         try:
             current_time = int(time.time() * 1000)
-            auth_time = int(timestamp)
-            time_diff = abs(current_time - auth_time)
-            
-            if time_diff > self.timestamp_tolerance:
-                logger.warning(f"Timestamp validation failed: {time_diff}ms > {self.timestamp_tolerance}ms tolerance")
+            expires = int(timestamp)
+
+            # PnL-FIX v3: ``timestamp`` is Bybit's ``expires`` value — must be
+            # in the future and within a reasonable window (< 60s ahead).
+            if expires <= current_time:
+                logger.warning(f"Auth expires already elapsed: expires={expires}, now={current_time}")
                 return False
-            
-            logger.debug(f"Timestamp validation passed: {time_diff}ms")
+            if (expires - current_time) > 60_000:
+                logger.warning(f"Auth expires too far in the future: +{expires - current_time}ms")
+                return False
+
+            logger.debug(f"Timestamp validation passed: expires in {expires - current_time}ms")
             return True
             
         except Exception as e:

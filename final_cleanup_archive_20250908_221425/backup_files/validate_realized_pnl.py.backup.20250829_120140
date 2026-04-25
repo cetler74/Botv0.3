@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+Validate Realized PnL - Check and calculate correct realized PnL for closed trades
+"""
+
+import psycopg2
+import psycopg2.extras
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+def get_db_connection():
+    """Get database connection"""
+    try:
+        connection = psycopg2.connect(
+            host=os.getenv('DB_HOST', 'localhost'),
+            port=os.getenv('DB_PORT', '5432'),
+            database=os.getenv('DB_NAME', 'trading_bot_futures'),
+            user=os.getenv('DB_USER', 'carloslarramba'),
+            password=os.getenv('DB_PASSWORD', 'mypassword')
+        )
+        return connection
+    except Exception as e:
+        print(f"❌ Database connection error: {e}")
+        return None
+
+def execute_query(connection, query, params=None):
+    """Execute SQL query and return results"""
+    try:
+        with connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+    except Exception as e:
+        print(f"❌ Query execution error: {e}")
+        return []
+
+def format_currency(amount):
+    """Format currency amount"""
+    if amount is None:
+        return "NULL"
+    elif amount == 0:
+        return "$0.00"
+    elif amount > 0:
+        return f"${amount:,.2f}"
+    else:
+        return f"-${abs(amount):,.2f}"
+
+def calculate_realized_pnl(entry_price, exit_price, position_size, side='buy'):
+    """Calculate realized PnL for a closed trade"""
+    if not entry_price or not exit_price or not position_size:
+        return 0.0
+    
+    if side == 'buy':
+        # For buy orders: (exit_price - entry_price) * position_size
+        pnl = (exit_price - entry_price) * position_size
+    else:
+        # For sell orders: (entry_price - exit_price) * position_size
+        pnl = (entry_price - exit_price) * position_size
+    
+    return pnl
+
+def update_trade_realized_pnl(connection, trade_id, realized_pnl):
+    """Update trade with calculated realized PnL"""
+    try:
+        update_query = """
+        UPDATE trading.trades 
+        SET realized_pnl = %s, updated_at = %s
+        WHERE trade_id = %s
+        """
+        params = (realized_pnl, datetime.utcnow(), trade_id)
+        
+        with connection.cursor() as cursor:
+            cursor.execute(update_query, params)
+            connection.commit()
+        
+        return True
+    except Exception as e:
+        print(f"❌ Error updating realized PnL for trade {trade_id}: {e}")
+        return False
+
+def main():
+    """Main function"""
+    print(f"\n💰 VALIDATING REALIZED PnL - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 100)
+    
+    # Connect to database
+    connection = get_db_connection()
+    if not connection:
+        print("❌ Failed to connect to database")
+        return
+    
+    try:
+        # Get all closed trades
+        closed_trades_query = """
+        SELECT 
+            trade_id,
+            pair,
+            exchange,
+            status,
+            entry_price,
+            exit_price,
+            position_size,
+            realized_pnl,
+            entry_time,
+            exit_time,
+            created_at,
+            strategy
+        FROM trading.trades 
+        WHERE status = 'CLOSED'
+        ORDER BY exit_time DESC, created_at DESC
+        """
+        
+        closed_trades = execute_query(connection, closed_trades_query)
+        
+        if not closed_trades:
+            print("❌ No closed trades found")
+            return
+        
+        print(f"📊 Found {len(closed_trades)} closed trades to validate")
+        print()
+        
+        total_calculated_pnl = 0.0
+        total_stored_pnl = 0.0
+        updated_count = 0
+        
+        for i, trade in enumerate(closed_trades, 1):
+            trade_id = trade['trade_id']
+            pair = trade['pair']
+            exchange = trade['exchange']
+            entry_price = float(trade['entry_price']) if trade['entry_price'] else 0
+            exit_price = float(trade['exit_price']) if trade['exit_price'] else 0
+            position_size = float(trade['position_size']) if trade['position_size'] else 0
+            stored_realized_pnl = float(trade['realized_pnl']) if trade['realized_pnl'] else 0
+            
+            print(f"🔍 Closed Trade #{i}: {pair} on {exchange}")
+            print(f"   Entry Price: {format_currency(entry_price)}")
+            print(f"   Exit Price: {format_currency(exit_price)}")
+            print(f"   Position Size: {position_size}")
+            print(f"   Stored Realized PnL: {format_currency(stored_realized_pnl)}")
+            
+            # Calculate expected realized PnL
+            if entry_price and exit_price and position_size:
+                calculated_pnl = calculate_realized_pnl(entry_price, exit_price, position_size, 'buy')
+                print(f"   Calculated Realized PnL: {format_currency(calculated_pnl)}")
+                
+                # Check if there's a discrepancy
+                if abs(calculated_pnl - stored_realized_pnl) > 0.01:  # Allow small rounding differences
+                    print(f"   ⚠️  DISCREPANCY DETECTED!")
+                    print(f"   Difference: {format_currency(calculated_pnl - stored_realized_pnl)}")
+                    
+                    # Update the database with correct value
+                    success = update_trade_realized_pnl(connection, trade_id, calculated_pnl)
+                    if success:
+                        print(f"   ✅ Updated database with correct realized PnL")
+                        updated_count += 1
+                    else:
+                        print(f"   ❌ Failed to update database")
+                else:
+                    print(f"   ✅ Values match")
+                
+                total_calculated_pnl += calculated_pnl
+                total_stored_pnl += stored_realized_pnl
+            else:
+                print(f"   ❌ Missing required data for calculation")
+            
+            print("-" * 80)
+        
+        # Show summary
+        print(f"\n📊 SUMMARY:")
+        print(f"   Closed Trades: {len(closed_trades)}")
+        print(f"   Trades Updated: {updated_count}")
+        print(f"   Total Stored Realized PnL: {format_currency(total_stored_pnl)}")
+        print(f"   Total Calculated Realized PnL: {format_currency(total_calculated_pnl)}")
+        print(f"   Total Difference: {format_currency(total_calculated_pnl - total_stored_pnl)}")
+        
+        # Show updated totals
+        print(f"\n📈 UPDATED TOTALS:")
+        totals_query = """
+        SELECT 
+            COUNT(*) as total_trades,
+            COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+            COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+            COALESCE(SUM(unrealized_pnl + realized_pnl), 0) as total_combined_pnl
+        FROM trading.trades
+        """
+        
+        totals = execute_query(connection, totals_query)
+        if totals:
+            total_data = totals[0]
+            print(f"   Total Trades: {total_data['total_trades']}")
+            print(f"   Unrealized PnL: {format_currency(total_data['total_unrealized_pnl'])}")
+            print(f"   Realized PnL: {format_currency(total_data['total_realized_pnl'])}")
+            print(f"   Combined PnL: {format_currency(total_data['total_combined_pnl'])}")
+        
+        # Check for trades closed today
+        print(f"\n📅 TRADES CLOSED TODAY:")
+        today_closed_query = """
+        SELECT 
+            COUNT(*) as trades_closed_today,
+            COALESCE(SUM(realized_pnl), 0) as realized_pnl_today
+        FROM trading.trades 
+        WHERE status = 'CLOSED' 
+        AND DATE(exit_time) = CURRENT_DATE
+        """
+        
+        today_closed = execute_query(connection, today_closed_query)
+        if today_closed:
+            today_data = today_closed[0]
+            print(f"   Trades Closed Today: {today_data['trades_closed_today']}")
+            print(f"   Realized PnL Today: {format_currency(today_data['realized_pnl_today'])}")
+        
+        print("\n" + "=" * 100)
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    finally:
+        connection.close()
+
+if __name__ == "__main__":
+    main()

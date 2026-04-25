@@ -1,0 +1,12 @@
+{% extends "base_app.html" %}
+{% block title %}Settings · Trading Bot{% endblock %}
+{% block nav_brand %}Settings{% endblock %}
+{% block content %}
+<div class="bg-white rounded-lg shadow p-6 max-w-4xl">
+    <p class="text-gray-600 mb-4">
+        Runtime settings are loaded from <code class="bg-gray-100 px-1 rounded">config/config.yaml</code> and environment variables
+        (see <code class="bg-gray-100 px-1 rounded">.env</code>). Restart services after changing configuration.
+    </p>
+    <p class="text-sm text-gray-500">This page is reserved for future in-dashboard settings.</p>
+</div>
+{% endblock %}

@@ -1,4 +1,4 @@
-from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, calculate_realized_pnl_with_fees
+# Local PnL calculation functions to avoid strategy dependency
 
 def calculate_trade_pnl_with_fees(entry_price: float, current_price: float, position_size: float, 
                                 entry_fee_amount: float = 0.0, exit_fee_amount: float = 0.0) -> float:
@@ -17,7 +17,10 @@ def calculate_trade_pnl_with_fees(entry_price: float, current_price: float, posi
                 self.side = 'buy'       # SPOT trading - always buy
         
         position = MockPosition(entry_price, position_size, entry_fee_amount, exit_fee_amount)
-        return calculate_unrealized_pnl(position, current_price)
+        # Simple PnL calculation without strategy dependency
+        pnl = (current_price - entry_price) * position_size
+        total_fees = entry_fee_amount + exit_fee_amount
+        return pnl - total_fees
     except Exception as e:
         logger.error(f"Error calculating PnL with fees: {e}")
         # Fallback to basic calculation
@@ -48,6 +51,13 @@ from pydantic import BaseModel
 import uvicorn
 import os
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
+
+# Import centralized trade closure service
+try:
+    from .centralized_trade_closure import get_trade_closure_service
+except ImportError:
+    # Handle relative import when running as script in Docker
+    from centralized_trade_closure import get_trade_closure_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -587,7 +597,68 @@ class EventMaterializer:
         await self.db_manager.execute_query(update_query, (filled_status, local_order_id))
         
         logger.info(f"📊 Materialized OrderFilled: {local_order_id} -> {filled_status} (qty: {fill_data['qty']})")
+        
+        # CRITICAL FIX: Close corresponding trade when order is fully filled
+        if payload.get('fully_filled', True):
+            await self._close_trade_for_filled_order(local_order_id, fill_data)
+            
+            # NEW: Also process through unified trade closure system
+            if hasattr(self, 'trade_closure_integration'):
+                await self.trade_closure_integration.handle_order_filled(payload)
+        
         return True
+    
+    async def _close_trade_for_filled_order(self, local_order_id: str, fill_data: Dict[str, Any]):
+        """Close trade when its corresponding order is fully filled - REFACTORED to use centralized closure"""
+        try:
+            # Check if this is a sell order (exit)
+            if fill_data.get('side', '').lower() != 'sell':
+                logger.debug(f"Buy order filled for {local_order_id} - not closing trade")
+                return
+            
+            # Get centralized trade closure service
+            closure_service = get_trade_closure_service(self.db_manager)
+            
+            # CRITICAL FIX: Use filled_price instead of price for accurate exit price
+            exit_price = fill_data.get('filled_price', fill_data.get('price', 0))
+            if not exit_price or exit_price <= 0:
+                logger.error(f"Invalid exit_price {exit_price} for order {local_order_id}")
+                return
+            
+            # Prepare closure data
+            exit_reason = f"order_filled_auto_closure"
+            exit_time = fill_data.get('timestamp')
+            if isinstance(exit_time, str):
+                exit_time = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
+            elif exit_time is None:
+                exit_time = datetime.utcnow()
+            
+            fees = fill_data.get('fee', 0)
+            exchange_order_id = fill_data.get('exchange_order_id', local_order_id)
+            
+            # Use centralized closure - it will find the trade by order ID
+            results = await closure_service.close_trades_by_order_id(
+                order_id=local_order_id,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                fees=fees
+            )
+            
+            # Log results
+            for result in results:
+                if result.get('success'):
+                    logger.info(f"✅ CENTRALIZED AUTO-CLOSURE: Trade {result['trade_id']} "
+                               f"closed at ${result['exit_price']:.4f}, "
+                               f"PnL: ${result['realized_pnl']:.2f} ({result['pnl_percentage']:.2f}%)")
+                else:
+                    logger.error(f"❌ Failed to close trade {result.get('trade_id', 'unknown')}: "
+                                f"{result.get('error', 'unknown error')}")
+            
+            if not results:
+                logger.debug(f"No open trades found for filled order {local_order_id}")
+                       
+        except Exception as e:
+            logger.error(f"❌ Failed to close trade for filled order {local_order_id}: {e}")
     
     async def handle_order_cancelled(self, payload: Dict[str, Any]) -> bool:
         """Handle OrderCancelled event"""
@@ -758,6 +829,14 @@ class DatabaseManager:
         results = await self.execute_query(query, params)
         return results[0] if results else None
 
+    async def fetch_all(self, query: str, params: Optional[Tuple] = None) -> List[Dict[str, Any]]:
+        """Compatibility helper expected by tracker modules."""
+        return await self.execute_query(query, params)
+
+    async def fetch_one(self, query: str, params: Optional[Tuple] = None) -> Optional[Dict[str, Any]]:
+        """Compatibility helper expected by tracker modules."""
+        return await self.execute_single_query(query, params)
+
     async def get_pool_stats(self) -> Dict[str, Any]:
         """Get connection pool statistics"""
         if self.pool:
@@ -770,8 +849,258 @@ class DatabaseManager:
 
 # Global variables
 db_manager: Optional[DatabaseManager] = None
-config_service_url: str = "http://config-service:8001"
+trade_closure_integration = None
+periodic_fill_checker = None
+sell_order_tracker = None
+pending_trade_cleaner = None
+
+class SellOrderTracker:
+    """
+    Dedicated service for tracking sell orders and closing trades every 20 seconds
+    """
+    
+    def __init__(self):
+        # Database configuration
+        self.db_config = {
+            'host': 'localhost',
+            'port': 5432,
+            'user': 'carloslarramba',
+            'password': 'carloslarramba',
+            'database': 'trading_bot_futures'
+        }
+        
+        # Service URLs
+        self.exchange_service_url = "http://localhost:8003"
+        
+        # Configuration
+        self.check_interval = 20  # seconds
+        self.is_running = False
+        self.check_task = None
+        
+        # Metrics
+        import time
+        self.metrics = {
+            'checks_performed': 0,
+            'sell_orders_checked': 0,
+            'orders_found_filled': 0,
+            'trades_closed': 0,
+            'errors': 0,
+            'start_time': time.time()
+        }
+        
+        logger.info("🎯 Sell Order Tracker initialized - 20s interval tracking")
+    
+    async def start(self):
+        """Start the sell order tracking service"""
+        if self.is_running:
+            return
+        
+        self.is_running = True
+        import time
+        self.metrics['start_time'] = time.time()
+        logger.info("🚀 Starting Sell Order Tracker with 20s interval")
+        
+        # Start the periodic check task
+        self.check_task = asyncio.create_task(self._run_periodic_checks())
+        logger.info("✅ Sell Order Tracker started successfully")
+    
+    async def stop(self):
+        """Stop the sell order tracking service"""
+        if not self.is_running:
+            return
+        
+        self.is_running = False
+        
+        if self.check_task:
+            self.check_task.cancel()
+            try:
+                await self.check_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info("🛑 Sell Order Tracker stopped")
+    
+    async def _run_periodic_checks(self):
+        """Run periodic checks every 20 seconds"""
+        logger.info(f"🔄 Starting periodic sell order checks every {self.check_interval}s")
+        
+        while self.is_running:
+            try:
+                await self._check_all_sell_orders()
+                self.metrics['checks_performed'] += 1
+                
+                # Log progress every 10 checks
+                if self.metrics['checks_performed'] % 10 == 0:
+                    logger.info(f"📊 Sell Order Tracker: {self.metrics['checks_performed']} checks, "
+                              f"{self.metrics['trades_closed']} trades closed")
+                
+                await asyncio.sleep(self.check_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in periodic check: {e}")
+                self.metrics['errors'] += 1
+                await asyncio.sleep(5)
+    
+    async def _check_all_sell_orders(self):
+        """Check all pending sell orders for fills"""
+        try:
+            pending_sell_orders = await self._get_pending_sell_orders()
+            
+            if not pending_sell_orders:
+                return
+            
+            logger.debug(f"🔍 Checking {len(pending_sell_orders)} pending sell orders")
+            
+            for order in pending_sell_orders:
+                await self._check_single_sell_order(order)
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking all sell orders: {e}")
+            self.metrics['errors'] += 1
+    
+    async def _get_pending_sell_orders(self) -> List[Dict[str, Any]]:
+        """Get all pending sell orders from database"""
+        global db_manager
+        if not db_manager:
+            return []
+            
+        try:
+            query = """
+            SELECT 
+                om.client_order_id,
+                om.exchange_order_id,
+                om.exchange,
+                om.symbol,
+                om.trade_id,
+                t.entry_price,
+                t.position_size
+            FROM trading.order_mappings om
+            LEFT JOIN trading.trades t ON om.trade_id = t.trade_id
+            WHERE om.side = 'sell' 
+              AND om.status = 'PENDING'
+              AND om.exchange_order_id IS NOT NULL
+              AND t.status = 'OPEN'
+            ORDER BY om.created_at DESC
+            LIMIT 50
+            """
+            
+            rows = await db_manager.fetch_all(query)
+            orders = [dict(row) for row in rows] if rows else []
+            self.metrics['sell_orders_checked'] += len(orders)
+            return orders
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting pending sell orders: {e}")
+            return []
+    
+    async def _check_single_sell_order(self, order: Dict[str, Any]):
+        """Check a single sell order for fill status"""
+        try:
+            exchange_order_id = order['exchange_order_id']
+            exchange = order['exchange']
+            symbol = order['symbol']
+            trade_id = order['trade_id']
+            
+            # Get order status from exchange
+            async with httpx.AsyncClient(timeout=10) as client:
+                url = f"{self.exchange_service_url}/api/v1/trading/order/{exchange}/{exchange_order_id}"
+                response = await client.get(url, params={"symbol": symbol})
+                
+                if response.status_code != 200:
+                    return
+                
+                order_status = response.json()
+                order_data = order_status.get('order', {})
+                status = order_data.get('status', '').upper()
+                
+                if status in ['FILLED', 'CLOSED', 'COMPLETED']:
+                    logger.info(f"🎯 SELL ORDER FILLED: {exchange_order_id} - CLOSING TRADE {trade_id}")
+                    
+                    # Close the trade
+                    await self._close_trade_for_filled_sell_order(order, order_data)
+                    
+                    self.metrics['orders_found_filled'] += 1
+                    self.metrics['trades_closed'] += 1
+                
+        except Exception as e:
+            logger.error(f"❌ Error checking sell order {order.get('exchange_order_id', 'unknown')}: {e}")
+            self.metrics['errors'] += 1
+    
+    async def _close_trade_for_filled_sell_order(self, order: Dict[str, Any], order_data: Dict[str, Any]):
+        """Close trade when sell order is filled - REFACTORED to use centralized closure"""
+        try:
+            trade_id = order['trade_id']
+            
+            # Get filled price
+            filled_price = order_data.get('average', order_data.get('price', 0))
+            if not filled_price or filled_price <= 0:
+                logger.error(f"Invalid filled_price {filled_price} for trade {trade_id}")
+                return
+            
+            timestamp = order_data.get('timestamp', 0)
+            
+            # Format exit time
+            if timestamp:
+                exit_time = datetime.fromtimestamp(timestamp / 1000)
+            else:
+                exit_time = datetime.utcnow()
+            
+            # Get centralized trade closure service
+            global db_manager
+            if not db_manager:
+                logger.error("❌ Database manager not available")
+                return
+                
+            closure_service = get_trade_closure_service(db_manager)
+            exit_id = order['exchange_order_id']
+            
+            # Use centralized closure
+            result = await closure_service.close_trade(
+                trade_id=trade_id,
+                exit_price=filled_price,
+                exit_reason='sell_order_tracker_filled',
+                exit_time=exit_time,
+                exit_order_id=exit_id,
+                validated_by_exchange=True
+            )
+            
+            if result.get('success'):
+                # Update order mapping
+                update_order_query = """
+                UPDATE trading.order_mappings 
+                SET status = 'FILLED', updated_at = CURRENT_TIMESTAMP
+                WHERE client_order_id = %s
+                """
+                await db_manager.execute_query(update_order_query, (order['client_order_id'],))
+                
+                logger.info(f"✅ CENTRALIZED TRADE CLOSED: {trade_id} | "
+                           f"Exit: ${result['exit_price']:.4f} | "
+                           f"PnL: ${result['realized_pnl']:.2f} ({result['pnl_percentage']:.2f}%)")
+            else:
+                logger.error(f"❌ Failed to close trade {trade_id}: {result.get('reason', 'unknown')}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error closing trade for filled sell order: {e}")
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics"""
+        import time
+        uptime = time.time() - self.metrics['start_time']
+        return {
+            **self.metrics,
+            'uptime_seconds': uptime,
+            'is_running': self.is_running,
+            'check_interval': self.check_interval
+        }
+config_service_url: str = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
 exchange_service_url: str = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
+SIMULATION_DEFAULT_BALANCE_USD: float = 10000.0
+PENDING_TRADE_STALE_MINUTES: int = int(os.getenv("PENDING_TRADE_STALE_MINUTES", "60"))
+PENDING_TRADE_CLEANUP_INTERVAL_SECONDS: int = int(
+    os.getenv("PENDING_TRADE_CLEANUP_INTERVAL_SECONDS", "300")
+)
 
 async def get_config_from_service() -> Dict[str, Any]:
     """Get configuration from config service"""
@@ -791,6 +1120,144 @@ async def get_config_from_service() -> Dict[str, Any]:
             "password": os.getenv("DB_PASSWORD", ""),
             "pool_size": int(os.getenv("DB_POOL_SIZE", "10"))
         }
+
+
+async def get_simulation_settings_cached() -> Dict[str, float]:
+    """Return simulation accounting parameters from config-service.
+
+    Provides the single source of truth for paper-trading P&L:
+      - starting_balance_per_exchange_usd
+      - fee_rate_per_side
+    Falls back to safe defaults if config-service is unreachable.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{config_service_url}/api/v1/config/simulation")
+            if r.status_code == 200:
+                data = r.json() or {}
+                return {
+                    "starting_balance_per_exchange_usd": float(
+                        data.get("starting_balance_per_exchange_usd", 2000.0)
+                    ),
+                    "fee_rate_per_side": float(data.get("fee_rate_per_side", 0.0005)),
+                }
+    except Exception as e:
+        logger.debug("get_simulation_settings_cached: %s", e)
+    return {"starting_balance_per_exchange_usd": 2000.0, "fee_rate_per_side": 0.0005}
+
+
+async def is_simulation_mode() -> bool:
+    """Return True if the trading mode is 'simulation'."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{config_service_url}/api/v1/config/mode")
+            if r.status_code == 200:
+                return bool(r.json().get("is_simulation", False))
+    except Exception:
+        pass
+    return False
+
+
+async def get_derived_exchange_balances() -> Dict[str, Dict[str, float]]:
+    """Compute the authoritative per-exchange paper balance.
+
+    balance        = starting_capital + SUM(realized_pnl for closed trades)
+    available      = balance          - SUM(position_size * entry_price for open trades)
+    total_pnl      = SUM(realized_pnl for closed trades)
+    daily_pnl      = SUM(realized_pnl for closed trades exited today)
+
+    This makes the dashboard impossible to drift from the trades table,
+    eliminating the dual-ledger bug class entirely.
+    """
+    sim = await get_simulation_settings_cached()
+    starting = float(sim["starting_balance_per_exchange_usd"])
+
+    pnl_query = """
+        SELECT exchange,
+               COALESCE(SUM(realized_pnl), 0)                                            AS total_realized_pnl,
+               COALESCE(SUM(CASE WHEN exit_time >= CURRENT_DATE THEN realized_pnl END), 0) AS daily_realized_pnl
+          FROM trading.trades
+         WHERE LOWER(status) = 'closed' AND realized_pnl IS NOT NULL
+         GROUP BY exchange
+    """
+    invested_query = """
+        SELECT exchange,
+               COALESCE(SUM(position_size * entry_price), 0) AS invested_amount
+          FROM trading.trades
+         WHERE LOWER(status) = 'open'
+         GROUP BY exchange
+    """
+    exchanges_query = "SELECT DISTINCT exchange FROM trading.balance"
+
+    pnl_rows = await db_manager.execute_query(pnl_query) or []
+    invested_rows = await db_manager.execute_query(invested_query) or []
+    exchange_rows = await db_manager.execute_query(exchanges_query) or []
+
+    pnl_by_ex = {r["exchange"]: r for r in pnl_rows}
+    inv_by_ex = {r["exchange"]: float(r["invested_amount"] or 0) for r in invested_rows}
+    all_exchanges = {r["exchange"] for r in exchange_rows}
+    all_exchanges |= set(pnl_by_ex.keys()) | set(inv_by_ex.keys())
+
+    out: Dict[str, Dict[str, float]] = {}
+    for ex in all_exchanges:
+        total_pnl = float((pnl_by_ex.get(ex) or {}).get("total_realized_pnl") or 0)
+        daily_pnl = float((pnl_by_ex.get(ex) or {}).get("daily_realized_pnl") or 0)
+        invested = float(inv_by_ex.get(ex) or 0)
+        balance = starting + total_pnl
+        available = max(0.0, balance - invested)
+        out[ex] = {
+            "balance": balance,
+            "available_balance": available,
+            "total_pnl": total_pnl,
+            "daily_pnl": daily_pnl,
+            "invested_amount": invested,
+            "starting_balance": starting,
+        }
+    return out
+
+
+async def seed_simulation_balances_if_needed() -> None:
+    """
+    If config trading.mode is simulation and latest balance rows are still zero, set the
+    default paper float in the DB. The dashboard reads balances from here; orchestrator
+    may be on an older image that does not persist the default.
+    """
+    global db_manager
+    if not db_manager:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{config_service_url}/api/v1/config/mode")
+            if r.status_code != 200:
+                return
+            if not r.json().get("is_simulation"):
+                return
+    except Exception as e:
+        logger.debug("seed_simulation_balances_if_needed: mode check failed: %s", e)
+        return
+    try:
+        query = """
+            UPDATE trading.balance b
+            SET balance = %s,
+                available_balance = %s,
+                timestamp = NOW(),
+                updated_at = NOW()
+            FROM (
+                SELECT DISTINCT ON (exchange) id
+                FROM trading.balance
+                ORDER BY exchange, timestamp DESC
+            ) latest
+            WHERE b.id = latest.id
+              AND COALESCE(b.balance, 0) <= 0
+              AND COALESCE(b.available_balance, 0) <= 0
+        """
+        await db_manager.execute_query(
+            query,
+            (SIMULATION_DEFAULT_BALANCE_USD, SIMULATION_DEFAULT_BALANCE_USD),
+        )
+    except Exception as e:
+        logger.warning("seed_simulation_balances_if_needed: update failed: %s", e)
+
 
 # Background task for materializer
 async def materializer_background_task():
@@ -813,10 +1280,13 @@ async def materializer_background_task():
 
 async def initialize_database():
     """Initialize database connection and materializer"""
-    global db_manager, materializer
+    global db_manager, materializer, trade_closure_integration
     try:
         config = await get_config_from_service()
         db_manager = DatabaseManager({"database": config})
+
+        # Auto-heal critical fee-tracking columns required by trade update flow.
+        await ensure_trade_fee_columns(db_manager)
         
         # Initialize materializer (Phase 3)
         materializer = EventMaterializer(db_manager)
@@ -828,6 +1298,24 @@ async def initialize_database():
         logger.info("✅ Database service initialized successfully with Phase 3 materializer")
     except Exception as e:
         logger.error(f"Failed to initialize database service: {e}")
+        raise
+
+
+async def ensure_trade_fee_columns(manager: "DatabaseManager") -> None:
+    """Ensure fee columns exist on trading.trades for backward-compatible updates."""
+    try:
+        fee_schema_patch = """
+            ALTER TABLE trading.trades
+            ADD COLUMN IF NOT EXISTS entry_fee_amount DECIMAL(20, 8) DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS entry_fee_currency VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS exit_fee_amount DECIMAL(20, 8) DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS exit_fee_currency VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS total_fees_usd DECIMAL(20, 8) DEFAULT 0;
+        """
+        await manager.execute_query(fee_schema_patch)
+        logger.info("✅ Ensured fee-tracking columns exist on trading.trades")
+    except Exception as e:
+        logger.error(f"Failed ensuring fee-tracking columns on trading.trades: {e}")
         raise
 
 # API Endpoints
@@ -1050,7 +1538,7 @@ async def get_trades(
         base_query = """
             SELECT *,
                    pair as symbol,
-                   (COALESCE(current_price, entry_price, 0) * COALESCE(position_size, 0)) as notional_value,
+                   (COALESCE(current_price, entry_price, exit_price, 0) * COALESCE(position_size, 0)) as notional_value,
                    profit_protection_trigger as profit_trigger,
                    trail_stop_trigger as trailing_stop,
                    CASE 
@@ -1518,24 +2006,40 @@ async def sync_orders_from_exchange(sync_data: Dict[str, Any]):
                         realized_pnl = 0
                         realized_pnl_pct = 0
                     
-                    # Update trade as closed
-                    update_query = """
-                        UPDATE trading.trades 
-                        SET exit_price = %s, 
-                            exit_time = %s,
-                            exit_id = %s,
-                            realized_pnl = %s,
-                            status = 'CLOSED',
-                            exit_reason = 'exchange_sync',
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE trade_id = %s
-                    """
-                    await db_manager.execute_query(update_query, (
-                        price, order_datetime, order_id, realized_pnl, trade_id
-                    ))
-                    
-                    closed_trades += 1
-                    logger.info(f"Closed trade {trade_id} from exchange sync - {symbol} at {price}")
+                    # Use centralized trade closure
+                    try:
+                        closure_service = get_trade_closure_service(db_manager)
+                        result = await closure_service.close_trade(
+                            trade_id=trade_id,
+                            exit_price=price,
+                            exit_reason='exchange_sync_filled',
+                            exit_time=order_datetime,
+                            exit_order_id=order_id,
+                            validated_by_exchange=True
+                        )
+                        
+                        if result.get('success'):
+                            closed_trades += 1
+                            logger.info(f"✅ CENTRALIZED SYNC CLOSURE: {trade_id} from exchange sync - "
+                                       f"{symbol} at ${price:.4f}, PnL: ${result['realized_pnl']:.2f}")
+                        else:
+                            logger.error(f"❌ Failed to close trade {trade_id} in sync: {result.get('reason', 'unknown')}")
+                    except Exception as sync_error:
+                        logger.error(f"❌ Centralized closure failed for {trade_id}, falling back to direct update: {sync_error}")
+                        # Fallback to direct update if centralized service fails
+                        update_query = """
+                            UPDATE trading.trades 
+                            SET exit_price = %s, exit_time = %s, exit_id = %s,
+                                realized_pnl = %s, status = 'CLOSED',
+                                exit_reason = 'exchange_sync_fallback',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE trade_id = %s
+                        """
+                        await db_manager.execute_query(update_query, (
+                            price, order_datetime, order_id, realized_pnl, trade_id
+                        ))
+                        closed_trades += 1
+                        logger.info(f"Closed trade {trade_id} from exchange sync (fallback) - {symbol} at {price}")
                     
             elif side == 'buy':
                 # For buy orders, look for FAILED trades that might actually be successful
@@ -1816,35 +2320,104 @@ async def comprehensive_sync_from_exchange(sync_data: Dict[str, Any]):
                         position_size = float(existing_trade['position_size'] or 0)
                         realized_pnl = (price - entry_price) * position_size if entry_price > 0 else 0
                         
-                        # Apply corrections for exit order and CLOSE the trade
-                        correct_exit_query = """
-                            UPDATE trading.trades 
-                            SET exit_price = %s,
-                                realized_pnl = %s,
-                                exit_time = %s,
-                                status = 'CLOSED',
-                                exit_reason = 'exchange_sync',
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE trade_id = %s
-                        """
-                        await db_manager.execute_query(correct_exit_query, (
-                            price, realized_pnl, trade_datetime, db_trade_id
-                        ))
-                        corrected_trades += 1
-                        logger.warning(f"🔧 [SYNC CORRECTION] Exit order {trade_id}: {', '.join(corrections_needed)}, recalculated PnL: {realized_pnl}")
-                    else:
-                        # Even if data matches, ensure the trade is marked as CLOSED
-                        if existing_trade['status'] != 'CLOSED':
-                            close_validated_query = """
+                        # Apply corrections for exit order and CLOSE the trade using centralized closure
+                        try:
+                            closure_service = get_trade_closure_service(db_manager)
+                            result = await closure_service.close_trade(
+                                trade_id=db_trade_id,
+                                exit_price=price,
+                                exit_reason='exchange_sync_correction',
+                                exit_time=trade_datetime,
+                                exit_order_id=trade_id,
+                                validated_by_exchange=True
+                            )
+                            
+                            if result.get('success'):
+                                corrected_trades += 1
+                                logger.warning(f"🔧 [CENTRALIZED SYNC CORRECTION] Exit order {trade_id}: {', '.join(corrections_needed)}, "
+                                             f"PnL: ${result['realized_pnl']:.2f}")
+                            else:
+                                logger.error(f"❌ Failed centralized correction for {db_trade_id}: {result.get('reason', 'unknown')}")
+                                # Fallback to direct update
+                                correct_exit_query = """
+                                    UPDATE trading.trades 
+                                    SET exit_price = %s, realized_pnl = %s, exit_time = %s,
+                                        status = 'CLOSED', exit_reason = 'exchange_sync_fallback',
+                                        updated_at = CURRENT_TIMESTAMP
+                                    WHERE trade_id = %s
+                                """
+                                await db_manager.execute_query(correct_exit_query, (
+                                    price, realized_pnl, trade_datetime, db_trade_id
+                                ))
+                                corrected_trades += 1
+                                logger.warning(f"🔧 [SYNC CORRECTION FALLBACK] Exit order {trade_id}: {', '.join(corrections_needed)}")
+                        except Exception as correction_error:
+                            logger.error(f"❌ Sync correction failed: {correction_error}, using fallback")
+                            # Fallback to original logic
+                            correct_exit_query = """
                                 UPDATE trading.trades 
-                                SET status = 'CLOSED',
-                                    exit_reason = 'exchange_sync',
+                                SET exit_price = %s, realized_pnl = %s, exit_time = %s,
+                                    status = 'CLOSED', exit_reason = 'exchange_sync_fallback',
                                     updated_at = CURRENT_TIMESTAMP
                                 WHERE trade_id = %s
                             """
-                            await db_manager.execute_query(close_validated_query, (db_trade_id,))
-                            logger.info(f"🔧 [SYNC STATUS FIX] Exit order {trade_id} marked trade {db_trade_id} as CLOSED")
+                            await db_manager.execute_query(correct_exit_query, (
+                                price, realized_pnl, trade_datetime, db_trade_id
+                            ))
                             corrected_trades += 1
+                            logger.warning(f"🔧 [SYNC CORRECTION FALLBACK] Exit order {trade_id}: {', '.join(corrections_needed)}")
+                    else:
+                        # Even if data matches, ensure the trade is marked as CLOSED using centralized service
+                        if existing_trade['status'] != 'CLOSED':
+                            # This case means we have exit data but trade isn't closed - should use centralized closure
+                            try:
+                                if existing_trade.get('exit_price'):
+                                    closure_service = get_trade_closure_service(db_manager)
+                                    result = await closure_service.close_trade(
+                                        trade_id=db_trade_id,
+                                        exit_price=float(existing_trade['exit_price']),
+                                        exit_reason='exchange_sync_status_fix',
+                                        exit_time=existing_trade.get('exit_time') or trade_datetime,
+                                        exit_order_id=trade_id,
+                                        validated_by_exchange=True
+                                    )
+                                    
+                                    if result.get('success'):
+                                        logger.info(f"🔧 [CENTRALIZED SYNC STATUS FIX] Exit order {trade_id} marked trade {db_trade_id} as CLOSED")
+                                        corrected_trades += 1
+                                    else:
+                                        logger.error(f"❌ Failed to close trade {db_trade_id} in status fix: {result.get('reason', 'unknown')}")
+                                        # This shouldn't happen but fallback anyway
+                                        close_validated_query = """
+                                            UPDATE trading.trades 
+                                            SET status = 'CLOSED', exit_reason = 'exchange_sync_fallback',
+                                                updated_at = CURRENT_TIMESTAMP
+                                            WHERE trade_id = %s
+                                        """
+                                        await db_manager.execute_query(close_validated_query, (db_trade_id,))
+                                        corrected_trades += 1
+                                else:
+                                    # No exit_price available - can't use centralized closure, log warning
+                                    logger.warning(f"⚠️ Trade {db_trade_id} has exit order {trade_id} but no exit_price - using fallback status update")
+                                    close_validated_query = """
+                                        UPDATE trading.trades 
+                                        SET status = 'CLOSED', exit_reason = 'exchange_sync_no_exit_price',
+                                            updated_at = CURRENT_TIMESTAMP
+                                        WHERE trade_id = %s
+                                    """
+                                    await db_manager.execute_query(close_validated_query, (db_trade_id,))
+                                    corrected_trades += 1
+                                    
+                            except Exception as status_fix_error:
+                                logger.error(f"❌ Status fix failed: {status_fix_error}, using fallback")
+                                close_validated_query = """
+                                    UPDATE trading.trades 
+                                    SET status = 'CLOSED', exit_reason = 'exchange_sync_fallback',
+                                        updated_at = CURRENT_TIMESTAMP
+                                    WHERE trade_id = %s
+                                """
+                                await db_manager.execute_query(close_validated_query, (db_trade_id,))
+                                corrected_trades += 1
                         else:
                             validated_trades += 1
                             logger.debug(f"✅ [SYNC VALIDATED] Exit order {trade_id} matches database")
@@ -2228,15 +2801,35 @@ async def create_balance(balance: Balance):
 
 @app.get("/api/v1/balances")
 async def get_all_balances():
-    """Get balances for all exchanges"""
+    """Get balances for all exchanges.
+
+    Simulation mode: balance is DERIVED (starting_capital + sum(realized_pnl)).
+    Live mode: balance is the latest persisted row from trading.balance.
+    """
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not initialized")
-    
+
     try:
+        if await is_simulation_mode():
+            derived = await get_derived_exchange_balances()
+            now = datetime.utcnow().isoformat()
+            balances = [
+                {
+                    "exchange": ex,
+                    "balance": v["balance"],
+                    "available_balance": v["available_balance"],
+                    "total_pnl": v["total_pnl"],
+                    "daily_pnl": v["daily_pnl"],
+                    "timestamp": now,
+                }
+                for ex, v in sorted(derived.items())
+            ]
+            return {"balances": balances}
+
         query = """
-            SELECT DISTINCT ON (exchange) 
+            SELECT DISTINCT ON (exchange)
                 exchange, balance, available_balance, total_pnl, daily_pnl, timestamp
-            FROM trading.balance 
+            FROM trading.balance
             ORDER BY exchange, timestamp DESC
         """
         balances = await db_manager.execute_query(query)
@@ -2247,15 +2840,41 @@ async def get_all_balances():
 
 @app.get("/api/v1/balances/{exchange_name}")
 async def get_balance(exchange_name: str):
-    """Get balance for specific exchange"""
+    """Get balance for specific exchange.
+
+    Simulation mode: derived from starting_capital + sum(realized_pnl).
+    """
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not initialized")
-    
+
+    await seed_simulation_balances_if_needed()
+
     try:
+        if await is_simulation_mode():
+            derived = await get_derived_exchange_balances()
+            v = derived.get(exchange_name)
+            if v is None:
+                # Unknown exchange: still respond with starting capital (no trades yet)
+                sim = await get_simulation_settings_cached()
+                v = {
+                    "balance": sim["starting_balance_per_exchange_usd"],
+                    "available_balance": sim["starting_balance_per_exchange_usd"],
+                    "total_pnl": 0.0,
+                    "daily_pnl": 0.0,
+                }
+            return {
+                "exchange": exchange_name,
+                "balance": v["balance"],
+                "available_balance": v["available_balance"],
+                "total_pnl": v["total_pnl"],
+                "daily_pnl": v["daily_pnl"],
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
         query = """
-            SELECT * FROM trading.balance 
-            WHERE exchange = %s 
-            ORDER BY timestamp DESC 
+            SELECT * FROM trading.balance
+            WHERE exchange = %s
+            ORDER BY timestamp DESC
             LIMIT 1
         """
         balance = await db_manager.execute_single_query(query, (exchange_name,))
@@ -2302,22 +2921,40 @@ async def get_portfolio_summary():
     """Get portfolio summary"""
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not initialized")
+
+    await seed_simulation_balances_if_needed()
+
     try:
-        # Get total and available balances 
-        balance_query = """
-            SELECT 
-                SUM(balance) as total_balance,
-                SUM(available_balance) as available_balance
-            FROM (
-                SELECT DISTINCT ON (exchange) 
-                    balance, available_balance
-                FROM trading.balance 
-                ORDER BY exchange, timestamp DESC
-            ) latest_balances
-        """
-        balance_result = await db_manager.execute_single_query(balance_query)
-        if not balance_result:
-            balance_result = {"total_balance": 0, "available_balance": 0}
+        # Per-exchange balances:
+        #   Simulation: derived from starting_capital + sum(realized_pnl) — single source of truth
+        #   Live:       latest snapshot from trading.balance
+        sim_mode = await is_simulation_mode()
+        derived_balances: Dict[str, Dict[str, float]] = (
+            await get_derived_exchange_balances() if sim_mode else {}
+        )
+
+        if sim_mode:
+            total_balance = sum(v["balance"] for v in derived_balances.values())
+            available_balance = sum(v["available_balance"] for v in derived_balances.values())
+            balance_result = {
+                "total_balance": total_balance,
+                "available_balance": available_balance,
+            }
+        else:
+            balance_query = """
+                SELECT
+                    SUM(balance) as total_balance,
+                    SUM(available_balance) as available_balance
+                FROM (
+                    SELECT DISTINCT ON (exchange)
+                        balance, available_balance
+                    FROM trading.balance
+                    ORDER BY exchange, timestamp DESC
+                ) latest_balances
+            """
+            balance_result = await db_manager.execute_single_query(balance_query)
+            if not balance_result:
+                balance_result = {"total_balance": 0, "available_balance": 0}
         # Calculate realized PnL from closed trades
         pnl_query = """
             SELECT 
@@ -2336,11 +2973,11 @@ async def get_portfolio_summary():
         # Get trade statistics including daily counts
         trade_query = """
             SELECT 
-                COUNT(*) as total_trades,
+                COUNT(CASE WHEN status != 'FAILED' THEN 1 END) as total_trades,
                 COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as active_trades,
                 COUNT(CASE WHEN status = 'CLOSED' AND realized_pnl > 0 THEN 1 END) as winning_trades,
                 COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_trades,
-                COUNT(CASE WHEN entry_time >= CURRENT_DATE THEN 1 END) as daily_total_trades,
+                COUNT(CASE WHEN entry_time >= CURRENT_DATE AND status != 'FAILED' THEN 1 END) as daily_total_trades,
                 COUNT(CASE WHEN entry_time >= CURRENT_DATE AND status = 'CLOSED' THEN 1 END) as daily_closed_trades,
                 COALESCE(SUM(CASE WHEN status = 'OPEN' THEN unrealized_pnl ELSE 0 END), 0) as total_unrealized_pnl
             FROM trading.trades
@@ -2360,6 +2997,29 @@ async def get_portfolio_summary():
             ORDER BY exchange, timestamp DESC
         """
         exchanges = await db_manager.execute_query(exchange_query)
+
+        # Derive per-exchange realized PnL from trades (authoritative source),
+        # instead of relying on potentially stale values persisted in trading.balance.
+        exchange_pnl_query = """
+            SELECT
+                exchange,
+                COALESCE(SUM(realized_pnl), 0) AS total_realized_pnl,
+                COALESCE(SUM(CASE
+                    WHEN exit_time >= CURRENT_DATE THEN realized_pnl
+                    ELSE 0
+                END), 0) AS daily_realized_pnl
+            FROM trading.trades
+            WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL
+            GROUP BY exchange
+        """
+        exchange_pnl_rows = await db_manager.execute_query(exchange_pnl_query)
+        exchange_pnl_dict = {}
+        if exchange_pnl_rows:
+            for row in exchange_pnl_rows:
+                exchange_pnl_dict[row['exchange']] = {
+                    'total_pnl': float(row.get('total_realized_pnl') or 0),
+                    'daily_pnl': float(row.get('daily_realized_pnl') or 0),
+                }
         
         # Get invested amounts per exchange (sum of position values for open trades)
         invested_query = """
@@ -2380,15 +3040,29 @@ async def get_portfolio_summary():
         if exchanges:
             for ex in exchanges:
                 exchange_name = ex['exchange']
-                exchange_dict[exchange_name] = {
-                    'balance': float(ex['balance']),
-                    'available': float(ex['available_balance']),
-                    'available_balance': float(ex['available_balance']),
-                    'invested_amount': invested_dict.get(exchange_name, 0.0),
-                    'total_pnl': float(ex.get('total_pnl', 0)),
-                    'daily_pnl': float(ex.get('daily_pnl', 0)),
-                    'timestamp': ex['timestamp'].isoformat() if ex.get('timestamp') is not None else None
-                }
+                if sim_mode and exchange_name in derived_balances:
+                    # Simulation: derived balance is the only authoritative source
+                    d = derived_balances[exchange_name]
+                    exchange_dict[exchange_name] = {
+                        'balance': float(d['balance']),
+                        'available': float(d['available_balance']),
+                        'available_balance': float(d['available_balance']),
+                        'invested_amount': float(d['invested_amount']),
+                        'total_pnl': float(d['total_pnl']),
+                        'daily_pnl': float(d['daily_pnl']),
+                        'starting_balance': float(d['starting_balance']),
+                        'timestamp': datetime.utcnow().isoformat(),
+                    }
+                else:
+                    exchange_dict[exchange_name] = {
+                        'balance': float(ex['balance']),
+                        'available': float(ex['available_balance']),
+                        'available_balance': float(ex['available_balance']),
+                        'invested_amount': invested_dict.get(exchange_name, 0.0),
+                        'total_pnl': exchange_pnl_dict.get(exchange_name, {}).get('total_pnl', 0.0),
+                        'daily_pnl': exchange_pnl_dict.get(exchange_name, {}).get('daily_pnl', 0.0),
+                        'timestamp': ex['timestamp'].isoformat() if ex.get('timestamp') is not None else None
+                    }
         return PortfolioSummary(
             total_balance=balance_result['total_balance'] or 0,
             available_balance=balance_result['available_balance'] or 0,
@@ -3336,14 +4010,111 @@ async def replay_events(from_sequence: int = 0):
 async def startup_event():
     """Initialize database on startup"""
     await initialize_database()
+    
+    # Initialize trade closure integration
+    global trade_closure_integration
+    try:
+        from trade_closure_fix import TradeClosureIntegration
+        trade_closure_integration = TradeClosureIntegration(db_manager, {})
+        await trade_closure_integration.start()
+        logger.info("✅ Trade Closure Integration started")
+    except Exception as e:
+        logger.error(f"❌ Failed to start Trade Closure Integration: {e}")
+    
+    # Initialize periodic fill checker
+    global periodic_fill_checker
+    try:
+        from periodic_fill_checker import PeriodicFillChecker
+        periodic_fill_checker = PeriodicFillChecker(db_manager, {})
+        await periodic_fill_checker.start()
+        logger.info("✅ Periodic Fill Checker started")
+    except Exception as e:
+        logger.error(f"❌ Failed to start Periodic Fill Checker: {e}")
+    
+    # 🚀 CRITICAL FIX: Initialize sell order tracker (20s interval)
+    global sell_order_tracker
+    try:
+        sell_order_tracker = SellOrderTracker()
+        await sell_order_tracker.start()
+        logger.info("✅ Sell Order Tracker started (20s interval)")
+    except Exception as e:
+        logger.error(f"❌ Failed to start Sell Order Tracker: {e}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
+
+    # Initialize stale pending trade cleaner
+    global pending_trade_cleaner
+    try:
+        from pending_trade_cleaner import PendingTradeCleaner
+
+        pending_trade_cleaner = PendingTradeCleaner(
+            db_manager,
+            stale_minutes=PENDING_TRADE_STALE_MINUTES,
+            check_interval_seconds=PENDING_TRADE_CLEANUP_INTERVAL_SECONDS,
+        )
+        await pending_trade_cleaner.start()
+        logger.info("✅ Pending Trade Cleaner started")
+    except Exception as e:
+        logger.error(f"❌ Failed to start Pending Trade Cleaner: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    global db_manager
+    global db_manager, periodic_fill_checker, sell_order_tracker, pending_trade_cleaner
+    
+    # Stop sell order tracker
+    if sell_order_tracker:
+        await sell_order_tracker.stop()
+        logger.info("Sell Order Tracker stopped")
+    
+    # Stop periodic fill checker
+    if periodic_fill_checker:
+        await periodic_fill_checker.stop()
+        logger.info("Periodic Fill Checker stopped")
+
+    # Stop pending trade cleaner
+    if pending_trade_cleaner:
+        await pending_trade_cleaner.stop()
+        logger.info("Pending Trade Cleaner stopped")
+    
     if db_manager and db_manager.pool:
         db_manager.pool.closeall()
         logger.info("Database connections closed")
+
+@app.get("/api/v1/periodic-fill-checker/status")
+async def get_periodic_fill_checker_status():
+    """Get status of the periodic fill checker"""
+    global periodic_fill_checker
+    if not periodic_fill_checker:
+        raise HTTPException(status_code=503, detail="Periodic Fill Checker not initialized")
+    
+    return {
+        "status": "running" if periodic_fill_checker.is_running else "stopped",
+        "metrics": periodic_fill_checker.get_metrics(),
+        "check_interval": periodic_fill_checker.check_interval
+    }
+
+@app.get("/api/v1/sell-order-tracker/status")
+async def get_sell_order_tracker_status():
+    """Get status of the sell order tracker"""
+    global sell_order_tracker
+    if not sell_order_tracker:
+        raise HTTPException(status_code=503, detail="Sell Order Tracker not initialized")
+    
+    return {
+        "status": "running" if sell_order_tracker.is_running else "stopped",
+        "metrics": sell_order_tracker.get_metrics(),
+        "check_interval": sell_order_tracker.check_interval,
+        "description": "20-second periodic sell order tracking with REST API fallback"
+    }
+
+@app.get("/api/v1/pending-trade-cleaner/status")
+async def get_pending_trade_cleaner_status():
+    """Get status of stale pending trade cleaner."""
+    global pending_trade_cleaner
+    if not pending_trade_cleaner:
+        raise HTTPException(status_code=503, detail="Pending Trade Cleaner not initialized")
+    return pending_trade_cleaner.get_status()
 
 @app.get("/api/v1/pnl/realized")
 async def get_realized_pnl(exchange: str, symbol: str, start: Optional[str] = None, end: Optional[str] = None):
@@ -3732,6 +4503,111 @@ async def deactivate_trailing_stop(trade_id: str):
         
     except Exception as e:
         logger.error(f"Error deactivating trailing stop: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Centralized Trade Closure API Endpoints
+
+@app.post("/api/v1/trades/{trade_id}/close")
+async def close_trade_centralized(trade_id: str, closure_data: Dict[str, Any]):
+    """Close a trade using the centralized trade closure service"""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    
+    try:
+        closure_service = get_trade_closure_service(db_manager)
+        
+        # Extract parameters from request
+        exit_price = closure_data.get('exit_price')
+        exit_reason = closure_data.get('exit_reason', 'api_closure')
+        exit_time = closure_data.get('exit_time')
+        exit_order_id = closure_data.get('exit_order_id')
+        fees = closure_data.get('fees', 0.0)
+        validated_by_exchange = closure_data.get('validated_by_exchange', False)
+        
+        if not exit_price:
+            raise HTTPException(status_code=400, detail="exit_price is required")
+        
+        # Parse exit_time if provided
+        if exit_time:
+            if isinstance(exit_time, str):
+                try:
+                    exit_time = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
+                except ValueError:
+                    exit_time = datetime.utcnow()
+            elif not isinstance(exit_time, datetime):
+                exit_time = datetime.utcnow()
+        else:
+            exit_time = datetime.utcnow()
+        
+        # Use centralized closure
+        result = await closure_service.close_trade(
+            trade_id=trade_id,
+            exit_price=float(exit_price),
+            exit_reason=exit_reason,
+            exit_time=exit_time,
+            exit_order_id=exit_order_id,
+            fees=float(fees),
+            validated_by_exchange=bool(validated_by_exchange)
+        )
+        
+        if result.get('success'):
+            return {
+                "success": True,
+                "trade_id": result['trade_id'],
+                "exit_price": result['exit_price'],
+                "realized_pnl": result['realized_pnl'],
+                "pnl_percentage": result['pnl_percentage'],
+                "message": f"Trade {trade_id} closed successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to close trade: {result.get('reason', 'unknown error')}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in centralized trade closure for {trade_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/trades/close-by-order")
+async def close_trades_by_order_id(closure_data: Dict[str, Any]):
+    """Close trades by order ID using the centralized trade closure service"""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    
+    try:
+        closure_service = get_trade_closure_service(db_manager)
+        
+        # Extract parameters
+        order_id = closure_data.get('order_id')
+        exit_price = closure_data.get('exit_price')
+        exit_reason = closure_data.get('exit_reason', 'order_filled_api')
+        fees = closure_data.get('fees', 0.0)
+        
+        if not order_id or not exit_price:
+            raise HTTPException(status_code=400, detail="order_id and exit_price are required")
+        
+        # Use centralized closure
+        results = await closure_service.close_trades_by_order_id(
+            order_id=order_id,
+            exit_price=float(exit_price),
+            exit_reason=exit_reason,
+            fees=float(fees)
+        )
+        
+        return {
+            "success": True,
+            "results": results,
+            "trades_closed": len([r for r in results if r.get('success')]),
+            "message": f"Processed {len(results)} trades for order {order_id}"
+        }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in centralized order closure for {closure_data.get('order_id', 'unknown')}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/trailing-stops")

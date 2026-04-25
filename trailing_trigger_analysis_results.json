@@ -1,0 +1,49 @@
+{
+  "total_trades": 100,
+  "open_trades": 7,
+  "closed_trades": 93,
+  "trades_that_should_have_activated": [],
+  "trades_with_active_trailing": [],
+  "trades_with_inactive_trailing": [
+    {
+      "trade_id": "28057e85-42db-483b-9813-0095c56faae9",
+      "profit_pct": 0.0008996851102114068,
+      "trail_stop_status": "inactive"
+    },
+    {
+      "trade_id": "7f25f0e4-62d1-44d0-bed6-1bf710557c28",
+      "profit_pct": 0.0009172603249989547,
+      "trail_stop_status": "inactive"
+    },
+    {
+      "trade_id": "cc1eb0a7-1a69-44e4-aa67-131f13eeb3cd",
+      "profit_pct": 8.04477491869606e-05,
+      "trail_stop_status": "inactive"
+    },
+    {
+      "trade_id": "da88552f-643c-44ef-be70-91d1267ae3e3",
+      "profit_pct": -0.013468833745171042,
+      "trail_stop_status": "inactive"
+    },
+    {
+      "trade_id": "46c2dfbb-56f6-4be9-bf4e-3103af2aaa6d",
+      "profit_pct": -0.017088747883608823,
+      "trail_stop_status": "inactive"
+    },
+    {
+      "trade_id": "aab9bca6-ed0a-42b4-9dbf-377138ff3d3a",
+      "profit_pct": -0.0006053268765132505,
+      "trail_stop_status": "inactive"
+    },
+    {
+      "trade_id": "67eba0f7-c112-49d5-82bf-6a9043e92c8d",
+      "profit_pct": -0.017088747883608823,
+      "trail_stop_status": "inactive"
+    }
+  ],
+  "profit_analysis": {
+    "profitable_trades": 3,
+    "losing_trades": 4,
+    "trades_above_threshold": 0
+  }
+}

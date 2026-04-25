@@ -1,0 +1,1598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Management Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-100">
+    <div class="min-h-screen">
+        <!-- Navigation -->
+        <nav class="bg-white shadow-sm border-b">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="flex justify-between h-16">
+                    <div class="flex items-center">
+                        <h1 class="text-xl font-semibold text-gray-900">Order Management Dashboard</h1>
+                    </div>
+                    <div class="flex items-center space-x-4">
+                        <a href="/" class="text-gray-500 hover:text-gray-700">
+                            <i class="fas fa-home"></i> Home
+                        </a>
+                        <a href="/orders" class="text-blue-600 hover:text-blue-800">
+                            <i class="fas fa-list"></i> Orders
+                        </a>
+                        <a href="/profitability" class="text-gray-500 hover:text-gray-700">
+                            <i class="fas fa-chart-line"></i> Profitability
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <div class="w-full mx-auto py-6 px-4 sm:px-6 lg:px-8">
+            <!-- WebSocket Connection Status -->
+            <div class="bg-white rounded-lg shadow p-6 mb-8">
+                <div class="flex items-center justify-between">
+                    <h2 class="text-lg font-semibold text-gray-900">Real-time Connection Status</h2>
+                    <div class="flex items-center space-x-2">
+                        <div id="websocket-indicator" class="w-3 h-3 rounded-full bg-gray-400"></div>
+                        <span id="websocket-status" class="text-sm text-gray-600">Connecting...</span>
+                    </div>
+                </div>
+                <div id="websocket-details" class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- WebSocket details will be populated here -->
+                </div>
+            </div>
+
+            <!-- Order Filtering and Search -->
+            <div class="bg-white rounded-lg shadow p-6 mb-8">
+                <h2 class="text-lg font-semibold text-gray-900 mb-4">Order Filtering & Search</h2>
+                
+                <!-- Search and Filter Controls -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <!-- Search Box -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Search Orders</label>
+                        <div class="relative">
+                            <input type="text" id="order-search" placeholder="Search by ID, symbol, exchange..." 
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <div class="absolute inset-y-0 right-0 pr-3 flex items-center">
+                                <i class="fas fa-search text-gray-400"></i>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Exchange Filter -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Exchange</label>
+                        <select id="exchange-filter" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="">All Exchanges</option>
+                            <option value="binance">Binance</option>
+                            <option value="cryptocom">Crypto.com</option>
+                            <option value="bybit">Bybit</option>
+                        </select>
+                    </div>
+
+                    <!-- Order Type Filter -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Order Type</label>
+                        <select id="order-type-filter" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="">All Types</option>
+                            <option value="limit">Limit Orders</option>
+                            <option value="market">Market Orders</option>
+                        </select>
+                    </div>
+
+                    <!-- Status Filter -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Status</label>
+                        <select id="status-filter" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="">All Status</option>
+                            <option value="pending">Pending</option>
+                            <option value="filled">Filled</option>
+                            <option value="cancelled">Cancelled</option>
+                            <option value="timeout">Timeout</option>
+                            <option value="failed">Failed</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Date Range Filter -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">From Date</label>
+                        <input type="datetime-local" id="from-date" 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">To Date</label>
+                        <input type="datetime-local" id="to-date" 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    </div>
+                    <div class="flex items-end">
+                        <button id="clear-filters" class="w-full px-4 py-2 bg-gray-500 text-white rounded-md hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500">
+                            Clear Filters
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Quick Actions -->
+                <div class="flex flex-wrap gap-2">
+                    <button id="export-orders" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500">
+                        <i class="fas fa-download mr-2"></i>Export Orders
+                    </button>
+                    <button id="refresh-orders" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <i class="fas fa-sync-alt mr-2"></i>Refresh
+                    </button>
+                    <button id="bulk-cancel" class="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500">
+                        <i class="fas fa-times mr-2"></i>Bulk Cancel
+                    </button>
+                </div>
+            </div>
+
+            <!-- Orders Table -->
+            <div class="bg-white rounded-lg shadow p-6 mb-8">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-gray-900">Orders</h2>
+                    <div class="flex items-center space-x-4">
+                        <span id="orders-count" class="text-sm text-gray-600">Loading orders...</span>
+                        <div class="flex items-center space-x-2">
+                            <label class="text-sm text-gray-600">Show:</label>
+                            <select id="page-size" class="px-2 py-1 border border-gray-300 rounded text-sm">
+                                <option value="10">10</option>
+                                <option value="25">25</option>
+                                <option value="50">50</option>
+                                <option value="100">100</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                    <input type="checkbox" id="select-all" class="rounded border-gray-300">
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('order_id')">
+                                    Order ID <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('exchange')">
+                                    Exchange <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('symbol')">
+                                    Symbol <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('side')">
+                                    Side <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('type')">
+                                    Type <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('amount')">
+                                    Amount <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('price')">
+                                    Price <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('status')">
+                                    Status <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer" onclick="sortTable('created_at')">
+                                    Created <i class="fas fa-sort ml-1"></i>
+                                </th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                    Actions
+                                </th>
+                            </tr>
+                        </thead>
+                        <tbody id="orders-table-body" class="bg-white divide-y divide-gray-200">
+                            <!-- Orders will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Pagination -->
+                <div class="flex items-center justify-between mt-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="text-sm text-gray-700">Showing</span>
+                        <span id="showing-start" class="text-sm font-medium">1</span>
+                        <span class="text-sm text-gray-700">to</span>
+                        <span id="showing-end" class="text-sm font-medium">10</span>
+                        <span class="text-sm text-gray-700">of</span>
+                        <span id="total-orders" class="text-sm font-medium">0</span>
+                        <span class="text-sm text-gray-700">results</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <button id="prev-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">
+                            Previous
+                        </button>
+                        <span id="current-page" class="text-sm font-medium">1</span>
+                        <button id="next-page" class="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50">
+                            Next
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Performance Analytics -->
+            <div class="bg-white rounded-lg shadow p-6 mb-8">
+                <h2 class="text-lg font-semibold text-gray-900 mb-6">Performance Analytics</h2>
+                
+                <!-- Order Request & Outcome Summary -->
+                <div class="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-8">
+                    <div class="bg-blue-50 p-4 rounded-lg">
+                        <div class="flex items-center">
+                            <div class="p-2 bg-blue-100 rounded-lg">
+                                <i class="fas fa-paper-plane text-blue-600"></i>
+                            </div>
+                            <div class="ml-3">
+                                <p class="text-sm font-medium text-blue-700">Total Requests</p>
+                                <p class="text-xl font-bold text-blue-900" id="total-requests">0</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-green-50 p-4 rounded-lg">
+                        <div class="flex items-center">
+                            <div class="p-2 bg-green-100 rounded-lg">
+                                <i class="fas fa-check-circle text-green-600"></i>
+                            </div>
+                            <div class="ml-3">
+                                <p class="text-sm font-medium text-green-700">Successful</p>
+                                <p class="text-xl font-bold text-green-900" id="successful-orders">0</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-red-50 p-4 rounded-lg">
+                        <div class="flex items-center">
+                            <div class="p-2 bg-red-100 rounded-lg">
+                                <i class="fas fa-times-circle text-red-600"></i>
+                            </div>
+                            <div class="ml-3">
+                                <p class="text-sm font-medium text-red-700">Failed</p>
+                                <p class="text-xl font-bold text-red-900" id="failed-orders">0</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-yellow-50 p-4 rounded-lg">
+                        <div class="flex items-center">
+                            <div class="p-2 bg-yellow-100 rounded-lg">
+                                <i class="fas fa-clock text-yellow-600"></i>
+                            </div>
+                            <div class="ml-3">
+                                <p class="text-sm font-medium text-yellow-700">Pending</p>
+                                <p class="text-xl font-bold text-yellow-900" id="pending-orders">0</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Order Type Performance -->
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+                    <div class="border rounded-lg p-4">
+                        <h3 class="text-lg font-semibold text-gray-900 mb-4">Limit Order Performance</h3>
+                        <div class="space-y-3">
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Total Attempts:</span>
+                                <span class="font-semibold text-blue-600" id="limit-total">0</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Successful:</span>
+                                <span class="font-semibold text-green-600" id="limit-filled">0</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Cancelled/Timeout:</span>
+                                <span class="font-semibold text-yellow-600" id="limit-cancelled">0</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Success Rate:</span>
+                                <span class="font-semibold text-gray-900" id="limit-success-rate">0%</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Avg Fee Rate:</span>
+                                <span class="font-semibold text-green-600">~0.1% (Maker)</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="border rounded-lg p-4">
+                        <h3 class="text-lg font-semibold text-gray-900 mb-4">Market Order Performance</h3>
+                        <div class="space-y-3">
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Total Attempts:</span>
+                                <span class="font-semibold text-blue-600" id="market-total">0</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Successful:</span>
+                                <span class="font-semibold text-green-600" id="market-filled">0</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Failed:</span>
+                                <span class="font-semibold text-red-600" id="market-failed">0</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Success Rate:</span>
+                                <span class="font-semibold text-gray-900" id="market-success-rate">0%</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-sm text-gray-600">Avg Fee Rate:</span>
+                                <span class="font-semibold text-red-600">~0.4% (Taker)</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fee Impact Analysis -->
+                <div class="border-t pt-6">
+                    <h3 class="text-lg font-semibold text-gray-900 mb-4">Fee Impact Analysis</h3>
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div class="text-center p-4 bg-green-50 rounded-lg">
+                            <p class="text-2xl font-bold text-green-600" id="fee-savings">$0.00</p>
+                            <p class="text-sm text-green-700">Total Fee Savings</p>
+                            <p class="text-xs text-gray-600 mt-1">vs All Market Orders</p>
+                        </div>
+                        <div class="text-center p-4 bg-blue-50 rounded-lg">
+                            <p class="text-2xl font-bold text-blue-600" id="limit-preference">0%</p>
+                            <p class="text-sm text-blue-700">Limit Order Preference</p>
+                            <p class="text-xs text-gray-600 mt-1">First Attempt Rate</p>
+                        </div>
+                        <div class="text-center p-4 bg-purple-50 rounded-lg">
+                            <p class="text-2xl font-bold text-purple-600" id="avg-fill-time">0s</p>
+                            <p class="text-sm text-purple-700">Avg Fill Time</p>
+                            <p class="text-xs text-gray-600 mt-1">Limit Orders Only</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Real-time Alerts -->
+                <div id="performance-alerts" class="mt-6"></div>
+            </div>
+            
+            <!-- Performance Alerts -->
+            <div class="bg-white rounded-lg shadow p-6 mb-8">
+                <h2 class="text-lg font-semibold text-gray-900 mb-4">Performance Alerts</h2>
+                <div id="performance-alerts" class="space-y-3">
+                    <!-- Alerts will be populated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Order Details Modal -->
+    <div id="order-modal" class="fixed inset-0 bg-gray-600 bg-opacity-50 hidden z-50">
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full">
+                <div class="flex items-center justify-between p-6 border-b">
+                    <h3 class="text-lg font-semibold text-gray-900">Order Details</h3>
+                    <button id="close-modal" class="text-gray-400 hover:text-gray-600">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div id="order-details" class="p-6">
+                    <!-- Order details will be populated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let currentPage = 1;
+        let pageSize = 10;
+        let totalOrders = 0;
+        let allOrders = [];
+        let filteredOrders = [];
+        let sortColumn = 'created_at';
+        let sortDirection = 'desc';
+        let charts = {};
+
+        // Initialize page
+
+        function setupEventListeners() {
+            // Search and filter events
+            document.getElementById('order-search').addEventListener('input', filterOrders);
+            document.getElementById('exchange-filter').addEventListener('change', filterOrders);
+            document.getElementById('order-type-filter').addEventListener('change', filterOrders);
+            document.getElementById('status-filter').addEventListener('change', filterOrders);
+            document.getElementById('from-date').addEventListener('change', filterOrders);
+            document.getElementById('to-date').addEventListener('change', filterOrders);
+            document.getElementById('page-size').addEventListener('change', function() {
+                pageSize = parseInt(this.value);
+                currentPage = 1;
+                renderOrders();
+            });
+
+            // Action buttons
+            document.getElementById('clear-filters').addEventListener('click', clearFilters);
+            document.getElementById('export-orders').addEventListener('click', exportOrders);
+            document.getElementById('refresh-orders').addEventListener('click', loadOrdersData);
+            document.getElementById('bulk-cancel').addEventListener('click', bulkCancelOrders);
+
+            // Pagination
+            document.getElementById('prev-page').addEventListener('click', () => {
+                if (currentPage > 1) {
+                    currentPage--;
+                    renderOrders();
+                }
+            });
+            document.getElementById('next-page').addEventListener('click', () => {
+                if (currentPage < Math.ceil(filteredOrders.length / pageSize)) {
+                    currentPage++;
+                    renderOrders();
+                }
+            });
+
+            // Select all checkbox
+            document.getElementById('select-all').addEventListener('change', function() {
+                const checkboxes = document.querySelectorAll('.order-checkbox');
+                checkboxes.forEach(checkbox => checkbox.checked = this.checked);
+            });
+
+            // Modal
+            document.getElementById('close-modal').addEventListener('click', closeModal);
+        }
+
+        function setDefaultDates() {
+            const now = new Date();
+            const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            
+            document.getElementById('from-date').value = oneWeekAgo.toISOString().slice(0, 16);
+            document.getElementById('to-date').value = now.toISOString().slice(0, 16);
+        }
+
+        function clearFilters() {
+            document.getElementById('order-search').value = '';
+            document.getElementById('exchange-filter').value = '';
+            document.getElementById('order-type-filter').value = '';
+            document.getElementById('status-filter').value = '';
+            setDefaultDates();
+            filterOrders();
+        }
+
+        function filterOrders() {
+            const searchTerm = document.getElementById('order-search').value.toLowerCase();
+            const exchangeFilter = document.getElementById('exchange-filter').value;
+            const orderTypeFilter = document.getElementById('order-type-filter').value;
+            const statusFilter = document.getElementById('status-filter').value;
+            const fromDate = document.getElementById('from-date').value;
+            const toDate = document.getElementById('to-date').value;
+
+            filteredOrders = allOrders.filter(order => {
+                // Search term
+                if (searchTerm && !order.id.toLowerCase().includes(searchTerm) && 
+                    !order.symbol.toLowerCase().includes(searchTerm) && 
+                    !order.exchange.toLowerCase().includes(searchTerm)) {
+                    return false;
+                }
+
+                // Exchange filter
+                if (exchangeFilter && order.exchange !== exchangeFilter) {
+                    return false;
+                }
+
+                // Order type filter
+                if (orderTypeFilter && order.type !== orderTypeFilter) {
+                    return false;
+                }
+
+                // Status filter
+                if (statusFilter && order.status !== statusFilter) {
+                    return false;
+                }
+
+                // Date range filter
+                if (fromDate || toDate) {
+                    const orderDate = new Date(order.created_at);
+                    if (fromDate && orderDate < new Date(fromDate)) {
+                        return false;
+                    }
+                    if (toDate && orderDate > new Date(toDate)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            });
+
+            currentPage = 1;
+            renderOrders();
+            updatePerformanceMetrics();
+        }
+
+        function sortTable(column) {
+            if (sortColumn === column) {
+                sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortColumn = column;
+                sortDirection = 'asc';
+            }
+
+            filteredOrders.sort((a, b) => {
+                let aVal = a[column];
+                let bVal = b[column];
+
+                if (column === 'created_at') {
+                    aVal = new Date(aVal);
+                    bVal = new Date(bVal);
+                } else if (column === 'amount' || column === 'price') {
+                    aVal = parseFloat(aVal) || 0;
+                    bVal = parseFloat(bVal) || 0;
+                } else {
+                    aVal = String(aVal).toLowerCase();
+                    bVal = String(bVal).toLowerCase();
+                }
+
+                if (aVal < bVal) return sortDirection === 'asc' ? -1 : 1;
+                if (aVal > bVal) return sortDirection === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            renderOrders();
+        }
+
+        function renderOrders() {
+            console.log('renderOrders called with filteredOrders:', filteredOrders.length);
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = startIndex + pageSize;
+            const pageOrders = filteredOrders.slice(startIndex, endIndex);
+            console.log('Rendering', pageOrders.length, 'orders on page', currentPage);
+
+            const tbody = document.getElementById('orders-table-body');
+            tbody.innerHTML = '';
+
+            pageOrders.forEach(order => {
+                const row = document.createElement('tr');
+                row.className = 'hover:bg-gray-50';
+                row.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        <input type="checkbox" class="order-checkbox rounded border-gray-300" value="${order.id}">
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                        ${order.id}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                            ${order.exchange}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        ${order.symbol}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${order.side === 'buy' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                            ${order.side.toUpperCase()}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
+                            ${order.type}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        ${parseFloat(order.amount).toFixed(6)}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        ${order.price ? parseFloat(order.price).toFixed(6) : 'N/A'}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(order.status)}">
+                            ${order.status}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        ${new Date(order.created_at).toLocaleString()}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        <button onclick="viewOrderDetails('${order.id}')" class="text-blue-600 hover:text-blue-900 mr-2">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                        ${order.status === 'pending' ? `
+                            <button onclick="cancelOrder('${order.id}')" class="text-red-600 hover:text-red-900">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        ` : ''}
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+
+            // Update pagination info
+            document.getElementById('showing-start').textContent = startIndex + 1;
+            document.getElementById('showing-end').textContent = Math.min(endIndex, filteredOrders.length);
+            document.getElementById('total-orders').textContent = filteredOrders.length;
+            document.getElementById('current-page').textContent = currentPage;
+            document.getElementById('orders-count').textContent = `${filteredOrders.length} orders`;
+
+            // Update pagination buttons
+            document.getElementById('prev-page').disabled = currentPage === 1;
+            document.getElementById('next-page').disabled = currentPage >= Math.ceil(filteredOrders.length / pageSize);
+        }
+
+        function getStatusColor(status) {
+            const colors = {
+                'pending': 'bg-yellow-100 text-yellow-800',
+                'filled': 'bg-green-100 text-green-800',
+                'cancelled': 'bg-gray-100 text-gray-800',
+                'timeout': 'bg-orange-100 text-orange-800',
+                'failed': 'bg-red-100 text-red-800'
+            };
+            return colors[status] || 'bg-gray-100 text-gray-800';
+        }
+
+        function viewOrderDetails(orderId) {
+            const order = allOrders.find(o => o.id === orderId);
+            if (!order) return;
+
+            const details = document.getElementById('order-details');
+            details.innerHTML = `
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <h4 class="font-medium text-gray-900">Order Information</h4>
+                        <dl class="mt-2 space-y-1">
+                            <div><dt class="text-sm text-gray-500">Order ID:</dt><dd class="text-sm text-gray-900">${order.id}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Exchange:</dt><dd class="text-sm text-gray-900">${order.exchange}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Symbol:</dt><dd class="text-sm text-gray-900">${order.symbol}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Side:</dt><dd class="text-sm text-gray-900">${order.side}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Type:</dt><dd class="text-sm text-gray-900">${order.type}</dd></div>
+                        </dl>
+                    </div>
+                    <div>
+                        <h4 class="font-medium text-gray-900">Order Details</h4>
+                        <dl class="mt-2 space-y-1">
+                            <div><dt class="text-sm text-gray-500">Amount:</dt><dd class="text-sm text-gray-900">${parseFloat(order.amount).toFixed(6)}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Price:</dt><dd class="text-sm text-gray-900">${order.price ? parseFloat(order.price).toFixed(6) : 'N/A'}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Status:</dt><dd class="text-sm text-gray-900">${order.status}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Created:</dt><dd class="text-sm text-gray-900">${new Date(order.created_at).toLocaleString()}</dd></div>
+                            <div><dt class="text-sm text-gray-500">Updated:</dt><dd class="text-sm text-gray-900">${order.updated_at ? new Date(order.updated_at).toLocaleString() : 'N/A'}</dd></div>
+                        </dl>
+                    </div>
+                </div>
+            `;
+
+            document.getElementById('order-modal').classList.remove('hidden');
+        }
+
+        function closeModal() {
+            document.getElementById('order-modal').classList.add('hidden');
+        }
+
+        function cancelOrder(orderId) {
+            if (confirm('Are you sure you want to cancel this order?')) {
+                // Implement order cancellation
+                console.log('Cancelling order:', orderId);
+            }
+        }
+
+        function bulkCancelOrders() {
+            const selectedOrders = Array.from(document.querySelectorAll('.order-checkbox:checked')).map(cb => cb.value);
+            if (selectedOrders.length === 0) {
+                alert('Please select orders to cancel');
+                return;
+            }
+            if (confirm(`Are you sure you want to cancel ${selectedOrders.length} orders?`)) {
+                // Implement bulk cancellation
+                console.log('Bulk cancelling orders:', selectedOrders);
+            }
+        }
+
+        function exportOrders() {
+            const csvContent = generateCSV(filteredOrders);
+            const blob = new Blob([csvContent], { type: 'text/csv' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `orders_${new Date().toISOString().split('T')[0]}.csv`;
+            a.click();
+            window.URL.revokeObjectURL(url);
+        }
+
+                 function generateCSV(orders) {
+             const headers = ['Order ID', 'Exchange', 'Symbol', 'Side', 'Type', 'Amount', 'Price', 'Status', 'Created At'];
+             const rows = orders.map(order => [
+                 order.id,
+                 order.exchange,
+                 order.symbol,
+                 order.side,
+                 order.type,
+                 order.amount,
+                 order.price || '',
+                 order.status,
+                 order.created_at
+             ]);
+             return [headers, ...rows].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+         }
+
+         // Load orders from API
+         async function loadOrders() {
+             try {
+                 const response = await fetch('/api/v1/orders');
+                 if (response.ok) {
+                     const data = await response.json();
+                     allOrders = data.orders || [];
+                     filteredOrders = [...allOrders];
+                     renderOrders();
+                     updatePerformanceMetrics();
+                 }
+             } catch (error) {
+                 console.error('Error loading orders:', error);
+             }
+         }
+
+         // Load performance metrics
+         async function loadPerformanceMetrics() {
+             try {
+                 const response = await fetch('/api/v1/orders/performance');
+                 if (response.ok) {
+                     const data = await response.json();
+                     updatePerformanceMetrics(data);
+                     updatePerformanceCharts(data);
+                     updatePerformanceAlerts(data);
+                 }
+             } catch (error) {
+                 console.error('Error loading performance metrics:', error);
+             }
+         }
+
+         // Update performance metrics display
+         function updatePerformanceMetrics(data) {
+             if (!data) return;
+             
+             // Calculate metrics from filtered orders
+             const limitOrders = filteredOrders.filter(order => order.order_type === 'limit');
+             const marketOrders = filteredOrders.filter(order => order.order_type === 'market');
+             
+             const limitFilled = limitOrders.filter(order => order.status === 'filled' || order.status === 'closed').length;
+             const limitCancelled = limitOrders.filter(order => order.status === 'cancelled' || order.status === 'timeout').length;
+             const limitTotal = limitOrders.length;
+             
+             const marketFilled = marketOrders.filter(order => order.status === 'filled' || order.status === 'closed').length;
+             const marketFailed = marketOrders.filter(order => order.status === 'failed' || order.status === 'rejected').length;
+             const marketTotal = marketOrders.length;
+             
+             const totalRequests = filteredOrders.length;
+             const successfulOrders = limitFilled + marketFilled;
+             const failedOrders = limitCancelled + marketFailed;
+             const pendingOrders = filteredOrders.filter(order => order.status === 'pending' || order.status === 'open').length;
+             
+             // Update Performance Analytics sections
+             document.getElementById('total-requests').textContent = totalRequests;
+             document.getElementById('successful-orders').textContent = successfulOrders;
+             document.getElementById('failed-orders').textContent = failedOrders;
+             document.getElementById('pending-orders').textContent = pendingOrders;
+             
+             // Update Limit Order Performance
+             document.getElementById('limit-total').textContent = limitTotal;
+             document.getElementById('limit-filled').textContent = limitFilled;
+             document.getElementById('limit-cancelled').textContent = limitCancelled;
+             document.getElementById('limit-success-rate').textContent = limitTotal > 0 ? 
+                 Math.round((limitFilled / limitTotal) * 100) + '%' : '0%';
+             
+             // Update Market Order Performance
+             document.getElementById('market-total').textContent = marketTotal;
+             document.getElementById('market-filled').textContent = marketFilled;
+             document.getElementById('market-failed').textContent = marketFailed;
+             document.getElementById('market-success-rate').textContent = marketTotal > 0 ? 
+                 Math.round((marketFilled / marketTotal) * 100) + '%' : '0%';
+             
+             // Calculate fee savings (estimate)
+             const avgLimitFee = 0.001; // 0.1%
+             const avgMarketFee = 0.004; // 0.4%
+             const estimatedLimitVolume = limitFilled * 100; // Rough estimate
+             const feeSavings = estimatedLimitVolume * (avgMarketFee - avgLimitFee);
+             
+             const feeSavingsElement = document.getElementById('fee-savings');
+             if (feeSavingsElement) {
+                 feeSavingsElement.textContent = '$' + feeSavings.toFixed(2);
+             }
+         }
+
+         // Initialize charts
+         function initializeCharts() {
+             // Success Rate Chart
+             const successRateCtx = document.getElementById('successRateChart').getContext('2d');
+             charts.successRate = new Chart(successRateCtx, {
+                 type: 'doughnut',
+                 data: {
+                     labels: ['Limit Orders', 'Market Orders'],
+                     datasets: [{
+                         data: [0, 0],
+                         backgroundColor: ['#3B82F6', '#10B981'],
+                         borderWidth: 2,
+                         borderColor: '#ffffff'
+                     }]
+                 },
+                 options: {
+                     responsive: true,
+                     maintainAspectRatio: false,
+                     plugins: {
+                         legend: {
+                             position: 'bottom'
+                         }
+                     }
+                 }
+             });
+
+             // Fill Time Chart
+             const fillTimeCtx = document.getElementById('fillTimeChart').getContext('2d');
+             charts.fillTime = new Chart(fillTimeCtx, {
+                 type: 'line',
+                 data: {
+                     labels: [],
+                     datasets: [{
+                         label: 'Average Fill Time (seconds)',
+                         data: [],
+                         borderColor: '#8B5CF6',
+                         backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                         tension: 0.4
+                     }]
+                 },
+                 options: {
+                     responsive: true,
+                     maintainAspectRatio: false,
+                     scales: {
+                         y: {
+                             beginAtZero: true
+                         }
+                     }
+                 }
+             });
+
+             // Fee Savings Chart
+             const feeSavingsCtx = document.getElementById('feeSavingsChart').getContext('2d');
+             charts.feeSavings = new Chart(feeSavingsCtx, {
+                 type: 'bar',
+                 data: {
+                     labels: [],
+                     datasets: [{
+                         label: 'Fee Savings',
+                         data: [],
+                         backgroundColor: '#F59E0B',
+                         borderColor: '#D97706',
+                         borderWidth: 1
+                     }]
+                 },
+                 options: {
+                     responsive: true,
+                     maintainAspectRatio: false,
+                     scales: {
+                         y: {
+                             beginAtZero: true
+                         }
+                     }
+                 }
+             });
+
+             // Order Type Distribution Chart
+             const orderTypeCtx = document.getElementById('orderTypeChart').getContext('2d');
+             charts.orderType = new Chart(orderTypeCtx, {
+                 type: 'pie',
+                 data: {
+                     labels: ['Limit Orders', 'Market Orders'],
+                     datasets: [{
+                         data: [0, 0],
+                         backgroundColor: ['#3B82F6', '#10B981'],
+                         borderWidth: 2,
+                         borderColor: '#ffffff'
+                     }]
+                 },
+                 options: {
+                     responsive: true,
+                     maintainAspectRatio: false,
+                     plugins: {
+                         legend: {
+                             position: 'bottom'
+                         }
+                     }
+                 }
+             });
+         }
+
+         // Update performance charts
+         function updatePerformanceCharts(data) {
+             if (!data) return;
+
+             // Update Success Rate Chart
+             if (data.success_rates && charts.successRate) {
+                 charts.successRate.data.datasets[0].data = [
+                     Math.round(data.success_rates.limit_orders * 100),
+                     Math.round(data.success_rates.market_orders * 100)
+                 ];
+                 charts.successRate.update();
+             }
+
+             // Update Order Type Distribution Chart
+             if (data.order_counts && charts.orderType) {
+                 charts.orderType.data.datasets[0].data = [
+                     data.order_counts.limit_orders.total,
+                     data.order_counts.market_orders.total
+                 ];
+                 charts.orderType.update();
+             }
+
+             // Update Fill Time Chart (add new data point)
+             if (data.performance_metrics && charts.fillTime) {
+                 const avgFillTime = data.performance_metrics.avg_fill_time;
+                 const now = new Date().toLocaleTimeString();
+                 
+                 charts.fillTime.data.labels.push(now);
+                 charts.fillTime.data.datasets[0].data.push(avgFillTime);
+                 
+                 // Keep only last 10 data points
+                 if (charts.fillTime.data.labels.length > 10) {
+                     charts.fillTime.data.labels.shift();
+                     charts.fillTime.data.datasets[0].data.shift();
+                 }
+                 
+                 charts.fillTime.update();
+             }
+
+             // Update Fee Savings Chart (add new data point)
+             if (data.performance_metrics && charts.feeSavings) {
+                 const feeSavings = data.performance_metrics.total_fee_savings;
+                 const now = new Date().toLocaleTimeString();
+                 
+                 charts.feeSavings.data.labels.push(now);
+                 charts.feeSavings.data.datasets[0].data.push(feeSavings);
+                 
+                 // Keep only last 10 data points
+                 if (charts.feeSavings.data.labels.length > 10) {
+                     charts.feeSavings.data.labels.shift();
+                     charts.feeSavings.data.datasets[0].data.shift();
+                 }
+                 
+                 charts.feeSavings.update();
+             }
+         }
+
+         // Update performance alerts
+         function updatePerformanceAlerts(data) {
+             if (!data || !data.alerts) return;
+             
+             const alertsContainer = document.getElementById('performance-alerts');
+             if (!alertsContainer) return;
+
+             alertsContainer.innerHTML = data.alerts.map(alert => `
+                 <div class="flex items-start p-4 border rounded-lg ${alert.type === 'error' ? 'border-red-200 bg-red-50' : 'border-yellow-200 bg-yellow-50'}">
+                     <div class="flex-shrink-0">
+                         <i class="fas ${alert.type === 'error' ? 'fa-exclamation-triangle text-red-400' : 'fa-exclamation-circle text-yellow-400'}"></i>
+                     </div>
+                     <div class="ml-3">
+                         <h3 class="text-sm font-medium ${alert.type === 'error' ? 'text-red-800' : 'text-yellow-800'}">
+                             ${alert.title}
+                         </h3>
+                         <div class="mt-2 text-sm ${alert.type === 'error' ? 'text-red-700' : 'text-yellow-700'}">
+                             <p>${alert.message}</p>
+                         </div>
+                         <div class="mt-2 text-xs text-gray-500">
+                             ${new Date(alert.timestamp).toLocaleString()}
+                         </div>
+                     </div>
+                 </div>
+             `).join('');
+         }
+
+         // WebSocket connection for real-time updates
+         function connectWebSocket() {
+             try {
+                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                 const wsUrl = `${protocol}//${window.location.host}/ws/orders`;
+                 
+                 websocket = new WebSocket(wsUrl);
+                 
+                 websocket.onopen = function(event) {
+                     console.log('WebSocket connected for real-time order updates');
+                     updateWebSocketConnectionStatus(true);
+                 };
+                 
+                 websocket.onmessage = function(event) {
+                     try {
+                         const data = JSON.parse(event.data);
+                         if (data.type === 'order_update') {
+                             if (data.performance_metrics) {
+                                 updatePerformanceMetrics(data.performance_metrics);
+                                 updatePerformanceCharts(data.performance_metrics);
+                                 updatePerformanceAlerts(data.performance_metrics);
+                             }
+                             if (data.websocket_status) {
+                                 updateWebSocketStatus(data.websocket_status.connections);
+                             }
+                         }
+                     } catch (error) {
+                         console.error('Error parsing WebSocket message:', error);
+                     }
+                 };
+                 
+                 websocket.onclose = function(event) {
+                     console.log('WebSocket disconnected');
+                     updateWebSocketConnectionStatus(false);
+                     setTimeout(connectWebSocket, 5000); // Reconnect
+                 };
+                 
+                 websocket.onerror = function(error) {
+                     console.error('WebSocket error:', error);
+                     updateWebSocketConnectionStatus(false);
+                 };
+             } catch (error) {
+                 console.error('Error connecting to WebSocket:', error);
+                 updateWebSocketConnectionStatus(false);
+             }
+         }
+
+         // Update WebSocket status display
+         function updateWebSocketStatus(connections) {
+             const detailsContainer = document.getElementById('websocket-details');
+             if (!detailsContainer) return;
+
+             detailsContainer.innerHTML = Object.entries(connections).map(([exchange, status]) => `
+                 <div class="flex items-center justify-between p-4 border rounded-lg">
+                     <div class="flex items-center">
+                         <div class="w-3 h-3 rounded-full ${status.connected ? 'bg-green-500' : 'bg-red-500'}"></div>
+                         <span class="ml-2 font-medium text-gray-900">${exchange.charAt(0).toUpperCase() + exchange.slice(1)}</span>
+                     </div>
+                     <span class="text-sm text-gray-500">${status.status}</span>
+                 </div>
+             `).join('');
+         }
+
+         // Update WebSocket connection status
+         function updateWebSocketConnectionStatus(connected) {
+             const statusIndicator = document.getElementById('websocket-indicator');
+             const statusText = document.getElementById('websocket-status');
+             
+             if (statusIndicator) {
+                 statusIndicator.className = `w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`;
+                 statusIndicator.title = connected ? 'WebSocket Connected' : 'WebSocket Disconnected';
+             }
+             if (statusText) {
+                 statusText.textContent = connected ? 'Connected' : 'Disconnected';
+                 statusText.className = `text-sm ${connected ? 'text-green-600' : 'text-red-600'}`;
+             }
+         }
+
+         // Orders data
+        let ordersData = {
+            database_orders: [],
+            realtime_orders: {},
+            summary: {}
+        };
+
+        // Load orders data - SIMPLIFIED VERSION
+        async function loadOrdersData() {
+            try {
+                const response = await fetch('/api/v1/orders?t=' + Date.now());
+                const data = await response.json();
+                
+                // Direct table update - bypass complex processing
+                const orders = data.orders || [];
+                const tableBody = document.getElementById('orders-table-body');
+                
+                // Clear and populate table directly
+                let html = '';
+                for (let i = 0; i < Math.min(10, orders.length); i++) {
+                    const order = orders[i];
+                    html += `<tr>
+                        <td class="px-6 py-4">${order.id}</td>
+                        <td class="px-6 py-4">${order.exchange}</td>
+                        <td class="px-6 py-4">${order.symbol}</td>
+                        <td class="px-6 py-4">${order.side}</td>
+                        <td class="px-6 py-4">${order.type}</td>
+                        <td class="px-6 py-4">${order.amount}</td>
+                        <td class="px-6 py-4">${order.price || 'N/A'}</td>
+                        <td class="px-6 py-4">${order.status}</td>
+                        <td class="px-6 py-4">${order.created_at}</td>
+                        <td class="px-6 py-4">View</td>
+                    </tr>`;
+                }
+                
+                tableBody.innerHTML = html;
+                
+                // Update counts directly
+                document.getElementById('orders-count').textContent = `${orders.length} orders`;
+                document.getElementById('total-orders').textContent = orders.length;
+                document.getElementById('showing-end').textContent = Math.min(10, orders.length);
+                
+            } catch (error) {
+                console.error('Error loading orders:', error);
+                document.getElementById('orders-count').textContent = 'Error loading orders';
+            }
+        }
+
+        // Update orders display
+        function updateOrdersDisplay() {
+            updateSummaryCards();
+            updateOrdersTable();
+        }
+
+        // Update summary cards
+        function updateSummaryCards() {
+            const summary = ordersData.summary;
+            document.getElementById('total-orders').textContent = summary.total_orders || 0;
+            document.getElementById('pending-orders').textContent = summary.pending_orders || 0;
+            document.getElementById('filled-orders').textContent = summary.filled_orders || 0;
+            document.getElementById('cancelled-orders').textContent = summary.cancelled_orders || 0;
+        }
+
+        // Update orders table
+        function updateOrdersTable() {
+            try {
+                console.log('updateOrdersTable called, database_orders:', ordersData.database_orders?.length);
+                const tableBody = document.getElementById('orders-table-body');
+                const exchangeFilter = document.getElementById('exchange-filter').value;
+                const statusFilter = document.getElementById('status-filter').value;
+                
+                // Combine database and realtime orders
+                let allOrders = [...ordersData.database_orders];
+            
+            // Add realtime orders that aren't in database
+            Object.entries(ordersData.realtime_orders).forEach(([exchange, orders]) => {
+                orders.forEach(order => {
+                    const existingOrder = allOrders.find(o => o.id === order.id);
+                    if (!existingOrder) {
+                        allOrders.push({...order, exchange});
+                    }
+                });
+            });
+            
+            // Apply filters
+            let filteredOrders = allOrders;
+            if (exchangeFilter) {
+                filteredOrders = filteredOrders.filter(order => order.exchange === exchangeFilter);
+            }
+            if (statusFilter) {
+                filteredOrders = filteredOrders.filter(order => order.status === statusFilter);
+            }
+            
+            // Sort by creation time (newest first)
+            filteredOrders.sort((a, b) => new Date(b.created_at || b.timestamp) - new Date(a.created_at || a.timestamp));
+            
+            // Apply pagination
+            const pageSize = parseInt(document.getElementById('page-size').value) || 10;
+            const currentPage = 1; // For now, just show first page
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = Math.min(startIndex + pageSize, filteredOrders.length);
+            const pageOrders = filteredOrders.slice(startIndex, endIndex);
+            
+            // Generate table rows - simplified version
+            let tableHTML = '';
+            for (let i = 0; i < pageOrders.length; i++) {
+                const order = pageOrders[i];
+                tableHTML += `<tr class="hover:bg-gray-50">
+                    <td class="px-6 py-4">${order.id || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.exchange || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.symbol || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.side || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.type || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.amount || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.price || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.status || 'N/A'}</td>
+                    <td class="px-6 py-4">${order.created_at || 'N/A'}</td>
+                    <td class="px-6 py-4">Actions</td>
+                </tr>`;
+            }
+            tableBody.innerHTML = tableHTML;
+            
+            // Update pagination info
+            const totalOrders = filteredOrders.length;
+            
+            // Update showing info
+            document.getElementById('showing-start').textContent = totalOrders > 0 ? startIndex + 1 : 0;
+            document.getElementById('showing-end').textContent = endIndex;
+            document.getElementById('total-orders').textContent = totalOrders;
+            document.getElementById('orders-count').textContent = `${totalOrders} orders`;
+            } catch (error) {
+                console.error('Error in updateOrdersTable:', error);
+                document.getElementById('orders-count').textContent = 'Error loading orders';
+            }
+        }
+
+        // Format date
+        function formatDate(dateString) {
+            if (!dateString) return 'N/A';
+            const date = new Date(dateString);
+            return date.toLocaleString();
+        }
+
+        // Refresh orders
+        function refreshOrders() {
+            loadOrdersData();
+        }
+
+        // Performance charts
+        let successRateChart, fillTimeChart, feeSavingsChart, orderTypeChart;
+
+        // Initialize charts
+        function initializeCharts() {
+            // Success Rate Chart
+            const successRateCtx = document.getElementById('successRateChart').getContext('2d');
+            successRateChart = new Chart(successRateCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Limit Orders', 'Market Orders'],
+                    datasets: [{
+                        data: [0, 0],
+                        backgroundColor: ['#3B82F6', '#10B981'],
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        }
+                    }
+                }
+            });
+
+            // Fill Time Chart
+            const fillTimeCtx = document.getElementById('fillTimeChart').getContext('2d');
+            fillTimeChart = new Chart(fillTimeCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Fill Time (seconds)',
+                        data: [],
+                        borderColor: '#8B5CF6',
+                        backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+
+            // Fee Savings Chart
+            const feeSavingsCtx = document.getElementById('feeSavingsChart').getContext('2d');
+            feeSavingsChart = new Chart(feeSavingsCtx, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Fee Savings ($)',
+                        data: [],
+                        backgroundColor: '#F59E0B',
+                        borderColor: '#D97706',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+
+            // Order Type Chart
+            const orderTypeCtx = document.getElementById('orderTypeChart').getContext('2d');
+            orderTypeChart = new Chart(orderTypeCtx, {
+                type: 'pie',
+                data: {
+                    labels: ['Limit Orders', 'Market Orders'],
+                    datasets: [{
+                        data: [0, 0],
+                        backgroundColor: ['#3B82F6', '#10B981'],
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        }
+                    }
+                }
+            });
+        }
+
+        // Load performance metrics
+        async function loadPerformanceMetrics() {
+            try {
+                const response = await fetch('/api/v1/orders/performance');
+                const data = await response.json();
+                
+                if (!data.error) {
+                    updatePerformanceMetrics(data);
+                    updatePerformanceCharts(data);
+                    updatePerformanceAlerts(data);
+                } else {
+                    console.error('Failed to load performance metrics:', data.error);
+                }
+            } catch (error) {
+                console.error('Error loading performance metrics:', error);
+            }
+        }
+
+        // Update performance metrics display
+        function updatePerformanceMetrics(data) {
+            // Limit orders
+            const limitOrders = data.limit_orders || {};
+            document.getElementById('limit-orders-total').textContent = limitOrders.total || 0;
+            const limitSuccessRate = limitOrders.success_rate || 0;
+            document.getElementById('limit-orders-success-rate').textContent = `${(limitSuccessRate * 100).toFixed(1)}%`;
+            
+            // Market orders
+            const marketOrders = data.market_orders || {};
+            document.getElementById('market-orders-total').textContent = marketOrders.total || 0;
+            const marketSuccessRate = marketOrders.success_rate || 0;
+            document.getElementById('market-orders-success-rate').textContent = `${(marketSuccessRate * 100).toFixed(1)}%`;
+            
+            // Performance metrics
+            const performance = data.performance || {};
+            const avgFillTime = performance.average_fill_time_seconds || 0;
+            document.getElementById('avg-fill-time').textContent = `${avgFillTime.toFixed(1)}s`;
+            
+            const totalFeeSavings = performance.total_fee_savings_usd || 0;
+            document.getElementById('total-fee-savings').textContent = `$${totalFeeSavings.toFixed(2)}`;
+        }
+
+        // Update performance charts
+        function updatePerformanceCharts(data) {
+            const limitOrders = data.limit_orders || {};
+            const marketOrders = data.market_orders || {};
+            const performance = data.performance || {};
+            const recentFillTimes = data.recent_fill_times || [];
+            const recentFeeSavings = data.recent_fee_savings || [];
+
+            // Update Success Rate Chart
+            successRateChart.data.datasets[0].data = [
+                limitOrders.filled || 0,
+                marketOrders.filled || 0
+            ];
+            successRateChart.update();
+
+            // Update Fill Time Chart
+            const fillTimeLabels = recentFillTimes.map((_, index) => `Order ${index + 1}`);
+            const fillTimeData = recentFillTimes.map(item => item.fill_time || 0);
+            fillTimeChart.data.labels = fillTimeLabels;
+            fillTimeChart.data.datasets[0].data = fillTimeData;
+            fillTimeChart.update();
+
+            // Update Fee Savings Chart
+            const feeSavingsLabels = recentFeeSavings.map((_, index) => `Order ${index + 1}`);
+            const feeSavingsData = recentFeeSavings.map(item => item.fee_saved || 0);
+            feeSavingsChart.data.labels = feeSavingsLabels;
+            feeSavingsChart.data.datasets[0].data = feeSavingsData;
+            feeSavingsChart.update();
+
+            // Update Order Type Chart
+            orderTypeChart.data.datasets[0].data = [
+                limitOrders.total || 0,
+                marketOrders.total || 0
+            ];
+            orderTypeChart.update();
+        }
+
+        // Update performance alerts
+        function updatePerformanceAlerts(data) {
+            const alertsContainer = document.getElementById('performance-alerts');
+            const alerts = [];
+
+            const limitOrders = data.limit_orders || {};
+            const marketOrders = data.market_orders || {};
+            const performance = data.performance || {};
+
+            // Check limit order success rate
+            if (limitOrders.total > 0) {
+                const limitSuccessRate = limitOrders.success_rate || 0;
+                if (limitSuccessRate < 0.7) {
+                    alerts.push({
+                        type: 'warning',
+                        message: `Low limit order success rate: ${(limitSuccessRate * 100).toFixed(1)}%. Consider adjusting spread settings.`
+                    });
+                }
+            }
+
+            // Check market order success rate
+            if (marketOrders.total > 0) {
+                const marketSuccessRate = marketOrders.success_rate || 0;
+                if (marketSuccessRate < 0.9) {
+                    alerts.push({
+                        type: 'error',
+                        message: `Low market order success rate: ${(marketSuccessRate * 100).toFixed(1)}%. Check exchange connectivity.`
+                    });
+                }
+            }
+
+            // Check fill time
+            const avgFillTime = performance.average_fill_time_seconds || 0;
+            if (avgFillTime > 60) {
+                alerts.push({
+                    type: 'warning',
+                    message: `High average fill time: ${avgFillTime.toFixed(1)}s. Consider using market orders for faster execution.`
+                });
+            }
+
+            // Check fee savings
+            const totalFeeSavings = performance.total_fee_savings_usd || 0;
+            if (totalFeeSavings > 0) {
+                alerts.push({
+                    type: 'success',
+                    message: `Fee savings achieved: $${totalFeeSavings.toFixed(2)} from limit orders.`
+                });
+            }
+
+            // Display alerts
+            alertsContainer.innerHTML = alerts.map(alert => `
+                <div class="flex items-center p-3 rounded-lg ${
+                    alert.type === 'success' ? 'bg-green-50 border border-green-200' :
+                    alert.type === 'warning' ? 'bg-yellow-50 border border-yellow-200' :
+                    'bg-red-50 border border-red-200'
+                }">
+                    <div class="flex-shrink-0">
+                        <i data-feather="${
+                            alert.type === 'success' ? 'check-circle' :
+                            alert.type === 'warning' ? 'alert-triangle' :
+                            'x-circle'
+                        }" class="w-5 h-5 ${
+                            alert.type === 'success' ? 'text-green-600' :
+                            alert.type === 'warning' ? 'text-yellow-600' :
+                            'text-red-600'
+                        }"></i>
+                    </div>
+                    <div class="ml-3">
+                        <p class="text-sm ${
+                            alert.type === 'success' ? 'text-green-800' :
+                            alert.type === 'warning' ? 'text-yellow-800' :
+                            'text-red-800'
+                        }">${alert.message}</p>
+                    </div>
+                </div>
+            `).join('');
+
+            // Re-initialize Feather icons for new alerts
+            feather.replace();
+        }
+
+        // WebSocket connection for real-time updates
+        let websocket = null;
+
+        // Connect to WebSocket for real-time updates
+        function connectWebSocket() {
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/orders`;
+                
+                websocket = new WebSocket(wsUrl);
+                
+                websocket.onopen = function(event) {
+                    console.log('WebSocket connected for real-time order updates');
+                    updateWebSocketConnectionStatus(true);
+                };
+                
+                websocket.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'order_update') {
+                            // Update performance metrics in real-time
+                            if (data.performance_metrics) {
+                                updatePerformanceMetrics(data.performance_metrics);
+                                updatePerformanceCharts(data.performance_metrics);
+                                updatePerformanceAlerts(data.performance_metrics);
+                            }
+                            
+                            // Update WebSocket status
+                            if (data.websocket_status) {
+                                updateWebSocketStatus(data.websocket_status.connections);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error parsing WebSocket message:', error);
+                    }
+                };
+                
+                websocket.onclose = function(event) {
+                    console.log('WebSocket disconnected');
+                    updateWebSocketConnectionStatus(false);
+                    // Try to reconnect after 5 seconds
+                    setTimeout(connectWebSocket, 5000);
+                };
+                
+                websocket.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                    updateWebSocketConnectionStatus(false);
+                };
+                
+            } catch (error) {
+                console.error('Error connecting to WebSocket:', error);
+                updateWebSocketConnectionStatus(false);
+            }
+        }
+
+        // Update WebSocket connection status
+        function updateWebSocketConnectionStatus(connected) {
+            const statusIndicator = document.getElementById('websocket-indicator');
+            const statusText = document.getElementById('websocket-status');
+            const detailsContainer = document.getElementById('websocket-details');
+
+            if (statusIndicator) {
+                statusIndicator.className = `w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`;
+                statusIndicator.title = connected ? 'WebSocket Connected' : 'WebSocket Disconnected';
+            }
+            if (statusText) {
+                statusText.textContent = connected ? 'Connected' : 'Disconnected';
+                statusText.className = `text-sm ${connected ? 'text-green-600' : 'text-red-600'}`;
+            }
+            if (detailsContainer) {
+                detailsContainer.innerHTML = Object.entries(data.websocket_status.connections).map(([exchange, status]) => `
+                    <div class="flex items-center justify-between p-4 border rounded-lg">
+                        <div class="flex items-center">
+                            <div class="w-3 h-3 rounded-full ${
+                                status.connected ? 'bg-green-500' : 'bg-red-500'
+                            }"></div>
+                            <span class="ml-2 font-medium text-gray-900">${exchange.charAt(0).toUpperCase() + exchange.slice(1)}</span>
+                        </div>
+                        <span class="text-sm text-gray-500">${status.status}</span>
+                    </div>
+                `).join('');
+            }
+        }
+
+        // Load WebSocket status
+        async function loadWebSocketStatus() {
+            try {
+                const response = await fetch('/api/v1/orders/websocket/status');
+                const data = await response.json();
+                
+                if (!data.error) {
+                    updateWebSocketStatus(data.connections);
+                } else {
+                    console.error('Failed to load WebSocket status:', data.error);
+                }
+            } catch (error) {
+                console.error('Error loading WebSocket status:', error);
+            }
+        }
+
+        // Update WebSocket status display
+        function updateWebSocketStatus(connections) {
+            const statusContainer = document.getElementById('websocket-status');
+            if (statusContainer) {
+                statusContainer.innerHTML = Object.entries(connections).map(([exchange, status]) => `
+                    <div class="flex items-center justify-between p-4 border rounded-lg">
+                        <div class="flex items-center">
+                            <div class="w-3 h-3 rounded-full ${
+                                status.connected ? 'bg-green-500' : 'bg-red-500'
+                            }"></div>
+                            <span class="ml-2 font-medium text-gray-900">${exchange.charAt(0).toUpperCase() + exchange.slice(1)}</span>
+                        </div>
+                        <span class="text-sm text-gray-500">${status.status}</span>
+                    </div>
+                `).join('');
+            }
+        }
+
+        // Filter change handlers
+        document.getElementById('exchange-filter').addEventListener('change', filterOrders);
+        document.getElementById('status-filter').addEventListener('change', filterOrders);
+
+        // Auto-refresh every 30 seconds
+        setInterval(loadOrdersData, 30000);
+        setInterval(loadPerformanceMetrics, 30000);
+
+        // Wait for DOM to be ready, then initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            setupEventListeners();
+            setDefaultDates();
+            loadOrdersData();
+        });
+    </script>
+</body>
+</html> 

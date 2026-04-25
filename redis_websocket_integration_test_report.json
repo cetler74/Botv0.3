@@ -1,0 +1,93 @@
+{
+  "timestamp": "2025-08-31T18:45:21.672859",
+  "test_name": "Redis WebSocket Integration Test",
+  "results": {
+    "exchange_health": true,
+    "binance_websocket_status": {
+      "enabled": true,
+      "status": "active",
+      "initialized": true,
+      "running": true,
+      "connected": true,
+      "stream_status": {
+        "is_running": true,
+        "is_connected": true,
+        "is_healthy": false,
+        "listen_key_valid": true,
+        "websocket_url": true,
+        "message_queue_size": 0,
+        "callbacks_registered": 5,
+        "uptime": "2025-08-31T18:40:55.782751",
+        "last_message": "2025-08-31T18:41:13.832812",
+        "connection_manager_status": {
+          "service": "binance-websocket",
+          "state": "disconnected",
+          "healthy": false,
+          "connection_attempts": 0,
+          "consecutive_failures": 0,
+          "uptime_seconds": 0,
+          "last_connection": null,
+          "last_disconnect": null,
+          "last_message": null,
+          "circuit_breaker_open": false,
+          "circuit_breaker_open_since": null,
+          "metrics": {
+            "total_connections": 0,
+            "total_disconnections": 0,
+            "consecutive_failures": 0,
+            "uptime_seconds": 0,
+            "messages_received": 0,
+            "errors_count": 0,
+            "reconnections": 0,
+            "circuit_breaker_trips": 0
+          }
+        },
+        "error_handler_stats": {
+          "service": "binance-websocket",
+          "total_errors": 0,
+          "errors_by_category": {
+            "network": 0,
+            "authentication": 0,
+            "rate_limit": 0,
+            "data_format": 0,
+            "api_error": 0,
+            "system": 0,
+            "unknown": 0
+          },
+          "errors_by_severity": {
+            "low": 0,
+            "medium": 0,
+            "high": 0,
+            "critical": 0
+          },
+          "recent_errors_count": 0,
+          "last_error_time": null
+        },
+        "recovery_manager_stats": {
+          "service": "binance-websocket",
+          "active_recoveries": 0,
+          "recovery_attempts": {},
+          "registered_handlers": [
+            "retry",
+            "reconnect",
+            "fallback",
+            "alert"
+          ]
+        }
+      },
+      "stream_healthy": false
+    },
+    "integration_summary": {
+      "passed": 1,
+      "total": 5,
+      "success_rate": 20.0,
+      "details": {
+        "Exchange Service Health": true,
+        "Orchestrator Service Health": false,
+        "Redis Connection": false,
+        "WebSocket Callback Endpoint": false,
+        "Redis Order Tracking": false
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>JavaScript Test</title>
+</head>
+<body>
+    <h1>Testing JavaScript</h1>
+    <p id="test-element">This should change if JavaScript works</p>
+    
+    <script>
+        console.log('Inline JavaScript is working');
+        document.getElementById('test-element').textContent = 'JavaScript is working!';
+        
+        // Test API call
+        fetch('/api/v1/market/sentiment')
+            .then(response => response.json())
+            .then(data => {
+                console.log('API data:', data);
+                document.getElementById('test-element').textContent = 'API works! Sentiment: ' + data.overall_trend;
+            })
+            .catch(error => {
+                console.error('API error:', error);
+                document.getElementById('test-element').textContent = 'API failed: ' + error.message;
+            });
+    </script>
+</body>
+</html>

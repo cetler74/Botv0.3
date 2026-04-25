@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -10,6 +10,7 @@
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css?v=20240723" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css?v=20240723" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20240723" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
 
     <style>
         .gradient-bg {
@@ -95,64 +96,22 @@
             -webkit-overflow-scrolling: touch;
         }
         
-        /* Mobile navigation improvements */
-        .mobile-nav-toggle {
-            display: none;
-        }
-        
-        @media (max-width: 768px) {
-            .mobile-nav-toggle {
-                display: block;
-            }
-            
-            .nav-menu {
-                display: none;
-            }
-            
-            .nav-menu.active {
-                display: flex;
-                flex-direction: column;
-                position: absolute;
-                top: 100%;
-                left: 0;
-                right: 0;
-                background: rgba(102, 126, 234, 0.95);
-                backdrop-filter: blur(10px);
-                z-index: 50;
-            }
-        }
     </style>
 </head>
 <body class="bg-gray-100">
-    <!-- Navigation -->
-    <nav class="gradient-bg text-white shadow-lg relative">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex justify-between h-16">
-                <div class="flex items-center">
-                    <i class="fas fa-chart-line text-2xl mr-3"></i>
-                    <h1 class="text-xl font-bold mobile-text-lg">Trading Bot Dashboard</h1>
-                </div>
-                
-                <!-- Mobile menu button -->
-                <button class="mobile-nav-toggle touch-target md:hidden" id="mobile-menu-toggle">
-                    <i class="fas fa-bars text-xl"></i>
-                </button>
-                
-                <!-- Desktop navigation -->
-                <div class="nav-menu hidden md:flex items-center space-x-4" id="nav-menu">
-                    <div class="flex items-center">
-                        <span class="status-indicator status-online" id="connection-status"></span>
-                        <span id="connection-text" class="mobile-text-sm">Connected</span>
-                    </div>
-                    <button id="emergency-stop" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors touch-target">
-                        <i class="fas fa-stop-circle mr-2"></i>
-                        <span class="mobile-hidden">Emergency Stop</span>
-                        <span class="md:hidden">Stop</span>
-                    </button>
-                </div>
+    {% set page_title = "Trading Bot Dashboard" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
+    <div class="gradient-bg text-white shadow-sm border-b border-white border-opacity-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div class="flex items-center gap-2">
+                <span class="status-indicator status-online" id="connection-status"></span>
+                <span id="connection-text" class="text-sm">Connected</span>
             </div>
+            <button id="emergency-stop" type="button" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors touch-target self-start sm:self-auto">
+                <i class="fas fa-stop-circle mr-2"></i>Emergency Stop
+            </button>
         </div>
-    </nav>
+    </div>
 
     <!-- Main Content -->
     <div class="w-full px-2 sm:px-4 py-4 sm:py-6 lg:py-8">
@@ -232,7 +191,59 @@
         </script>
         <!-- End Bot/System Status Section -->
         <!-- Portfolio Overview -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4 sm:gap-6 mb-6 sm:mb-8 w-full">
+        <!-- Trading Performance Cards Row -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 sm:gap-6 mb-4 sm:mb-6 w-full">
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-emerald-100 text-emerald-600">
+                        <i class="fas fa-trophy text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Win Rate</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="win-rate">0%</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-orange-100 text-orange-600">
+                        <i class="fas fa-chart-bar text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Total Trades</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="total-trades-count">0</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-teal-100 text-teal-600">
+                        <i class="fas fa-door-open text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Daily Opened</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="daily-opened-trades">0</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
+                <div class="flex items-center">
+                    <div class="p-3 rounded-full bg-red-100 text-red-600">
+                        <i class="fas fa-door-closed text-xl"></i>
+                    </div>
+                    <div class="ml-4">
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Daily Closed</p>
+                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="daily-closed-trades">0</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Balance and PnL Cards Row -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 sm:gap-6 mb-6 sm:mb-8 w-full">
             <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-blue-100 text-blue-600">
@@ -244,6 +255,7 @@
                     </div>
                 </div>
             </div>
+
             <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
                 <div class="flex items-center">
                     <div class="p-3 rounded-full bg-cyan-100 text-cyan-600">
@@ -298,56 +310,8 @@
                         <i class="fas fa-chart-area text-xl"></i>
                     </div>
                     <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Total Unrealized PnL</p>
+                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Unrealized PnL</p>
                         <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="total-unrealized-pnl">$0.00</p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
-                <div class="flex items-center">
-                    <div class="p-3 rounded-full bg-emerald-100 text-emerald-600">
-                        <i class="fas fa-trophy text-xl"></i>
-                    </div>
-                    <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Win Rate</p>
-                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="win-rate">0%</p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
-                <div class="flex items-center">
-                    <div class="p-3 rounded-full bg-blue-100 text-blue-600">
-                        <i class="fas fa-chart-line text-xl"></i>
-                    </div>
-                    <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Total Trades</p>
-                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="total-trades-count">0</p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
-                <div class="flex items-center">
-                    <div class="p-3 rounded-full bg-green-100 text-green-600">
-                        <i class="fas fa-door-open text-xl"></i>
-                    </div>
-                    <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Daily Opened</p>
-                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="daily-opened-trades">0</p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="bg-white rounded-lg shadow-md mobile-p-3 p-6 card-hover w-full">
-                <div class="flex items-center">
-                    <div class="p-3 rounded-full bg-red-100 text-red-600">
-                        <i class="fas fa-door-closed text-xl"></i>
-                    </div>
-                    <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600 mobile-text-xs">Daily Closed</p>
-                        <p class="text-2xl font-bold text-gray-900 mobile-text-lg laptop-text-xl desktop-text-2xl" id="daily-closed-trades">0</p>
                     </div>
                 </div>
             </div>
@@ -423,6 +387,7 @@
                                 Exit Time <i class="fas fa-sort ml-1"></i>
                             </th>
                             <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Entry Price</th>
+                            <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Exit Price</th>
                             <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Current Price</th>
                             <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Amount (units)</th>
                             <th class="px-2 sm:px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider mobile-text-xs">Notional Value ($)</th>
@@ -689,7 +654,7 @@
             if (filtered.length === 0) {
                 const row = document.createElement('tr');
                 row.innerHTML = `
-                    <td colspan="10" class="px-4 py-8 text-center text-gray-500">
+                    <td colspan="11" class="px-4 py-8 text-center text-gray-500">
                         No trades found
                     </td>
                 `;
@@ -732,6 +697,7 @@
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${entryTime}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${exitTime}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.exit_price ? '$' + trade.exit_price.toFixed(4) : 'N/A'}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${trade.position_size?.toFixed(6) || '0.000000'}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
@@ -953,25 +919,6 @@
             return { isMobile, isTablet, isLaptop };
         }
         
-        // Mobile navigation toggle
-        function initializeMobileNavigation() {
-            const mobileMenuToggle = document.getElementById('mobile-menu-toggle');
-            const navMenu = document.getElementById('nav-menu');
-            
-            if (mobileMenuToggle && navMenu) {
-                mobileMenuToggle.addEventListener('click', function() {
-                    navMenu.classList.toggle('active');
-                });
-                
-                // Close mobile menu when clicking outside
-                document.addEventListener('click', function(event) {
-                    if (!navMenu.contains(event.target) && !mobileMenuToggle.contains(event.target)) {
-                        navMenu.classList.remove('active');
-                    }
-                });
-            }
-        }
-        
         // Responsive table handling
         function initializeResponsiveTables() {
             const tables = document.querySelectorAll('.responsive-table');
@@ -1007,7 +954,6 @@
             const deviceInfo = detectDeviceType();
             
             // Initialize mobile-specific features
-            initializeMobileNavigation();
             initializeResponsiveTables();
             initializeTouchInteractions();
             
@@ -1034,6 +980,7 @@
             });
         });
     </script>
+    <script src="/static/js/mobile-nav.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js?v=20240723"></script>
     <script src="/static/js/dashboard.js?v=20240723"></script>
 </body>

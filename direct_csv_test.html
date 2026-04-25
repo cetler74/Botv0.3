@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Direct CSV Export Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .button { background: #10b981; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
+        .button:hover { background: #059669; }
+        .button:disabled { background: #6b7280; cursor: not-allowed; }
+        .status { margin-top: 20px; padding: 10px; border-radius: 5px; }
+        .success { background: #d1fae5; color: #065f46; }
+        .error { background: #fee2e2; color: #991b1b; }
+        .info { background: #dbeafe; color: #1e40af; }
+        .test-section { margin: 20px 0; padding: 20px; border: 1px solid #e5e7eb; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Direct CSV Export Test</h1>
+    
+    <div class="test-section">
+        <h3>Test 1: Basic Export (All Trades)</h3>
+        <button id="test1" class="button">Export All Trades</button>
+        <div id="result1" class="status"></div>
+    </div>
+    
+    <div class="test-section">
+        <h3>Test 2: Limited Export (5 Trades)</h3>
+        <button id="test2" class="button">Export 5 Trades</button>
+        <div id="result2" class="status"></div>
+    </div>
+    
+    <div class="test-section">
+        <h3>Test 3: Filtered Export (CLOSED Trades)</h3>
+        <button id="test3" class="button">Export CLOSED Trades</button>
+        <div id="result3" class="status"></div>
+    </div>
+
+    <script>
+        async function testExport(endpoint, buttonId, resultId, description) {
+            const button = document.getElementById(buttonId);
+            const result = document.getElementById(resultId);
+            
+            button.disabled = true;
+            button.textContent = 'Exporting...';
+            result.innerHTML = '';
+            
+            try {
+                console.log(`Testing: ${description}`);
+                console.log(`Endpoint: ${endpoint}`);
+                
+                const response = await fetch(endpoint);
+                console.log('Response status:', response.status);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                console.log('Response data:', data);
+                
+                if (data.status === 'error') {
+                    throw new Error(data.message || 'Export failed');
+                }
+                
+                console.log('CSV content length:', data.csv_content.length);
+                console.log('Trade count:', data.trade_count);
+                console.log('Filename:', data.filename);
+                
+                // Create and download the CSV file
+                const blob = new Blob([data.csv_content], { type: 'text/csv;charset=utf-8;' });
+                console.log('Blob size:', blob.size);
+                
+                const link = document.createElement('a');
+                const url = URL.createObjectURL(blob);
+                link.setAttribute('href', url);
+                link.setAttribute('download', data.filename);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                // Clean up
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                
+                result.innerHTML = `<div class="success">
+                    ✅ Success! Exported ${data.trade_count} trades<br>
+                    File: ${data.filename}<br>
+                    Size: ${blob.size} bytes<br>
+                    CSV Length: ${data.csv_content.length} characters
+                </div>`;
+                
+            } catch (error) {
+                console.error('Export error:', error);
+                result.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+            } finally {
+                button.disabled = false;
+                button.textContent = `Export ${description}`;
+            }
+        }
+        
+        // Test 1: All trades
+        document.getElementById('test1').addEventListener('click', () => {
+            testExport('/api/v1/trades/export/csv?limit=10000', 'test1', 'result1', 'All Trades');
+        });
+        
+        // Test 2: Limited trades
+        document.getElementById('test2').addEventListener('click', () => {
+            testExport('/api/v1/trades/export/csv?limit=5', 'test2', 'result2', '5 Trades');
+        });
+        
+        // Test 3: CLOSED trades
+        document.getElementById('test3').addEventListener('click', () => {
+            testExport('/api/v1/trades/export/csv?status=CLOSED&limit=10000', 'test3', 'result3', 'CLOSED Trades');
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,427 @@
+alerts:
+  channels:
+    database: true
+    email: false
+    webhook: false
+  enabled: true
+  thresholds:
+    api_error: 5
+    balance_low: 50
+    daily_loss: 0.05
+    trade_failure: 3
+balance_manager:
+  check_interval_seconds: 30
+  max_balance_usage: 0.9
+  min_balance_threshold: 10
+database:
+  host: postgres
+  max_overflow: 20
+  name: trading_bot_futures
+  options: -c search_path=trading,public
+  password: mypassword
+  pool_size: 10
+  port: 5432
+  user: carloslarramba
+database_manager:
+  backup_interval_hours: 24
+  connection_timeout: 30
+  max_retries: 3
+  query_timeout: 60
+exchange_manager:
+  max_retries: 3
+  rate_limit_delay: 0.1
+  request_timeout: 30
+  retry_delay: 1
+exchanges:
+  binance:
+    base_currency: USDC
+    market_type: spot
+    max_pairs: 15  # INCREASED: 88.19% win rate, +$27.07 profit
+    min_volatility: 0.02
+    min_volume_24h: 1000000
+    sandbox: false
+    websocket_url: "wss://stream.binance.com:9443/ws/!ticker@arr"
+    websocket_private: "wss://stream.binance.com:9443/ws"
+  bybit:
+    base_currency: USDC
+    market_type: spot
+    max_pairs: 15
+    min_volatility: 0.015
+    min_volume_24h: 500000
+    sandbox: false
+    websocket_url: "wss://stream.bybit.com/v5/public/spot"
+    websocket_private: "wss://stream.bybit.com/v5/private"
+  cryptocom:
+    base_currency: USD
+    market_type: spot
+    max_pairs: 15  # REDUCED: 48.48% win rate, -$22.22 loss
+    min_volatility: 0.005  # TIGHTENED: Only high-quality pairs
+    min_volume_24h: 500000  # INCREASED: Better volume requirements
+    sandbox: false
+    websocket_url: "wss://stream.crypto.com/v2/market"
+    websocket_private: "wss://stream.crypto.com/v2/user"
+invalid:
+  path: test
+logging:
+  backup_count: 5
+  file: logs/trading_bot.log
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  level: INFO
+  max_file_size: 10485760
+mcp:
+  enabled: true
+  perplexity:
+    api_key: ''
+    base_url: https://api.perplexity.ai
+    cache:
+      enabled: true
+      max_size: 1000
+      ttl_seconds: 3600
+    enabled: true
+    features:
+      news_analysis: true
+      real_time_data: true
+      web_scraping: true
+      web_search: true
+    max_retries: 3
+    rate_limit_delay: 1.0
+    scraping_settings:
+      include_images: false
+      include_links: true
+      max_content_length: 50000
+      timeout: 15
+    search_settings:
+      exclude_domains: []
+      include_domains: []
+      max_results: 10
+      search_type: web
+    timeout: 30
+pair_selector:
+  scoring_weights:
+    market_cap: 0.2
+    spread: 0.1
+    volatility: 0.3
+    volume_24h: 0.4
+  selection_criteria:
+    max_spread_percentage: 0.5
+    max_volatility: 0.1
+    min_market_cap: 100000000
+    min_volatility: 0.01
+    min_volume_24h: 1000000
+  # DYNAMIC BLACKLIST: Pairs with poor performance (24h cooling period)
+  blacklisted_pairs:
+    - "ACH/USD"      # 47.54% win rate, -$7.90 loss, -$0.129/trade
+    - "1INCH/USD"    # 30.43% win rate, -$52.06 loss, -$1.13/trade  
+    - "AAVE/USD"     # 15.79% win rate, -$7.29 loss, -$0.38/trade
+  # Automatic blacklist criteria
+  auto_blacklist:
+    enabled: true
+    min_trades_threshold: 10          # Minimum trades before considering blacklist
+    max_win_rate_threshold: 0.45      # Blacklist if win rate < 45%
+    max_avg_pnl_threshold: -0.10      # Blacklist if avg PnL < -$0.10
+    cooling_period_hours: 24          # 24-hour cooling period
+    max_consecutive_losses: 5         # Blacklist after 5 consecutive losses
+  # Replacement pair selection when blacklisting
+  replacement_selection:
+    enabled: true
+    min_volume_24h_multiplier: 1.5    # Require 1.5x minimum volume for replacements
+    min_market_cap_multiplier: 1.2    # Require 1.2x minimum market cap
+    exclude_new_listings_days: 7      # Exclude pairs newer than 7 days
+  update_interval_minutes: 60
+redis:
+  db: 0
+  host: localhost
+  max_connections: 20
+  password: ''
+  port: 6379
+strategies:
+  engulfing_multi_tf:
+    enabled: true
+    parameters:
+      adx_entry_threshold: 25  # ENHANCED: Higher ADX for stronger trends
+      adx_period: 14
+      atr_multiplier_sl: 1.5
+      atr_multiplier_tp: 2.0
+      atr_period: 14
+      confirmation_timeframes: 0  # MEDIUM FIX: Removed confirmation delays
+      cooldown_minutes: 60
+      fixed_sl_pct: 0.020  # ENHANCED: 2% stop loss aligned with global settings
+      fixed_tp_pct: 0.08   # ENHANCED: 8% take profit aligned with global settings
+      max_trade_duration_hours: 24
+      min_bearish_engulfing: 1.2
+      min_confidence: 0.65  # ENHANCED: Higher confidence threshold for reliability
+      profit_lock_percentage: 0.015    # PROFIT FIX: Lock 1.5% profit when reached
+      trailing_stop_trigger: 0.02      # PROFIT FIX: Start trailing at 2%
+      max_trade_duration_hours: 18     # PROFIT FIX: Reduced from 24h to avoid overnight risk
+      min_engulfing_size_multiplier: 0.6
+      regime_aware: true
+      require_adx_and_volume_confirmation: true
+      min_volume_multiplier: 2.0        # QUALITY: Require 2x average volume
+      min_rsi_range: 20                 # QUALITY: Avoid choppy markets (RSI range < 20)
+      sma_period: 50
+      stop_loss_pct: 0.8  # TIGHTER: Reduce losses quickly
+      strict_volume_adx: false
+      take_profit_pct: 1.5  # CONSERVATIVE: Take profits earlier
+      target_timeframes:
+      - 4h
+      - 1h
+      - 15m
+      - 5m
+      timeframe_weights:
+        15m: 0.2
+        1h: 0.3
+        4h: 0.4
+        5m: 0.1
+      use_atr_for_exits: true
+      use_atr_levels: true
+      use_volume_confirmation: true
+      volume_avg_period: 10
+  heikin_ashi:
+    enabled: false  # DISABLED: Strategy showing consistent 4-6% losses, needs major revision
+    parameters:
+      adx_period: 14
+      adx_threshold: 35  # CONSERVATIVE: Even higher ADX for very strong trends only
+      atr_period: 14
+      atr_threshold: 0.001   # STRICTER: Higher volatility for quality setups (10x increase)
+      ema_fast_period: 12
+      ema_slow_period: 26
+      max_hold_time_hours: 24  # OPTIMIZED: Shorter hold time to capture profits before reversal
+      min_candle_size: 0.004  # STRICTER: Much larger candles for strong signals (4x increase)
+      min_candles: 50
+      min_trend_strength: 0.003   # STRICTER: Higher trend strength (4x increase)
+      min_volume: 1000 # STRICTER: Higher volume for institutional interest (10x increase)
+      primary_timeframe: 1h
+      require_ema_confluence: true  # OPTIMIZED: Enable confluence for higher accuracy
+      risk_per_trade: 0.01
+      rsi_buy_threshold: 40  # CONSERVATIVE: Avoid overbought entries
+      rsi_confluence_threshold: 40  # CONSERVATIVE: Higher confluence requirement
+      rsi_overbought: 75  # OPTIMIZED: More conservative overbought (avoid tops)
+      rsi_oversold: 25   # OPTIMIZED: More conservative oversold (avoid false bottoms)
+      rsi_period: 14
+      rsi_uptrend_max: 70  # OPTIMIZED: Lower max to avoid overbought entries
+      rsi_uptrend_min: 35  # OPTIMIZED: Higher min for quality trend entries
+      trend_period: 14
+      volume_sma_period: 20
+      volume_spike_multiplier: 2.0  # STRICTER: Require strong volume spikes (100% increase)
+      volume_quality_filter: true  # OPTIMIZED: Enable quality filter for better entries
+      volume_threshold: 1.5  # STRICTER: 150% volume requirement for quality
+      volume_threshold_percentage: 0.5  # STRICTER: Higher percentile (50% vs 20%)
+      # ADDITIONAL QUALITY FILTERS
+      min_confidence_score: 0.7        # Require 70% confidence minimum
+      require_trend_confirmation: true  # Must confirm trend across timeframes
+      avoid_consolidation: true         # Skip sideways markets
+      min_momentum_strength: 0.6        # Require strong momentum (60%+)
+      max_drawdown_entry: 0.02         # Don't enter if recent 2%+ drawdown
+      cooldown_after_loss: 2           # Wait 2 hours after any loss on this pair
+    target_timeframes:
+    - 1h
+    - 15m
+  multi_timeframe_confluence:
+    enabled: true
+    parameters:
+      adx_threshold: 15  # STRICTER: Lower threshold for sideways markets
+      trending_adx_threshold: 25  # ENHANCED: Minimum for trending market detection
+      bb_period: 20
+      bb_std: 2
+      confluence_threshold: 0.90     # ENHANCED: 90% confluence for highest-quality signals
+      smart_exit_enabled: true        # PROFIT FIX: Enable intelligent exit logic
+      long_period: 30
+      max_price_range_pct: 35.0     # PROFIT FIX: Allow wider ranges with better stops
+      max_daily_volatility_pct: 5.0  # NEW: Skip trading if daily range > 5%
+      entry_confirmation_required: false # PROFIT FIX: Remove confirmation delays
+      max_volume_ratio: 2.0
+      medium_period: 15
+      min_confluence: 3  # ENHANCED: Require at least 3 confluences for higher reliability
+      required_timeframe_agreement: 3  # STRICTER: Require 3 timeframes to agree
+      min_confidence: 0.80  # ENHANCED: Require 80% confidence to avoid poor trades
+      profit_protection_enabled: true   # PROFIT FIX: Enable profit locking
+      dynamic_stop_loss: true          # PROFIT FIX: Trailing stops
+      min_sideways_periods: 5  # Reduced for faster detection
+      rsi_overbought: 70  # More sensitive levels
+      rsi_oversold: 30   # More sensitive levels  
+      short_period: 5
+      stop_loss_pct: 0.020   # ENHANCED: 2% stop loss with ATR adjustments
+      take_profit_pct: 0.08   # OPTIMIZED: 8% take profit for better R:R
+      vwap_period: 20
+      atr_stop_loss_multiplier: 1.5  # NEW: ATR-based stop loss adjustment
+      # PROFIT MAXIMIZATION: Increased position size for 100% win rate strategy
+      position_size_percentage: 0.15      # REDUCED: 15% position size to limit losses
+      max_position_size_usd: 200          # REDUCED: Max $200 per trade to limit risk
+      position_size_multiplier: 2.5       # 2.5x the global position size
+      # NEW: Support both sideways and trending markets
+      enable_trending_trades: true  # Allow trades in trending markets with ADX > 25
+      # EMERGENCY FILTERS: Stop trading in poor conditions
+      min_market_stability: 0.8     # Require 80% market stability
+      avoid_high_volatility: true   # Skip extremely volatile periods
+      max_daily_range: 0.15         # Don't trade if daily range > 15%
+      require_volume_confirmation: true  # Must have volume confirmation
+      min_rsi_divergence: 5         # Minimum RSI divergence for entries
+      cooldown_after_loss_hours: 4  # Wait 4 hours after any loss
+    target_timeframes:
+    - 1h
+    - 15m
+  strategy_pnl_enhanced:
+    enabled: true   # ENABLED: Critical for enhanced exit logic and risk management
+    parameters:
+      atr_period: 14
+      dynamic_stop_loss: true
+      volatility_multiplier: 1.2
+    target_timeframes:
+    - 1h
+    - 15m
+  vwma_hull:
+    enabled: false  # TEMPORARILY DISABLED: Focus on multi_timeframe_confluence only
+    parameters:
+      atr_period: 7
+      atr_threshold: 0.0006  # STRICTER: Much higher ATR for strong volatility (12x increase)
+      crossover_confidence_boost: 0.95 # STRICTER: Very high confidence for crossovers
+      hull_period: 21  # CONSERVATIVE: Longer period for smoother signals
+      min_absolute_volume: 800  # STRICTER: Much higher volume requirement (20x increase)
+      min_price_move: 0.0008  # STRICTER: Higher price move for stronger signals (8x increase)
+      min_volatility_threshold: 0.002  # STRICTER: Higher volatility threshold (4x increase)
+      scalping_enabled: false  # OPTIMIZED: Disable scalping for trend following approach
+      strength_multiplier: 20  # STRICTER: Higher multiplier for very strong signals
+      trend_confidence_boost: 0.85 # STRICTER: Higher trend confidence
+      trend_threshold: 0.004  # STRICTER: Higher trend threshold (4x increase)
+      volatility_adjustment: true
+      volume_method: percentile
+      volume_percentile: 0.4  # STRICTER: Use 40th percentile for quality filtering
+      volume_threshold: 0.6  # STRICTER: Higher volume threshold (60% vs 10%, 6x increase)
+      profit_target_multiplier: 2.5  # IMPROVED: Better risk-reward ratio (2.5:1 minimum)
+      volume_window: 50
+      vwma_period: 20
+      # ADDITIONAL QUALITY FILTERS FOR BETTER WIN RATE
+      min_confidence_score: 0.75       # Require 75% confidence minimum
+      require_volume_breakout: true     # Require volume breakout confirmation  
+      avoid_range_bound_markets: true   # Skip choppy/sideways markets
+      min_trend_duration: 3            # Require 3+ periods of trend
+      max_rsi_entry: 65                # Don't enter if RSI > 65 (avoid tops)
+      min_rsi_entry: 35                # Don't enter if RSI < 35 (avoid bottoms)
+      require_price_momentum: true      # Require positive price momentum
+      stop_loss_atr_multiplier: 1.5    # Tighter stops (1.5x ATR vs 2.0x)
+    target_timeframes:
+    - 1h
+    - 15m
+strategy_manager:
+  analysis_timeout: 30
+  max_concurrent_analyses: 10
+  signal_cache_duration: 300
+trading:
+  max_concurrent_trades: 6      # CONSERVATIVE: Fewer trades, better focus
+  max_daily_loss: 0.015         # EMERGENCY: 1.5% daily loss limit to stop bleeding
+  max_daily_trades: 15           # PROFIT FIX: More trades with better R:R
+  win_rate_threshold: 0.70       # HIGHER: Pause if win rate drops below 70%
+  consecutive_loss_limit: 2      # EMERGENCY: Stop after 2 consecutive losses
+  max_total_loss: 0.15
+  max_trades_per_exchange: 100  # Increased to accommodate CryptoCom's diverse portfolio
+  min_exchange_balance: 50.0
+  min_order_size_usd:
+    cryptocom: 50.0    # ENFORCED: Global $50 minimum order size
+    binance: 50.0      # ENFORCED: Global $50 minimum order size
+    bybit: 50.0        # ENFORCED: Global $50 minimum order size
+    default: 50.0      # ENFORCED: Global $50 minimum order size
+  risk_reward_minimum: 2.0  # PROFIT FIX: Minimum 2:1 risk-reward ratio
+  mode: live
+  position_size_percentage: 0.10  # CONSERVATIVE: 10% position size to reduce risk
+  # STRATEGY-SPECIFIC POSITION SIZING
+  strategy_position_sizing:
+    enabled: true
+    multi_timeframe_confluence:
+      position_size_percentage: 0.25    # 25% for 100% win rate strategy  
+      max_position_usd: 1000           # Maximum $1000 per trade
+      priority: high                   # High priority for capital allocation
+    engulfing_multi_tf:
+      position_size_percentage: 0.08   # 8% for conservative strategy
+      max_position_usd: 400            # Maximum $400 per trade  
+      priority: medium                 # Medium priority
+    heikin_ashi:
+      position_size_percentage: 0.06   # 6% for improved strategy (conservative)
+      max_position_usd: 300            # Maximum $300 per trade
+      priority: medium                 # Medium priority - test phase
+    vwma_hull:
+      position_size_percentage: 0.07   # 7% for improved strategy
+      max_position_usd: 350            # Maximum $350 per trade  
+      priority: medium                 # Medium priority - test phase
+    default:
+      position_size_percentage: 0.05   # 5% for other strategies
+      max_position_usd: 200            # Maximum $200 per trade
+      priority: low                    # Low priority
+  profit_protection:
+    enabled: true
+    lock_percentage: 0.025     # OPTIMIZED: Lock 2.5% profit when hit (higher lock)
+    trigger_percentage: 0.020  # ENHANCED: Trigger at 2% profit (earlier activation)
+    partial_exit_percentage: 50 # OPTIMIZED: Take 50% profit at first target
+    # Enhanced profit protection parameters
+    activation_threshold: 0.015  # ENHANCED: Activate at 1.5% profit
+    max_drawdown: 0.25          # ENHANCED: 25% max drawdown before exit
+    consecutive_threshold: 6     # ENHANCED: Exit after 6 consecutive decreases
+    significant_decrease_multiplier: 0.0015  # ENHANCED: Sensitivity to price drops
+  stop_loss_percentage: 0.020  # ENHANCED: 2% stop loss for tighter risk control in volatile conditions
+  take_profit_percentage: 0.08   # OPTIMIZED: 8% take profit for better risk/reward ratio
+  max_daily_loss_per_exchange: 0.05  # NEW: 5% maximum daily loss limit per exchange
+  dynamic_stop_loss_enabled: true    # NEW: Enable ATR-based dynamic stop loss adjustments
+  trailing_stop:
+    enabled: true
+    step_percentage: 0.005     # OPTIMIZED: Larger steps (0.5%) to avoid noise
+    trigger_percentage: 0.015  # ENHANCED: Start trailing at 1.5% profit (reduced from 2.0%)
+    max_trail_distance: 0.025  # OPTIMIZED: Larger maximum trail distance (2.5%)
+    # Enhanced trailing stop parameters
+    activation_threshold: 0.015  # ENHANCED: Start trailing at 1.5% profit (reduced from 2%)
+    base_trailing_distance: 0.12  # ENHANCED: 12% trailing distance
+  fee_optimization:
+    use_limit_orders: true           # Use limit orders to get maker fees (0.1% vs 0.4%)
+    max_taker_fee: 0.0015           # Maximum 0.15% taker fee (alert if higher)
+    prefer_maker_orders: true       # Prefer maker orders when possible
+    limit_order_spread: 0.0002      # 0.02% spread for limit orders (reduced from 0.05%)
+    fee_alert_threshold: 0.002      # Alert if fee rate > 0.2%
+    fee_to_pnl_ratio_limit: 0.25    # Alert if fees > 25% of PnL
+    order_timeout_seconds: 300      # 5 minutes timeout for limit orders
+    max_retry_attempts: 2           # Maximum retry attempts for failed orders
+    min_spread_for_limit: 0.000001  # Minimum spread to attempt limit order (0.0001% - ultra-tight spreads)
+    volatility_threshold: 0.015     # Maximum volatility for limit orders (1.5% - increased from 0.5%)
+  
+  # Enhanced Order Management Configuration
+  order_management:
+    limit_order_timeout_seconds: 300    # 5 minutes timeout for unfilled limit orders
+    order_sync_interval_seconds: 30     # How often to sync order status from exchanges  
+    max_cancellation_retries: 3         # Maximum attempts to cancel an order
+    cancellation_retry_delay: 5         # Seconds between cancellation attempts
+    competitive_pricing_enabled: true   # Use orderbook-based competitive pricing
+    competitive_pricing_buffer: 0.0001  # 0.01% buffer for competitive pricing
+    stale_order_cleanup_hours: 24       # Clean up old orders after 24 hours
+    order_status_cache_seconds: 60      # Cache order status for 60 seconds
+    
+    # Performance tracking
+    performance_calculation_interval: 300  # Calculate metrics every 5 minutes
+    performance_history_days: 30           # Keep performance history for 30 days
+    alert_on_low_success_rate: true        # Alert when success rate drops
+    low_success_rate_threshold: 0.20       # Alert if success rate < 20%
+    alert_on_high_timeout_rate: true       # Alert when timeout rate is high
+    high_timeout_rate_threshold: 0.60      # Alert if timeout rate > 60%
+trading_manager:
+  cycle_interval_seconds: 60
+  exit_cycle_first: true
+  max_cycle_duration: 300
+web_ui:
+  debug: false
+  host: 0.0.0.0
+  port: 8000
+  refresh_interval_seconds: 5
+
+# Real-time pricing and WebSocket preferences
+realtime:
+  enable_websocket_prices: false
+  stale_price_threshold_seconds: 30
+  rest_poll_interval_seconds: 1
+  ws:
+    reconnect_backoff_seconds: [1, 2, 5, 10, 30]
+    heartbeat_interval_seconds: 20
+    max_concurrent_subscriptions_per_exchange: 50
+    subscribe_only_for_open_trades: true
+    exchanges:
+      binance:
+        enable: true
+      bybit:
+        enable: true
+      cryptocom:
+        enable: true

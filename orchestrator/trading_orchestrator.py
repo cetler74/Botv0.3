@@ -1,3 +1,6 @@
+# Remove problematic import that doesn't exist
+# from fix_unrealized_pnl_fees import calculate_unrealized_pnl_with_fees
+
 """
 Trading Orchestrator for the Multi-Exchange Trading Bot
 Main orchestrator that coordinates all components and manages trading cycles
@@ -17,6 +20,7 @@ from core.database_manager import DatabaseManager
 from core.exchange_manager import ExchangeManager
 from core.strategy_manager import StrategyManager
 from core.pair_selector import PairSelector, BinancePairSelector, BybitPairSelector
+from core.enhanced_pair_selector import EnhancedPairSelector
 from core.balance_manager import BalanceManager
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,9 @@ class TradingOrchestrator:
         self.active_trades = {}
         self.pair_selections = {}
         self.balances = {}
+        
+        # Enhanced pair selection
+        self.enhanced_pair_selector = None
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -108,6 +115,10 @@ class TradingOrchestrator:
             )
             await self.balance_manager.initialize_balances()
             logger.info("Balance manager initialized")
+            
+            # Initialize enhanced pair selector
+            self.enhanced_pair_selector = EnhancedPairSelector(self.config_manager)
+            logger.info("Enhanced pair selector initialized")
             
             # Initialize balances
             await self._initialize_balances()
@@ -165,55 +176,102 @@ class TradingOrchestrator:
             logger.error(f"Error initializing balances: {e}")
             
     async def _initialize_pair_selections(self) -> None:
-        """Dynamically select and persist pairs for all exchanges"""
+        """Dynamically select and persist pairs for all exchanges using enhanced scalping-optimized selection"""
         assert self.config_manager is not None, "config_manager must be initialized"
         assert self.database_manager is not None, "database_manager must be initialized"
+        assert self.enhanced_pair_selector is not None, "enhanced_pair_selector must be initialized"
+        
         try:
-            logger.info("[DEBUG] _initialize_pair_selections called!")
+            logger.info("[ENHANCED] Starting scalping-optimized pair selection...")
             exchanges = self.config_manager.get_all_exchanges()
+            
             for exchange_name in exchanges:
                 # Get config for this exchange
                 exchange_config = self.config_manager.get_exchange_config(exchange_name)
                 base_pair = exchange_config.get("base_currency", "USDC")
                 num_pairs = exchange_config.get("max_pairs", 15)
 
-                # Use the correct PairSelector for this exchange
-                if exchange_name.lower() == "cryptocom":
-                    selector = PairSelector(base_pair=base_pair, num_pairs=num_pairs)
-                elif exchange_name.lower() == "binance":
-                    selector = BinancePairSelector(base_pair=base_pair, num_pairs=num_pairs)
-                elif exchange_name.lower() == "bybit":
-                    selector = BybitPairSelector(base_pair=base_pair, num_pairs=num_pairs)
-                else:
-                    logger.warning(f"No pair selector implemented for {exchange_name}, skipping.")
-                    continue
+                logger.info(f"[ENHANCED] Selecting {num_pairs} scalping-optimized pairs for {exchange_name} with {base_pair}")
+                
+                # Use enhanced pair selector for scalping optimization
+                try:
+                    selected_pairs_with_scores = await self.enhanced_pair_selector.select_top_scalping_pairs(
+                        exchange_name, base_pair, num_pairs
+                    )
+                    
+                    if selected_pairs_with_scores:
+                        selected_pairs = [pair[0] for pair in selected_pairs_with_scores]
+                        scores = [pair[1] for pair in selected_pairs_with_scores]
+                        
+                        logger.info(f"[ENHANCED] {exchange_name} selected pairs with scores: {list(zip(selected_pairs, scores))}")
+                        
+                        # Always forcibly add CRO/USD for cryptocom if not already selected
+                        if exchange_name.lower() == "cryptocom" and "CRO/USD" not in selected_pairs:
+                            selected_pairs.append("CRO/USD")
+                            logger.info(f"[FORCE] Added CRO/USD to cryptocom pairs")
+                        
+                        # Persist to database
+                        await self.database_manager.save_pairs(
+                            exchange=exchange_name,
+                            pairs=selected_pairs
+                        )
+                        
+                        # Update in-memory
+                        self.pair_selections[exchange_name] = selected_pairs
+                        
+                        logger.info(f"[ENHANCED] Successfully selected {len(selected_pairs)} pairs for {exchange_name}")
+                        
+                    else:
+                        logger.warning(f"[ENHANCED] No suitable pairs found for {exchange_name}, falling back to legacy selector")
+                        await self._fallback_to_legacy_selector(exchange_name, base_pair, num_pairs)
+                        
+                except Exception as e:
+                    logger.error(f"[ENHANCED] Error in enhanced pair selection for {exchange_name}: {e}")
+                    logger.info(f"[FALLBACK] Falling back to legacy selector for {exchange_name}")
+                    await self._fallback_to_legacy_selector(exchange_name, base_pair, num_pairs)
 
-                result = await selector.select_top_pairs()
-
-                # Always forcibly add only CRO/USD before saving to DB for cryptocom
-                if exchange_name.lower() == "cryptocom":
-                    logger.info(f"[DEBUG] cryptocom pairs before force-add: {result['selected_pairs']}")
-                    if "CRO/USD" not in result["selected_pairs"]:
-                        result["selected_pairs"].append("CRO/USD")
-                    logger.info(f"[FORCE] cryptocom pairs to be saved: {result['selected_pairs']}")
-
-                # Persist to database
-                logger.info(f"[DEBUG] Saving pairs for {exchange_name}: {result['selected_pairs']}")
-                await self.database_manager.save_pairs(
-                    exchange=exchange_name,
-                    pairs=result["selected_pairs"]
-                )
-
-                # Update in-memory
-                self.pair_selections[exchange_name] = result["selected_pairs"]
-
-                # Log timestamp/result
-                logger.info(f"Selected pairs for {exchange_name}: {result['selected_pairs']} at {result['timestamp']}")
-
-            logger.info(f"Pair selection complete for {len(exchanges)} exchanges")
+            logger.info(f"[ENHANCED] Scalping-optimized pair selection complete for {len(exchanges)} exchanges")
 
         except Exception as e:
             logger.error(f"Error in dynamic pair selection: {e}")
+    
+    async def _fallback_to_legacy_selector(self, exchange_name: str, base_pair: str, num_pairs: int) -> None:
+        """Fallback to legacy pair selector if enhanced selector fails"""
+        try:
+            logger.info(f"[FALLBACK] Using legacy selector for {exchange_name}")
+            
+            # Use the correct legacy PairSelector for this exchange
+            if exchange_name.lower() == "cryptocom":
+                selector = PairSelector(base_pair=base_pair, num_pairs=num_pairs)
+            elif exchange_name.lower() == "binance":
+                selector = BinancePairSelector(base_pair=base_pair, num_pairs=num_pairs)
+            elif exchange_name.lower() == "bybit":
+                selector = BybitPairSelector(base_pair=base_pair, num_pairs=num_pairs)
+            else:
+                logger.warning(f"[FALLBACK] No legacy pair selector implemented for {exchange_name}")
+                return
+
+            result = await selector.select_top_pairs()
+
+            # Always forcibly add CRO/USD for cryptocom
+            if exchange_name.lower() == "cryptocom":
+                if "CRO/USD" not in result["selected_pairs"]:
+                    result["selected_pairs"].append("CRO/USD")
+                logger.info(f"[FALLBACK] cryptocom pairs: {result['selected_pairs']}")
+
+            # Persist to database
+            await self.database_manager.save_pairs(
+                exchange=exchange_name,
+                pairs=result["selected_pairs"]
+            )
+
+            # Update in-memory
+            self.pair_selections[exchange_name] = result["selected_pairs"]
+            
+            logger.info(f"[FALLBACK] Legacy selector completed for {exchange_name}: {result['selected_pairs']}")
+            
+        except Exception as e:
+            logger.error(f"[FALLBACK] Error in legacy pair selection for {exchange_name}: {e}")
             
     async def run(self) -> None:
         """Main trading loop"""
@@ -351,7 +409,8 @@ class TradingOrchestrator:
                 return
             # Update unrealized PnL
             if entry_price > 0 and position_size > 0:
-                unrealized_pnl = (current_price - entry_price) * position_size
+                # Calculate unrealized PnL with estimated fees (0.1% trading fee)
+                unrealized_pnl = ((current_price - entry_price) * position_size) - (position_size * current_price * 0.001)
                 await self.database_manager.update_trade(trade_id, {
                     'unrealized_pnl': unrealized_pnl,
                     'highest_price': max(current_price, float(trade.get('highest_price', 0) or 0))

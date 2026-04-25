@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSV Export Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .button { background: #10b981; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+        .button:hover { background: #059669; }
+        .button:disabled { background: #6b7280; cursor: not-allowed; }
+        .status { margin-top: 20px; padding: 10px; border-radius: 5px; }
+        .success { background: #d1fae5; color: #065f46; }
+        .error { background: #fee2e2; color: #991b1b; }
+    </style>
+</head>
+<body>
+    <h1>CSV Export Test</h1>
+    <p>Testing the CSV export functionality from the dashboard.</p>
+    
+    <button id="test-export" class="button">
+        <i class="fas fa-download"></i> Test Export CSV
+    </button>
+    
+    <div id="status"></div>
+
+    <script>
+        document.getElementById('test-export').addEventListener('click', async function() {
+            const button = this;
+            const statusDiv = document.getElementById('status');
+            
+            try {
+                // Show loading state
+                button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Exporting...';
+                button.disabled = true;
+                statusDiv.innerHTML = '';
+                
+                // Call the export endpoint
+                const response = await fetch('http://localhost:8006/api/v1/trades/export/csv?limit=5');
+                
+                if (!response.ok) {
+                    throw new Error(`Export failed: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (data.status === 'error') {
+                    throw new Error(data.message || 'Export failed');
+                }
+                
+                // Create and download the CSV file
+                const blob = new Blob([data.csv_content], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement('a');
+                const url = URL.createObjectURL(blob);
+                link.setAttribute('href', url);
+                link.setAttribute('download', data.filename);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                // Show success
+                statusDiv.innerHTML = `<div class="status success">✅ Successfully exported ${data.trade_count} trades to CSV (${data.filename})</div>`;
+                
+            } catch (error) {
+                console.error('Error exporting trades to CSV:', error);
+                statusDiv.innerHTML = `<div class="status error">❌ Export failed: ${error.message}</div>`;
+            } finally {
+                // Restore button state
+                button.innerHTML = '<i class="fas fa-download"></i> Test Export CSV';
+                button.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

@@ -32,34 +32,43 @@ class DynamicBlacklistManager:
     
     async def get_active_blacklist(self) -> List[str]:
         """Get currently active blacklisted pairs (considering cooling periods)"""
-        if not self.config:
-            await self.load_config()
-            
-        current_time = datetime.utcnow()
-        active_blacklist = []
-        
-        # Get static blacklist from config
-        static_blacklist = self.config.get('pair_selector', {}).get('blacklisted_pairs', [])
-        
-        for pair in static_blacklist:
-            # Check if cooling period has expired
-            if pair in self.cooling_periods:
-                blacklist_time = datetime.fromisoformat(self.cooling_periods[pair])
-                cooling_hours = self.config.get('pair_selector', {}).get('auto_blacklist', {}).get('cooling_period_hours', 24)
+        try:
+            if not self.config:
+                await self.load_config()
                 
-                if current_time - blacklist_time < timedelta(hours=cooling_hours):
-                    active_blacklist.append(pair)
-                    logger.debug(f"[Blacklist] {pair} still in cooling period")
+            current_time = datetime.utcnow()
+            active_blacklist = []
+            
+            # Get static blacklist from config
+            static_blacklist = self.config.get('pair_selector', {}).get('blacklisted_pairs', [])
+            
+            # Ensure static_blacklist is a list
+            if not isinstance(static_blacklist, list):
+                logger.warning(f"[Blacklist] Static blacklist is not a list: {type(static_blacklist)}, using empty list")
+                static_blacklist = []
+            
+            for pair in static_blacklist:
+                # Check if cooling period has expired
+                if pair in self.cooling_periods:
+                    blacklist_time = datetime.fromisoformat(self.cooling_periods[pair])
+                    cooling_hours = self.config.get('pair_selector', {}).get('auto_blacklist', {}).get('cooling_period_hours', 24)
+                    
+                    if current_time - blacklist_time < timedelta(hours=cooling_hours):
+                        active_blacklist.append(pair)
+                        logger.debug(f"[Blacklist] {pair} still in cooling period")
+                    else:
+                        logger.info(f"[Blacklist] ✅ {pair} cooling period expired, removing from blacklist")
+                        del self.cooling_periods[pair]
                 else:
-                    logger.info(f"[Blacklist] ✅ {pair} cooling period expired, removing from blacklist")
-                    del self.cooling_periods[pair]
-            else:
-                # First time seeing this pair, add cooling period
-                self.cooling_periods[pair] = current_time.isoformat()
-                active_blacklist.append(pair)
-                logger.info(f"[Blacklist] 🚫 {pair} added to blacklist with 24h cooling period")
-        
-        return active_blacklist
+                    # First time seeing this pair, add cooling period
+                    self.cooling_periods[pair] = current_time.isoformat()
+                    active_blacklist.append(pair)
+                    logger.info(f"[Blacklist] 🚫 {pair} added to blacklist with 24h cooling period")
+            
+            return active_blacklist
+        except Exception as e:
+            logger.error(f"[Blacklist] Error getting active blacklist: {e}")
+            return []
     
     async def evaluate_pair_performance(self, exchange: str, pair: str) -> bool:
         """Evaluate if a pair should be blacklisted based on performance"""

@@ -374,7 +374,19 @@ async def get_trading_config():
     if not config_data:
         raise HTTPException(status_code=503, detail="Configuration not loaded")
     
-    trading_config = config_data.get('trading', {})
+    trading_config = dict(config_data.get('trading', {}) or {})
+    # Orchestrator reads cycle_interval_seconds / exit_cycle_first from this payload;
+    # they live under trading_manager in YAML — merge so tuning applies.
+    tm = config_data.get("trading_manager") or {}
+    for key in (
+        "cycle_interval_seconds",
+        "exit_cycle_first",
+        "max_cycle_duration",
+        "exit_check_concurrency",
+        "exit_price_prefetch_concurrency",
+    ):
+        if key in tm:
+            trading_config[key] = tm[key]
     return trading_config
 
 @app.get("/api/v1/config/strategies")
@@ -505,6 +517,23 @@ async def get_trading_mode():
     trading_config = config_data.get('trading', {})
     mode = trading_config.get('mode', 'simulation')
     return {"mode": mode, "is_simulation": mode == 'simulation', "is_live": mode == 'live'}
+
+
+@app.get("/api/v1/config/simulation")
+async def get_simulation_settings():
+    """Return simulation accounting parameters (single source of truth for paper P&L).
+
+    Consumed by:
+      - database-service: derives per-exchange balance = starting + sum(realized_pnl)
+      - orchestrator-service: applies uniform fee on every simulated fill
+    """
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    sim = (config_data.get('trading', {}) or {}).get('simulation', {}) or {}
+    return {
+        "starting_balance_per_exchange_usd": float(sim.get('starting_balance_per_exchange_usd', 2000.0)),
+        "fee_rate_per_side": float(sim.get('fee_rate_per_side', 0.0005)),
+    }
 
 @app.get("/api/v1/config/pair_specific/{pair}/{strategy_name}")
 async def get_pair_specific_config(pair: str, strategy_name: str, exchange: Optional[str] = None):

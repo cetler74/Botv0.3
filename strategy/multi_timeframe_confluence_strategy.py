@@ -237,17 +237,42 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             df['bb_lower'] = indicators_cache[cache_keys['bb_lower']]
         else:
             bb = ta.bbands(df['close'], length=20, std=2)
-            upper = bb['BBU_20_2.0']
-            middle = bb['BBM_20_2.0']
-            lower = bb['BBL_20_2.0']
-            df['bb_upper'] = upper
-            df['bb_middle'] = middle
-            df['bb_lower'] = lower
-            if indicators_cache is not None:
-                indicators_cache[cache_keys['bb_upper']] = upper
-                indicators_cache[cache_keys['bb_middle']] = middle
-                indicators_cache[cache_keys['bb_lower']] = lower
-                self.logger.debug(f"[CACHE STORE] Hourly BB for {pair} {self.hourly_timeframe}")
+            # PnL-FIX v7: pandas-ta has changed BB column-naming across
+            # versions ("BBU_20_2.0" vs "BBU_20_2.0_2.0" etc.) and returns
+            # None when there are too few candles. Resolve columns by prefix
+            # and degrade gracefully instead of throwing KeyError, which was
+            # silently disabling multi_timeframe_confluence on every pair
+            # that hit the cache miss path.
+            if bb is None or bb.empty:
+                df['bb_upper'] = float('nan')
+                df['bb_middle'] = float('nan')
+                df['bb_lower'] = float('nan')
+            else:
+                def _find(prefix: str):
+                    for col in bb.columns:
+                        if col.startswith(prefix):
+                            return bb[col]
+                    return None
+                upper = _find('BBU_20')
+                middle = _find('BBM_20')
+                lower = _find('BBL_20')
+                if upper is None or middle is None or lower is None:
+                    self.logger.warning(
+                        f"[BB COLUMN MISS] expected BBU_20/BBM_20/BBL_20 in "
+                        f"{list(bb.columns)} for {pair} {self.hourly_timeframe}"
+                    )
+                    df['bb_upper'] = float('nan')
+                    df['bb_middle'] = float('nan')
+                    df['bb_lower'] = float('nan')
+                else:
+                    df['bb_upper'] = upper
+                    df['bb_middle'] = middle
+                    df['bb_lower'] = lower
+                    if indicators_cache is not None:
+                        indicators_cache[cache_keys['bb_upper']] = upper
+                        indicators_cache[cache_keys['bb_middle']] = middle
+                        indicators_cache[cache_keys['bb_lower']] = lower
+                        self.logger.debug(f"[CACHE STORE] Hourly BB for {pair} {self.hourly_timeframe}")
         # VWAP
         if indicators_cache is not None and cache_keys['vwap'] in indicators_cache:
             self.logger.debug(f"[CACHE HIT] Hourly VWAP for {pair} {self.hourly_timeframe}")
@@ -538,7 +563,14 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         # Use exchange_adapter if provided to override self.exchange
         if exchange_adapter is not None:
             self.exchange = exchange_adapter
-        
+
+        # OPTION-A: apply regime-driven parameter overrides. Safe no-op if
+        # no regime_overrides block is configured for this strategy.
+        try:
+            self._apply_regime_overrides(getattr(self.state, 'market_regime', None))
+        except Exception as _ra_err:
+            self.logger.debug(f"[MultiTFConfluence] regime-override apply failed: {_ra_err}")
+
         # Handle both DataFrame and dict market_data formats
         if isinstance(market_data, dict):
             # If market_data is a dict with timeframes, use the primary timeframe

@@ -1,0 +1,26 @@
+Failed Order Recovery Analysis - 2025-08-20
+
+ORDERS WITH FILL VERIFICATION FAILURES:
+
+Crypto.com Orders:
+1. 6530219584044711694 - CRO/USD
+2. 6530219584046192613 - CRO/USD  
+3. 6530219584053293115 - AAVE/USD
+4. 6530219584053323410 - CRO/USD
+5. 6530219584053363820 - AAVE/USD
+6. 6530219584053379643 - CRO/USD
+7. 6530219584053444169 - AAVE/USD
+8. 6530219584053475528 - CRO/USD
+
+Binance Orders:
+9. 202472189 - TRX/USDC (ALREADY RECOVERED)
+10. 161799643 - XLM/USDC
+
+Other suspected orders (need verification):
+- 664980921 (exchange TBD)
+- 1202502536 (exchange TBD)
+- 1202503991 (exchange TBD)
+- 1202504685 (exchange TBD)
+
+CRITICAL: These orders failed fill verification due to API endpoint bug.
+All need to be checked on exchanges and missing trades created.

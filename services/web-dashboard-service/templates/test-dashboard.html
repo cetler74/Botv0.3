@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Dashboard Test</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        .success { color: green; }
+        .error { color: red; }
+        .loading { color: orange; }
+        button { padding: 10px; margin: 5px; }
+        pre { background: #f5f5f5; padding: 10px; overflow-x: auto; }
+        .dashboard-element { margin: 10px 0; padding: 10px; border: 1px solid #ddd; }
+    </style>
+</head>
+<body class="bg-gray-50">
+    {% set page_title = "Dashboard Test" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
+    <div class="max-w-3xl mx-auto px-4 py-6 app-main-safe">
+    <h1>Dashboard Test Page</h1>
+    
+    <div class="test-section">
+        <h2>Dashboard Elements Test</h2>
+        <div id="total-balance" class="dashboard-element">Total Balance: $0.00</div>
+        <div id="available-balance" class="dashboard-element">Available Balance: $0.00</div>
+        <div id="total-pnl" class="dashboard-element">Total PnL: $0.00</div>
+        <div id="daily-pnl" class="dashboard-element">Daily PnL: $0.00</div>
+        <div id="open-trades" class="dashboard-element">Open Trades: 0</div>
+        <div id="total-unrealized-pnl" class="dashboard-element">Unrealized PnL: $0.00</div>
+        <div id="win-rate" class="dashboard-element">Win Rate: 0.0%</div>
+        <div id="total-trades-count" class="dashboard-element">Total Trades: 0</div>
+        <div id="daily-opened-trades" class="dashboard-element">Daily Opened: 0</div>
+        <div id="daily-closed-trades" class="dashboard-element">Daily Closed: 0</div>
+        <div id="bot-trading-status" class="dashboard-element">Trading Status: Loading...</div>
+        <div id="bot-cycle-count" class="dashboard-element">Cycle Count: Loading...</div>
+        <div id="bot-uptime" class="dashboard-element">Uptime: Loading...</div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Manual API Tests</h2>
+        <button onclick="testAPIs()">Test All APIs</button>
+        <button onclick="testDashboard()">Test Dashboard Functions</button>
+        <div id="api-results"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Console Logs</h2>
+        <div id="console-logs"></div>
+    </div>
+    </div>
+
+    <script>
+        // Capture console logs
+        const originalLog = console.log;
+        const originalError = console.error;
+        const logContainer = document.getElementById('console-logs');
+        
+        console.log = function(...args) {
+            originalLog.apply(console, args);
+            const logEntry = document.createElement('div');
+            logEntry.className = 'success';
+            logEntry.textContent = 'LOG: ' + args.join(' ');
+            logContainer.appendChild(logEntry);
+        };
+        
+        console.error = function(...args) {
+            originalError.apply(console, args);
+            const logEntry = document.createElement('div');
+            logEntry.className = 'error';
+            logEntry.textContent = 'ERROR: ' + args.join(' ');
+            logContainer.appendChild(logEntry);
+        };
+
+        async function testAPIs() {
+            const results = document.getElementById('api-results');
+            results.innerHTML = '<div class="loading">Testing APIs...</div>';
+            
+            try {
+                // Test bot status
+                const botResponse = await fetch('/api/bot-status');
+                const botData = await botResponse.json();
+                
+                // Test portfolio
+                const portfolioResponse = await fetch('/api/portfolio');
+                const portfolioData = await portfolioResponse.json();
+                
+                results.innerHTML = `
+                    <div class="success">APIs Working!</div>
+                    <h3>Bot Status:</h3>
+                    <pre>${JSON.stringify(botData, null, 2)}</pre>
+                    <h3>Portfolio:</h3>
+                    <pre>${JSON.stringify(portfolioData, null, 2)}</pre>
+                `;
+                
+                // Update dashboard elements with real data
+                updateDashboardElements(portfolioData, botData);
+                
+            } catch (error) {
+                results.innerHTML = `<div class="error">API Error: ${error.message}</div>`;
+            }
+        }
+
+        function updateDashboardElements(portfolioData, botData) {
+            // Update portfolio elements
+            document.getElementById('total-balance').textContent = `Total Balance: $${portfolioData.total_balance || 0}`;
+            document.getElementById('available-balance').textContent = `Available Balance: $${portfolioData.available_balance || 0}`;
+            document.getElementById('total-pnl').textContent = `Total PnL: $${portfolioData.total_pnl || 0}`;
+            document.getElementById('daily-pnl').textContent = `Daily PnL: $${portfolioData.daily_pnl || 0}`;
+            document.getElementById('open-trades').textContent = `Open Trades: ${portfolioData.active_trades || 0}`;
+            document.getElementById('total-unrealized-pnl').textContent = `Unrealized PnL: $${portfolioData.total_unrealized_pnl || 0}`;
+            document.getElementById('win-rate').textContent = `Win Rate: ${(portfolioData.win_rate || 0).toFixed(1)}%`;
+            document.getElementById('total-trades-count').textContent = `Total Trades: ${portfolioData.total_trades || 0}`;
+            document.getElementById('daily-opened-trades').textContent = `Daily Opened: ${portfolioData.daily_total_trades || 0}`;
+            document.getElementById('daily-closed-trades').textContent = `Daily Closed: ${portfolioData.daily_closed_trades || 0}`;
+            
+            // Update bot status elements
+            const tradingStatus = botData.trading_status || {};
+            document.getElementById('bot-trading-status').textContent = `Trading Status: ${tradingStatus.status || 'unknown'}`;
+            document.getElementById('bot-cycle-count').textContent = `Cycle Count: ${tradingStatus.cycle_count || 0}`;
+            document.getElementById('bot-uptime').textContent = `Uptime: ${formatUptime(tradingStatus.uptime)}`;
+        }
+
+        function formatUptime(uptime) {
+            if (!uptime) return 'N/A';
+            const seconds = parseInt(uptime.replace('PT', '').replace('S', ''));
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            return `${h}h ${m}m ${s}s`;
+        }
+
+        function testDashboard() {
+            console.log('Testing dashboard functions...');
+            
+            // Test if dashboard class exists
+            if (typeof EnhancedDashboard !== 'undefined') {
+                console.log('EnhancedDashboard class found!');
+                
+                // Test if dashboard instance exists
+                if (window.dashboard) {
+                    console.log('Dashboard instance found!');
+                    
+                    // Test portfolio update
+                    if (window.dashboard.updatePortfolio) {
+                        console.log('updatePortfolio function exists!');
+                        window.dashboard.updatePortfolio();
+                    } else {
+                        console.error('updatePortfolio function not found!');
+                    }
+                    
+                    // Test bot status
+                    if (window.dashboard.fetchBotStatus) {
+                        console.log('fetchBotStatus function exists!');
+                        window.dashboard.fetchBotStatus();
+                    } else {
+                        console.error('fetchBotStatus function not found!');
+                    }
+                } else {
+                    console.error('Dashboard instance not found!');
+                }
+            } else {
+                console.error('EnhancedDashboard class not found!');
+            }
+        }
+
+        // Auto-run tests on page load
+        window.addEventListener('load', () => {
+            console.log('Test dashboard page loaded');
+            setTimeout(() => {
+                testAPIs();
+            }, 1000);
+        });
+    </script>
+
+    <!-- Include the actual dashboard JavaScript -->
+    <script src="/static/js/enhanced-dashboard.js"></script>
+    <script src="/static/js/mobile-nav.js"></script>
+</body>
+</html>
