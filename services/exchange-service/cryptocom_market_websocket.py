@@ -152,8 +152,15 @@ class CryptocomMarketWebSocket:
                         except Exception as e:
                             logger.error(f"❌ Connection callback error: {e}")
                     
-                    # Subscribe to default symbols
-                    await self._subscribe_to_default_symbols()
+                    # Subscribe to default symbols + every previously-added symbol.
+                    # WS-FIX: on reconnect we used to only re-subscribe to the 10
+                    # hard-coded defaults, silently dropping every dynamic
+                    # subscription (e.g. ACT_USD added via /api/v1/websocket
+                    # /cryptocom/subscribe for an open trade). Crypto.com closes
+                    # idle connections periodically, so without this, ticker-live
+                    # would 204 forever for any non-default pair after the first
+                    # disconnect → trail-stops degrade to fallback prices.
+                    await self._resubscribe_all_symbols()
                     
                     # Process messages
                     async for message in websocket:
@@ -214,6 +221,40 @@ class CryptocomMarketWebSocket:
         
         for symbol in default_symbols:
             await self.subscribe_to_ticker(symbol)
+
+    async def _resubscribe_all_symbols(self):
+        """Re-subscribe to every symbol previously added (defaults + dynamic).
+
+        Called on every (re)connect. Crypto.com periodically closes idle WS
+        connections; without this, all dynamically-added subscriptions
+        (e.g. for open-trade pairs not in the default 10) are silently dropped.
+        """
+        # Snapshot existing set BEFORE we clear it. The subscribe_to_ticker()
+        # call below adds to self.subscribed_symbols, so we copy first to avoid
+        # mutating the iterable mid-loop.
+        previously_subscribed = set(self.subscribed_symbols)
+
+        # Always include the baseline defaults so a fresh connection still
+        # gets the high-volume pairs.
+        baseline_defaults = {
+            "DOTUSD", "BTCUSD", "ETHUSD", "ADAUSD", "ALGOUSD",
+            "CROUSD", "AIXBTUSD", "MATICUSD", "SOLUSD", "AVAXUSD",
+        }
+        target_symbols = previously_subscribed | baseline_defaults
+
+        # Clear and re-subscribe so subscribe_to_ticker() actually re-sends the
+        # subscription frame for every symbol (it skips duplicates by design).
+        self.subscribed_symbols.clear()
+
+        logger.info(
+            f"📡 Re-subscribing to {len(target_symbols)} Crypto.com ticker(s) "
+            f"after (re)connect: {sorted(target_symbols)}"
+        )
+        ok = 0
+        for symbol in target_symbols:
+            if await self.subscribe_to_ticker(symbol):
+                ok += 1
+        logger.info(f"📡 Crypto.com ticker re-subscription complete: {ok}/{len(target_symbols)} succeeded")
     
     async def subscribe_to_ticker(self, symbol: str):
         """Subscribe to ticker updates for a symbol"""
@@ -241,6 +282,12 @@ class CryptocomMarketWebSocket:
             logger.info(f"📡 Subscribed to Crypto.com ticker: {symbol}")
             return True
             
+        except websockets.exceptions.ConnectionClosed as e:
+            # Connection can close normally (1000) between "is_connected" check and send.
+            # Mark disconnected so caller can retry after reconnect loop.
+            self.is_connected = False
+            logger.warning(f"🔌 Subscription skipped for {symbol} - socket closed: {e}")
+            return False
         except Exception as e:
             logger.error(f"❌ Error subscribing to ticker {symbol}: {e}")
             return False

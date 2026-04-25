@@ -8,7 +8,9 @@ import json
 import logging
 import os
 import time
+import uuid
 import websockets
+import yaml
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
@@ -18,6 +20,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Response
 from pydantic import BaseModel
 from binance_websocket_integration import binance_websocket, router as binance_ws_router
+# from test_price_integration import test_price_integration
 from cryptocom_websocket_integration import cryptocom_websocket, router as cryptocom_ws_router
 from bybit_websocket_integration import router as bybit_ws_router
 from health_monitor import HealthMonitorService, binance_websocket_health_check, cryptocom_websocket_health_check, redis_health_check
@@ -25,6 +28,21 @@ from health_monitor import HealthMonitorService, binance_websocket_health_check,
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Load configuration
+def load_config():
+    """Load configuration from config.yaml"""
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), '../../config/config.yaml')
+        with open(config_path, 'r') as file:
+            return yaml.safe_load(file)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return {}
+
+# Global config
+config = load_config()
+trading_config = config.get('trading', {})
 
 app = FastAPI(title="Exchange Service", version="1.0.0")
 
@@ -63,7 +81,11 @@ class WebSocketExchangeHandler:
                 return False
                 
             logger.info(f"Connecting to {self.exchange_name} WebSocket: {self.websocket_url}")
-            self.connection = await websockets.connect(self.websocket_url)
+            self.connection = await websockets.connect(
+                self.websocket_url,
+                open_timeout=60,
+                close_timeout=15,
+            )
             self.is_connected = True
             self.last_update = datetime.utcnow().isoformat()
             
@@ -79,10 +101,24 @@ class WebSocketExchangeHandler:
             
             logger.info(f"✅ {self.exchange_name} WebSocket connected with listener task")
             return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to {self.exchange_name} WebSocket: {e}")
+
+        except asyncio.CancelledError:
             self.is_connected = False
+            logger.warning(
+                "%s WebSocket connect cancelled (shutdown or parent task cancel)",
+                self.exchange_name,
+            )
+            raise
+
+        except Exception as e:
+            self.is_connected = False
+            logger.error(
+                "Failed to connect to %s WebSocket (%s): %s: %r",
+                self.exchange_name,
+                self.websocket_url,
+                type(e).__name__,
+                e,
+            )
             return False
     
     async def disconnect(self):
@@ -174,7 +210,11 @@ class WebSocketExchangeHandler:
                         
                         # Reconnect
                         logger.info(f"🔄 Reconnecting to {self.exchange_name} WebSocket...")
-                        self.connection = await websockets.connect(self.websocket_url)
+                        self.connection = await websockets.connect(
+                            self.websocket_url,
+                            open_timeout=60,
+                            close_timeout=15,
+                        )
                         self.is_connected = True
                         self.last_update = datetime.utcnow().isoformat()
                         
@@ -373,7 +413,9 @@ class WebSocketExchangeHandler:
                 return
             # Bybit subscribe (limit: 10 args per request)
             if self.exchange_name.lower() == 'bybit' and self.connection:
-                topics = [f"tickers.{sym}" for sym in new_syms]
+                # Bybit V5 SPOT topic format: tickers.{SYMBOL_NO_SLASH}, e.g. tickers.BTCUSDT
+                # Normalise so callers can pass either "BTCUSDT" or "BTC/USDT".
+                topics = [f"tickers.{sym.replace('/', '')}" for sym in new_syms]
                 # Split into chunks of 10 to respect Bybit's limit
                 for i in range(0, len(topics), 10):
                     chunk = topics[i:i+10]
@@ -413,7 +455,7 @@ class WebSocketExchangeHandler:
             self.subscribed_symbols -= remove_syms
             # Optional: send unsubscribe frames if needed for specific exchanges
             if self.exchange_name.lower() == 'bybit' and self.connection:
-                topics = [f"tickers.{sym}" for sym in remove_syms]
+                topics = [f"tickers.{sym.replace('/', '')}" for sym in remove_syms]
                 msg = {"op": "unsubscribe", "args": topics}
                 await self.connection.send(json.dumps(msg))
             if self.exchange_name.lower() == 'cryptocom' and self.connection:
@@ -575,6 +617,39 @@ websocket_manager = WebSocketManager()
 # In-memory ticker cache: key = f"{exchange}:{symbol_no_slash}", value dict(last,bid,ask,timestamp)
 ticker_cache: Dict[str, Dict[str, Any]] = {}
 
+# Optional Redis mirror of WS tickers (same key scheme as orchestrator ``ticker:live:{exchange|sym}``).
+_ticker_redis_mirror: Optional[Any] = None
+_ticker_redis_mirror_disabled: bool = False
+
+
+def _get_ticker_redis_mirror():
+    """Lazy sync Redis client for publishing ``ticker:live:*`` hashes from WebSocket updates."""
+    global _ticker_redis_mirror, _ticker_redis_mirror_disabled
+    if _ticker_redis_mirror_disabled:
+        return None
+    if _ticker_redis_mirror is not None:
+        return _ticker_redis_mirror
+    if os.getenv("TICKER_REDIS_MIRROR", "1").strip() == "0":
+        _ticker_redis_mirror_disabled = True
+        return None
+    url = os.getenv("REDIS_URL", "").strip()
+    if not url:
+        _ticker_redis_mirror_disabled = True
+        return None
+    try:
+        import redis as redis_sync
+
+        _ticker_redis_mirror = redis_sync.Redis.from_url(url, decode_responses=True)
+        _ticker_redis_mirror.ping()
+        logger.info("✅ Ticker Redis mirror enabled (WS → Redis for orchestrator fast path)")
+        return _ticker_redis_mirror
+    except Exception as e:
+        logger.warning("Ticker Redis mirror disabled: %s", e)
+        _ticker_redis_mirror = None
+        _ticker_redis_mirror_disabled = True
+        return None
+
+
 def _normalize_symbol_key(exchange: str, symbol: str) -> str:
     # Handle symbol normalization per exchange requirements
     if exchange.lower() == 'cryptocom':
@@ -589,7 +664,42 @@ def _normalize_symbol_key(exchange: str, symbol: str) -> str:
     
     return f"{exchange}:{normalized}"
 
-def _update_ticker_cache(exchange: str, symbol: str, last: Any, bid: Any, ask: Any) -> None:
+
+def _normalize_cryptocom_symbol_for_ccxt(symbol: str) -> str:
+    """
+    Map URL/path symbols to CCXT Crypto.com unified symbols.
+
+    CCXT lists Crypto.com *spot* pairs as BASE/USD or BASE/USDC. The previous
+    logic rewrote every ``.../USD`` into ``.../USD:USD``, which is invalid for
+    spot (e.g. AI16Z/USD -> AI16Z/USD:USD) and triggers "does not have market symbol".
+    Callers that truly need a settled/margin symbol can pass it with ``:`` already present.
+    """
+    s = (symbol or "").strip()
+    if "/" not in s:
+        # Check USDC before USD — e.g. ALICEUSDC also endswith "USD"
+        if len(s) >= 6 and s.endswith("USDC"):
+            base = s[:-4]
+            s = f"{base}/USDC"
+        elif len(s) >= 6 and s.endswith("USD"):
+            base = s[:-3]
+            s = f"{base}/USD"
+    # Collapse mistaken or legacy double suffix from callers / old clients
+    if s.endswith("/USD:USD"):
+        s = s[: -len(":USD")]
+    elif s.endswith("/USDC:USDC"):
+        s = s[: -len(":USDC")]
+    return s
+
+
+def _update_ticker_cache(
+    exchange: str,
+    symbol: str,
+    last: Any,
+    bid: Any,
+    ask: Any,
+    *,
+    redis_source: str = "websocket",
+) -> None:
     try:
         key = _normalize_symbol_key(exchange, symbol)
         last_f = float(last) if last is not None else None
@@ -603,6 +713,23 @@ def _update_ticker_cache(exchange: str, symbol: str, last: Any, bid: Any, ask: A
             'ask': ask_f,
             'timestamp': datetime.utcnow().isoformat()
         }
+        rc = _get_ticker_redis_mirror()
+        if rc:
+            try:
+                rk = "ticker:live:" + key.replace(":", "|")
+                rc.hset(
+                    rk,
+                    mapping={
+                        "last": str(last_f),
+                        "bid": str(bid_f) if bid_f is not None else "",
+                        "ask": str(ask_f) if ask_f is not None else "",
+                        "timestamp": ticker_cache[key]["timestamp"],
+                        "source": redis_source,
+                    },
+                )
+                rc.expire(rk, 300)
+            except Exception as ex:
+                logger.debug("ticker redis mirror publish failed: %s", ex)
     except Exception as e:
         logger.debug(f"Failed to update ticker cache for {exchange}:{symbol}: {e}")
 
@@ -627,8 +754,62 @@ class HealthResponse(BaseModel):
 exchanges = {}
 rate_limits = {}
 exchange_manager = None
+# CCXT clients with no API keys for public market data (OHLCV). Authenticated instances
+# often fail from Docker (-2015 on Binance, IP mismatch on Bybit) even for public endpoints.
+public_market_clients: Dict[str, Any] = {}
+# One lock per exchange so Binance load_markets() does not block Bybit/Crypto tickers.
+_public_market_client_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _public_market_lock_for(exchange_name: str) -> asyncio.Lock:
+    lock = _public_market_client_locks.get(exchange_name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _public_market_client_locks[exchange_name] = lock
+    return lock
+
+
+async def get_public_market_client(exchange_name: str):
+    """Lazy async CCXT client: same options/sandbox as live instance, no apiKey/secret."""
+    global public_market_clients
+    if exchange_name in public_market_clients:
+        return public_market_clients[exchange_name]
+    async with _public_market_lock_for(exchange_name):
+        if exchange_name in public_market_clients:
+            return public_market_clients[exchange_name]
+        if exchange_name not in exchanges:
+            raise HTTPException(status_code=404, detail=f"Exchange {exchange_name} not found")
+        live = exchanges[exchange_name]["instance"]
+        exchange_class = type(live)
+        cfg: Dict[str, Any] = {
+            "enableRateLimit": True,
+            "rateLimit": getattr(live, "rateLimit", 100) or 100,
+            "sandbox": bool(getattr(live, "sandbox", False)),
+            # CCXT: milliseconds; avoids hanging the event loop when outbound is black-holed.
+            "timeout": 25000,
+        }
+        opts = getattr(live, "options", None)
+        if isinstance(opts, dict) and opts:
+            cfg["options"] = dict(opts)
+        client = exchange_class(cfg)
+        try:
+            await asyncio.wait_for(client.load_markets(), timeout=20.0)
+        except Exception:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            raise
+        public_market_clients[exchange_name] = client
+        logger.info(
+            "Initialized public market CCXT client for %s (OHLCV; no API credentials)",
+            exchange_name,
+        )
+        return client
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
-database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database_service:8002")
+database_service_url = os.getenv(
+    "DATABASE_SERVICE_URL", "http://database-service:8002"
+)
 
 class ExchangeManager:
     """FIXED Exchange Manager with proper error handling"""
@@ -675,7 +856,8 @@ class ExchangeManager:
                 elif exchange_name == 'bybit':
                     exchange_config.update({
                         'options': {
-                            'defaultType': 'unified'  # Use unified trading account
+                            'defaultType': 'spot',          # SPOT markets only (matches WS /v5/public/spot)
+                            'accountsByType': {'spot': 'UNIFIED'},  # but route account ops through UTA
                         }
                     })
                 elif exchange_name == 'cryptocom':
@@ -725,7 +907,11 @@ class ExchangeManager:
                     if exchange_name == 'binance':
                         websocket_config['websocket_url'] = 'wss://stream.binance.com:9443/ws/!ticker@arr'
                     elif exchange_name == 'cryptocom':
-                        websocket_config['websocket_url'] = 'wss://stream.crypto.com/v2/market'
+                        # Must match Exchange public market WS (see exchange-docs v1 rest-ws).
+                        # v2/market was unreliable vs integration ``exchange/v1/market``.
+                        websocket_config['websocket_url'] = (
+                            'wss://stream.crypto.com/exchange/v1/market'
+                        )
                     elif exchange_name == 'bybit':
                         websocket_config['websocket_url'] = 'wss://stream.bybit.com/v5/public/spot'
                     else:
@@ -757,29 +943,81 @@ class ExchangeManager:
             rate_limit['request_count'] += 1
             
     async def _handle_exchange_error(self, exchange_name: str, error: Exception, operation: str) -> None:
-        """Handle exchange errors and create alerts"""
-        error_msg = f"Exchange error on {exchange_name} during {operation}: {str(error)}"
-        logger.error(error_msg)
-        
+        """Handle exchange errors and create alerts.
+
+        PnL-FIX v3: Detect Bybit retCode:10010 ("Unmatched IP") and mark the
+        exchange as 'auth_failed' so that:
+          (a) the orchestrator can skip it cleanly and not trade on stale prices,
+          (b) the log output isn't spammed every cycle (one loud warning is enough).
+        """
+        err_str = str(error)
+        is_ip_whitelist = ('retCode":10010' in err_str or 'Unmatched IP' in err_str
+                           or 'retCode":10003' in err_str or 'retCode":10007' in err_str)
+
         # Update exchange health
         if exchange_name in exchanges:
-            exchanges[exchange_name]['health']['error_count'] += 1
-            exchanges[exchange_name]['health']['status'] = 'degraded'
-        
-        # Create alert in database
+            h = exchanges[exchange_name].setdefault('health', {})
+            h['error_count'] = h.get('error_count', 0) + 1
+            if is_ip_whitelist:
+                # Permanent until the user updates the whitelist. Log ONCE loudly.
+                if h.get('status') != 'auth_failed':
+                    import requests as _rq
+                    try:
+                        public_ip = _rq.get('https://api.ipify.org', timeout=3).text.strip()
+                    except Exception:
+                        public_ip = 'unknown'
+                    logger.error(
+                        f"🚨 [AUTH] {exchange_name} API key is IP-whitelisted and does NOT "
+                        f"include the current public IP ({public_ip}). "
+                        f"Fix: open the Bybit dashboard → API management → edit the key's IP "
+                        f"whitelist to include {public_ip}, OR remove the whitelist entirely. "
+                        f"Marking {exchange_name} as auth_failed — it will be skipped until restart."
+                    )
+                    h['status'] = 'auth_failed'
+                    h['public_ip_seen'] = public_ip
+                # Suppress the repeated ERROR line for this operation once auth_failed is set.
+                logger.debug(f"[AUTH SUPPRESSED] {exchange_name}.{operation}: 10010 Unmatched IP")
+                return
+            else:
+                h['status'] = 'degraded'
+
+        error_msg = f"Exchange error on {exchange_name} during {operation}: {err_str}"
+        logger.error(error_msg)
+
+        # Best-effort alert: short timeout, never fail the HTTP handler. Python 3.11+
+        # asyncio.CancelledError inherits from BaseException (not Exception), so a
+        # bare ``except Exception`` lets CancelledError escape and crashes ASGI
+        # when the client disconnects mid-request or under cancellation storms.
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                # Must match database-service ``Alert`` model (POST /api/v1/alerts).
                 alert_data = {
-                    'exchange': exchange_name,
-                    'operation': operation,
-                    'error_message': str(error),
-                    'severity': 'warning',
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'resolved': False
+                    "alert_id": str(uuid.uuid4()),
+                    "level": "WARNING",
+                    "category": "exchange",
+                    "message": f"{operation}: {err_str[:4000]}",
+                    "exchange": exchange_name,
+                    "details": {"operation": operation, "error": err_str[:8000]},
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "resolved": False,
                 }
-                await client.post(f"{database_service_url}/api/v1/alerts", json=alert_data)
+                r = await client.post(
+                    f"{database_service_url}/api/v1/alerts", json=alert_data
+                )
+                if r.status_code >= 400:
+                    logger.debug(
+                        "Alert POST returned %s: %s", r.status_code, r.text[:500]
+                    )
+        except asyncio.CancelledError:
+            logger.debug(
+                "Alert post cancelled for %s %s (client disconnect or task cancel)",
+                exchange_name,
+                operation,
+            )
         except Exception as alert_error:
-            logger.warning(f"Failed to create alert for exchange error: {alert_error}")
+            logger.warning(
+                "Failed to create alert for exchange error: %s", alert_error
+            )
 
 async def get_config_from_service():
     """Get configuration from config service"""
@@ -878,63 +1116,122 @@ async def get_ticker_live(exchange: str, symbol: str, stale_threshold_seconds: i
         raise HTTPException(status_code=500, detail=str(e))
 @app.get("/api/v1/market/ticker/{exchange}/{symbol:path}")
 async def get_ticker(exchange: str, symbol: str):
-    """Get ticker information for a symbol - FIXED VERSION"""
+    """Get ticker information for a symbol - FIXED VERSION
+
+    PnL-FIX v3: Prefer the WebSocket ticker cache (fresh < 15s) to avoid
+    hammering the CCXT REST throttle queue (the root cause of the Bybit
+    ticker 500 errors — ``throttle queue is over maxCapacity (2000)``).
+    Fall back to REST only when no fresh WS tick is available.
+    """
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
-    
+
+    # Short-circuit: if the exchange is marked auth_failed, return 503 immediately.
+    try:
+        if exchanges.get(exchange, {}).get('health', {}).get('status') == 'auth_failed':
+            raise HTTPException(status_code=503, detail=f"{exchange} auth_failed — check API key IP whitelist")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Try WebSocket cache first (fresh for 15s is plenty for entry decisions).
+    try:
+        key = _normalize_symbol_key(exchange, symbol)
+        cached = ticker_cache.get(key)
+        if cached and cached.get('timestamp'):
+            try:
+                age = (datetime.utcnow() - datetime.fromisoformat(cached['timestamp'])).total_seconds()
+            except Exception:
+                age = 9999
+            if age <= 15 and cached.get('last'):
+                return {
+                    'symbol': symbol,
+                    'last': cached.get('last'),
+                    'bid': cached.get('bid'),
+                    'ask': cached.get('ask'),
+                    'high': cached.get('high'),
+                    'low': cached.get('low'),
+                    'volume': cached.get('volume'),
+                    'timestamp': cached.get('timestamp'),
+                    'source': 'websocket_cache'
+                }
+    except Exception as _cache_err:
+        logger.debug(f"[ticker cache miss] {exchange}/{symbol}: {_cache_err}")
+
     try:
         # Convert symbol format for different exchanges
         exchange_symbol = symbol
         if exchange == 'cryptocom':
-            # Crypto.com needs symbols with slashes, convert from BTCUSD to BTC/USD
+            exchange_symbol = _normalize_cryptocom_symbol_for_ccxt(symbol)
+        elif exchange in ['binance', 'bybit']:
+            # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD.
+            # Skip if the input already contains a slash (e.g. "TRX/USDC") — otherwise
+            # the suffix-strip would produce malformed "TRX//USDC" and cause a 404.
             if '/' not in symbol:
-                if len(symbol) >= 6 and symbol.endswith('USD'):
-                    base = symbol[:-3]
-                    exchange_symbol = f"{base}/USD"
-                elif len(symbol) >= 6 and symbol.endswith('USDC'):
+                if len(symbol) >= 7 and symbol.endswith('USDC'):
                     base = symbol[:-4]
                     exchange_symbol = f"{base}/USDC"
-                
-            # Add :USD or :USDC suffix when needed without introducing double slashes
-            if ':' not in exchange_symbol:
-                if exchange_symbol.endswith('/USD'):
-                    exchange_symbol = exchange_symbol.replace('/USD', '/USD:USD')
-                elif exchange_symbol.endswith('/USDC'):
-                    exchange_symbol = exchange_symbol.replace('/USDC', '/USDC:USDC')
-        elif exchange in ['binance', 'bybit']:
-            # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD
-            if len(symbol) >= 6 and symbol.endswith('USD'):
-                base = symbol[:-3]
-                exchange_symbol = f"{base}/USD"
-            elif len(symbol) >= 6 and symbol.endswith('USDC'):
-                base = symbol[:-4]
-                exchange_symbol = f"{base}/USDC"
+                elif len(symbol) >= 7 and symbol.endswith('USDT'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDT"
+                elif len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
         
         await exchange_manager._rate_limit(exchange)
-        
-        # CRITICAL FIX: Ensure we get the actual CCXT instance
-        exchange_instance = exchanges[exchange]['instance']
-        
-        # Verify the instance has the required methods
-        if not hasattr(exchange_instance, 'fetch_ticker'):
-            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_ticker method")
-        
+
+        # Public market data only — same as OHLCV (avoids Binance -2015 / Bybit IP mismatch on keys)
+        exchange_instance = await get_public_market_client(exchange)
+
+        if not hasattr(exchange_instance, "fetch_ticker"):
+            raise Exception(
+                f"Invalid exchange instance for {exchange}: missing fetch_ticker method"
+            )
+
         # Retry logic with exponential backoff
         max_retries = 3
         retry_delay = 1  # Start with 1 second
         ticker = None
-        
+
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
-                # CRITICAL FIX: Make sure this is actually async and properly awaited
-                ticker = await exchange_instance.fetch_ticker(exchange_symbol)
+                ticker = await asyncio.wait_for(
+                    exchange_instance.fetch_ticker(exchange_symbol),
+                    timeout=18.0,
+                )
                 response_time = time.time() - start_time
                 break  # Success, exit retry loop
             except Exception as e:
+                # PnL-FIX v3: don't retry CCXT throttle-queue overflows — they'll
+                # just pile up more requests and make the problem worse. Return
+                # the last-known WS cache value (even if slightly stale) or 503.
+                err_lc = str(e).lower()
+                if 'throttle queue' in err_lc or 'maxcapacity' in err_lc:
+                    logger.warning(
+                        f"[THROTTLE] {exchange} ticker for {exchange_symbol}: queue full, "
+                        f"serving cached price if available"
+                    )
+                    try:
+                        key = _normalize_symbol_key(exchange, symbol)
+                        cached = ticker_cache.get(key)
+                        if cached and cached.get('last'):
+                            return {
+                                'symbol': symbol,
+                                'last': cached.get('last'),
+                                'bid': cached.get('bid'),
+                                'ask': cached.get('ask'),
+                                'timestamp': cached.get('timestamp'),
+                                'source': 'stale_cache_throttle_fallback'
+                            }
+                    except Exception:
+                        pass
+                    raise HTTPException(status_code=503, detail=f"{exchange} REST throttle queue full; no cached price available")
+
                 if attempt == max_retries - 1:  # Last attempt
                     raise e  # Re-raise the exception
-                    
+
                 logger.warning(f"Ticker fetch attempt {attempt + 1} failed for {exchange_symbol} on {exchange}: {e}. Retrying in {retry_delay}s...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
@@ -944,6 +1241,31 @@ async def get_ticker(exchange: str, symbol: str):
         exchanges[exchange]['health']['status'] = 'healthy'
         exchanges[exchange]['health']['response_time'] = response_time
         exchanges[exchange]['health']['last_check'] = datetime.utcnow()
+        
+        # Check for test price override
+        # test_price = await test_price_integration.get_test_price(exchange, symbol)
+        # if test_price:
+        #     # Override the price with test value
+        #     ticker['last'] = test_price
+        #     ticker['test_override'] = True
+        #     ticker['original_price'] = ticker.get('last', test_price)
+        #     logger.info(f"🧪 Test price override applied: {exchange}/{symbol} = ${test_price:.6f}")
+
+        # Keep in-memory ticker cache + Redis ``ticker:live:*`` in sync when traffic is REST-heavy
+        # (WebSocket-only setups already populate via _handle_ticker_update).
+        try:
+            last_px = ticker.get("last") or ticker.get("close")
+            if last_px is not None and float(last_px) > 0:
+                _update_ticker_cache(
+                    exchange,
+                    symbol,
+                    last_px,
+                    ticker.get("bid"),
+                    ticker.get("ask"),
+                    redis_source="rest",
+                )
+        except Exception:
+            pass
         
         return ticker
         
@@ -959,61 +1281,76 @@ async def get_ticker(exchange: str, symbol: str):
 
 @app.get("/api/v1/market/orderbook/{exchange}/{symbol:path}")
 async def get_orderbook(exchange: str, symbol: str, limit: int = 20):
-    """Get orderbook information for a symbol - FIXED VERSION"""
+    """Public order book only — must not use the signed CCXT instance (avoids Binance
+    sapi/capital/config, Bybit asset/coin/query-info, etc. during load_markets / implicit
+    private prefetch).
+    """
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
-    
+
     try:
-        # Convert symbol format for different exchanges
         exchange_symbol = symbol
-        if exchange == 'cryptocom':
-            # Crypto.com needs symbols with slashes, convert from BTCUSD to BTC/USD
-            if '/' not in symbol:
-                if len(symbol) >= 6 and symbol.endswith('USD'):
-                    base = symbol[:-3]
-                    exchange_symbol = f"{base}/USD"
-                elif len(symbol) >= 7 and symbol.endswith('USDC'):
+        if exchange == "cryptocom":
+            exchange_symbol = _normalize_cryptocom_symbol_for_ccxt(symbol)
+        elif exchange in ("binance", "bybit"):
+            if "/" not in symbol:
+                if len(symbol) >= 7 and symbol.endswith("USDC"):
                     base = symbol[:-4]
                     exchange_symbol = f"{base}/USDC"
-            # Add :USD or :USDC suffix when needed without introducing double slashes
-            if ':' not in exchange_symbol:
-                if exchange_symbol.endswith('/USD'):
-                    exchange_symbol = exchange_symbol.replace('/USD', '/USD:USD')
-                elif exchange_symbol.endswith('/USDC'):
-                    exchange_symbol = exchange_symbol.replace('/USDC', '/USDC:USDC')
-        elif exchange in ['binance', 'bybit']:
-            # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD
-            if '/' not in symbol:
-                if len(symbol) >= 6 and symbol.endswith('USD'):
+                elif len(symbol) >= 7 and symbol.endswith("USDT"):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDT"
+                elif len(symbol) >= 6 and symbol.endswith("USD"):
                     base = symbol[:-3]
                     exchange_symbol = f"{base}/USD"
-                elif len(symbol) >= 7 and symbol.endswith('USDC'):
-                    base = symbol[:-4]
-                    exchange_symbol = f"{base}/USDC"
-        
+
         await exchange_manager._rate_limit(exchange)
-        
-        # CRITICAL FIX: Ensure we get the actual CCXT instance
-        exchange_instance = exchanges[exchange]['instance']
-        
-        # Verify the instance has the required methods
-        if not hasattr(exchange_instance, 'fetch_order_book'):
-            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_order_book method")
-        
+
+        exchange_instance = await get_public_market_client(exchange)
+        if not hasattr(exchange_instance, "fetch_order_book"):
+            raise Exception(
+                f"Invalid exchange instance for {exchange}: missing fetch_order_book method"
+            )
+
         start_time = time.time()
-        # CRITICAL FIX: Make sure this is actually async and properly awaited
-        orderbook = await exchange_instance.fetch_order_book(exchange_symbol, limit=limit)
+        orderbook = await asyncio.wait_for(
+            exchange_instance.fetch_order_book(exchange_symbol, limit=limit),
+            timeout=18.0,
+        )
         response_time = time.time() - start_time
-        
-        # Update health
-        exchanges[exchange]['health']['status'] = 'healthy'
-        exchanges[exchange]['health']['response_time'] = response_time
-        exchanges[exchange]['health']['last_check'] = datetime.utcnow()
-        
+
+        exchanges[exchange]["health"]["status"] = "healthy"
+        exchanges[exchange]["health"]["response_time"] = response_time
+        exchanges[exchange]["health"]["last_check"] = datetime.utcnow()
+
         return orderbook
-        
+
+    except asyncio.TimeoutError as e:
+        await exchange_manager._handle_exchange_error(
+            exchange, e, f"get_orderbook({symbol})"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"Orderbook request timed out for {exchange}/{symbol}",
+        ) from e
     except Exception as e:
-        await exchange_manager._handle_exchange_error(exchange, e, f"get_orderbook({symbol})")
+        error_msg = str(e).lower()
+        if any(
+            phrase in error_msg
+            for phrase in (
+                "does not have market symbol",
+                "symbol not found",
+                "invalid symbol",
+                "market not found",
+            )
+        ):
+            logger.warning("Symbol %s not found on %s: %s", exchange_symbol, exchange, e)
+            raise HTTPException(
+                status_code=404, detail=f"Symbol {symbol} not found on {exchange}"
+            )
+        await exchange_manager._handle_exchange_error(
+            exchange, e, f"get_orderbook({symbol})"
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/trading/orders/{exchange}")
@@ -1134,7 +1471,7 @@ async def place_order(order_request: OrderRequest):
                 
             if current_price:
                 notional_value = order_request.amount * current_price
-                min_notional = 200.0  # NEW: Binance minimum notional is now $200 USD
+                min_notional = trading_config.get('min_order_size_usd', {}).get('binance', 100.0)  # Get from config
                 
                 # IMPORTANT: Only apply minimum order value to BUY orders, not SELL orders
                 # SELL orders should be allowed to close any existing position regardless of size
@@ -1162,7 +1499,7 @@ async def place_order(order_request: OrderRequest):
             if order_request.side.lower() == 'buy' and order_request.amount < min_amount:
                 logger.warning(f"⚠️  BUY order amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
                 raise HTTPException(status_code=422, 
-                    detail=f"MINIMUM_ORDER_VALUE: Amount {order_request.amount} below Binance minimum {min_amount} for {order_request.symbol}. Binance now requires minimum order values of $200 USD.")
+                    detail=f"MINIMUM_ORDER_VALUE: Amount {order_request.amount} below Binance minimum {min_amount} for {order_request.symbol}. Binance requires minimum order values of ${min_notional} USD.")
             elif order_request.side.lower() == 'sell':
                 logger.info(f"✅ SELL order allowed: {order_request.amount} {order_request.symbol} on {exchange} (no minimum amount for sells)")
         
@@ -1178,7 +1515,7 @@ async def place_order(order_request: OrderRequest):
                 
             if current_price:
                 notional_value = order_request.amount * current_price
-                min_notional = 200.0  # NEW: Crypto.com minimum notional is now $200 USD
+                min_notional = trading_config.get('min_order_size_usd', {}).get('cryptocom', 100.0)  # Get from config
                 
                 # IMPORTANT: Only apply minimum order value to BUY orders, not SELL orders
                 if order_request.side.lower() == 'buy' and notional_value < min_notional:
@@ -1208,7 +1545,7 @@ async def place_order(order_request: OrderRequest):
             if order_request.side.lower() == 'buy' and order_request.amount < min_amount:
                 logger.warning(f"⚠️  BUY order amount {order_request.amount} below minimum {min_amount} for {order_request.symbol} on {exchange}")
                 raise HTTPException(status_code=422, 
-                    detail=f"MINIMUM_ORDER_VALUE: Amount {order_request.amount} below Crypto.com minimum {min_amount} for {order_request.symbol}. Crypto.com now requires minimum order values of $200 USD.")
+                    detail=f"MINIMUM_ORDER_VALUE: Amount {order_request.amount} below Crypto.com minimum {min_amount} for {order_request.symbol}. Crypto.com requires minimum order values of ${min_notional} USD.")
             elif order_request.side.lower() == 'sell':
                 logger.info(f"✅ SELL order allowed: {order_request.amount} {order_request.symbol} on {exchange} (no minimum amount for sells)")
         
@@ -1224,7 +1561,7 @@ async def place_order(order_request: OrderRequest):
                 
             if current_price:
                 notional_value = order_request.amount * current_price
-                min_notional = 5.0  # Bybit minimum order value is approximately $5 USD
+                min_notional = trading_config.get('min_order_size_usd', {}).get('bybit', 75.0)  # Get from config
                 if notional_value < min_notional:
                     logger.warning(f"⚠️  Order notional ${notional_value:.2f} below minimum ${min_notional} for {order_request.symbol} on {exchange}")
                     raise HTTPException(status_code=422, 
@@ -1352,6 +1689,62 @@ async def place_order(order_request: OrderRequest):
         exchanges[exchange]['health']['response_time'] = response_time
         exchanges[exchange]['health']['last_check'] = datetime.utcnow()
         
+        # Normalize CCXT order response for consistent orchestrator processing
+        normalized_order = {
+            'id': order.get('id'),
+            'symbol': order.get('symbol', exchange_symbol),
+            'type': order.get('type'),
+            'side': order.get('side'),
+            'amount': order.get('amount'),
+            'price': order.get('price'),
+            'status': order.get('status', 'open').lower(),  # Normalize to lowercase
+            'filled': order.get('filled', 0),  # Amount filled
+            'remaining': order.get('remaining', order.get('amount', 0)),
+            'average': order.get('average'),  # Average execution price
+            'timestamp': order.get('timestamp'),
+            'datetime': order.get('datetime'),
+            'fee': order.get('fee'),
+            'trades': order.get('trades', []),
+            'info': order.get('info', {})  # Raw exchange response
+        }
+        
+        # Handle exchange-specific field mapping
+        if exchange.lower() == 'cryptocom':
+            # Crypto.com specific normalization
+            info = order.get('info', {})
+            if info:
+                # Map crypto.com specific fields if needed
+                if 'cum_qty' in info:
+                    normalized_order['filled'] = float(info.get('cum_qty', 0))
+                if 'avg_price' in info:
+                    normalized_order['average'] = float(info.get('avg_price', 0)) if info.get('avg_price') else None
+                if info.get('status') == 'FILLED':
+                    normalized_order['status'] = 'filled'
+                elif info.get('status') == 'PARTIALLY_FILLED':
+                    normalized_order['status'] = 'open'
+        
+        elif exchange.lower() == 'binance':
+            # Binance specific normalization
+            info = order.get('info', {})
+            if info:
+                if 'executedQty' in info:
+                    normalized_order['filled'] = float(info.get('executedQty', 0))
+                if info.get('status') == 'FILLED':
+                    normalized_order['status'] = 'filled'
+                    
+        elif exchange.lower() == 'bybit':
+            # Bybit specific normalization
+            info = order.get('info', {})
+            if info:
+                if 'cumExecQty' in info:
+                    normalized_order['filled'] = float(info.get('cumExecQty', 0))
+                if 'avgPrice' in info:
+                    normalized_order['average'] = float(info.get('avgPrice', 0)) if info.get('avgPrice') else None
+                if info.get('orderStatus') == 'Filled':
+                    normalized_order['status'] = 'filled'
+        
+        logger.info(f"📋 Order response normalized: {exchange} order {normalized_order.get('id')} - status={normalized_order.get('status')}, filled={normalized_order.get('filled')}, avg={normalized_order.get('average')}")
+        
         # Register WebSocket callback for order updates if available
         if 'id' in order:
             handler = websocket_manager.get_handler(exchange)
@@ -1361,7 +1754,7 @@ async def place_order(order_request: OrderRequest):
                 
                 handler.register_order_callback(order['id'], order_callback)
         
-        return {"order": order, "exchange": exchange, "symbol": exchange_symbol}
+        return {"order": normalized_order, "exchange": exchange, "symbol": exchange_symbol}
         
     except HTTPException:
         # Re-raise HTTPExceptions (like 422 for dust amounts) without modification
@@ -1432,6 +1825,153 @@ async def cancel_order(exchange: str, order_id: str, symbol: str = None):
         await exchange_manager._handle_exchange_error(exchange, e, f"cancel_order({order_id})")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.put("/api/v1/trading/order/{exchange}/{order_id}")
+async def modify_order(exchange: str, order_id: str, modification: dict):
+    """
+    Modify an existing order (price, quantity, etc.) - ORDER MODIFICATION IMPROVEMENT
+    
+    CCXT Support by Exchange:
+    - Binance: ✅ editOrder() - Full support
+    - Bybit: ✅ editOrder() - Full support  
+    - Crypto.com: ❌ No support - will return 501
+    
+    Request body:
+    {
+        "symbol": "BTC/USDC",
+        "new_price": 50000.0,
+        "new_amount": 0.1  (optional)
+    }
+    """
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
+    
+    # Check if exchange has credentials
+    exchange_info = exchanges[exchange]
+    config = exchange_info.get('config', {})
+    if not config.get('api_key') or not config.get('api_secret'):
+        raise HTTPException(status_code=403, detail=f"Exchange {exchange} missing API credentials for trading operations")
+    
+    try:
+        await exchange_manager._rate_limit(exchange)
+        
+        # Get the actual CCXT instance
+        exchange_instance = exchanges[exchange]['instance']
+        
+        # Check if exchange supports order modification
+        if not hasattr(exchange_instance, 'edit_order'):
+            raise HTTPException(
+                status_code=501, 
+                detail=f"Exchange {exchange} does not support order modification. Use cancel-and-recreate instead."
+            )
+        
+        # Extract modification parameters
+        symbol = modification.get('symbol')
+        new_price = modification.get('new_price')
+        new_amount = modification.get('new_amount')
+        
+        if not symbol:
+            raise HTTPException(status_code=400, detail="Symbol is required for order modification")
+        
+        if not new_price and not new_amount:
+            raise HTTPException(status_code=400, detail="Either new_price or new_amount must be specified")
+        
+        # Convert symbol to exchange format  
+        exchange_symbol = symbol
+        
+        # Load markets if not already loaded
+        if not hasattr(exchange_instance, 'markets') or not exchange_instance.markets:
+            await exchange_instance.load_markets()
+        
+        # Validate symbol exists
+        if symbol not in exchange_instance.markets:
+            available_symbols = list(exchange_instance.markets.keys())[:10]  # First 10 for reference
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Symbol {symbol} not found on {exchange}. Available symbols include: {available_symbols}"
+            )
+        
+        start_time = time.time()
+        
+        # Get existing order details to determine side and current amount
+        try:
+            existing_order = await exchange_instance.fetch_order(order_id, exchange_symbol)
+            order_side = existing_order.get('side', 'sell')  # Default to sell for trailing stops
+            order_amount = existing_order.get('amount', new_amount)
+            
+            logger.info(f"🔄 Modifying order {order_id} on {exchange}: symbol={symbol}, side={order_side}, new_price={new_price}, new_amount={new_amount}")
+            
+            # Use existing amount if new_amount not specified
+            if new_amount is None:
+                new_amount = order_amount
+            
+            # Build edit parameters based on what's being modified
+            edit_params = {}
+            
+            result = await exchange_instance.edit_order(
+                id=order_id,
+                symbol=exchange_symbol,
+                type='limit',  # Most trailing stops are limit orders
+                side=order_side,     # Use existing side
+                amount=new_amount,   # New amount or existing amount
+                price=new_price,     # New price
+                params=edit_params
+            )
+            
+            response_time = time.time() - start_time
+            
+            # Update health
+            exchanges[exchange]['health']['status'] = 'healthy'
+            exchanges[exchange]['health']['response_time'] = response_time
+            exchanges[exchange]['health']['last_check'] = datetime.utcnow()
+            
+            logger.info(f"✅ Order {order_id} modified successfully on {exchange} - New price: ${new_price:.6f}" if new_price else f"✅ Order {order_id} modified successfully on {exchange}")
+            
+            return {
+                "success": True,
+                "order": result,
+                "exchange": exchange,
+                "order_id": order_id,
+                "modifications": {
+                    "new_price": new_price,
+                    "new_amount": new_amount
+                },
+                "response_time": response_time
+            }
+            
+        except Exception as edit_error:
+            # Handle common modification errors gracefully
+            error_message = str(edit_error).lower() if edit_error else ""
+            
+            if any(phrase in error_message for phrase in ['order not found', 'does not exist', 'invalid order', 'already filled', 'already executed']):
+                # Order was likely filled or already cancelled
+                logger.warning(f"Order {order_id} on {exchange} cannot be modified - likely filled or cancelled: {edit_error}")
+                return {
+                    "success": False,
+                    "error": "order_not_modifiable",
+                    "message": "Order likely filled, cancelled, or does not exist",
+                    "exchange": exchange,
+                    "order_id": order_id,
+                    "fallback_required": True
+                }
+            elif any(phrase in error_message for phrase in ['not supported', 'not allowed', 'invalid modification']):
+                # Exchange doesn't support this type of modification
+                logger.warning(f"Order modification not supported for {order_id} on {exchange}: {edit_error}")
+                return {
+                    "success": False,
+                    "error": "modification_not_supported",
+                    "message": f"Exchange {exchange} does not support this type of order modification",
+                    "exchange": exchange,
+                    "order_id": order_id,
+                    "fallback_required": True
+                }
+            else:
+                # Re-raise other errors
+                raise edit_error
+        
+    except Exception as e:
+        await exchange_manager._handle_exchange_error(exchange, e, f"modify_order({order_id})")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # OHLCV Data Endpoints
 @app.get("/api/v1/market/ohlcv/{exchange}/{symbol:path}")
 async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: int = 100):
@@ -1443,20 +1983,7 @@ async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: in
         # Convert symbol format for different exchanges
         exchange_symbol = symbol
         if exchange == 'cryptocom':
-            # Crypto.com needs symbols with slashes, convert from CROUSD to CRO/USD
-            if '/' not in symbol:
-                if len(symbol) >= 6 and symbol.endswith('USD'):
-                    base = symbol[:-3]
-                    exchange_symbol = f"{base}/USD"
-                elif len(symbol) >= 7 and symbol.endswith('USDC'):
-                    base = symbol[:-4]
-                    exchange_symbol = f"{base}/USDC"
-            # Add :USD or :USDC suffix when needed without introducing double slashes
-            if ':' not in exchange_symbol:
-                if exchange_symbol.endswith('/USD'):
-                    exchange_symbol = exchange_symbol.replace('/USD', '/USD:USD')
-                elif exchange_symbol.endswith('/USDC'):
-                    exchange_symbol = exchange_symbol.replace('/USDC', '/USDC:USDC')
+            exchange_symbol = _normalize_cryptocom_symbol_for_ccxt(symbol)
         elif exchange in ['binance', 'bybit']:
             # Binance and Bybit need symbols with slashes, convert from BTCUSD to BTC/USD
             if '/' not in symbol:
@@ -1468,17 +1995,19 @@ async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: in
                     exchange_symbol = f"{base}/USDC"
         
         await exchange_manager._rate_limit(exchange)
-        
-        # CRITICAL: Get the actual CCXT instance
-        exchange_instance = exchanges[exchange]['instance']
-        
-        # Verify the instance has the required methods
-        if not hasattr(exchange_instance, 'fetch_ohlcv'):
-            raise Exception(f"Invalid exchange instance for {exchange}: missing fetch_ohlcv method")
-        
+
+        # Use unsigned public client so OHLCV works when API keys are invalid or IP-restricted
+        exchange_instance = await get_public_market_client(exchange)
+
+        if not hasattr(exchange_instance, "fetch_ohlcv"):
+            raise Exception(
+                f"Invalid exchange instance for {exchange}: missing fetch_ohlcv method"
+            )
+
         start_time = time.time()
-        # Fetch OHLCV data using CCXT
-        ohlcv = await exchange_instance.fetch_ohlcv(exchange_symbol, timeframe=timeframe, limit=limit)
+        ohlcv = await exchange_instance.fetch_ohlcv(
+            exchange_symbol, timeframe=timeframe, limit=limit
+        )
         response_time = time.time() - start_time
         
         # Update health
@@ -1544,14 +2073,84 @@ async def get_orders_history(exchange: str, symbol: Optional[str] = None, since:
     try:
         await exchange_manager._rate_limit(exchange)
         exchange_instance = exchanges[exchange]['instance']
-        if not hasattr(exchange_instance, 'fetch_orders'):
-            raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing fetch_orders method")
-        orders = await exchange_instance.fetch_orders(symbol=symbol, since=since, limit=limit)
-        return {"orders": orders}
+        
+        # Handle exchanges that require symbol for fetch_orders
+        if exchange == 'binance' and not symbol:
+            # Binance requires symbol for both fetch_orders and fetch_my_trades
+            # Return empty result since we can't fetch all orders without symbol
+            logger.warning(f"⚠️ Binance requires symbol for order history, returning empty result")
+            return {"orders": []}
+        else:
+            # Standard fetch_orders for other exchanges or when symbol is provided
+            if not hasattr(exchange_instance, 'fetch_orders'):
+                raise HTTPException(status_code=500, detail=f"Invalid exchange instance for {exchange}: missing fetch_orders method")
+            orders = await exchange_instance.fetch_orders(symbol=symbol, since=since, limit=limit)
+            return {"orders": orders}
+            
     except HTTPException:
         raise
     except Exception as e:
         await exchange_manager._handle_exchange_error(exchange, e, "get_orders_history")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/market/info/{exchange}/{symbol:path}")
+async def get_market_info(exchange: str, symbol: str):
+    """Get market information including precision for a trading pair"""
+    if not exchange_manager or exchange not in exchanges:
+        raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
+    
+    try:
+        await exchange_manager._rate_limit(exchange)
+        exchange_instance = exchanges[exchange]['instance']
+        
+        # Convert symbol format for different exchanges
+        exchange_symbol = symbol
+        if exchange == 'cryptocom':
+            exchange_symbol = _normalize_cryptocom_symbol_for_ccxt(symbol)
+        elif exchange in ['binance', 'bybit']:
+            if '/' not in symbol:
+                if len(symbol) >= 6 and symbol.endswith('USD'):
+                    base = symbol[:-3]
+                    exchange_symbol = f"{base}/USD"
+                elif len(symbol) >= 7 and symbol.endswith('USDC'):
+                    base = symbol[:-4]
+                    exchange_symbol = f"{base}/USDC"
+        
+        # Get market information
+        markets = await exchange_instance.fetch_markets()
+        market_info = None
+        
+        for market in markets:
+            if market['symbol'] == exchange_symbol:
+                market_info = market
+                break
+        
+        if not market_info:
+            raise HTTPException(status_code=404, detail=f"Market {exchange_symbol} not found")
+        
+        # Extract precision information
+        precision_info = {
+            'symbol': market_info['symbol'],
+            'base': market_info['base'],
+            'quote': market_info['quote'],
+            'active': market_info['active'],
+            'precision': {
+                'amount': market_info.get('precision', {}).get('amount'),
+                'price': market_info.get('precision', {}).get('price')
+            },
+            'limits': {
+                'amount': market_info.get('limits', {}).get('amount'),
+                'price': market_info.get('limits', {}).get('price'),
+                'cost': market_info.get('limits', {}).get('cost')
+            }
+        }
+        
+        return precision_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await exchange_manager._handle_exchange_error(exchange, e, "get_market_info")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/trading/mytrades/{exchange}")
@@ -1600,6 +2199,17 @@ async def get_my_trades(exchange: str, symbol: Optional[str] = None, since: Opti
         raise HTTPException(status_code=500, detail=str(e))
 
 # WebSocket status endpoints
+@app.get("/api/v1/websocket/monitor/status")
+async def get_websocket_monitor_status():
+    """Aggregated monitor payload (must be registered before ``/{exchange}/status``).
+
+    Orchestrator's ``WebSocketPriceFeed`` calls this path; if only
+    ``/api/v1/websocket/{exchange}/status`` exists, ``exchange=monitor`` matches first
+    and returns ``Handler not found``.
+    """
+    return await get_all_websocket_status()
+
+
 @app.get("/api/v1/websocket/{exchange}/status")
 async def get_websocket_status(exchange: str):
     """Get WebSocket connection status for an exchange"""
@@ -1617,6 +2227,39 @@ async def get_websocket_status(exchange: str):
         "subscribed_symbols_list": list(handler.subscribed_symbols),
         "websocket_url": handler.websocket_url
     }
+
+@app.post("/api/v1/websocket/{exchange}/restart")
+async def restart_websocket_connection(exchange: str):
+    """Emergency restart WebSocket connection for an exchange"""
+    try:
+        if exchange.lower() == "cryptocom":
+            if cryptocom_websocket and hasattr(cryptocom_websocket, 'connection_manager'):
+                logger.warning(f"🔧 Manual restart requested for {exchange} WebSocket")
+                await cryptocom_websocket.connection_manager._emergency_restart()
+                return {
+                    "status": "restarted",
+                    "exchange": exchange,
+                    "message": "WebSocket connection restarted successfully"
+                }
+            else:
+                return {
+                    "status": "error",
+                    "exchange": exchange,
+                    "message": "WebSocket not available for restart"
+                }
+        else:
+            return {
+                "status": "error",
+                "exchange": exchange,
+                "message": f"Restart not implemented for {exchange}"
+            }
+    except Exception as e:
+        logger.error(f"❌ Failed to restart {exchange} WebSocket: {e}")
+        return {
+            "status": "error",
+            "exchange": exchange,
+            "message": f"Restart failed: {str(e)}"
+        }
 
 @app.get("/api/v1/websocket/monitor/all")
 async def get_all_websocket_status():
@@ -1695,6 +2338,59 @@ async def get_all_websocket_status():
     
     return result
 
+@app.get("/api/v1/websocket/status")
+async def get_websocket_status():
+    """Get WebSocket connection status for all exchanges"""
+    try:
+        result = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "exchanges": {}
+        }
+        
+        for exchange_name in ['binance', 'bybit', 'cryptocom']:
+            handler = websocket_manager.get_handler(exchange_name)
+            if handler:
+                result["exchanges"][exchange_name] = {
+                    "connected": handler.is_connected,
+                    "last_update": handler.last_update,
+                    "subscribed_symbols": len(handler.subscribed_symbols)
+                }
+            else:
+                result["exchanges"][exchange_name] = {
+                    "connected": False,
+                    "handler_exists": False
+                }
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error getting WebSocket status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/exchange/{exchange_name}/statistics")
+async def get_exchange_statistics(exchange_name: str):
+    """Get exchange-specific statistics"""
+    try:
+        if exchange_name not in exchanges:
+            raise HTTPException(status_code=404, detail=f"Exchange {exchange_name} not found")
+        
+        exchange_info = exchanges[exchange_name]
+        handler = websocket_manager.get_handler(exchange_name)
+        
+        stats = {
+            "exchange": exchange_name,
+            "status": exchange_info['health']['status'],
+            "last_check": exchange_info['health']['last_check'],
+            "error_count": exchange_info['health']['error_count'],
+            "websocket_connected": handler.is_connected if handler else False,
+            "subscribed_symbols": len(handler.subscribed_symbols) if handler else 0,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting statistics for {exchange_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/websocket/monitor/ticker-cache")
 async def get_ticker_cache_status():
     """Get detailed ticker cache information across all exchanges"""
@@ -1756,14 +2452,101 @@ async def get_ticker_cache_status():
 
 @app.post("/api/v1/websocket/{exchange}/subscribe")
 async def subscribe_symbols(exchange: str, payload: Dict[str, Any]):
-    """Subscribe to live tickers for given symbols (symbol format without slash, e.g., BTCUSD)."""
-    handler = websocket_manager.get_handler(exchange)
-    if not handler or not handler.is_connected:
-        raise HTTPException(status_code=503, detail="WebSocket not connected")
+    """Subscribe to live tickers for given symbols (symbol format without slash, e.g., BTCUSD).
+
+    WS-FIX (cryptocom 204 root cause): for cryptocom we ALSO push subscriptions
+    through the long-lived ``cryptocom_websocket.market_websocket`` (the
+    integration handler with heartbeats + reconnect), because the bare
+    ``WebSocketManager`` connection to ``stream.crypto.com/exchange/v1/market`` is
+    routinely closed by the exchange (close code 1000) between the
+    ``is_connected`` check and the actual send, dropping subscribe frames on
+    the floor. The integration handler is the source of truth for ticker
+    updates and survives reconnects.
+    """
     symbols = payload.get('symbols') or []
     if not isinstance(symbols, list) or not symbols:
         raise HTTPException(status_code=400, detail="symbols must be a non-empty list")
-    await handler.subscribe(symbols)
+
+    pushed_anywhere = False
+
+    # Try the standard WebSocketManager-based handler first for non-cryptocom exchanges.
+    # For Crypto.com we prefer the integration market socket because the generic handler
+    # is frequently closed by the server (close code 1000) between health check and send.
+    handler = websocket_manager.get_handler(exchange)
+    if exchange.lower() != "cryptocom" and handler and handler.is_connected:
+        try:
+            await handler.subscribe(symbols)
+            pushed_anywhere = True
+        except Exception as e:
+            logger.warning(f"[ws subscribe] manager handler failed for {exchange}: {e}")
+
+    # For cryptocom, push through the integration WS (resilient connection) first.
+    if exchange.lower() == 'cryptocom':
+        try:
+            market_ws = getattr(cryptocom_websocket, 'market_websocket', None)
+            if market_ws and getattr(market_ws, 'is_connected', False):
+                pushed_count = 0
+                for sym in symbols:
+                    # Normalize to Crypto.com instrument format (BASE_QUOTE).
+                    # E.g. "ACT/USD" -> "ACT_USD", "ACTUSD" -> "ACT_USD",
+                    # "ACT_USD" stays "ACT_USD". This matches the subscription
+                    # channel name "ticker.ACT_USD" that produces a cache key
+                    # "cryptocom:ACT_USD" — the same key the orchestrator's
+                    # ticker-live lookup computes.
+                    s = str(sym).upper().strip()
+                    if '/' in s:
+                        instrument = s.replace('/', '_')
+                    elif '_' in s:
+                        instrument = s
+                    elif s.endswith('USDC'):
+                        instrument = f"{s[:-4]}_USDC"
+                    elif s.endswith('USDT'):
+                        instrument = f"{s[:-4]}_USDT"
+                    elif s.endswith('USD'):
+                        instrument = f"{s[:-3]}_USD"
+                    else:
+                        instrument = s
+                    # Skip if already subscribed (the integration tracks its set).
+                    if instrument in getattr(market_ws, 'subscribed_symbols', set()):
+                        continue
+                    try:
+                        ok = await market_ws.subscribe_to_ticker(instrument)
+                        if ok:
+                            pushed_count += 1
+                    except Exception as ie:
+                        logger.warning(f"[ws subscribe] cryptocom integration subscribe failed for {instrument}: {ie}")
+                if pushed_count:
+                    logger.info(f"[ws subscribe] cryptocom integration: subscribed to {pushed_count} new ticker(s)")
+                    pushed_anywhere = True
+            # Fallback to generic handler only if integration channel was unavailable.
+            elif handler and handler.is_connected:
+                try:
+                    await handler.subscribe(symbols)
+                    pushed_anywhere = True
+                    logger.info("[ws subscribe] cryptocom fallback via generic handler")
+                except Exception as e:
+                    logger.warning(f"[ws subscribe] cryptocom fallback handler failed: {e}")
+        except Exception as e:
+            logger.warning(f"[ws subscribe] cryptocom integration push failed: {e}")
+
+    if not pushed_anywhere:
+        mgr = websocket_manager.get_handler(exchange)
+        cryptocom_mw = None
+        if exchange.lower() == "cryptocom":
+            cryptocom_mw = getattr(cryptocom_websocket, "market_websocket", None)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": f"{exchange} WebSocket not available for subscription",
+                "manager_handler_present": mgr is not None,
+                "manager_handler_connected": bool(mgr and mgr.is_connected),
+                "cryptocom_market_ws_present": cryptocom_mw is not None,
+                "cryptocom_market_ws_connected": bool(
+                    cryptocom_mw and getattr(cryptocom_mw, "is_connected", False)
+                ),
+            },
+        )
+
     return {"subscribed": symbols}
 
 @app.post("/api/v1/websocket/{exchange}/unsubscribe")
@@ -1865,58 +2648,78 @@ async def get_detailed_websocket_health():
         raise HTTPException(status_code=500, detail=f"Error getting WebSocket health: {e}")
 
 # Startup and shutdown events
-@app.on_event("startup")
-async def startup_event():
-    """Initialize exchanges on startup"""
+async def _background_websocket_and_health_startup():
+    """Binance listen-key + WS integrations can block on external I/O without timeouts.
+    Running this after the process accepts traffic keeps ``GET /health`` reachable so
+    Docker/orchestrator/dashboard do not see 'All connection attempts failed'."""
     global health_monitor
-    
-    await initialize_exchanges()
-    
-    # Initialize WebSocket integrations
+
     try:
-        logger.info("🚀 Initializing Binance WebSocket integration")
+        logger.info("🚀 Initializing Binance WebSocket integration (background)")
         if await binance_websocket.initialize():
-            await binance_websocket.start()
-            logger.info("✅ Binance WebSocket integration started successfully")
+            if await binance_websocket.start():
+                logger.info("✅ Binance WebSocket integration started successfully")
+            else:
+                logger.warning(
+                    "⚠️ Binance WebSocket integration initialized but stream did not start "
+                    "(listen key / user stream — REST tickers may still work)"
+                )
         else:
             logger.warning("⚠️ Binance WebSocket integration failed to initialize")
     except Exception as e:
         logger.error(f"❌ Error initializing Binance WebSocket integration: {e}")
-    
+
     try:
-        logger.info("🏢 Initializing Crypto.com WebSocket integration")
+        logger.info("🏢 Initializing Crypto.com WebSocket integration (background)")
         if await cryptocom_websocket.initialize():
-            await cryptocom_websocket.start()
-            logger.info("✅ Crypto.com WebSocket integration started successfully")
+            if await cryptocom_websocket.start():
+                logger.info("✅ Crypto.com WebSocket integration started successfully")
+            else:
+                logger.warning(
+                    "⚠️ Crypto.com WebSocket initialized but start() returned false"
+                )
         else:
             logger.warning("⚠️ Crypto.com WebSocket integration failed to initialize")
     except Exception as e:
         logger.error(f"❌ Error initializing Crypto.com WebSocket integration: {e}")
-    
+
     try:
-        logger.info("🚀 Initializing Bybit WebSocket integration")
-        from bybit_websocket_integration import initialize_bybit_websocket, start_bybit_websocket_task
+        logger.info("🚀 Initializing Bybit WebSocket integration (background)")
+        from bybit_websocket_integration import (
+            initialize_bybit_websocket,
+            start_bybit_websocket_task,
+        )
+
         initialize_bybit_websocket()
         await start_bybit_websocket_task()
-        logger.info("✅ Bybit WebSocket integration started successfully")
+        logger.info("✅ Bybit WebSocket background start task finished (see logs above for outcome)")
     except Exception as e:
         logger.error(f"❌ Error initializing Bybit WebSocket integration: {e}")
-    
-    # Initialize health monitoring
+
     try:
-        logger.info("🏥 Initializing health monitoring system")
-        health_monitor = HealthMonitorService(check_interval=30)  # Check every 30 seconds
-        
-        # Register health checks
-        health_monitor.register_health_check("binance-websocket", binance_websocket_health_check)
-        health_monitor.register_health_check("cryptocom-websocket", cryptocom_websocket_health_check)
+        logger.info("🏥 Initializing health monitoring system (background)")
+        health_monitor = HealthMonitorService(check_interval=30)
+        health_monitor.register_health_check(
+            "binance-websocket", binance_websocket_health_check
+        )
+        health_monitor.register_health_check(
+            "cryptocom-websocket", cryptocom_websocket_health_check
+        )
         health_monitor.register_health_check("redis", redis_health_check)
-        
-        # Start monitoring
         await health_monitor.start_monitoring()
         logger.info("✅ Health monitoring system started successfully")
     except Exception as e:
         logger.error(f"❌ Error initializing health monitoring: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize exchanges on startup — keep port open before long-running WS setup."""
+    await initialize_exchanges()
+    asyncio.create_task(_background_websocket_and_health_startup())
+    logger.info(
+        "✅ Exchange CCXT core ready; WebSocket + health monitor starting in background"
+    )
 
 @app.on_event("shutdown")
 async def shutdown_event():

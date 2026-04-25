@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Dict, Any, List, Optional, Set
 import signal
 import sys
+from urllib.parse import unquote
 from fastapi import FastAPI, HTTPException
 import uvicorn
 
@@ -82,68 +83,43 @@ class PriceFeedManager:
             raise
     
     async def _load_active_pairs(self):
-        """Load active trading pairs based on configuration and trading activity"""
+        """Load active trading pairs based on configuration and trading activity.
+
+        WS-FIX (ticker-live 204 root cause): the previous implementation either
+        used a hard-coded list of 15 pairs per exchange, or, when
+        ``subscribe_only_for_open_trades=true``, only the open-trade set. The
+        dynamic pair selector picks pairs OUTSIDE the hard-coded list every 15
+        minutes, so any open trade in a non-pre-listed pair (e.g. bybit/TRX/USDC
+        or binance/BLUR/USDC) never got a WS subscription → ``ticker-live``
+        returned 204 forever and the trail-stop / stop-loss reactions ran on
+        the slower REST/OHLCV fallback path.
+
+        New behaviour: ALWAYS include open-trade pairs and recent-trade pairs
+        (last 24h) in ``active_pairs``, regardless of the strategy flag. The
+        hard-coded list is now an *additional* baseline used only when the
+        strategy is "all-selected".
+        """
         try:
             logger.info(f"🔧 DEBUG: _load_active_pairs called, current config: {self.config}")
-            
-            # Clear existing pairs for fresh discovery
+
             self.active_pairs.clear()
-            
-            # Determine subscription strategy
+
             subscribe_only_for_open_trades = self.config.get('ws', {}).get('subscribe_only_for_open_trades', False)
             logger.info(f"🔧 DEBUG: subscribe_only_for_open_trades = {subscribe_only_for_open_trades}")
-            
-            if subscribe_only_for_open_trades:
-                logger.info("📊 Using open-trades-only subscription strategy")
-                
-                # Method 1: Load pairs from open trades (currently being traded)
-                async with self.db_pool.acquire() as conn:
-                    open_trades_query = """
-                        SELECT DISTINCT exchange, pair 
-                        FROM trading.trades 
-                        WHERE status = 'OPEN'
-                    """
-                    open_trades = await conn.fetch(open_trades_query)
-                    
-                    for row in open_trades:
-                        exchange = row['exchange']
-                        pair = row['pair']
-                        
-                        if exchange not in self.active_pairs:
-                            self.active_pairs[exchange] = set()
-                        self.active_pairs[exchange].add(pair)
-                    
-                    if open_trades:
-                        logger.info(f"📊 Loaded pairs from open trades: {dict((k, list(v)) for k, v in self.active_pairs.items())}")
-                    
-                    # Method 2: Load pairs from recent trading activity (last 24 hours)
-                    recent_trades_query = """
-                        SELECT DISTINCT exchange, pair 
-                        FROM trading.trades 
-                        WHERE created_at >= NOW() - INTERVAL '24 hours'
-                        ORDER BY exchange, pair
-                    """
-                    recent_trades = await conn.fetch(recent_trades_query)
-                    
-                    for row in recent_trades:
-                        exchange = row['exchange']
-                        pair = row['pair']
-                        
-                        if exchange not in self.active_pairs:
-                            self.active_pairs[exchange] = set()
-                        self.active_pairs[exchange].add(pair)
-                    
-                    if recent_trades:
-                        logger.info(f"📊 Added pairs from recent trades (24h): {dict((k, list(v)) for k, v in self.active_pairs.items())}")
-            
-            else:
-                logger.info("📊 Using all-selected-pairs subscription strategy")
-                
-                # Load ALL selected pairs for WebSocket monitoring
-                logger.info("📊 Loading all selected trading pairs for WebSocket monitoring...")
-                
-                # Define all selected pairs per exchange based on your specified list
-                all_selected_pairs = {
+
+            # ALWAYS load open-trade pairs first — these are the ones the
+            # orchestrator's exit cycle is actively polling ticker-live for.
+            # Skipping them for any reason guarantees stale stops.
+            await self._merge_open_trade_pairs()
+            await self._merge_recent_trade_pairs(hours=24)
+
+            if not subscribe_only_for_open_trades:
+                logger.info("📊 Adding hard-coded baseline of selected pairs to active monitoring")
+
+                # Baseline pairs to keep WS warm for likely-to-be-traded symbols.
+                # NOTE: this is just a hint — the open-trade merge above is
+                # the source of truth for what MUST be subscribed.
+                baseline_pairs = {
                     'binance': [
                         'BNB/USDC', 'BTC/USDC', 'ETH/USDC', 'XRP/USDC', 'XLM/USDC',
                         'LINK/USDC', 'LTC/USDC', 'TRX/USDC', 'ADA/USDC', 'NEO/USDC',
@@ -160,22 +136,69 @@ class PriceFeedManager:
                         'DOGE/USDC', 'AVAX/USDC', 'ADA/USDC', 'OP/USDC', 'APEX/USDC'
                     ]
                 }
-                
-                # Add all selected pairs to active monitoring
-                for exchange, pairs in all_selected_pairs.items():
-                    self.active_pairs[exchange] = set(pairs)
-                
-                logger.info(f"✅ Loaded ALL {sum(len(pairs) for pairs in all_selected_pairs.values())} selected pairs for WebSocket monitoring:")
-                for exchange, pairs in self.active_pairs.items():
-                    logger.info(f"   📡 {exchange.upper()}: {len(pairs)} pairs - {list(sorted(pairs))}")
-            
-            # If still no pairs found, log and use dynamic subscription
+
+                for exchange, pairs in baseline_pairs.items():
+                    if exchange not in self.active_pairs:
+                        self.active_pairs[exchange] = set()
+                    self.active_pairs[exchange].update(pairs)
+
+            for exchange, pairs in self.active_pairs.items():
+                logger.info(f"   📡 {exchange.upper()}: {len(pairs)} active pairs - {sorted(pairs)}")
+
             if not any(self.active_pairs.values()):
                 logger.info("📊 No trading pairs found, will subscribe dynamically based on requests")
-                # The WebSocket subscriptions will happen when the orchestrator requests prices
-                
+
         except Exception as e:
             logger.error(f"❌ Failed to load active pairs: {e}")
+
+    async def _merge_open_trade_pairs(self):
+        """Merge currently-OPEN trade pairs into ``active_pairs`` (idempotent)."""
+        try:
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT exchange, pair
+                    FROM trading.trades
+                    WHERE status = 'OPEN'
+                    """
+                )
+            added = []
+            for row in rows:
+                exchange = row['exchange']
+                pair = row['pair']
+                if exchange not in self.active_pairs:
+                    self.active_pairs[exchange] = set()
+                if pair not in self.active_pairs[exchange]:
+                    added.append(f"{exchange}/{pair}")
+                self.active_pairs[exchange].add(pair)
+            if added:
+                logger.info(f"📊 Merged {len(added)} open-trade pair(s) into active_pairs: {added}")
+            elif rows:
+                logger.debug(f"📊 Open trades already present in active_pairs ({len(rows)} pairs)")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to merge open-trade pairs: {e}")
+
+    async def _merge_recent_trade_pairs(self, hours: int = 24):
+        """Merge recently-traded pairs (last N hours) into ``active_pairs``."""
+        try:
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT exchange, pair
+                    FROM trading.trades
+                    WHERE created_at >= NOW() - ($1 || ' hours')::interval
+                    ORDER BY exchange, pair
+                    """,
+                    str(hours),
+                )
+            for row in rows:
+                exchange = row['exchange']
+                pair = row['pair']
+                if exchange not in self.active_pairs:
+                    self.active_pairs[exchange] = set()
+                self.active_pairs[exchange].add(pair)
+        except Exception as e:
+            logger.debug(f"_merge_recent_trade_pairs skipped: {e}")
     
     async def _load_open_trades_pairs(self):
         """Fallback method to load pairs from open trades only"""
@@ -366,8 +389,11 @@ class PriceFeedManager:
     async def _fetch_price(self, exchange_name: str, pair: str):
         """Fetch price for a specific exchange/pair"""
         try:
-            # Try to get price from exchange service
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            pair = unquote(pair)
+            # Match orchestrator: exchange-service ticker may await slow CCXT/upstream.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=8.0, read=25.0, write=25.0, pool=10.0)
+            ) as client:
                 # Use correct symbol format for each exchange
                 if exchange_name == 'cryptocom':
                     symbol = pair  # Keep slash format for Crypto.com: ACH/USD
@@ -399,7 +425,16 @@ class PriceFeedManager:
                         }
                         
                         return price
-                
+                snippet = (response.text or "")[:200].replace("\n", " ")
+                logger.warning(
+                    "price_feed _fetch_price non-200 exchange=%s pair=%s symbol=%s http=%s body=%s",
+                    exchange_name,
+                    pair,
+                    symbol,
+                    response.status_code,
+                    snippet,
+                )
+
         except Exception as e:
             logger.error(f"❌ Failed to fetch price for {exchange_name}/{pair}: {e}")
             return None
@@ -508,20 +543,29 @@ class PriceFeedManager:
             logger.error(f"❌ Failed to create trailing stop alert: {e}")
     
     async def _trailing_stop_update_loop(self):
-        """Dedicated loop for trailing stop management"""
-        logger.info("🚀 Starting trailing stop update loop")
-        
+        """Dedicated loop for trailing stop management.
+
+        WS-FIX: lowered cadence from 60s → 15s. The orchestrator's exit cycle
+        runs every 30s and reacts to ticker-live for trail-stop hits, so the
+        subscription set must converge faster than the exit cycle itself when
+        a new trade opens on a non-baseline pair (e.g. dynamically-selected).
+        Cleanup of old price rows still runs once per minute.
+        """
+        logger.info("🚀 Starting trailing stop update loop (ws-sync every 15s, cleanup every 60s)")
+
+        cleanup_counter = 0
         while not self.shutdown_event.is_set():
             try:
-                # Refresh active pairs periodically
                 await self._load_active_pairs()
                 await self._sync_ws_subscriptions()
-                
-                # Clean up old price data (keep last 1000 entries per pair)
-                await self._cleanup_old_prices()
-                
-                await asyncio.sleep(60.0)  # Run every minute
-                
+
+                cleanup_counter += 1
+                if cleanup_counter >= 4:  # every ~60s when sleeping 15s
+                    await self._cleanup_old_prices()
+                    cleanup_counter = 0
+
+                await asyncio.sleep(15.0)
+
             except Exception as e:
                 logger.error(f"❌ Error in trailing stop update loop: {e}")
                 await asyncio.sleep(30.0)
@@ -547,10 +591,16 @@ class PriceFeedManager:
             logger.error(f"❌ Failed to cleanup old prices: {e}")
 
     async def _sync_ws_subscriptions(self):
-        """Subscribe/unsubscribe to live ticker streams based on active pairs and config."""
+        """Subscribe to live ticker streams for every pair the bot is actively trading.
+
+        WS-FIX: previously gated entirely by ``enable_websocket_prices`` — when
+        that flag was false (the current production setting), NO subscriptions
+        were pushed to exchange-service even though the orchestrator's exit
+        cycle was hammering ``/api/v1/market/ticker-live/...`` for every open
+        trade and getting 204s. We now always sync subscriptions for the
+        actively-traded set so trail-stops / stop-losses run on real WS prices.
+        """
         try:
-            if not self.config.get('enable_websocket_prices'):
-                return
             max_per_ex = self.config.get('ws', {}).get('max_concurrent_subscriptions_per_exchange', 50)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 for exchange_name, pairs in self.active_pairs.items():
@@ -562,13 +612,27 @@ class PriceFeedManager:
                     if not symbols:
                         continue
                     try:
-                        resp = await client.post(f"{EXCHANGE_SERVICE_URL}/api/v1/websocket/{exchange_name}/subscribe", json={'symbols': symbols})
-                        if resp.status_code != 200:
-                            logger.debug(f"Subscription call response {resp.status_code} for {exchange_name}: {resp.text}")
+                        resp = await client.post(
+                            f"{EXCHANGE_SERVICE_URL}/api/v1/websocket/{exchange_name}/subscribe",
+                            json={'symbols': symbols},
+                        )
+                        if resp.status_code == 200:
+                            logger.info(
+                                f"📡 Synced WS subscriptions for {exchange_name}: {len(symbols)} symbol(s)"
+                            )
+                        elif resp.status_code == 503:
+                            logger.warning(
+                                f"⚠️ {exchange_name} WS not connected — subscription deferred "
+                                f"({len(symbols)} symbol(s) queued for next sync)"
+                            )
+                        else:
+                            logger.warning(
+                                f"⚠️ Subscription call returned {resp.status_code} for {exchange_name}: {resp.text}"
+                            )
                     except Exception as sub_e:
-                        logger.debug(f"Subscription error for {exchange_name}: {sub_e}")
+                        logger.warning(f"⚠️ Subscription error for {exchange_name}: {sub_e}")
         except Exception as e:
-            logger.debug(f"_sync_ws_subscriptions skipped: {e}")
+            logger.warning(f"⚠️ _sync_ws_subscriptions failed: {e}")
     
     async def _websocket_health_check_loop(self):
         """Monitor WebSocket health and reconnect if needed"""
@@ -774,17 +838,17 @@ async def get_active_trailing_stops():
 async def get_current_price(exchange: str, pair: str):
     """Get current price for a specific exchange/pair from cache"""
     try:
-        # URL decode the pair parameter to handle encoded slashes
-        from urllib.parse import unquote
+        # Normalize pair (orchestrator calls with quote(); path may still contain %2F)
         decoded_pair = unquote(pair)
-        
+        exchange_key = exchange.lower()
+
         # Try different cache key formats to match what's actually stored
         possible_keys = [
+            f"{exchange_key}:{decoded_pair}",
             f"{exchange}:{decoded_pair}",
             f"{exchange.lower()}:{decoded_pair.upper()}",
             f"{exchange.upper()}:{decoded_pair.lower()}",
             f"{exchange.upper()}:{decoded_pair.upper()}",
-            # Also try original pair format in case it wasn't encoded
             f"{exchange}:{pair}",
             f"{exchange.lower()}:{pair.upper()}",
             f"{exchange.upper()}:{pair.lower()}",
@@ -801,7 +865,7 @@ async def get_current_price(exchange: str, pair: str):
                     if cache_age < 30:
                         return {
                             "exchange": exchange,
-                            "pair": pair,
+                            "pair": decoded_pair,
                             "price": cached['price'],
                             "bid": cached.get('bid'),
                             "ask": cached.get('ask'),
@@ -821,15 +885,15 @@ async def get_current_price(exchange: str, pair: str):
                     row = await conn.fetchrow("""
                         SELECT price, bid, ask, timestamp, source
                         FROM trading.real_time_prices
-                        WHERE exchange = $1 AND pair = $2
+                        WHERE LOWER(exchange) = LOWER($1) AND pair = $2
                         ORDER BY timestamp DESC
                         LIMIT 1
-                    """, exchange, pair)
+                    """, exchange, decoded_pair)
                     
                     if row and row['price']:
                         return {
                             "exchange": exchange,
-                            "pair": pair,
+                            "pair": decoded_pair,
                             "price": float(row['price']),
                             "bid": float(row['bid']) if row['bid'] else None,
                             "ask": float(row['ask']) if row['ask'] else None,
@@ -838,22 +902,25 @@ async def get_current_price(exchange: str, pair: str):
                             "cache_hit": False
                         }
             except Exception as db_e:
-                logger.debug(f"Database query failed for {exchange}/{pair}: {db_e}")
+                logger.debug(f"Database query failed for {exchange}/{decoded_pair}: {db_e}")
         
         # If still no price, fetch fresh data
-        current_price = await price_feed_manager._fetch_price(exchange, pair)
+        current_price = await price_feed_manager._fetch_price(exchange, decoded_pair)
         
         if current_price and current_price > 0:
             return {
                 "exchange": exchange,
-                "pair": pair,
+                "pair": decoded_pair,
                 "price": current_price,
                 "timestamp": datetime.utcnow().isoformat(),
                 "source": "fresh_fetch",
                 "cache_hit": False
             }
         
-        raise HTTPException(status_code=404, detail=f"No price available for {exchange}/{pair}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No price available for {exchange}/{decoded_pair} (cache/DB empty and exchange ticker fetch failed)",
+        )
         
     except HTTPException:
         raise

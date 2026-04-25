@@ -1,0 +1,47 @@
+# Build context is the repo root (docker-compose `context: .`).
+# Without this, Docker tars .venv, .git, backups → huge context, pipe errors, slow builds.
+
+.venv
+venv
+.env
+.env.*
+!.env.example
+
+__pycache__
+*.py[cod]
+*$py.class
+.Python
+*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+.git
+.gitignore
+.idea
+.vscode
+.cursor
+.claude
+
+node_modules
+npm-debug.log*
+
+backups
+archived*
+*.backup*
+*backup*
+**/web-dashboard-service.backup.*
+
+*.md
+!README.md
+
+.DS_Store
+Thumbs.db
+*.log
+terminals
+
+# Large / irrelevant trees
+**/archived_emergency_scripts*
+**/final_cleanup_archive*

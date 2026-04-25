@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import uvicorn
@@ -24,6 +24,15 @@ from pathlib import Path
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import Performance Analytics
+try:
+    from performance_analytics import PerformanceAnalytics, create_performance_analytics
+    PERFORMANCE_ANALYTICS_AVAILABLE = True
+    logger.info("✅ Performance Analytics imported successfully")
+except ImportError as e:
+    PERFORMANCE_ANALYTICS_AVAILABLE = False
+    logger.warning(f"⚠️ Performance Analytics not available: {e}")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -49,7 +58,7 @@ templates = Jinja2Templates(directory="templates")
 
 # Service URLs
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
-database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database_service:8002")
+database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
 exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
 strategy_service_url = os.getenv("STRATEGY_SERVICE_URL", "http://strategy-service:8004")
 orchestrator_service_url = os.getenv("ORCHESTRATOR_SERVICE_URL", "http://orchestrator-service:8005")
@@ -57,6 +66,12 @@ order_sync_service_url = os.getenv("ORDER_SYNC_SERVICE_URL", "http://order-sync-
 
 # WebSocket connections
 active_connections: List[WebSocket] = []
+
+# Global performance analytics instance
+if PERFORMANCE_ANALYTICS_AVAILABLE:
+    performance_analytics: Optional[PerformanceAnalytics] = None
+else:
+    performance_analytics = None
 
 class WebSocketManager:
     """Manages WebSocket connections for real-time updates"""
@@ -145,6 +160,118 @@ async def readiness_check():
     """Readiness check endpoint"""
     return {"status": "ready"}
 
+@app.get("/api/v1/performance/analytics")
+async def get_performance_analytics():
+    """Get comprehensive performance analytics for trailing stop system"""
+    try:
+        if not PERFORMANCE_ANALYTICS_AVAILABLE or not performance_analytics:
+            logger.warning("Performance analytics not available")
+            # Do not set top-level "error": the dashboard JS treats any error as full failure (N/A).
+            return {
+                "performance_analytics_enabled": False,
+                "performance_analytics_message": (
+                    "Performance analytics module did not load or failed to initialize; "
+                    "check web-dashboard logs for import or startup errors."
+                ),
+                "trailing_stops": {
+                    "activations_today": 0,
+                    "success_rate": 0,
+                    "pnl_improvement": 0,
+                    "trail_distance": "0.25%",
+                },
+                "system_health": {
+                    "overall_score": 0,
+                    "websocket_latency": 0,
+                    "api_error_rate": 0,
+                    "uptime": 100.0,
+                },
+                "exchanges": [],
+                "recommendation": "Performance analytics is offline. Core trading may still run.",
+                "insights": [],
+            }
+            
+        # Get comprehensive analytics
+        dashboard_metrics = await performance_analytics.get_dashboard_metrics()
+        
+        logger.info(f"📊 Performance analytics retrieved - Health Score: {dashboard_metrics.get('system_health', {}).get('overall_score', 0):.1f}%")
+        
+        return dashboard_metrics
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting performance analytics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get performance analytics: {str(e)}")
+
+@app.get("/api/v1/performance/report")
+async def get_performance_report():
+    """Get detailed performance report"""
+    try:
+        if not PERFORMANCE_ANALYTICS_AVAILABLE or not performance_analytics:
+            return {"error": "Performance analytics not available"}
+            
+        report = await performance_analytics.generate_performance_report()
+        return report
+        
+    except Exception as e:
+        logger.error(f"❌ Error generating performance report: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate performance report: {str(e)}")
+
+@app.get("/api/v1/trailing-stops/metrics")
+async def get_trailing_stop_metrics():
+    """Get specific trailing stop metrics"""
+    try:
+        if not PERFORMANCE_ANALYTICS_AVAILABLE or not performance_analytics:
+            return {
+                "activations_count": 0,
+                "successful_fills": 0,
+                "success_rate": 0.0,
+                "trail_distance": 0.0025,
+                "pnl_improvement": 0.0
+            }
+            
+        metrics = await performance_analytics.collect_trailing_stop_metrics()
+        return {
+            "activations_count": metrics.activations_count,
+            "successful_fills": metrics.successful_fills,
+            "cancelled_orders": metrics.cancelled_orders,
+            "success_rate": metrics.success_rate,
+            "trail_distance": metrics.average_trail_distance,
+            "profit_at_activation": metrics.average_profit_at_activation,
+            "final_profit": metrics.average_final_profit,
+            "pnl_improvement": metrics.pnl_improvement_vs_old_system
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting trailing stop metrics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get trailing stop metrics: {str(e)}")
+
+@app.get("/api/v1/system/performance")
+async def get_system_performance():
+    """Get system performance metrics"""
+    try:
+        if not PERFORMANCE_ANALYTICS_AVAILABLE or not performance_analytics:
+            return {
+                "websocket_latency_avg": 0,
+                "order_creation_latency_avg": 0,
+                "api_error_rate": 0,
+                "system_uptime": 100
+            }
+            
+        metrics = await performance_analytics.collect_system_performance_metrics()
+        return {
+            "websocket_latency_avg": metrics.websocket_latency_avg,
+            "websocket_latency_p95": metrics.websocket_latency_p95,
+            "order_creation_latency_avg": metrics.order_creation_latency_avg,
+            "order_fill_detection_latency_avg": metrics.order_fill_detection_latency_avg,
+            "database_sync_latency_avg": metrics.database_sync_latency_avg,
+            "api_error_rate": metrics.api_error_rate,
+            "websocket_uptime": metrics.websocket_uptime,
+            "system_uptime": metrics.system_uptime
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting system performance: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get system performance: {str(e)}")
+
 @app.get("/live")
 async def liveness_check():
     """Liveness check endpoint"""
@@ -225,6 +352,11 @@ async def performance_page(request: Request):
 async def analytics_page(request: Request):
     """Trading analytics and in-depth analysis page"""
     return templates.TemplateResponse("analytics.html", {"request": request})
+
+@app.get("/exchange-info", response_class=HTMLResponse)
+async def exchange_info_page(request: Request):
+    """Exchange information page"""
+    return templates.TemplateResponse("exchange_info.html", {"request": request})
 
 @app.get("/orders")
 async def orders_page(request: Request):
@@ -360,6 +492,158 @@ async def get_exchange_pairs(exchange: str):
         logger.error(f"Error getting pairs for {exchange}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/exchange-information")
+async def get_exchange_information():
+    """Get consolidated exchange information for the Exchange Info page."""
+    default_exchanges = ["binance", "bybit", "cryptocom"]
+
+    def _normalize_ws_connection(connection_data: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(connection_data, dict):
+            return {
+                "connected": False,
+                "status": "unknown",
+                "last_update": None,
+                "registered_callbacks": 0,
+                "error": "invalid_payload",
+            }
+
+        connected = bool(connection_data.get("connected", False))
+        status = connection_data.get("status")
+        if not status:
+            status = "connected" if connected else "disconnected"
+
+        return {
+            "connected": connected,
+            "status": str(status),
+            "last_update": connection_data.get("last_update") or connection_data.get("timestamp"),
+            "registered_callbacks": int(connection_data.get("registered_callbacks", 0) or 0),
+            "error": connection_data.get("error"),
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            exchange_status_payload: Dict[str, Any] = {}
+            websocket_payload: Dict[str, Any] = {}
+            config_payload: Dict[str, Any] = {}
+
+            # 1) Exchange status from exchange-service.
+            try:
+                response = await client.get(f"{exchange_service_url}/status")
+                if response.status_code == 200:
+                    exchange_status_payload = response.json() or {}
+            except Exception as exchange_err:
+                logger.warning(f"Exchange status unavailable: {exchange_err}")
+
+            # 2) WebSocket status from orchestrator (primary source used by dashboard).
+            try:
+                response = await client.get(f"{orchestrator_service_url}/api/v1/orders/websocket/status")
+                if response.status_code == 200:
+                    websocket_payload = response.json() or {}
+            except Exception as ws_err:
+                logger.warning(f"WebSocket status unavailable: {ws_err}")
+
+            # 2.5) Config for blacklist metadata.
+            try:
+                response = await client.get(f"{config_service_url}/api/v1/config/all")
+                if response.status_code == 200:
+                    config_payload = response.json() or {}
+            except Exception as cfg_err:
+                logger.warning(f"Config status unavailable for blacklist metadata: {cfg_err}")
+
+            exchange_status_map = exchange_status_payload.get("exchanges", {}) if isinstance(exchange_status_payload, dict) else {}
+            websocket_map = websocket_payload.get("connections", {}) if isinstance(websocket_payload, dict) else {}
+            raw_blacklisted_pairs = (
+                (config_payload.get("pair_selector", {}) if isinstance(config_payload, dict) else {}).get("blacklisted_pairs", [])
+            )
+            if not isinstance(raw_blacklisted_pairs, list):
+                raw_blacklisted_pairs = []
+
+            exchanges = sorted(set(default_exchanges) | set(exchange_status_map.keys()) | set(websocket_map.keys()))
+
+            # 3) Selected pairs and last timestamp from database-service.
+            pair_tasks = [
+                client.get(f"{database_service_url}/api/v1/pairs/{exchange}")
+                for exchange in exchanges
+            ]
+            pair_results = await asyncio.gather(*pair_tasks, return_exceptions=True)
+
+            pairs_by_exchange: Dict[str, Dict[str, Any]] = {}
+            for exchange, result in zip(exchanges, pair_results):
+                if isinstance(result, Exception):
+                    pairs_by_exchange[exchange] = {
+                        "pairs": [],
+                        "timestamp": None,
+                        "error": str(result),
+                    }
+                    continue
+                if result.status_code != 200:
+                    pairs_by_exchange[exchange] = {
+                        "pairs": [],
+                        "timestamp": None,
+                        "error": f"http_{result.status_code}",
+                    }
+                    continue
+                data = result.json() or {}
+                pairs_by_exchange[exchange] = {
+                    "pairs": data.get("pairs", []) or [],
+                    "timestamp": data.get("timestamp"),
+                    "error": None,
+                }
+
+            merged = {}
+            for exchange in exchanges:
+                ex_status = exchange_status_map.get(exchange, {}) if isinstance(exchange_status_map, dict) else {}
+                ws_status = websocket_map.get(exchange, {}) if isinstance(websocket_map, dict) else {}
+                pair_data = pairs_by_exchange.get(exchange, {"pairs": [], "timestamp": None, "error": None})
+                selected_pairs = pair_data.get("pairs", [])
+                if exchange.lower() in ("binance", "bybit"):
+                    exchange_blacklisted = [p for p in raw_blacklisted_pairs if isinstance(p, str) and p.endswith("/USDC")]
+                elif exchange.lower() == "cryptocom":
+                    exchange_blacklisted = [p for p in raw_blacklisted_pairs if isinstance(p, str) and p.endswith("/USD")]
+                else:
+                    exchange_blacklisted = [p for p in raw_blacklisted_pairs if isinstance(p, str)]
+
+                selected_blacklisted = [p for p in selected_pairs if p in exchange_blacklisted]
+
+                merged[exchange] = {
+                    "exchange_status": {
+                        "status": ex_status.get("status", "unknown"),
+                        "last_check": ex_status.get("last_check"),
+                        "error_count": int(ex_status.get("error_count", 0) or 0),
+                        "websocket_connected": bool(ex_status.get("websocket_connected", False)),
+                    },
+                    "websocket": _normalize_ws_connection(ws_status),
+                    "selected_pairs": selected_pairs,
+                    "selected_pairs_count": len(selected_pairs),
+                    "pairs_last_selected_at": pair_data.get("timestamp"),
+                    "pairs_error": pair_data.get("error"),
+                    "blacklisted_pairs": exchange_blacklisted,
+                    "blacklisted_pairs_count": len(exchange_blacklisted),
+                    "selected_blacklisted_pairs": selected_blacklisted,
+                    "selected_blacklisted_count": len(selected_blacklisted),
+                }
+
+            return {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "exchanges": merged,
+            }
+    except Exception as e:
+        logger.error(f"Error getting consolidated exchange information: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/strategy/pair-snapshots")
+async def proxy_strategy_pair_snapshots():
+    """Proxy last per-pair strategy evaluation from strategy-service (Exchange Status UI)."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{strategy_service_url}/api/v1/pair-snapshots")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.warning(f"pair-snapshots unavailable: {e}")
+        return {}
+
 # Shadow PnL proxy endpoints (read-only)
 @app.get("/api/pnl/realized")
 async def api_pnl_realized(exchange: str, symbol: str, start: Optional[str] = None, end: Optional[str] = None):
@@ -391,12 +675,125 @@ async def api_pnl_unrealized(exchange: str, symbol: str):
 
 @app.get("/api/strategy-performance")
 async def get_strategy_performance():
-    """Get strategy performance metrics"""
+    """Get strategy performance merged with real strategy activity snapshots."""
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{database_service_url}/api/v1/analytics/strategy-performance")
-            response.raise_for_status()
-            return response.json()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            db_strategies: Dict[str, Any] = {}
+            activity_by_strategy: Dict[str, Dict[str, Any]] = {}
+            enabled_strategies: set[str] = set()
+
+            # 1) Trade-based performance from database service (executed usage)
+            try:
+                response = await client.get(f"{database_service_url}/api/v1/analytics/strategy-performance")
+                response.raise_for_status()
+                db_payload = response.json() or {}
+                db_strategies = db_payload.get("strategies", {}) or {}
+            except Exception as db_err:
+                logger.warning(f"Strategy DB performance unavailable: {db_err}")
+
+            # 2) Runtime activity from strategy snapshots (real analytical usage)
+            try:
+                snapshots_response = await client.get(f"{strategy_service_url}/api/v1/pair-snapshots")
+                snapshots_response.raise_for_status()
+                snapshots = snapshots_response.json() or {}
+
+                for _, pairs in snapshots.items():
+                    if not isinstance(pairs, dict):
+                        continue
+                    for _, snap in pairs.items():
+                        if not isinstance(snap, dict):
+                            continue
+
+                        snap_ts = snap.get("timestamp")
+
+                        # Strategies actively evaluated in this snapshot
+                        for strategy_name in (snap.get("applicable_strategies") or []):
+                            stats = activity_by_strategy.setdefault(
+                                strategy_name,
+                                {
+                                    "analysis_runs": 0,
+                                    "buy_signals": 0,
+                                    "sell_signals": 0,
+                                    "hold_signals": 0,
+                                    "last_analyzed_at": None,
+                                },
+                            )
+                            stats["analysis_runs"] += 1
+                            if snap_ts and (not stats["last_analyzed_at"] or snap_ts > stats["last_analyzed_at"]):
+                                stats["last_analyzed_at"] = snap_ts
+
+                        # Signal outcomes by strategy from the same snapshot
+                        for strategy_result in (snap.get("strategies") or []):
+                            if not isinstance(strategy_result, dict):
+                                continue
+                            strategy_name = strategy_result.get("strategy")
+                            if not strategy_name:
+                                continue
+
+                            stats = activity_by_strategy.setdefault(
+                                strategy_name,
+                                {
+                                    "analysis_runs": 0,
+                                    "buy_signals": 0,
+                                    "sell_signals": 0,
+                                    "hold_signals": 0,
+                                    "last_analyzed_at": None,
+                                },
+                            )
+                            signal = str(strategy_result.get("signal") or "hold").lower()
+                            if signal == "buy":
+                                stats["buy_signals"] += 1
+                            elif signal == "sell":
+                                stats["sell_signals"] += 1
+                            else:
+                                stats["hold_signals"] += 1
+                            if snap_ts and (not stats["last_analyzed_at"] or snap_ts > stats["last_analyzed_at"]):
+                                stats["last_analyzed_at"] = snap_ts
+            except Exception as snap_err:
+                logger.warning(f"Strategy snapshot activity unavailable: {snap_err}")
+
+            # 3) Include all enabled strategies from config, even before first run/trade.
+            try:
+                config_response = await client.get(f"{config_service_url}/api/v1/config/strategies")
+                config_response.raise_for_status()
+                strategies_cfg = config_response.json() or {}
+                if isinstance(strategies_cfg, dict):
+                    for strategy_name, cfg in strategies_cfg.items():
+                        if isinstance(cfg, dict) and bool(cfg.get("enabled", False)):
+                            enabled_strategies.add(strategy_name)
+            except Exception as cfg_err:
+                logger.warning(f"Enabled strategy list unavailable: {cfg_err}")
+
+            # 4) Merge all perspectives so dashboard reflects configured + real usage.
+            all_strategy_names = (
+                set(db_strategies.keys())
+                | set(activity_by_strategy.keys())
+                | enabled_strategies
+            )
+            merged: Dict[str, Any] = {}
+            for strategy_name in sorted(all_strategy_names):
+                base = dict(db_strategies.get(strategy_name, {}))
+                activity = activity_by_strategy.get(strategy_name, {})
+
+                merged[strategy_name] = {
+                    "total_trades": int(base.get("total_trades", 0) or 0),
+                    "open_trades": int(base.get("open_trades", 0) or 0),
+                    "closed_trades": int(base.get("closed_trades", 0) or 0),
+                    "winning_trades": int(base.get("winning_trades", 0) or 0),
+                    "win_rate": float(base.get("win_rate", 0) or 0),
+                    "win_rate_percentage": float(base.get("win_rate_percentage", 0) or 0),
+                    "total_pnl": float(base.get("total_pnl", 0) or 0),
+                    "avg_winning_trade": float(base.get("avg_winning_trade", 0) or 0),
+                    "avg_losing_trade": float(base.get("avg_losing_trade", 0) or 0),
+                    "profit_factor": float(base.get("profit_factor", 0) or 0),
+                    "analysis_runs": int(activity.get("analysis_runs", 0) or 0),
+                    "buy_signals": int(activity.get("buy_signals", 0) or 0),
+                    "sell_signals": int(activity.get("sell_signals", 0) or 0),
+                    "hold_signals": int(activity.get("hold_signals", 0) or 0),
+                    "last_analyzed_at": activity.get("last_analyzed_at"),
+                }
+
+            return {"strategies": merged}
     except Exception as e:
         logger.error(f"Error getting strategy performance: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -767,12 +1164,13 @@ async def get_trading_config():
                     
                     return {
                         "profit_protection": {
-                            "trigger_percentage": profit_protection.get('trigger_percentage', 0.01),
-                            "activation_threshold": profit_protection.get('activation_threshold', 0.008)
+                            "trigger_percentage": profit_protection.get('trigger_percentage', 0.007),
+                            "activation_threshold": profit_protection.get('activation_threshold', 0.007)
                         },
                         "trailing_stop": {
-                            "trigger_percentage": trailing_stop.get('trigger_percentage', 0.04),
-                            "activation_threshold": trailing_stop.get('activation_threshold', 0.005)
+                            "trigger_percentage": trailing_stop.get('trigger_percentage', 0.007),
+                            "activation_threshold": trailing_stop.get('activation_threshold', 0.007),
+                            "step_percentage": trailing_stop.get('step_percentage', 0.0035)
                         }
                     }
             except FileNotFoundError:
@@ -781,12 +1179,13 @@ async def get_trading_config():
         # Default fallback values
         return {
             "profit_protection": {
-                "trigger_percentage": 0.01,
-                "activation_threshold": 0.008
+                "trigger_percentage": 0.007,
+                "activation_threshold": 0.007
             },
             "trailing_stop": {
-                "trigger_percentage": 0.04,
-                "activation_threshold": 0.005
+                "trigger_percentage": 0.007,
+                "activation_threshold": 0.007,
+                "step_percentage": 0.0035
             }
         }
         
@@ -794,12 +1193,13 @@ async def get_trading_config():
         logger.error(f"Error getting trading config: {e}")
         return {
             "profit_protection": {
-                "trigger_percentage": 0.01,
-                "activation_threshold": 0.008
+                "trigger_percentage": 0.007,
+                "activation_threshold": 0.007
             },
             "trailing_stop": {
-                "trigger_percentage": 0.04,
-                "activation_threshold": 0.005
+                "trigger_percentage": 0.007,
+                "activation_threshold": 0.007,
+                "step_percentage": 0.0035
             }
         }
 
@@ -1796,7 +2196,7 @@ async def get_bybit_websocket_health():
     """Get Bybit WebSocket health status"""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get("http://exchange-service:8003/api/v1/websocket/bybit/health")
+            response = await client.get(f"{exchange_service_url}/api/v1/websocket/bybit/health")
             if response.status_code == 200:
                 return response.json()
             else:
@@ -1804,6 +2204,76 @@ async def get_bybit_websocket_health():
     except Exception as e:
         logger.error(f"Error getting Bybit WebSocket health: {str(e)}")
         return {"error": f"Error getting Bybit WebSocket health: {str(e)}"}
+
+
+@app.get("/api/v1/websocket/bybit/status")
+async def get_bybit_websocket_status_proxy():
+    """Proxy Bybit WebSocket status.
+
+    Bybit has two websocket paths in exchange-service:
+    - private/user stream manager (``/api/v1/websocket/bybit/status`` router payload)
+    - generic market ticker handler (``/api/v1/websocket/status`` -> exchanges.bybit)
+
+    The dashboard should show connected if either is active (same behavior as Binance).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{exchange_service_url}/api/v1/websocket/bybit/status")
+            market_response = await client.get(f"{exchange_service_url}/api/v1/websocket/status")
+        try:
+            data = response.json()
+        except Exception:
+            data = {"detail": response.text}
+        try:
+            market_data = market_response.json()
+        except Exception:
+            market_data = {}
+
+        market_connected = bool(
+            ((market_data.get("exchanges") or {}).get("bybit") or {}).get("connected", False)
+        )
+
+        if response.status_code == 200:
+            manager_status = data.get("manager_status")
+            if isinstance(manager_status, dict):
+                manager_connected = bool(manager_status.get("connected", False))
+                manager_status["market_stream_connected"] = market_connected
+                manager_status["connected"] = manager_connected or market_connected
+                if manager_status["connected"] and manager_status.get("state") in (
+                    None,
+                    "",
+                    "disconnected",
+                    "idle",
+                ):
+                    manager_status["state"] = "connected"
+            return JSONResponse(status_code=200, content=data)
+
+        msg = data.get("message") or data.get("detail") or f"exchange returned HTTP {response.status_code}"
+        normalized = {
+            "manager_status": {
+                "connected": market_connected,
+                "running": market_connected,
+                "state": "connected" if market_connected else "unavailable",
+                "market_stream_connected": market_connected,
+            },
+            "upstream_status": response.status_code,
+            "message": msg,
+        }
+        return JSONResponse(status_code=200, content=normalized)
+    except Exception as e:
+        logger.warning(f"Bybit WebSocket status proxy: {e}")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "manager_status": {
+                    "connected": False,
+                    "running": False,
+                    "state": "unavailable",
+                },
+                "upstream_status": None,
+                "message": str(e),
+            },
+        )
 
 @app.get("/api/v1/performance/metrics")
 async def get_performance_metrics():
@@ -2478,6 +2948,14 @@ async def get_actionable_analytics():
                 strategy_performance[strategy]['wins'] += 1
             else:
                 strategy_performance[strategy]['losses'] += 1
+
+        # Ensure all enabled strategies are represented, even before first closed trade.
+        for strategy_name, strategy_cfg in current_config.get('strategies', {}).items():
+            if isinstance(strategy_cfg, dict) and strategy_cfg.get('enabled', False):
+                strategy_performance.setdefault(
+                    strategy_name,
+                    {'wins': 0, 'losses': 0, 'total_pnl': 0, 'count': 0}
+                )
         
         # Find underperforming strategies (only those currently enabled)
         for strategy, stats in strategy_performance.items():
@@ -3362,6 +3840,38 @@ async def export_trades_csv(
     except Exception as e:
         logger.error(f"Error exporting trades to CSV: {e}")
         return {"status": "error", "message": str(e)}
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize performance analytics on startup"""
+    global performance_analytics
+    
+    try:
+        if PERFORMANCE_ANALYTICS_AVAILABLE:
+            performance_analytics = await create_performance_analytics(
+                database_url=database_service_url,
+                orchestrator_url=orchestrator_service_url
+            )
+            # Start background monitoring task
+            asyncio.create_task(performance_analytics.start_monitoring())
+            logger.info("✅ Performance Analytics initialized and monitoring started")
+        else:
+            logger.warning("⚠️ Performance Analytics not available - dashboard will show basic metrics only")
+            
+    except Exception as e:
+        logger.error(f"❌ Error initializing performance analytics: {e}")
+
+@app.on_event("shutdown") 
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global performance_analytics
+    
+    try:
+        if performance_analytics:
+            await performance_analytics.cleanup()
+            logger.info("📊 Performance Analytics cleanup completed")
+    except Exception as e:
+        logger.error(f"Error during performance analytics cleanup: {e}")
 
 if __name__ == "__main__":
     uvicorn.run(

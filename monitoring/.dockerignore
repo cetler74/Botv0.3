@@ -1,0 +1,4 @@
+# Build context is ./monitoring (redis-exporter). Keep tar tiny and stable.
+.DS_Store
+*.log
+.git
