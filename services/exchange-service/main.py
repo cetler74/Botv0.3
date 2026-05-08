@@ -31,14 +31,31 @@ logger = logging.getLogger(__name__)
 
 # Load configuration
 def load_config():
-    """Load configuration from config.yaml"""
-    try:
-        config_path = os.path.join(os.path.dirname(__file__), '../../config/config.yaml')
-        with open(config_path, 'r') as file:
-            return yaml.safe_load(file)
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        return {}
+    """Load configuration from config.yaml (Docker: /app/config; local dev: repo config/)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    env_path = os.environ.get("CONFIG_PATH", "").strip()
+    if env_path:
+        candidates.append(env_path)
+    candidates.append("/app/config/config.yaml")
+    candidates.append(os.path.join(here, "..", "..", "config", "config.yaml"))
+    for raw in candidates:
+        if not raw:
+            continue
+        config_path = os.path.abspath(os.path.normpath(raw))
+        if not os.path.isfile(config_path):
+            continue
+        try:
+            with open(config_path, "r", encoding="utf-8") as file:
+                logger.info("Exchange service loaded config from %s", config_path)
+                return yaml.safe_load(file) or {}
+        except Exception as e:
+            logger.error("Failed to load config from %s: %s", config_path, e)
+    logger.error(
+        "No config.yaml found for exchange-service (set CONFIG_PATH or mount /app/config/config.yaml). Tried: %s",
+        candidates,
+    )
+    return {}
 
 # Global config
 config = load_config()
@@ -953,6 +970,12 @@ class ExchangeManager:
         err_str = str(error)
         is_ip_whitelist = ('retCode":10010' in err_str or 'Unmatched IP' in err_str
                            or 'retCode":10003' in err_str or 'retCode":10007' in err_str)
+        is_cryptocom_auth = (
+            '"code":40101' in err_str
+            or "'code':40101" in err_str
+            or "Authentication failure" in err_str
+            or "authentication failure" in err_str
+        )
 
         # Update exchange health
         if exchange_name in exchanges:
@@ -977,6 +1000,16 @@ class ExchangeManager:
                     h['public_ip_seen'] = public_ip
                 # Suppress the repeated ERROR line for this operation once auth_failed is set.
                 logger.debug(f"[AUTH SUPPRESSED] {exchange_name}.{operation}: 10010 Unmatched IP")
+                return
+            elif exchange_name.lower() == "cryptocom" and is_cryptocom_auth:
+                if h.get('status') != 'auth_failed':
+                    logger.error(
+                        "🚨 [AUTH] cryptocom authentication failed (code 40101). "
+                        "Check CRYPTOCOM_API_KEY / CRYPTOCOM_API_SECRET and key permissions. "
+                        "Marking cryptocom as auth_failed — it will be skipped until restart."
+                    )
+                    h['status'] = 'auth_failed'
+                logger.debug(f"[AUTH SUPPRESSED] {exchange_name}.{operation}: 40101 Authentication failure")
                 return
             else:
                 h['status'] = 'degraded'
@@ -1358,6 +1391,15 @@ async def get_open_orders(exchange: str, symbol: Optional[str] = None):
     """Get open orders for an exchange - FIXED VERSION"""
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
+
+    # Short-circuit repeated private-endpoint failures once auth is known bad.
+    try:
+        if exchanges.get(exchange, {}).get('health', {}).get('status') == 'auth_failed':
+            raise HTTPException(status_code=503, detail=f"{exchange} auth_failed — check API credentials/whitelist")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     
     try:
         await exchange_manager._rate_limit(exchange)
@@ -1383,6 +1425,8 @@ async def get_open_orders(exchange: str, symbol: Optional[str] = None):
         
         return {"orders": orders}
         
+    except HTTPException:
+        raise
     except Exception as e:
         await exchange_manager._handle_exchange_error(exchange, e, "get_open_orders")
         raise HTTPException(status_code=500, detail=str(e))

@@ -24,6 +24,7 @@ mcp:
 - Trading strategies must use 15-minute and 1-hour timeframes
 - Entry reasons for trades must be detailed and descriptive
 - Solve problems without asking for confirmation at each step
+- Keep business logic in dedicated modules; avoid adding new logic directly to services/orchestrator-service/main.py unless it is orchestration glue
 
 # MCP Usage Guidelines
 - Use Perplexity MCP for real-time market data and news

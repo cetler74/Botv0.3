@@ -1,0 +1,21 @@
+# Test deps — use the SAME interpreter for pip and pytest:
+#   python3 -m pip install -r requirements-test.txt
+#   PYTHONPATH=. python3 -m pytest ...
+#
+# macOS: the command `python3` is often Apple’s **3.9** (Xcode CLT), not Homebrew’s
+# **3.13**. Check with: `python3 -c "import sys; print(sys.executable, sys.version)"`.
+# To use Homebrew Python: `/opt/homebrew/bin/python3` (put it before /usr/bin in PATH).
+#
+# pandas_ta comes from:
+#   - Python 3.9–3.11: pandas-ta-openbb 0.4.20 (PyPI: >=3.9,<3.13)
+#   - Python 3.12:      pandas-ta 0.4.71b0 (matches strategy-service Docker)
+#   - Python 3.13+:     pandas-ta-openbb >=0.4.23
+
+pytest>=7.4.0
+
+numpy>=1.26,<3
+pandas>=2.1.4,<3
+
+pandas-ta-openbb>=0.4.20,<0.4.21; python_version < "3.12"
+pandas-ta==0.4.71b0; python_version >= "3.12" and python_version < "3.13"
+pandas-ta-openbb>=0.4.23; python_version >= "3.13" and python_version < "4"

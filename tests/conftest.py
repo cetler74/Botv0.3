@@ -2,6 +2,9 @@
 Pytest configuration and shared fixtures for trading bot microservices tests
 """
 
+import importlib.util
+import warnings
+
 import pytest
 import asyncio
 import httpx
@@ -12,6 +15,21 @@ from typing import Dict, Any, Generator
 from unittest.mock import Mock, patch
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+def pytest_configure(config):
+    """Warn once if optional strategy TA stack is missing (avoids silent confusion)."""
+    if importlib.util.find_spec("pandas_ta") is None:
+        warnings.warn(
+            "pandas_ta is not installed: test_ta_indicator_parity and "
+            "test_regime_detector_synthetic will be skipped. "
+            "Fix: run `python3 -m pip install -r requirements-test.txt` with the "
+            "same `python3` you use for pytest (on macOS, Apple python3 is often 3.9 — "
+            "requirements-test.txt installs pandas-ta-openbb there). "
+            "Or use /opt/homebrew/bin/python3, or the strategy-service Docker image.",
+            UserWarning,
+            stacklevel=1,
+        )
+
 
 # Test configuration
 TEST_CONFIG = {

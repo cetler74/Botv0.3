@@ -9,12 +9,12 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 import httpx
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import os
 import yaml
@@ -338,6 +338,27 @@ async def profitability_page(request: Request):
     """Profitability analysis page"""
     return templates.TemplateResponse("profitability.html", {"request": request})
 
+
+@app.get("/monthly-profit", response_class=HTMLResponse)
+async def monthly_profit_page(request: Request):
+    """Monthly realized PnL vs configurable USD goal"""
+    return templates.TemplateResponse("monthly_profit.html", {"request": request})
+
+
+@app.get("/strategy-performance", response_class=HTMLResponse)
+async def strategy_performance_page(request: Request):
+    """Per-strategy performance with windowed cards and timeline chart."""
+    return templates.TemplateResponse(
+        "strategy_performance.html", {"request": request}
+    )
+
+
+@app.get("/macd-analysis-log", response_class=HTMLResponse)
+async def macd_analysis_log_page(request: Request):
+    """MACD analysis audit page."""
+    return templates.TemplateResponse("macd_analysis_log.html", {"request": request})
+
+
 @app.get("/optimizer", response_class=HTMLResponse)
 async def optimizer_page(request: Request):
     """Strategy optimizer page"""
@@ -632,6 +653,27 @@ async def get_exchange_information():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class PairEntryBlocksProxyBody(BaseModel):
+    exchange: str
+    pairs: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/trading/pair-entry-blocks")
+async def proxy_pair_entry_blocks(body: PairEntryBlocksProxyBody):
+    """Proxy to orchestrator: pairs soft-blocked from new entries (risk cooldown, recent loss, etc.)."""
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(
+                f"{orchestrator_service_url}/api/v1/trading/pairs/entry-blocks",
+                json={"exchange": body.exchange, "pairs": body.pairs or []},
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.warning("pair-entry-blocks proxy failed: %s", e)
+        return {"exchange": body.exchange, "blocks": {}, "error": str(e)}
+
+
 @app.get("/api/v1/strategy/pair-snapshots")
 async def proxy_strategy_pair_snapshots():
     """Proxy last per-pair strategy evaluation from strategy-service (Exchange Status UI)."""
@@ -643,6 +685,32 @@ async def proxy_strategy_pair_snapshots():
     except Exception as e:
         logger.warning(f"pair-snapshots unavailable: {e}")
         return {}
+
+
+@app.get("/api/v1/analytics/macd-analysis-logs")
+async def proxy_macd_analysis_logs(
+    exchange: Optional[str] = None,
+    pair: Optional[str] = None,
+    hours: int = 24,
+    limit: int = 200,
+):
+    """Proxy MACD analysis logs from database-service."""
+    try:
+        params: Dict[str, Any] = {"hours": hours, "limit": limit}
+        if exchange:
+            params["exchange"] = exchange
+        if pair:
+            params["pair"] = pair
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                f"{database_service_url}/api/v1/analytics/macd-analysis-logs",
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Failed to proxy macd-analysis-logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Shadow PnL proxy endpoints (read-only)
 @app.get("/api/pnl/realized")
@@ -692,10 +760,24 @@ async def get_strategy_performance():
                 logger.warning(f"Strategy DB performance unavailable: {db_err}")
 
             # 2) Runtime activity from strategy snapshots (real analytical usage)
+            cumulative_from_service: Dict[str, int] = {}
             try:
                 snapshots_response = await client.get(f"{strategy_service_url}/api/v1/pair-snapshots")
                 snapshots_response.raise_for_status()
-                snapshots = snapshots_response.json() or {}
+                raw_snaps = snapshots_response.json() or {}
+                if isinstance(raw_snaps, dict) and "snapshots" in raw_snaps and isinstance(
+                    raw_snaps.get("snapshots"), dict
+                ):
+                    snapshots = raw_snaps.get("snapshots") or {}
+                    _cum = raw_snaps.get("strategy_cumulative_runs") or {}
+                    if isinstance(_cum, dict):
+                        for k, v in _cum.items():
+                            try:
+                                cumulative_from_service[str(k)] = int(v)
+                            except (TypeError, ValueError):
+                                continue
+                else:
+                    snapshots = raw_snaps
 
                 for _, pairs in snapshots.items():
                     if not isinstance(pairs, dict):
@@ -769,6 +851,7 @@ async def get_strategy_performance():
                 set(db_strategies.keys())
                 | set(activity_by_strategy.keys())
                 | enabled_strategies
+                | set(cumulative_from_service.keys())
             )
             merged: Dict[str, Any] = {}
             for strategy_name in sorted(all_strategy_names):
@@ -780,13 +863,17 @@ async def get_strategy_performance():
                     "open_trades": int(base.get("open_trades", 0) or 0),
                     "closed_trades": int(base.get("closed_trades", 0) or 0),
                     "winning_trades": int(base.get("winning_trades", 0) or 0),
+                    "losing_trades": int(base.get("losing_trades", 0) or 0),
                     "win_rate": float(base.get("win_rate", 0) or 0),
                     "win_rate_percentage": float(base.get("win_rate_percentage", 0) or 0),
                     "total_pnl": float(base.get("total_pnl", 0) or 0),
+                    "total_profit": float(base.get("total_profit", 0) or 0),
+                    "total_loss": float(base.get("total_loss", 0) or 0),
                     "avg_winning_trade": float(base.get("avg_winning_trade", 0) or 0),
                     "avg_losing_trade": float(base.get("avg_losing_trade", 0) or 0),
                     "profit_factor": float(base.get("profit_factor", 0) or 0),
                     "analysis_runs": int(activity.get("analysis_runs", 0) or 0),
+                    "cumulative_analysis_runs": int(cumulative_from_service.get(strategy_name, 0) or 0),
                     "buy_signals": int(activity.get("buy_signals", 0) or 0),
                     "sell_signals": int(activity.get("sell_signals", 0) or 0),
                     "hold_signals": int(activity.get("hold_signals", 0) or 0),
@@ -797,6 +884,227 @@ async def get_strategy_performance():
     except Exception as e:
         logger.error(f"Error getting strategy performance: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _resolve_strategy_window(
+    window: str,
+    start: Optional[str],
+    end: Optional[str],
+) -> Dict[str, str]:
+    """Resolve a window keyword into UTC start/end ISO strings (end is exclusive)."""
+    from datetime import timezone
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    win = (window or "last_7d").strip().lower()
+    if win == "today":
+        s, e = today_start, today_start + timedelta(days=1)
+    elif win == "yesterday":
+        s, e = today_start - timedelta(days=1), today_start
+    elif win == "last_24h":
+        s, e = now - timedelta(hours=24), now
+    elif win == "last_7d":
+        s, e = today_start - timedelta(days=6), today_start + timedelta(days=1)
+    elif win == "last_30d":
+        s, e = today_start - timedelta(days=29), today_start + timedelta(days=1)
+    elif win == "last_90d":
+        s, e = today_start - timedelta(days=89), today_start + timedelta(days=1)
+    elif win == "month_to_date":
+        s = today_start.replace(day=1)
+        e = today_start + timedelta(days=1)
+    elif win == "custom":
+        if not start or not end:
+            raise HTTPException(
+                status_code=400,
+                detail="`custom` window requires both `start` and `end`",
+            )
+        try:
+            sv = str(start).replace("Z", "+00:00")
+            ev = str(end).replace("Z", "+00:00")
+            s = datetime.fromisoformat(sv)
+            e = datetime.fromisoformat(ev)
+            if s.tzinfo is None:
+                s = s.replace(tzinfo=timezone.utc)
+            if e.tzinfo is None:
+                e = e.replace(tzinfo=timezone.utc)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid custom dates: {exc}")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown window: {window}")
+
+    if e <= s:
+        raise HTTPException(status_code=400, detail="`end` must be greater than `start`")
+    return {"start": s.isoformat(), "end": e.isoformat(), "label": win}
+
+
+@app.get("/api/strategy-performance/range")
+async def get_strategy_performance_range(
+    window: str = "last_7d",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    """
+    Window-aware strategy performance: trade-based aggregates from DB
+    plus session-only snapshot activity (analysis_runs / cumulative) merged in
+    so the UI can label them as not windowed.
+    """
+    try:
+        resolved = _resolve_strategy_window(window, start, end)
+        s, e = resolved["start"], resolved["end"]
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            db_strategies: Dict[str, Any] = {}
+            db_window: Dict[str, Any] = {"start": s, "end": e}
+            try:
+                response = await client.get(
+                    f"{database_service_url}/api/v1/analytics/strategy-performance/range",
+                    params={"start": s, "end": e},
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                db_strategies = payload.get("strategies", {}) or {}
+                db_window = payload.get("window", db_window) or db_window
+            except Exception as db_err:
+                logger.warning(f"Windowed DB strategy performance unavailable: {db_err}")
+
+            activity_by_strategy: Dict[str, Dict[str, Any]] = {}
+            cumulative_from_service: Dict[str, int] = {}
+            try:
+                snapshots_response = await client.get(
+                    f"{strategy_service_url}/api/v1/pair-snapshots"
+                )
+                snapshots_response.raise_for_status()
+                raw_snaps = snapshots_response.json() or {}
+                if isinstance(raw_snaps, dict) and "snapshots" in raw_snaps and isinstance(
+                    raw_snaps.get("snapshots"), dict
+                ):
+                    snapshots = raw_snaps.get("snapshots") or {}
+                    _cum = raw_snaps.get("strategy_cumulative_runs") or {}
+                    if isinstance(_cum, dict):
+                        for k, v in _cum.items():
+                            try:
+                                cumulative_from_service[str(k)] = int(v)
+                            except (TypeError, ValueError):
+                                continue
+                else:
+                    snapshots = raw_snaps
+
+                for _, pairs in snapshots.items():
+                    if not isinstance(pairs, dict):
+                        continue
+                    for _, snap in pairs.items():
+                        if not isinstance(snap, dict):
+                            continue
+                        snap_ts = snap.get("timestamp")
+                        for strategy_name in (snap.get("applicable_strategies") or []):
+                            stats = activity_by_strategy.setdefault(
+                                strategy_name,
+                                {
+                                    "analysis_runs": 0,
+                                    "buy_signals": 0,
+                                    "sell_signals": 0,
+                                    "hold_signals": 0,
+                                    "last_analyzed_at": None,
+                                },
+                            )
+                            stats["analysis_runs"] += 1
+                            if snap_ts and (
+                                not stats["last_analyzed_at"]
+                                or snap_ts > stats["last_analyzed_at"]
+                            ):
+                                stats["last_analyzed_at"] = snap_ts
+                        for strategy_result in (snap.get("strategies") or []):
+                            if not isinstance(strategy_result, dict):
+                                continue
+                            strategy_name = strategy_result.get("strategy")
+                            if not strategy_name:
+                                continue
+                            stats = activity_by_strategy.setdefault(
+                                strategy_name,
+                                {
+                                    "analysis_runs": 0,
+                                    "buy_signals": 0,
+                                    "sell_signals": 0,
+                                    "hold_signals": 0,
+                                    "last_analyzed_at": None,
+                                },
+                            )
+                            signal = str(strategy_result.get("signal") or "hold").lower()
+                            if signal == "buy":
+                                stats["buy_signals"] += 1
+                            elif signal == "sell":
+                                stats["sell_signals"] += 1
+                            else:
+                                stats["hold_signals"] += 1
+                            if snap_ts and (
+                                not stats["last_analyzed_at"]
+                                or snap_ts > stats["last_analyzed_at"]
+                            ):
+                                stats["last_analyzed_at"] = snap_ts
+            except Exception as snap_err:
+                logger.warning(f"Strategy snapshot activity unavailable: {snap_err}")
+
+            enabled_strategies: set[str] = set()
+            try:
+                config_response = await client.get(
+                    f"{config_service_url}/api/v1/config/strategies"
+                )
+                config_response.raise_for_status()
+                strategies_cfg = config_response.json() or {}
+                if isinstance(strategies_cfg, dict):
+                    for strategy_name, cfg in strategies_cfg.items():
+                        if isinstance(cfg, dict) and bool(cfg.get("enabled", False)):
+                            enabled_strategies.add(strategy_name)
+            except Exception as cfg_err:
+                logger.warning(f"Enabled strategy list unavailable: {cfg_err}")
+
+            all_names = (
+                set(db_strategies.keys())
+                | set(activity_by_strategy.keys())
+                | enabled_strategies
+                | set(cumulative_from_service.keys())
+            )
+
+            merged: Dict[str, Any] = {}
+            for sname in sorted(all_names):
+                base = dict(db_strategies.get(sname, {}))
+                activity = activity_by_strategy.get(sname, {})
+                merged[sname] = {
+                    "total_trades": int(base.get("total_trades", 0) or 0),
+                    "open_trades": int(base.get("open_trades", 0) or 0),
+                    "closed_trades": int(base.get("closed_trades", 0) or 0),
+                    "winning_trades": int(base.get("winning_trades", 0) or 0),
+                    "losing_trades": int(base.get("losing_trades", 0) or 0),
+                    "win_rate": float(base.get("win_rate", 0) or 0),
+                    "win_rate_percentage": float(base.get("win_rate_percentage", 0) or 0),
+                    "total_pnl": float(base.get("total_pnl", 0) or 0),
+                    "total_profit": float(base.get("total_profit", 0) or 0),
+                    "total_loss": float(base.get("total_loss", 0) or 0),
+                    "avg_winning_trade": float(base.get("avg_winning_trade", 0) or 0),
+                    "avg_losing_trade": float(base.get("avg_losing_trade", 0) or 0),
+                    "profit_factor": float(base.get("profit_factor", 0) or 0),
+                    "series": base.get("series", []),
+                    "analysis_runs": int(activity.get("analysis_runs", 0) or 0),
+                    "cumulative_analysis_runs": int(
+                        cumulative_from_service.get(sname, 0) or 0
+                    ),
+                    "buy_signals": int(activity.get("buy_signals", 0) or 0),
+                    "sell_signals": int(activity.get("sell_signals", 0) or 0),
+                    "hold_signals": int(activity.get("hold_signals", 0) or 0),
+                    "last_analyzed_at": activity.get("last_analyzed_at"),
+                }
+
+            return {
+                "window": {**db_window, "label": resolved.get("label")},
+                "strategies": merged,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting windowed strategy performance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/trades")
 async def get_trades(
@@ -1136,14 +1444,16 @@ async def get_trading_config():
                 
                 return {
                     "profit_protection": {
-                        "trigger_percentage": profit_protection.get('trigger_percentage', 0.01),
-                        "activation_threshold": profit_protection.get('activation_threshold', 0.008)
+                        "activation_threshold": profit_protection.get(
+                            "activation_threshold", 0.005
+                        )
                     },
                     "trailing_stop": {
-                        "trigger_percentage": trailing_stop.get('trigger_percentage', 0.04),
-                        "activation_threshold": trailing_stop.get('activation_threshold', 0.005),
-                        "step_percentage": trailing_stop.get('step_percentage', 0.005)
-                    }
+                        "activation_threshold": trailing_stop.get(
+                            "activation_threshold", 0.005
+                        ),
+                        "step_percentage": trailing_stop.get("step_percentage", 0.005),
+                    },
                 }
         
         # Fallback to local config file
@@ -1164,14 +1474,18 @@ async def get_trading_config():
                     
                     return {
                         "profit_protection": {
-                            "trigger_percentage": profit_protection.get('trigger_percentage', 0.007),
-                            "activation_threshold": profit_protection.get('activation_threshold', 0.007)
+                            "activation_threshold": profit_protection.get(
+                                "activation_threshold", 0.005
+                            )
                         },
                         "trailing_stop": {
-                            "trigger_percentage": trailing_stop.get('trigger_percentage', 0.007),
-                            "activation_threshold": trailing_stop.get('activation_threshold', 0.007),
-                            "step_percentage": trailing_stop.get('step_percentage', 0.0035)
-                        }
+                            "activation_threshold": trailing_stop.get(
+                                "activation_threshold", 0.003
+                            ),
+                            "step_percentage": trailing_stop.get(
+                                "step_percentage", 0.0035
+                            ),
+                        },
                     }
             except FileNotFoundError:
                 continue
@@ -1179,28 +1493,24 @@ async def get_trading_config():
         # Default fallback values
         return {
             "profit_protection": {
-                "trigger_percentage": 0.007,
-                "activation_threshold": 0.007
+                "activation_threshold": 0.005,
             },
             "trailing_stop": {
-                "trigger_percentage": 0.007,
-                "activation_threshold": 0.007,
-                "step_percentage": 0.0035
-            }
+                "activation_threshold": 0.003,
+                "step_percentage": 0.0035,
+            },
         }
         
     except Exception as e:
         logger.error(f"Error getting trading config: {e}")
         return {
             "profit_protection": {
-                "trigger_percentage": 0.007,
-                "activation_threshold": 0.007
+                "activation_threshold": 0.005,
             },
             "trailing_stop": {
-                "trigger_percentage": 0.007,
-                "activation_threshold": 0.007,
-                "step_percentage": 0.0035
-            }
+                "activation_threshold": 0.003,
+                "step_percentage": 0.0035,
+            },
         }
 
 @app.put("/api/config/update")
@@ -1266,6 +1576,61 @@ async def update_risk_limits(limits: Dict[str, Any]):
         logger.error(f"Error updating risk limits: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+async def _fetch_all_closed_trades_paginated(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    """Load every CLOSED trade, oldest exit first, for correct cumulative PnL and drawdown."""
+    batch_size = 4000
+    offset = 0
+    all_trades: List[Dict[str, Any]] = []
+    while True:
+        url = (
+            f"{database_service_url}/api/v1/trades"
+            f"?status=CLOSED&sort_by=exit_time&sort_order=asc&limit={batch_size}&offset={offset}"
+        )
+        response = await client.get(url)
+        response.raise_for_status()
+        chunk = response.json().get("trades") or []
+        all_trades.extend(chunk)
+        if len(chunk) < batch_size:
+            break
+        offset += batch_size
+    return all_trades
+
+
+async def _get_monthly_profit_target_usd() -> float:
+    env_default = os.getenv("MONTHLY_PROFIT_TARGET_USD")
+    default = float(env_default) if env_default else 1000.0
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"{config_service_url}/api/v1/config/all")
+            if response.status_code == 200:
+                cfg = response.json()
+                raw = (cfg.get("trading") or {}).get("monthly_profit_target_usd")
+                if raw is not None:
+                    return float(raw)
+    except Exception as e:
+        logger.warning(f"Could not load monthly_profit_target_usd from config: {e}")
+    return default
+
+
+@app.get("/api/v1/monthly-profit-summary")
+async def get_monthly_profit_summary(months: int = Query(18, ge=1, le=120)):
+    """Per-month realized PnL from DB plus configurable monthly USD goal."""
+    try:
+        target = await _get_monthly_profit_target_usd()
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{database_service_url}/api/v1/trades/stats/monthly-realized",
+                params={"months": months},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        payload["target_usd"] = target
+        return payload
+    except Exception as e:
+        logger.error(f"Error getting monthly profit summary: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get monthly profit summary")
+
+
 @app.get("/api/v1/profitability")
 async def get_profitability_data():
     """Get comprehensive profitability analysis data"""
@@ -1276,11 +1641,9 @@ async def get_profitability_data():
             response.raise_for_status()
             trading_status = response.json()
         
-        # Get all trades
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{database_service_url}/api/v1/trades?limit=1000")
-            response.raise_for_status()
-            all_trades = response.json().get('trades', [])
+        # All CLOSED trades (paginated) — not a single 1000-row sample
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            all_trades = await _fetch_all_closed_trades_paginated(client)
         
         # Get balances
         balances = {}
@@ -1809,8 +2172,23 @@ async def get_optimization_status():
         logger.error(f"Error getting optimization status: {e}")
         raise HTTPException(status_code=500, detail="Failed to get optimization status")
 
+def _realized_pnl_float(trade: Dict[str, Any]) -> float:
+    v = trade.get("realized_pnl", 0)
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _exit_time_sort_key(trade: Dict[str, Any]) -> str:
+    v = trade.get("exit_time")
+    if v is None:
+        return ""
+    return str(v)
+
+
 def calculate_profitability_metrics(trades: List[Dict[str, Any]], trading_status: Dict[str, Any], balances: Dict[str, Any]) -> Dict[str, Any]:
-    """Calculate comprehensive profitability metrics"""
+    """Calculate comprehensive profitability metrics from closed trades (chronological by exit_time)."""
     if not trades:
         return {
             "health_score": 0,
@@ -1819,121 +2197,122 @@ def calculate_profitability_metrics(trades: List[Dict[str, Any]], trading_status
             "total_pnl": 0,
             "trades_per_cycle": 0,
             "max_drawdown": 0,
+            "max_drawdown_pct": 0,
             "sharpe_ratio": 0,
             "balance_utilization": 0,
             "exchange_stats": {},
             "strategy_stats": {},
             "pnl_timeline": [],
-            "recommendations": []
+            "recommendations": [],
+            "closed_trade_count": 0,
         }
-    
-    # Basic metrics
-    total_trades = len(trades)
-    closed_trades = [t for t in trades if t.get('status') == 'CLOSED']
-    open_trades = [t for t in trades if t.get('status') == 'OPEN']
-    
+
+    closed_trades = [t for t in trades if str(t.get("status", "")).upper() == "CLOSED"]
+    closed_trades.sort(key=_exit_time_sort_key)
+
     # PnL calculations
-    total_pnl = sum(t.get('realized_pnl', 0) for t in closed_trades)
-    profitable_trades = [t for t in closed_trades if t.get('realized_pnl', 0) > 0]
-    losing_trades = [t for t in closed_trades if t.get('realized_pnl', 0) < 0]
-    
+    total_pnl = sum(_realized_pnl_float(t) for t in closed_trades)
+    profitable_trades = [t for t in closed_trades if _realized_pnl_float(t) > 0]
+    losing_trades = [t for t in closed_trades if _realized_pnl_float(t) < 0]
+
     win_rate = len(profitable_trades) / max(len(closed_trades), 1)
-    loss_rate = len(losing_trades) / max(len(closed_trades), 1)
-    
+
     # Profit factor calculation
-    gross_profit = sum(t.get('realized_pnl', 0) for t in profitable_trades)
-    gross_loss = abs(sum(t.get('realized_pnl', 0) for t in losing_trades))
+    gross_profit = sum(_realized_pnl_float(t) for t in profitable_trades)
+    gross_loss = abs(sum(_realized_pnl_float(t) for t in losing_trades))
     profit_factor = gross_profit / max(gross_loss, 1)
-    
-    # Trades per cycle
-    cycle_count = trading_status.get('cycle_count', 0)
-    trades_per_cycle = total_trades / max(cycle_count, 1)
-    
+
+    # Trades per cycle (closed only — open rows are not part of this payload)
+    cycle_count = trading_status.get("cycle_count", 0)
+    trades_per_cycle = len(closed_trades) / max(cycle_count, 1)
+
     # Balance utilization
-    total_balance = sum(b['total'] for b in balances.values())
-    used_balance = sum(b['used'] for b in balances.values())
+    total_balance = sum(b["total"] for b in balances.values())
+    used_balance = sum(b["used"] for b in balances.values())
     balance_utilization = used_balance / max(total_balance, 1)
-    
-    # Calculate drawdown
-    cumulative_pnl = []
-    running_max = 0
-    max_drawdown = 0
-    
+
+    # Drawdown on cumulative realized PnL (dollars); max_drawdown_pct vs peak cumulative profit
+    running_max = 0.0
+    max_drawdown = 0.0
+    cumulative = 0.0
     for trade in closed_trades:
-        pnl = trade.get('realized_pnl', 0)
-        if not cumulative_pnl:
-            cumulative_pnl.append(pnl)
-        else:
-            cumulative_pnl.append(cumulative_pnl[-1] + pnl)
-        
-        running_max = max(running_max, cumulative_pnl[-1])
-        drawdown = running_max - cumulative_pnl[-1]
+        pnl = _realized_pnl_float(trade)
+        cumulative += pnl
+        running_max = max(running_max, cumulative)
+        drawdown = running_max - cumulative
         max_drawdown = max(max_drawdown, drawdown)
-    
+    max_drawdown_pct = (max_drawdown / running_max) if running_max > 0 else 0.0
+
     # Sharpe ratio (simplified)
-    pnl_values = [t.get('realized_pnl', 0) for t in closed_trades]
+    pnl_values = [_realized_pnl_float(t) for t in closed_trades]
     if len(pnl_values) > 1:
         import statistics
+
         mean_pnl = statistics.mean(pnl_values)
         std_pnl = statistics.stdev(pnl_values) if len(pnl_values) > 1 else 0
         sharpe_ratio = mean_pnl / max(std_pnl, 1)
     else:
         sharpe_ratio = 0
-    
-    # Exchange statistics
-    exchange_stats = {}
+
+    # Exchange statistics (no embedded trade rows — keeps payload small)
+    exchange_stats: Dict[str, Any] = {}
     for trade in closed_trades:
-        exchange = trade.get('exchange', 'unknown')
+        exchange = trade.get("exchange", "unknown")
         if exchange not in exchange_stats:
-            exchange_stats[exchange] = {'trades': [], 'pnl': 0, 'wins': 0, 'losses': 0}
-        
-        exchange_stats[exchange]['trades'].append(trade)
-        pnl = trade.get('realized_pnl', 0)
-        exchange_stats[exchange]['pnl'] += pnl
+            exchange_stats[exchange] = {"pnl": 0.0, "wins": 0, "losses": 0, "flat": 0}
+
+        pnl = _realized_pnl_float(trade)
+        exchange_stats[exchange]["pnl"] += pnl
         if pnl > 0:
-            exchange_stats[exchange]['wins'] += 1
+            exchange_stats[exchange]["wins"] += 1
+        elif pnl < 0:
+            exchange_stats[exchange]["losses"] += 1
         else:
-            exchange_stats[exchange]['losses'] += 1
-    
-    # Calculate win rates by exchange
+            exchange_stats[exchange]["flat"] += 1
+
     for exchange in exchange_stats:
-        total = exchange_stats[exchange]['wins'] + exchange_stats[exchange]['losses']
-        exchange_stats[exchange]['win_rate'] = exchange_stats[exchange]['wins'] / max(total, 1)
-        exchange_stats[exchange]['total_trades'] = total
-    
+        st = exchange_stats[exchange]
+        total = st["wins"] + st["losses"] + st["flat"]
+        exchange_stats[exchange]["win_rate"] = st["wins"] / max(total, 1)
+        exchange_stats[exchange]["total_trades"] = total
+
     # Strategy statistics
-    strategy_stats = {}
+    strategy_stats: Dict[str, Any] = {}
     for trade in closed_trades:
-        strategy = trade.get('strategy', 'unknown')
+        strategy = trade.get("strategy", "unknown")
         if strategy not in strategy_stats:
-            strategy_stats[strategy] = {'trades': [], 'pnl': 0, 'wins': 0, 'losses': 0}
-        
-        strategy_stats[strategy]['trades'].append(trade)
-        pnl = trade.get('realized_pnl', 0)
-        strategy_stats[strategy]['pnl'] += pnl
+            strategy_stats[strategy] = {"pnl": 0.0, "wins": 0, "losses": 0, "flat": 0}
+
+        pnl = _realized_pnl_float(trade)
+        strategy_stats[strategy]["pnl"] += pnl
         if pnl > 0:
-            strategy_stats[strategy]['wins'] += 1
+            strategy_stats[strategy]["wins"] += 1
+        elif pnl < 0:
+            strategy_stats[strategy]["losses"] += 1
         else:
-            strategy_stats[strategy]['losses'] += 1
-    
-    # Calculate win rates by strategy
+            strategy_stats[strategy]["flat"] += 1
+
     for strategy in strategy_stats:
-        total = strategy_stats[strategy]['wins'] + strategy_stats[strategy]['losses']
-        strategy_stats[strategy]['win_rate'] = strategy_stats[strategy]['wins'] / max(total, 1)
-        strategy_stats[strategy]['total_trades'] = total
-    
+        st = strategy_stats[strategy]
+        total = st["wins"] + st["losses"] + st["flat"]
+        strategy_stats[strategy]["win_rate"] = st["wins"] / max(total, 1)
+        strategy_stats[strategy]["total_trades"] = total
+
     # PnL timeline
     pnl_timeline = []
-    cumulative = 0
+    cumulative_tl = 0.0
     for trade in closed_trades:
-        pnl = trade.get('realized_pnl', 0)
-        cumulative += pnl
-        exit_time = trade.get('exit_time', '')
+        pnl = _realized_pnl_float(trade)
+        cumulative_tl += pnl
+        exit_time = trade.get("exit_time", "")
         if exit_time:
-            pnl_timeline.append({
-                'date': exit_time.split('T')[0],  # Just the date part
-                'cumulative_pnl': cumulative
-            })
+            et = str(exit_time)
+            pnl_timeline.append(
+                {
+                    "date": et.split("T")[0],
+                    "cumulative_pnl": cumulative_tl,
+                }
+            )
     
     # Add optimization status indicator for multi-timeframe confluence strategy
     mtf_performance_note = ""
@@ -1972,12 +2351,14 @@ def calculate_profitability_metrics(trades: List[Dict[str, Any]], trading_status
         "total_pnl": total_pnl,
         "trades_per_cycle": trades_per_cycle,
         "max_drawdown": max_drawdown,
+        "max_drawdown_pct": max_drawdown_pct,
         "sharpe_ratio": sharpe_ratio,
         "balance_utilization": balance_utilization,
         "exchange_stats": exchange_stats,
         "strategy_stats": strategy_stats,
         "pnl_timeline": pnl_timeline,
-        "recommendations": recommendations
+        "recommendations": recommendations,
+        "closed_trade_count": len(closed_trades),
     }
 
 # --- Bot Status Aggregation Endpoint ---
@@ -2931,7 +3312,7 @@ async def get_actionable_analytics():
                         "current_value": f"{current_trigger:.1%}",
                         "recommended_value": f"{optimal_trigger:.1%}",
                         "impact": f"Avg profit per winning trade: ${avg_profit_by_trigger[optimal_trigger]:.2f}",
-                        "config_path": "trading.trailing_stop.trigger_percentage",
+                        "config_path": "trading.trailing_stop.activation_threshold",
                         "reason": f"Trailing stops triggered at {optimal_trigger:.1%} profit show highest average returns"
                     })
         
@@ -3277,8 +3658,9 @@ async def get_parameter_optimization_suggestions():
         
         # Get current config values first
         current_stop_loss = current_config.get('trading', {}).get('stop_loss_percentage', 0.02)
-        current_take_profit = current_config.get('trading', {}).get('take_profit_percentage', 0.08)
-        current_trigger = current_config.get('trading', {}).get('trailing_stop', {}).get('trigger_percentage', 0.015)
+        current_trigger = current_config.get("trading", {}).get("trailing_stop", {}).get(
+            "activation_threshold", 0.003
+        )
         
         # Get current min_confidence from strategies (check all enabled strategies)
         current_min_confidence = 0.8  # Default fallback
@@ -3306,26 +3688,6 @@ async def get_parameter_optimization_suggestions():
                     "reason": f"{sl_rate:.1%} of trades hit stop loss, avg loss ${avg_sl_loss:.2f}",
                     "expected_impact": "Reduce average loss per trade by 25%",
                     "config_location": "trading.stop_loss_percentage"
-                })
-        
-        # 2. TAKE PROFIT OPTIMIZATION
-        tp_trades = [t for t in closed_trades if 'take_profit' in t.get('exit_reason', '')]
-        manual_exits = [t for t in closed_trades if 'manual' not in t.get('exit_reason', '') and 'take_profit' not in t.get('exit_reason', '') and 'stop_loss' not in t.get('exit_reason', '')]
-        
-        if len(tp_trades) >= 3 and len(manual_exits) >= 3:
-            avg_tp_profit = sum(t.get('realized_pnl', 0) for t in tp_trades) / len(tp_trades)
-            avg_manual_profit = sum(t.get('realized_pnl', 0) for t in manual_exits) / len(manual_exits)
-            
-            if avg_manual_profit > avg_tp_profit * 1.5:
-                suggested_tp = min(0.15, current_take_profit + 0.04)  # Suggest 4% higher but not above 15%
-                suggestions.append({
-                    "parameter": "take_profit_percentage",
-                    "current_value": f"{current_take_profit*100:.1f}%",
-                    "suggested_value": f"{suggested_tp*100:.1f}%",
-                    "priority": "medium",
-                    "reason": f"Manual exits avg ${avg_manual_profit:.2f} vs TP ${avg_tp_profit:.2f}",
-                    "expected_impact": f"Increase profit per trade by ${avg_manual_profit - avg_tp_profit:.2f}",
-                    "config_location": "trading.take_profit_percentage"
                 })
         
         # 3. CONFIDENCE THRESHOLD ANALYSIS
@@ -3438,7 +3800,7 @@ async def get_parameter_optimization_suggestions():
                         "priority": "medium",
                         "reason": f"{trades_that_could_improve} trades reached {proposed_trigger*100:.1f}%+ (gain ${additional_profit:.2f}), {trades_that_would_miss} trades didn't (lose ${lost_profit:.2f})",
                         "expected_impact": f"Net ${net_improvement:.2f} additional profit ({improvement_pct:.1f}% improvement)",
-                        "config_location": "trading.trailing_stop.trigger_percentage"
+                        "config_location": "trading.trailing_stop.activation_threshold"
                     })
                 else:
                     # Current trigger is better
@@ -3449,7 +3811,7 @@ async def get_parameter_optimization_suggestions():
                         "priority": "low",
                         "reason": f"Higher trigger would lose more than it gains: {trades_that_would_miss} trades wouldn't trigger (lose ${lost_profit:.2f}) vs {trades_that_could_improve} that could improve (gain ${additional_profit:.2f})",
                         "expected_impact": f"Current {current_trigger*100:.1f}% trigger is optimal",
-                        "config_location": "trading.trailing_stop.trigger_percentage"
+                        "config_location": "trading.trailing_stop.activation_threshold"
                     })
             
             elif len(early_exits) > 0:
@@ -3462,7 +3824,7 @@ async def get_parameter_optimization_suggestions():
                     "priority": "low",
                     "reason": f"None of {len(early_exits)} early exits reached {proposed_trigger*100:.1f}% (max: {max(e['max_profit_pct'] for e in early_exits)*100:.1f}%)",
                     "expected_impact": f"Higher trigger would forfeit ${total_early_profit:.2f} in profits",
-                    "config_location": "trading.trailing_stop.trigger_percentage"
+                    "config_location": "trading.trailing_stop.activation_threshold"
                 })
         
         # 5. POSITION SIZE ANALYSIS
@@ -3619,12 +3981,12 @@ def apply_config_change(config: Dict, config_path: str, value: Any, recommendati
             return True
             
         elif recommendation_type == "trailing_stop_trigger":
-            # trading.trailing_stop.trigger_percentage
+            # trading.trailing_stop.activation_threshold (decimal, e.g. 0.003 = +0.3%)
             if 'trading' not in config:
                 config['trading'] = {}
             if 'trailing_stop' not in config['trading']:
                 config['trading']['trailing_stop'] = {}
-            config['trading']['trailing_stop']['trigger_percentage'] = float(value)
+            config['trading']['trailing_stop']['activation_threshold'] = float(value)
             return True
             
         elif recommendation_type == "strategy_disable":
@@ -3715,7 +4077,9 @@ async def get_current_config():
         current_values = {
             "confidence_thresholds": {},
             "stop_loss_percentage": config.get('trading', {}).get('stop_loss_percentage'),
-            "trailing_stop_trigger": config.get('trading', {}).get('trailing_stop', {}).get('trigger_percentage'),
+            "trailing_stop_trigger": config.get("trading", {})
+            .get("trailing_stop", {})
+            .get("activation_threshold"),
             "enabled_strategies": {},
             "blacklisted_pairs": config.get('pair_selector', {}).get('blacklisted_pairs', []),
             "min_order_sizes": config.get('trading', {}).get('min_order_size_usd', {}),

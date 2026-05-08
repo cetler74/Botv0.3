@@ -1120,15 +1120,43 @@
             <!-- Total Unrealized PnL -->
             <div class="enhanced-card animate-in" style="--delay: 1.0s">
                 <div class="enhanced-card-content">
-                    <div class="flex items-center">
-                        <div class="icon-container bg-indigo-500 mr-4">
+                    <div class="flex items-start">
+                        <div class="icon-container bg-indigo-500 mr-4 flex-shrink-0">
                             <i class="fas fa-chart-area text-xl text-white"></i>
                         </div>
-                        <div class="flex-1">
+                        <div class="flex-1 min-w-0">
                             <p class="text-sm font-medium text-gray-600 mb-1">Unrealized PnL</p>
                             <p class="text-2xl font-bold" id="total-unrealized-pnl">$0.00</p>
+                            <div class="mt-2 space-y-1 text-xs sm:text-sm">
+                                <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                    <span class="text-gray-500 whitespace-nowrap"><i class="fas fa-arrow-trend-up mr-1 text-emerald-600" aria-hidden="true"></i>Winning</span>
+                                    <span class="font-mono font-semibold text-profit" id="unrealized-winning-pnl">$0.00</span>
+                                    <span class="text-gray-400" id="unrealized-winning-count">(0 open)</span>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                    <span class="text-gray-500 whitespace-nowrap"><i class="fas fa-arrow-trend-down mr-1 text-red-500" aria-hidden="true"></i>Losing</span>
+                                    <span class="font-mono font-semibold text-loss" id="unrealized-losing-pnl">$0.00</span>
+                                    <span class="text-gray-400" id="unrealized-losing-count">(0 open)</span>
+                                </div>
+                            </div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Daily PnL Chart -->
+        <div class="enhanced-card animate-in mb-8" style="--delay: 0.7s">
+            <div class="enhanced-card-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-bold text-gray-900 flex items-center">
+                        <i class="fas fa-chart-column text-emerald-600 mr-3"></i>
+                        Daily PnL
+                    </h3>
+                    <span class="text-sm text-gray-500">Last 7 days</span>
+                </div>
+                <div class="relative" style="height: 280px;">
+                    <canvas id="daily-pnl-chart"></canvas>
                 </div>
             </div>
         </div>
@@ -1337,7 +1365,7 @@
                                 <th class="fee-col mobile-hidden">Entry Fee</th>
                                 <th class="fee-col mobile-hidden">Exit Fee</th>
                                 <th class="fee-col">Total Fees ($)</th>
-                                <th>Unrealized PnL</th>
+                                <th title="OPEN: unrealized (mark-to-market). CLOSED: realized PnL (net of fees).">Net PnL</th>
                                 <th>Status</th>
                                 <th class="mobile-hidden">Entry Reason</th>
                                 <th class="profit-trigger-col">Profit Trigger</th>
@@ -1415,7 +1443,8 @@
     </div>
 
     <!-- Include enhanced dashboard JavaScript -->
-    <script src="/static/js/enhanced-dashboard.js?v=20260421b"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js?v=20260430a"></script>
+    <script src="/static/js/enhanced-dashboard.js?v=20260504a"></script>
     <script src="/static/js/performance-analytics.js"></script>
     <script>
         // Add test data for sorting when backend is not available

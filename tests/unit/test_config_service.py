@@ -130,16 +130,16 @@ def sample_config():
             "max_trades_per_exchange": 3,
             "position_size_percentage": 0.1,
             "stop_loss_percentage": 0.03,
-            "take_profit_percentage": 0.06,
+            "overall_profit_take_exit_pct": 0.045,
             "profit_protection": {
                 "enabled": True,
                 "lock_percentage": 0.01,
-                "trigger_percentage": 0.02
+                "activation_threshold": 0.005
             },
             "trailing_stop": {
                 "enabled": True,
                 "step_percentage": 0.005,
-                "trigger_percentage": 0.03
+                "activation_threshold": 0.003
             }
         },
         "database": {

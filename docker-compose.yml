@@ -97,7 +97,9 @@ services:
 
   # Exchange Service
   exchange-service:
-    build: ./services/exchange-service
+    build:
+      context: .
+      dockerfile: services/exchange-service/Dockerfile
     container_name: trading-bot-exchange
     ports:
       - "8003:8003"
@@ -123,6 +125,7 @@ services:
       - BYBIT_ENABLE_USER_DATA_STREAM=true
       - BYBIT_API_KEY=${EXCHANGE_BYBIT_API_KEY}
       - BYBIT_API_SECRET=${EXCHANGE_BYBIT_API_SECRET}
+      - CONFIG_PATH=/app/config/config.yaml
     volumes:
       - ./scripts:/app/scripts
     networks:

@@ -37,7 +37,10 @@ class EnhancedTrailingStopManager:
                 'exchange': trade_data.get('exchange'),
                 'pair': trade_data.get('pair'),
                 'trailing_enabled': trailing_config.get('enabled', True),
-                'trailing_trigger_percentage': float(trailing_config.get('trigger_percentage', 0.035)),  # 3.5%
+                'trailing_trigger_percentage': float(
+                    trailing_config.get('activation_threshold')
+                    or trailing_config.get('trigger_percentage', 0.003)
+                ),
                 'trailing_step_percentage': float(trailing_config.get('step_percentage', 0.005)),  # 0.5%
                 'max_trail_distance_percentage': float(trailing_config.get('max_trail_distance', 0.025)),  # 2.5%
                 'entry_price': float(trade_data.get('entry_price', 0)),

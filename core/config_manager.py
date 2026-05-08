@@ -55,18 +55,17 @@ class TradingConfig(BaseModel):
     max_daily_loss: float
     max_total_loss: float
     stop_loss_percentage: float
-    take_profit_percentage: float
 
 
 class ProfitProtectionConfig(BaseModel):
     enabled: bool
-    trigger_percentage: float
+    activation_threshold: float
     lock_percentage: float
 
 
 class TrailingStopConfig(BaseModel):
     enabled: bool
-    trigger_percentage: float
+    activation_threshold: float
     step_percentage: float
 
 

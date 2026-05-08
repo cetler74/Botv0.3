@@ -1,3 +1,4 @@
+import copy
 import logging
 import pandas as pd
 from datetime import datetime
@@ -129,46 +130,17 @@ def calculate_volatility_adjustment(atr_value, current_price):
 
 def get_dynamic_config(atr_value, current_price, base_config):
     """
-    Adjust thresholds dynamically based on ATR volatility.
+    Return an isolated copy of base_config for ATR-aware call paths.
 
-    Args:
-        atr_value: Average True Range value
-        current_price: Current asset price
-        base_config: Base configuration object or dict
-
-    Returns:
-        Adjusted configuration
+    Previously wrote top-level profit_protection_threshold / trailing_stop_activation
+    keys that were never read (nested trading.profit_protection.* is used instead).
     """
-    config = base_config.copy() if isinstance(base_config, dict) else base_config.__dict__.copy()
-    volatility_pct = atr_value / current_price if atr_value and current_price > 0 else 0.03
-    
-    # Dynamic thresholds based on volatility
-    if volatility_pct > 0.05:  # High volatility
-        thresholds = {
-            'profit_protection_threshold': 0.015,  # 1.5%
-            'trailing_stop_activation': 0.04,      # 4%
-            'max_drawdown': 0.35                   # 35%
-        }
-    elif volatility_pct > 0.03:  # Medium volatility
-        thresholds = {
-            'profit_protection_threshold': 0.01,   # 1%
-            'trailing_stop_activation': 0.03,      # 3%
-            'max_drawdown': 0.30                   # 30%
-        }
-    else:  # Low volatility
-        thresholds = {
-            'profit_protection_threshold': 0.008,  # 0.8%
-            'trailing_stop_activation': 0.025,     # 2.5%
-            'max_drawdown': 0.25                   # 25%
-        }
-    
-    for key, value in thresholds.items():
-        if isinstance(config, dict):
-            config[key] = value
-        else:
-            setattr(config, key, value)
-    
-    return config
+    _ = (atr_value, current_price)  # reserved for future volatility-aware overrides
+    if isinstance(base_config, dict):
+        return copy.deepcopy(base_config)
+    if hasattr(base_config, "__dict__"):
+        return copy.deepcopy(base_config.__dict__)
+    return base_config
 
 def _validate_position_for_pnl(position):
     """

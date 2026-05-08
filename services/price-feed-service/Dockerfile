@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code (DDL is embedded in main.py so a single-file image always self-migrates)
 COPY main.py .
 
 # Health check

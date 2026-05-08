@@ -35,7 +35,7 @@ VERSION_DATE = "2025-08-25"
 RISK_MANAGEMENT_VERSION = "2.4.0"
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import uuid
 import time
@@ -74,6 +74,14 @@ try:
 except ImportError as e:
     logger.warning(f"⚠️ New trailing stop system not available: {e}")
     TRAILING_STOP_SYSTEM_AVAILABLE = False
+
+from pair_rotation_manager import rotate_pair_after_loss
+from pair_loss_policy import (
+    infer_trade_notional_usd,
+    is_macd_momentum_strategy,
+    loss_cooldown_key,
+    qualifies_for_hard_loss_cooldown,
+)
 
 
 # Create custom registry to avoid conflicts
@@ -500,6 +508,13 @@ class RiskLimits(BaseModel):
     max_total_loss: float
     position_size_percentage: float
 
+
+class PairEntryBlocksRequest(BaseModel):
+    """Dashboard: which symbols are soft-blocked from new entries (risk/cooldown)."""
+
+    exchange: str
+    pairs: List[str] = Field(default_factory=list)
+
 class TradeSignal(BaseModel):
     exchange: str
     pair: str
@@ -593,6 +608,14 @@ class TradingOrchestrator:
         self.exiting_trades = set()  # Track trades currently being exited to prevent duplicates
         self._trade_feed_degraded_since: Dict[str, datetime] = {}
         self._pair_execution_downgrade_until: Dict[Tuple[str, str], datetime] = {}
+        self._pair_rotation_blacklist_until: Dict[str, datetime] = {}
+        self._hard_loss_cooldown_until: Dict[Tuple[str, str], datetime] = {}
+        self._recent_negative_realized_blacklist_until: Dict[str, datetime] = {}
+        self._pair_rotation_processed_trade_ids: set[str] = set()
+        # Global in-process pair entry reservation (across exchanges) to prevent
+        # same-cycle dual opens on the same instrument.
+        self._pair_entry_reservation_lock = asyncio.Lock()
+        self._pair_entry_reservations: set[str] = set()
         self.momentum_filter = MomentumFilter()  # Initialize momentum filter
         self.last_pair_update = datetime.utcnow()  # Track when pairs were last updated
 
@@ -602,6 +625,10 @@ class TradingOrchestrator:
         # re-entered the same losing pair within the same cycle.
         self._pair_cooldown_until: Dict[tuple, datetime] = {}
         self._pair_cooldown_minutes: int = 30
+        # Cross-exchange pair cooldown: if DOGE/USDC was entered on any exchange,
+        # block re-entry on the same normalized pair everywhere for N minutes.
+        self._global_pair_cooldown_until: Dict[str, datetime] = {}
+        self._global_pair_cooldown_minutes: int = 5
         # Correlation cap: number of concurrent long entries allowed within the same
         # "basket" (crypto-beta cluster). All pairs are highly correlated so we treat
         # them as a single basket for now; easy to extend to per-cluster buckets later.
@@ -612,6 +639,8 @@ class TradingOrchestrator:
         self._loop_cycle_interval: float = 60.0
         self._loop_max_cycle_duration: float = 60.0
         self._loop_exit_cycle_first: bool = True
+        # Wall time reserved for entry + maintenance after exit's timebox (exit_cycle_first).
+        self._loop_entry_reserve_seconds: float = 90.0
         
         # Initialize strategy manager and database manager
         self.database_manager = None
@@ -706,6 +735,11 @@ class TradingOrchestrator:
                 "trigger_detected_at": now_iso,
             }
             await self._update_trade_data(trade_id, update_data)
+            logger.warning(
+                f"[Trade {trade_id}] [ExitTelemetry] TRIGGER_CAPTURED: "
+                f"reason={exit_reason}, trigger={trigger_price:.6f}, detected={current_price:.6f}, "
+                f"source={price_source}, feed_quality={feed_quality}, ts={now_iso}"
+            )
         except Exception as e:
             logger.warning(f"[Trade {trade_id}] [ExitState] Could not persist trigger metadata: {e}")
 
@@ -774,6 +808,12 @@ class TradingOrchestrator:
                 return True
             consensus = signals_data.get("consensus", {}) or {}
             strategies = signals_data.get("strategies", {}) or {}
+            consensus_excluded_strategies = {"macd_momentum"}
+            consensus_strategies = {
+                name: data
+                for name, data in strategies.items()
+                if name not in consensus_excluded_strategies
+            }
             rsi_checklist_override = bool(consensus.get("rsi_checklist_buy_override", False))
             if rsi_checklist_override:
                 logger.warning(
@@ -794,12 +834,22 @@ class TradingOrchestrator:
             if not isinstance(macd_override_cfg, dict):
                 macd_override_cfg = {}
             macd_override_enabled = bool(macd_override_cfg.get("enabled", True))
-            macd_signal = str(((strategies.get("macd_momentum") or {}).get("signal", "hold"))).lower()
-            if macd_override_enabled and macd_signal == "buy":
+            macd_strategy_data = strategies.get("macd_momentum", {}) or {}
+            macd_signal = str((macd_strategy_data.get("signal", "hold"))).lower()
+            macd_validation = (macd_strategy_data.get("validation", {}) or {})
+            macd_rule_triggered = bool(
+                macd_validation.get("trigger")
+                or macd_validation.get("macd_green_rsi_buy_ok")
+                or macd_strategy_data.get("macd_green_rsi_buy_ok")
+            )
+            if macd_override_enabled and (macd_signal == "buy" or macd_rule_triggered):
                 logger.warning(
-                    "[EntryGate] MACD override active for %s %s: bypassing entry quality gate on macd_momentum BUY",
+                    "[EntryGate] MACD override active for %s %s: bypassing entry quality gate "
+                    "(signal=%s, rule_triggered=%s)",
                     exchange_name,
                     pair,
+                    macd_signal,
+                    macd_rule_triggered,
                 )
                 return True
             entry_policy = (resolved_policy or {}).get("entry", {}) or {}
@@ -819,7 +869,7 @@ class TradingOrchestrator:
 
             buy_votes = []
             sell_votes = []
-            for s in strategies.values():
+            for s in consensus_strategies.values():
                 s_signal = str((s or {}).get("signal", "")).lower()
                 s_conf = float((s or {}).get("confidence", 0) or 0.0)
                 s_strength = float((s or {}).get("strength", 0) or 0.0)
@@ -851,7 +901,7 @@ class TradingOrchestrator:
                 logger.info("[EntryGate] Reject %s %s: agreement %.1f < %.1f", exchange_name, pair, c_agree, min_agreement_pct)
                 return False
 
-            buy_signals = [s for s in strategies.values() if (s or {}).get("signal") == "buy"]
+            buy_signals = [s for s in consensus_strategies.values() if (s or {}).get("signal") == "buy"]
             if len(buy_signals) < min_buy_strategies and not fallback_override:
                 logger.info("[EntryGate] Reject %s %s: buy strategies %s < %s", exchange_name, pair, len(buy_signals), min_buy_strategies)
                 return False
@@ -1426,6 +1476,27 @@ class TradingOrchestrator:
                 exchange_blacklisted_pairs = [p for p in blacklisted_pairs if p.endswith("/USD")]
             else:
                 exchange_blacklisted_pairs = list(blacklisted_pairs)
+            # Add temporary cooldown blacklist from loss-based pair rotation.
+            now = datetime.utcnow()
+            expired_temp_keys = [
+                k for k, until in self._pair_rotation_blacklist_until.items() if until <= now
+            ]
+            for k in expired_temp_keys:
+                self._pair_rotation_blacklist_until.pop(k, None)
+            temp_exchange_blacklist = []
+            prefix = f"{exchange_name}|"
+            for k in self._pair_rotation_blacklist_until.keys():
+                if k.startswith(prefix):
+                    _, pair_name = k.split("|", 1)
+                    temp_exchange_blacklist.append(pair_name)
+            exchange_blacklisted_pairs = list(
+                dict.fromkeys(exchange_blacklisted_pairs + temp_exchange_blacklist)
+            )
+            # Restart-safe blacklist: derive recent loss blacklist from closed-trade history.
+            historical_loss_blacklist = await self._get_recent_loss_blacklist_pairs(exchange_name)
+            exchange_blacklisted_pairs = list(
+                dict.fromkeys(exchange_blacklisted_pairs + historical_loss_blacklist)
+            )
             logger.info(
                 "[Blacklist] Active blacklisted pairs for %s: %s (global=%s)",
                 exchange_name, exchange_blacklisted_pairs, len(blacklisted_pairs)
@@ -1540,6 +1611,126 @@ class TradingOrchestrator:
         except Exception as pair_error:
             logger.error(f"Error generating pairs for {exchange_name}: {pair_error}")
             self.pair_selections[exchange_name] = []
+
+    async def _get_recent_loss_blacklist_pairs(self, exchange_name: str) -> List[str]:
+        """Build temporary blacklist from recent losing closed trades (restart-safe)."""
+        try:
+            loss_threshold_pct = float(
+                await self._get_config_value(
+                    "trading.pair_rotation.remove_pair_loss_threshold_pct", -1.0
+                )
+                or -1.0
+            )
+            cooldown_hours = float(
+                await self._get_config_value(
+                    "trading.pair_rotation.temp_blacklist_cooldown_hours", 12
+                )
+                or 12
+            )
+            scan_limit = int(
+                await self._get_config_value(
+                    "trading.pair_rotation.scan_recent_closed_limit", 2000
+                )
+                or 2000
+            )
+            cutoff = datetime.utcnow() - timedelta(hours=cooldown_hours)
+
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                trades_resp = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={
+                        "limit": scan_limit,
+                        "exchange": exchange_name,
+                        "sort_by": "exit_time",
+                        "sort_order": "desc",
+                    },
+                )
+                if trades_resp.status_code != 200:
+                    return []
+                recent_trades = (trades_resp.json() or {}).get("trades", []) or []
+
+            blacklist_pairs: set[str] = set()
+            for t in recent_trades:
+                if str(t.get("status", "")).upper() != "CLOSED":
+                    continue
+                if not is_macd_momentum_strategy(t.get("strategy")):
+                    continue
+                pair = str(t.get("pair") or "")
+                if not pair:
+                    continue
+                exit_time_raw = t.get("exit_time")
+                if not exit_time_raw:
+                    continue
+                try:
+                    exit_time = datetime.fromisoformat(str(exit_time_raw).replace("Z", "+00:00")).replace(tzinfo=None)
+                except Exception:
+                    continue
+                if exit_time < cutoff:
+                    continue
+
+                try:
+                    entry_price = float(t.get("entry_price") or 0.0)
+                    position_size = float(t.get("position_size") or 0.0)
+                    realized_pnl = float(t.get("realized_pnl") or 0.0)
+                    total_investment = float(t.get("total_investment") or 0.0)
+                    entry_notional = float(t.get("entry_notional") or 0.0)
+                except Exception:
+                    continue
+                notional = infer_trade_notional_usd(
+                    entry_price=entry_price,
+                    position_size=position_size,
+                    total_investment=total_investment,
+                    entry_notional=entry_notional,
+                )
+                if notional <= 0:
+                    continue
+                realized_pnl_pct = (realized_pnl / notional) * 100.0
+                if realized_pnl_pct <= loss_threshold_pct:
+                    blacklist_pairs.add(pair)
+            if blacklist_pairs:
+                logger.warning(
+                    "[PairRotation] Historical loss blacklist for %s (<= %.2f%% within %.1fh): %s",
+                    exchange_name,
+                    loss_threshold_pct,
+                    cooldown_hours,
+                    sorted(blacklist_pairs),
+                )
+            return list(blacklist_pairs)
+        except Exception as e:
+            logger.warning("[PairRotation] Historical blacklist build skipped for %s: %s", exchange_name, e)
+            return []
+
+    async def _rotate_pair_after_loss(
+        self,
+        exchange_name: str,
+        pair: str,
+        realized_pnl_pct: float,
+    ) -> None:
+        """Delegate pair-rotation behavior to dedicated module."""
+        await rotate_pair_after_loss(
+            exchange_name=exchange_name,
+            pair=pair,
+            realized_pnl_pct=realized_pnl_pct,
+            pair_selections=self.pair_selections,
+            config_service_url=config_service_url,
+            database_service_url=database_service_url,
+            get_config_value=self._get_config_value,
+            generate_and_store_pairs=self._generate_and_store_pairs,
+            temp_blacklist_until=self._pair_rotation_blacklist_until,
+        )
+        # Immediate strict entry block, even before the next map refresh.
+        try:
+            cooldown_hours = float(
+                await self._get_config_value(
+                    "trading.pair_rotation.temp_blacklist_cooldown_hours", 12
+                )
+                or 12
+            )
+        except Exception:
+            cooldown_hours = 12.0
+        self._hard_loss_cooldown_until[loss_cooldown_key(exchange_name, pair)] = (
+            datetime.utcnow() + timedelta(hours=cooldown_hours)
+        )
     
     async def _get_strategy_position_config(self, strategy_name: str) -> tuple[float, float]:
         """Get position sizing configuration for a specific strategy"""
@@ -1582,6 +1773,30 @@ class TradingOrchestrator:
         # Keep within sane bounds: responsive loops without pathological sub-second churn
         self._loop_max_cycle_duration = max(15.0, min(raw_max, 600.0))
         self._loop_exit_cycle_first = bool(tc.get("exit_cycle_first", True))
+        raw_reserve = float(tc.get("entry_loop_reserve_seconds", 90) or 90)
+        # Cap reserve so exit always has at least ~25s of wall before its deadline.
+        max_reserve_for_exit = max(25.0, self._loop_max_cycle_duration - 25.0)
+        self._loop_entry_reserve_seconds = max(30.0, min(raw_reserve, max_reserve_for_exit))
+        # Exit runs in [0, max_wall - reserve]; entry+maintenance use full max_wall deadline.
+        if self._loop_exit_cycle_first:
+            min_loop_wall = max(
+                120.0,
+                self._loop_cycle_interval * 2.0 + 60.0,
+                self._loop_entry_reserve_seconds + 40.0,
+            )
+            if self._loop_max_cycle_duration < min_loop_wall:
+                logger.warning(
+                    "[TradingLoop] max_cycle_duration=%.0fs is too low with exit_cycle_first=true "
+                    "(need >=%.0fs = entry_loop_reserve %.0fs + ~40s exit headroom). Raising.",
+                    self._loop_max_cycle_duration,
+                    min_loop_wall,
+                    self._loop_entry_reserve_seconds,
+                )
+                self._loop_max_cycle_duration = min(min_loop_wall, 600.0)
+                max_reserve_for_exit = max(25.0, self._loop_max_cycle_duration - 25.0)
+                self._loop_entry_reserve_seconds = max(
+                    30.0, min(self._loop_entry_reserve_seconds, max_reserve_for_exit)
+                )
             
     async def start_trading(self) -> bool:
         """Start the trading orchestrator"""
@@ -1846,14 +2061,21 @@ class TradingOrchestrator:
                     'strategies': strategies_config
                 }
                 
-                logger.info(f"Configuration loaded successfully: trailing_stop trigger={trading_config.get('trailing_stop', {}).get('trigger_percentage', 'unknown')}")
+                logger.info(
+                    f"Configuration loaded successfully: trailing_stop activation_threshold="
+                    f"{trading_config.get('trailing_stop', {}).get('activation_threshold', 'unknown')}"
+                )
 
                 # PnL-FIX v3: hydrate runtime cooldown/correlation settings from config.
                 try:
                     self._pair_cooldown_minutes = int(trading_config.get('pair_cooldown_minutes', self._pair_cooldown_minutes))
+                    self._global_pair_cooldown_minutes = int(
+                        trading_config.get("global_pair_cooldown_minutes", self._global_pair_cooldown_minutes)
+                    )
                     self._correlation_basket_cap = int(trading_config.get('correlation_basket_cap', self._correlation_basket_cap))
                     logger.info(
                         f"[PnL-FIX v3] pair_cooldown_minutes={self._pair_cooldown_minutes}, "
+                        f"global_pair_cooldown_minutes={self._global_pair_cooldown_minutes}, "
                         f"correlation_basket_cap={self._correlation_basket_cap}"
                     )
                 except Exception as _cfg_err:
@@ -2013,10 +2235,12 @@ class TradingOrchestrator:
             
             logger.info(
                 "📊 Trading configuration loaded: cycle_interval=%ss, exit_cycle_first=%s, "
-                "max_cycle_duration=%ss (hard wall-clock budget per full loop)",
+                "max_cycle_duration=%ss, entry_loop_reserve=%ss (exit timebox = max - reserve, "
+                "then entry/maintenance until max)",
                 cycle_interval,
                 exit_cycle_first,
                 self._loop_max_cycle_duration,
+                self._loop_entry_reserve_seconds,
             )
             
             # Start order monitoring in background
@@ -2036,22 +2260,36 @@ class TradingOrchestrator:
                     cycle_interval = self._loop_cycle_interval
                     exit_cycle_first = self._loop_exit_cycle_first
                     max_wall = self._loop_max_cycle_duration
-                    cycle_deadline = time.monotonic() + max_wall
+                    loop_start = time.monotonic()
+                    full_deadline = loop_start + max_wall
+                    exit_deadline: Optional[float] = None
+                    if exit_cycle_first:
+                        exit_deadline = full_deadline - self._loop_entry_reserve_seconds
+                        if exit_deadline <= loop_start + 5.0:
+                            exit_deadline = loop_start + max(30.0, max_wall - self._loop_entry_reserve_seconds)
 
                     cycle_start = datetime.utcnow()
                     self.cycle_count += 1
                     global cycle_count
                     cycle_count = self.cycle_count
                     
-                    logger.info(
-                        f"🔄 Starting trading cycle {self.cycle_count} "
-                        f"(wall budget {max_wall:.0f}s until {cycle_interval:.0f}s spacing)"
-                    )
+                    if exit_cycle_first and exit_deadline is not None:
+                        logger.info(
+                            f"🔄 Starting trading cycle {self.cycle_count} "
+                            f"(exit timebox {exit_deadline - loop_start:.0f}s, "
+                            f"entry+maintenance reserve {self._loop_entry_reserve_seconds:.0f}s, "
+                            f"full wall {max_wall:.0f}s, spacing {cycle_interval:.0f}s)"
+                        )
+                    else:
+                        logger.info(
+                            f"🔄 Starting trading cycle {self.cycle_count} "
+                            f"(wall budget {max_wall:.0f}s until {cycle_interval:.0f}s spacing)"
+                        )
                     
-                    # Run exit cycle first if configured
+                    # Run exit cycle first if configured (timeboxed so entry always gets wall time)
                     if exit_cycle_first:
                         logger.info(f"📤 Running exit cycle {self.cycle_count}...")
-                        await self._run_exit_cycle(deadline=cycle_deadline)
+                        await self._run_exit_cycle(deadline=exit_deadline)
                         logger.info(f"✅ Exit cycle {self.cycle_count} completed")
                         
                     # New trailing stop system runs continuously after startup
@@ -2059,12 +2297,12 @@ class TradingOrchestrator:
                         
                     # Run entry cycle
                     logger.info(f"📥 Running entry cycle {self.cycle_count}...")
-                    await self._run_entry_cycle(deadline=cycle_deadline)
+                    await self._run_entry_cycle(deadline=full_deadline)
                     logger.info(f"✅ Entry cycle {self.cycle_count} completed")
                     
                     # Run maintenance tasks
                     logger.info(f"🔧 Running maintenance tasks for cycle {self.cycle_count}...")
-                    await self._run_maintenance_tasks(deadline=cycle_deadline)
+                    await self._run_maintenance_tasks(deadline=full_deadline)
                     logger.info(f"✅ Maintenance tasks for cycle {self.cycle_count} completed")
                     
                     # Calculate cycle duration
@@ -2180,12 +2418,9 @@ class TradingOrchestrator:
     async def _run_exit_cycle(self, deadline: Optional[float] = None) -> None:
         """Run exit cycle to check for trade exits.
 
-        All open trades are checked **every** cycle. Prices are prefetched in parallel (Redis mirror
-        from exchange WebSockets, then ``ticker-live`` HTTP). Exit checks run concurrently so count
-        scales without linear wall time.
-
-        ``deadline`` is reserved for future coordination with entry/maintenance; exit work is not
-        truncated by round-robin when using parallel checks.
+        All open trades are targeted **every** loop; when ``deadline`` is set (exit-first scheduling),
+        parallel exit checks are **timeboxed** so entry still has wall time for strategy-service calls.
+        Prices are prefetched in parallel (Redis mirror + ``ticker-live`` HTTP).
         """
         cycle_start_time = time.time()
         try:
@@ -2276,6 +2511,14 @@ class TradingOrchestrator:
                 len(unique_pairs),
             )
 
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "⏱️ Exit cycle: deadline reached before parallel exit checks (%s trades pending next loop)",
+                    len(valid_trades),
+                )
+                cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+                return
+
             sem = asyncio.Semaphore(exit_conc)
 
             async def run_exit_check(tr: Dict[str, Any]) -> None:
@@ -2287,10 +2530,35 @@ class TradingOrchestrator:
                         prefetched_prices=prefetched,
                     )
 
-            results = await asyncio.gather(
+            gather_coro = asyncio.gather(
                 *(run_exit_check(t) for t in valid_trades),
                 return_exceptions=True,
             )
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "⏱️ Exit cycle: no time left for parallel exit checks (%s trades); deferring to next loop",
+                        len(valid_trades),
+                    )
+                    cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+                    return
+                try:
+                    results = await asyncio.wait_for(
+                        gather_coro,
+                        timeout=max(1.0, remaining - 0.25),
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "⏱️ Exit cycle: timebox hit after %.1fs with %s trades (unfinished checks run next loop)",
+                        time.time() - cycle_start_time,
+                        len(valid_trades),
+                    )
+                    cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+                    return
+            else:
+                results = await gather_coro
+
             for res in results:
                 if isinstance(res, Exception):
                     logger.error("Exit check task failed: %s", res)
@@ -2406,6 +2674,20 @@ class TradingOrchestrator:
             trailing_trigger_pct = trailing_trigger_decimal * 100
             trailing_step_decimal = trailing_stop_config.get('step_percentage', 0.01)
             trailing_step_pct = trailing_step_decimal * 100
+            dynamic_tightening_enabled = bool(
+                trailing_stop_config.get("dynamic_tightening_enabled", False)
+            )
+            tighten_profit_threshold_decimal = float(
+                trailing_stop_config.get("tighten_profit_threshold", 0.009) or 0.009
+            )
+            tighten_profit_threshold_pct = tighten_profit_threshold_decimal * 100
+            tightened_step_decimal = float(
+                trailing_stop_config.get("tightened_step_percentage", trailing_step_decimal)
+                or trailing_step_decimal
+            )
+            if tightened_step_decimal <= 0:
+                tightened_step_decimal = trailing_step_decimal
+            tightened_step_pct = tightened_step_decimal * 100
             # PnL-FIX v9 (F3 fix): the hard floor that protects the trail from
             # locking a net loss must come from config, not a hard-coded 0.10%.
             # Default 0.30% covers ~round-trip taker fees + small slippage budget.
@@ -2414,27 +2696,22 @@ class TradingOrchestrator:
             )
             if breakeven_floor_decimal < 0:
                 breakeven_floor_decimal = 0.0
-            # PnL-FIX v11 (2026-04-20) — PROFIT-PROTECTION ACTIVATION FROM CONFIG.
-            # Previously the profit-protection block hard-coded `pnl_percentage >= 1.0`
-            # and `profit_guarantee_pct = 0.5`. Config PnL-FIX v8 lowered the intended
-            # activation to +0.30% (config.profit_protection.activation_threshold=0.003)
-            # so trades peaking below +1.0% (e.g. +0.57%, +0.86% seen live) would still
-            # lock in a net-of-fees profit instead of bleeding back to zero or red.
-            # That config was set but never wired to the code — this reads it now.
-            # The lock level uses the breakeven_floor (+0.30% default) so the stop
-            # always sits above round-trip taker fees.
+            # PnL-FIX v11+ — profit-protection arms when peak >= activation_threshold
+            # (config trading.profit_protection.activation_threshold, decimal e.g. 0.005 = +0.5%).
             profit_protection_config = trading_config.get('profit_protection', {}) or {}
             pp_activation_decimal = float(
-                profit_protection_config.get('activation_threshold', 0.003) or 0.003
+                profit_protection_config.get('activation_threshold', 0.005) or 0.005
             )
             if pp_activation_decimal < 0:
-                pp_activation_decimal = 0.003
+                pp_activation_decimal = 0.005
             profit_protection_activation_pct = pp_activation_decimal * 100
             # Lock level = breakeven floor (same value that clamps the real trailing stop).
             profit_guarantee_pct_cfg = breakeven_floor_decimal * 100
             logger.debug(
                 f"[Trade {trade_id}] [ExitCheck] Config — stop loss: {default_stop_loss}%, "
                 f"trailing trigger: {trailing_trigger_pct}%, trailing step: {trailing_step_pct}%, "
+                f"dynamic tighten: {dynamic_tightening_enabled}, tighten threshold: {tighten_profit_threshold_pct:.3f}%, "
+                f"tightened step: {tightened_step_pct:.3f}%, "
                 f"breakeven floor: {breakeven_floor_decimal * 100:.3f}%, "
                 f"profit-protection activation: {profit_protection_activation_pct:.3f}%, "
                 f"profit-guarantee lock: {profit_guarantee_pct_cfg:.3f}%"
@@ -2571,9 +2848,10 @@ class TradingOrchestrator:
             # Check exit conditions with profit protection
             exit_reason = None
             should_exit = False
+            exit_trigger_price = current_price
 
             # Profit protection: lock stop at breakeven-floor when peak PnL reaches
-            # profit_protection.activation_threshold (config-driven, default +0.30%).
+            # profit_protection.activation_threshold (config-driven; e.g. 0.005 = +0.5%).
             profit_protection_status = trade.get('profit_protection')
             logger.info(
                 f"[Trade {trade_id}] [ProfitProtection] Checking conditions - "
@@ -2685,6 +2963,7 @@ class TradingOrchestrator:
                 pp_trigger_px = float(trade.get('trail_stop_trigger') or 0.0)
                 if pp_trigger_px > 0 and current_price <= pp_trigger_px:
                     should_exit = True
+                    exit_trigger_price = pp_trigger_px
                     exit_reason = (
                         f"profit_protection_breach@{pnl_percentage:.2f}%"
                         f"_trigger{pp_trigger_px:.6f}_px{current_price:.6f}"
@@ -2736,6 +3015,7 @@ class TradingOrchestrator:
                                     f"[Trade {trade_id}] [TRAILING_STOP_HIT] 🚨 CANCEL FAILED — escalating to emergency executable exit"
                                 )
                             should_exit = True
+                            exit_trigger_price = float(current_trigger_price)
                             exit_reason = (
                                 f"trailing_stop_triggered@{pnl_percentage:.2f}%"
                                 f"_trigger{current_trigger_price:.6f}_px{current_price:.6f}"
@@ -2751,6 +3031,7 @@ class TradingOrchestrator:
                                 },
                             )
                             should_exit = True
+                            exit_trigger_price = float(current_trigger_price)
                             exit_reason = (
                                 f"trailing_stop_triggered_cancel_error@{pnl_percentage:.2f}%"
                                 f"_trigger{current_trigger_price:.6f}_px{current_price:.6f}"
@@ -2770,9 +3051,21 @@ class TradingOrchestrator:
                     # Check if highest price has increased since last update
                     # Use old_highest_price (before database update) for comparison
                     if highest_price > old_highest_price:
+                        active_step_decimal = trailing_step_decimal
+                        active_step_pct = trailing_step_pct
+                        peak_pct_for_step = (
+                            ((highest_price - entry_price) / entry_price) * 100.0
+                            if highest_price and entry_price
+                            else pnl_percentage
+                        )
+                        if (
+                            dynamic_tightening_enabled
+                            and peak_pct_for_step >= tighten_profit_threshold_pct
+                        ):
+                            active_step_decimal = tightened_step_decimal
+                            active_step_pct = tightened_step_pct
                         # Calculate new exit price based on new highest
-                        trailing_step_decimal = trailing_step_pct / 100
-                        calculated_new_exit_price = highest_price * (1 - trailing_step_decimal)
+                        calculated_new_exit_price = highest_price * (1 - active_step_decimal)
                         
                         # CRITICAL FIX: Ensure new exit price is ALWAYS above entry price by the
                         # configured breakeven floor (covers round-trip fees + slippage).
@@ -2783,6 +3076,12 @@ class TradingOrchestrator:
                         if new_exit_price > current_trigger_price:
                             logger.info(f"[Trade {trade_id}] [NewTrailingStop] 🔄 UPDATING: New highest {highest_price:.6f} > old highest {old_highest_price:.6f}")
                             logger.info(f"[Trade {trade_id}] [NewTrailingStop] 🔄 New exit: {new_exit_price:.6f} > current: {current_trigger_price:.6f}")
+                            logger.info(
+                                f"[Trade {trade_id}] [NewTrailingStop] 📐 STEP_MODE: "
+                                f"{'tightened' if active_step_decimal == tightened_step_decimal and dynamic_tightening_enabled else 'base'} "
+                                f"(peak={peak_pct_for_step:.2f}%, step={active_step_pct:.2f}%, "
+                                f"tighten_threshold={tighten_profit_threshold_pct:.2f}%)"
+                            )
                             
                             try:
                                 # 🚀 ORDER MODIFICATION IMPROVEMENT: Try modifying existing order first
@@ -2822,6 +3121,8 @@ class TradingOrchestrator:
                     # CRITICAL FIX: Check if PnL meets activation threshold (0.7%)
                     # This should activate regardless of profit protection status when profit is between 0.7% and 1.0%
                     if pnl_percentage >= trailing_trigger_pct:
+                        active_step_decimal = trailing_step_decimal
+                        active_step_pct = trailing_step_pct
                         # PnL-FIX v11.3 (2026-04-20) — PEAK-BUFFER GATE.
                         # Observed live: ACH/USD peak +0.57% and ARB/USDC peak +0.60%
                         # armed the trail just barely above the +0.5% activation.
@@ -2836,9 +3137,6 @@ class TradingOrchestrator:
                         # profit-protection still acts as a soft marker and the
                         # stop-loss / stagnant-loser handle the downside, but we
                         # NEVER place a "no-buffer" trail that can only lose.
-                        min_peak_pct_for_trail = (
-                            (breakeven_floor_decimal + trailing_step_decimal) * 100.0
-                        )
                         try:
                             current_peak_pct = (
                                 ((highest_price - entry_price) / entry_price) * 100.0
@@ -2847,6 +3145,15 @@ class TradingOrchestrator:
                             )
                         except Exception:
                             current_peak_pct = pnl_percentage
+                        if (
+                            dynamic_tightening_enabled
+                            and current_peak_pct >= tighten_profit_threshold_pct
+                        ):
+                            active_step_decimal = tightened_step_decimal
+                            active_step_pct = tightened_step_pct
+                        min_peak_pct_for_trail = (
+                            (breakeven_floor_decimal + active_step_decimal) * 100.0
+                        )
                         trail_placement_allowed = current_peak_pct >= min_peak_pct_for_trail
                         if not trail_placement_allowed:
                             logger.info(
@@ -2854,7 +3161,7 @@ class TradingOrchestrator:
                                 f"peak {current_peak_pct:.2f}% < required "
                                 f"{min_peak_pct_for_trail:.2f}% (breakeven_floor "
                                 f"{breakeven_floor_decimal*100:.2f}% + step "
-                                f"{trailing_step_pct:.2f}%) — NOT placing trail "
+                                f"{active_step_pct:.2f}%) — NOT placing trail "
                                 f"limit yet, waiting for higher peak"
                             )
 
@@ -2916,13 +3223,17 @@ class TradingOrchestrator:
                         
                             # ACTIVATE TRAILING STOP - Create sell limit order
                             logger.info(f"[Trade {trade_id}] [NewTrailingStop] 🚀 ACTIVATING: PnL {pnl_percentage:.2f}% >= {trailing_trigger_pct:.2f}% threshold")
+                            logger.info(
+                                f"[Trade {trade_id}] [NewTrailingStop] 📐 STEP_MODE: "
+                                f"{'tightened' if active_step_decimal == tightened_step_decimal and dynamic_tightening_enabled else 'base'} "
+                                f"(peak={current_peak_pct:.2f}%, step={active_step_pct:.2f}%, "
+                                f"tighten_threshold={tighten_profit_threshold_pct:.2f}%)"
+                            )
                         
                             # Calculate trailing stop exit price
-                            trailing_step_decimal = trailing_step_pct / 100  # Convert to decimal (0.3% -> 0.003)
-                        
                             # CRITICAL FIX: Ensure exit price is ALWAYS above entry price by the
                             # configured breakeven floor — never below entry + breakeven_floor_percentage.
-                            calculated_exit_price = highest_price * (1 - trailing_step_decimal)
+                            calculated_exit_price = highest_price * (1 - active_step_decimal)
                             breakeven_floor_price = entry_price * (1.0 + breakeven_floor_decimal)
                             exit_price = max(calculated_exit_price, breakeven_floor_price)
                         
@@ -2931,7 +3242,12 @@ class TradingOrchestrator:
                                 logger.warning(f"[Trade {trade_id}] [NewTrailingStop] ❌ SKIPPING: Highest price ${highest_price:.6f} <= entry price ${entry_price:.6f} - no profit to protect")
                                 return
                         
-                            logger.info(f"[Trade {trade_id}] [NewTrailingStop] Creating sell limit order: {position_size} @ {exit_price:.6f} (highest: {highest_price:.6f}, step: {trailing_step_pct:.2f}%)")
+                            logger.info(
+                                f"[Trade {trade_id}] [NewTrailingStop] Creating sell limit order: "
+                                f"{position_size} @ {exit_price:.6f} "
+                                f"(highest: {highest_price:.6f}, step: {active_step_pct:.2f}%, "
+                                f"breakeven_floor: {breakeven_floor_price:.6f})"
+                            )
                         
                             try:
                                 # Get actual available balance for the base asset
@@ -3072,6 +3388,7 @@ class TradingOrchestrator:
                         logger.info(f"[Trade {trade_id}] [LegacyTrailingStop] Price check - Current: ${current_price:.6f}, Trigger: ${trigger_price:.6f} (source={current_price_source})")
                         if current_price <= trigger_price and risk_exit_allowed_by_feed:
                             should_exit = True
+                            exit_trigger_price = float(trigger_price)
                             # PnL-FIX v9: append realized PnL % so we can audit
                             # how much profit was actually locked in by the trail.
                             exit_reason = f"trailing_stop_trigger_${trigger_price:.4f}@{pnl_percentage:.2f}%"
@@ -3088,6 +3405,7 @@ class TradingOrchestrator:
             logger.info(f"[Trade {trade_id}] [StopLoss] Checking exit - PnL: {pnl_percentage:.2f}%, Stop Level: {current_stop_loss:.2f}% (source={current_price_source})")
             if not should_exit and pnl_percentage <= current_stop_loss and risk_exit_allowed_by_feed:
                 should_exit = True
+                exit_trigger_price = current_price
                 # PnL-FIX v9: include the ACTUAL realized PnL % (not only the
                 # configured threshold) so the dashboard surfaces real slippage.
                 # Format: "stop_loss_<configured>%@<actual>%" e.g. "stop_loss_-1.5%@-5.10%"
@@ -3102,15 +3420,44 @@ class TradingOrchestrator:
             elif not should_exit:
                 logger.info(f"[Trade {trade_id}] [StopLoss] ❌ NO EXIT: PnL {pnl_percentage:.2f}% > stop loss {current_stop_loss:.2f}%")
 
-            # Take profit check (5% take profit)
-            logger.info(f"[Trade {trade_id}] [TakeProfit] Checking exit - PnL: {pnl_percentage:.2f}%, Target: 5.0%")
-            if not should_exit and pnl_percentage >= 5.0:
-                should_exit = True
-                # PnL-FIX v9: include actual realized PnL % alongside target.
-                exit_reason = f"take_profit_5%@{pnl_percentage:.2f}%"
-                logger.info(f"[Trade {trade_id}] [TakeProfit] ✅ EXIT TRIGGERED: PnL {pnl_percentage:.2f}% >= 5.0%")
-            else:
-                logger.info(f"[Trade {trade_id}] [TakeProfit] ❌ NO EXIT: PnL {pnl_percentage:.2f}% < 5.0%")
+            # Global hard take-profit on mark PnL% (config: trading.overall_profit_take_exit_pct, e.g. 0.045 = +4.5%).
+            # Set to 0 to disable. Same feed-quality gate as stop-loss (no synthetic-only TP).
+            try:
+                overall_tp_dec = float(
+                    trading_config.get("overall_profit_take_exit_pct", 0.045) or 0.0
+                )
+            except (TypeError, ValueError):
+                overall_tp_dec = 0.045
+            if overall_tp_dec > 0:
+                overall_tp_pct = overall_tp_dec * 100.0
+                logger.info(
+                    f"[Trade {trade_id}] [OverallTakeProfit] Checking: PnL {pnl_percentage:.2f}% "
+                    f"vs target +{overall_tp_pct:.2f}% (source={current_price_source})"
+                )
+                if (
+                    not should_exit
+                    and pnl_percentage >= overall_tp_pct
+                    and risk_exit_allowed_by_feed
+                ):
+                    should_exit = True
+                    exit_trigger_price = current_price
+                    exit_reason = (
+                        f"overall_take_profit_{overall_tp_pct:.2f}%@{pnl_percentage:.2f}%"
+                    )
+                    logger.info(
+                        f"[Trade {trade_id}] [OverallTakeProfit] ✅ EXIT TRIGGERED: "
+                        f"PnL {pnl_percentage:.2f}% >= +{overall_tp_pct:.2f}%"
+                    )
+                elif (
+                    not should_exit
+                    and pnl_percentage >= overall_tp_pct
+                    and not risk_exit_allowed_by_feed
+                ):
+                    logger.warning(
+                        f"[Trade {trade_id}] [OverallTakeProfit] ⚠️ SKIPPING: PnL {pnl_percentage:.2f}% "
+                        f">= +{overall_tp_pct:.2f}% but price source {current_price_source!r} "
+                        f"(feed_quality={feed_quality}) — defer TP until live feed recovers"
+                    )
 
             # PnL-FIX v10 (2026-04-20) — STAGNANT LOSER DIVERGENCE EXIT.
             # Observed from 7-day trade review: a non-trivial class of
@@ -3171,6 +3518,7 @@ class TradingOrchestrator:
                         and pnl_percentage <= dynamic_loss_trigger_pct
                     ):
                         should_exit = True
+                        exit_trigger_price = current_price
                         exit_reason = (
                             f"stagnant_loser_divergence@{pnl_percentage:.2f}%"
                             f"_peak{peak_pct:.2f}%_age{age_minutes:.0f}m"
@@ -3195,13 +3543,10 @@ class TradingOrchestrator:
                     logger.warning(f"[Trade {trade_id}] [Exit] ⚠️ SKIPPING: Trade already being processed for exit")
                     return
 
-                trigger_price_for_telemetry = float(
-                    trade.get("trail_stop_trigger") or current_price
-                )
                 await self._mark_trade_triggered_exit(
                     trade_id=trade_id,
                     exit_reason=exit_reason or "unknown",
-                    trigger_price=trigger_price_for_telemetry,
+                    trigger_price=float(exit_trigger_price or current_price),
                     current_price=float(current_price),
                     feed_quality=feed_quality,
                     price_source=current_price_source,
@@ -3285,6 +3630,11 @@ class TradingOrchestrator:
                 logger.warning("⏱️ Entry cycle stopped after open-trades fetch: wall budget exhausted")
                 cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
                 return
+
+            # Strict loss-block refresh: build hard entry cooldowns from recent losing closes.
+            await self._refresh_hard_loss_cooldown_map()
+            # Cross-exchange blacklist for pairs with recent negative realized closes.
+            await self._refresh_recent_negative_realized_blacklist_map()
             
             # Check exchanges in parallel so one slow/failing exchange cannot block others
             exchange_tasks = [
@@ -3311,6 +3661,100 @@ class TradingOrchestrator:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             # Record cycle duration even on error
             cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+
+    async def _refresh_hard_loss_cooldown_map(self) -> None:
+        """Rebuild strict pair-entry cooldowns from recent closed losing trades."""
+        try:
+            hard_loss_thr = float(
+                await self._get_config_value(
+                    "trading.pair_rotation.hard_entry_cooldown_loss_pct_threshold", 0.0
+                )
+                or 0.0
+            )
+            cooldown_hours = float(
+                await self._get_config_value(
+                    "trading.pair_rotation.temp_blacklist_cooldown_hours", 12
+                )
+                or 12
+            )
+            scan_limit = int(
+                await self._get_config_value(
+                    "trading.pair_rotation.scan_recent_closed_limit", 2000
+                )
+                or 2000
+            )
+            now = datetime.utcnow()
+            cooldown_delta = timedelta(hours=cooldown_hours)
+
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                ex_resp = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
+                if ex_resp.status_code != 200:
+                    return
+                exchanges = (ex_resp.json() or {}).get("exchanges", []) or []
+
+                new_map: Dict[Tuple[str, str], datetime] = {}
+                for exchange_name in exchanges:
+                    rows: List[Dict[str, Any]] = []
+                    # CRITICAL: fetch terminal states explicitly.
+                    # Generic /trades sorted by exit_time can still return OPEN rows with null exit_time
+                    # near the top, which may hide recent closes inside scan_limit.
+                    for st_filter in ("CLOSED", "FAILED"):
+                        trades_resp = await client.get(
+                            f"{database_service_url}/api/v1/trades",
+                            params={
+                                "status": st_filter,
+                                "limit": scan_limit,
+                                "exchange": exchange_name,
+                                "sort_by": "exit_time",
+                                "sort_order": "desc",
+                            },
+                        )
+                        if trades_resp.status_code != 200:
+                            continue
+                        rows.extend((trades_resp.json() or {}).get("trades", []) or [])
+                    for t in rows:
+                        if str(t.get("status", "")).upper() not in ("CLOSED", "FAILED"):
+                            continue
+                        if not is_macd_momentum_strategy(t.get("strategy")):
+                            continue
+                        pair = str(t.get("pair") or "")
+                        if not pair:
+                            continue
+                        try:
+                            entry_price = float(t.get("entry_price") or 0.0)
+                            position_size = float(t.get("position_size") or 0.0)
+                            realized_pnl = float(t.get("realized_pnl") or 0.0)
+                            total_investment = float(t.get("total_investment") or 0.0)
+                            entry_notional = float(t.get("entry_notional") or 0.0)
+                            exit_time_raw = t.get("exit_time")
+                            if not exit_time_raw:
+                                continue
+                            exit_time = datetime.fromisoformat(
+                                str(exit_time_raw).replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                        except Exception:
+                            continue
+                        notional = infer_trade_notional_usd(
+                            entry_price=entry_price,
+                            position_size=position_size,
+                            total_investment=total_investment,
+                            entry_notional=entry_notional,
+                        )
+                        if notional <= 0:
+                            continue
+                        realized_pnl_pct = (realized_pnl / notional) * 100.0
+                        if not qualifies_for_hard_loss_cooldown(realized_pnl_pct, hard_loss_thr):
+                            continue
+                        until = exit_time + cooldown_delta
+                        if until <= now:
+                            continue
+                        key = loss_cooldown_key(exchange_name, pair)
+                        prev = new_map.get(key)
+                        if prev is None or until > prev:
+                            new_map[key] = until
+                self._hard_loss_cooldown_until = new_map
+        except Exception as e:
+            logger.warning("[PAIR COOLDOWN] Hard-loss cooldown refresh skipped: %s", e)
 
     async def _run_entry_cycle_for_exchange(
         self,
@@ -3670,9 +4114,39 @@ class TradingOrchestrator:
         (see _mark_pair_cooldown_on_close).
         """
         try:
-            key = (exchange_name, pair)
-            cooldown_until = self._pair_cooldown_until.get(key)
             now = datetime.utcnow()
+
+            # Global cross-exchange cooldown for the normalized pair.
+            pair_global_key = self._normalized_pair_key(pair)
+            recent_negative_until = self._recent_negative_realized_blacklist_until.get(pair_global_key)
+            if recent_negative_until and recent_negative_until > now:
+                remaining = (recent_negative_until - now).total_seconds() / 60.0
+                logger.warning(
+                    "🚫 [RECENT NEGATIVE REALIZED] %s blocked on %s for %.1f more min (until %s)",
+                    pair,
+                    exchange_name,
+                    remaining,
+                    recent_negative_until.isoformat(),
+                )
+                return False
+            if recent_negative_until and recent_negative_until <= now:
+                self._recent_negative_realized_blacklist_until.pop(pair_global_key, None)
+            global_cooldown_until = self._global_pair_cooldown_until.get(pair_global_key)
+            if global_cooldown_until and global_cooldown_until > now:
+                remaining = (global_cooldown_until - now).total_seconds() / 60.0
+                logger.info(
+                    "🧊 [GLOBAL PAIR COOLDOWN] %s blocked on %s for %.1f more min (until %s)",
+                    pair,
+                    exchange_name,
+                    remaining,
+                    global_cooldown_until.isoformat(),
+                )
+                return False
+            if global_cooldown_until and global_cooldown_until <= now:
+                self._global_pair_cooldown_until.pop(pair_global_key, None)
+
+            key = loss_cooldown_key(exchange_name, pair)
+            cooldown_until = self._pair_cooldown_until.get(key)
             if cooldown_until and cooldown_until > now:
                 remaining = (cooldown_until - now).total_seconds() / 60.0
                 logger.info(
@@ -3683,19 +4157,161 @@ class TradingOrchestrator:
             # Stale entries get pruned to keep the dict small.
             if cooldown_until and cooldown_until <= now:
                 self._pair_cooldown_until.pop(key, None)
+            # Strict hard-loss cooldown (derived from recent closed losses).
+            hard_until = self._hard_loss_cooldown_until.get(key)
+            if hard_until and hard_until > now:
+                remaining = (hard_until - now).total_seconds() / 60.0
+                logger.warning(
+                    f"🚫 [HARD LOSS COOLDOWN] Blocking {pair} on {exchange_name} for "
+                    f"{remaining:.1f} more min (until {hard_until.isoformat()})"
+                )
+                return False
+            if hard_until and hard_until <= now:
+                self._hard_loss_cooldown_until.pop(key, None)
             return True
         except Exception as e:
             logger.error(f"[PAIR COOLDOWN] Error checking cooldown for {pair}: {e}")
             return True  # fail-open; other checks will catch real problems
 
+    async def _refresh_recent_negative_realized_blacklist_map(self) -> None:
+        """Rebuild cross-exchange blacklist for pairs with weak realized closes."""
+        try:
+            raw_enabled = await self._get_config_value(
+                "trading.block_pair_after_negative_realized_enabled", True
+            )
+            enabled = not (raw_enabled is False or str(raw_enabled).lower() in ("0", "false", "no"))
+            if not enabled:
+                self._recent_negative_realized_blacklist_until = {}
+                return
+            window_hours = float(
+                await self._get_config_value("trading.block_pair_after_negative_realized_hours", 12) or 12
+            )
+            min_realized_pct = float(
+                await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.5)
+                or 0.5
+            )
+            scan_limit = int(
+                await self._get_config_value("trading.pair_rotation.scan_recent_closed_limit", 2000) or 2000
+            )
+            now = datetime.utcnow()
+            cutoff = now - timedelta(hours=window_hours)
+            rows: List[Dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                for st_filter in ("CLOSED", "FAILED"):
+                    trades_resp = await client.get(
+                        f"{database_service_url}/api/v1/trades",
+                        params={
+                            "status": st_filter,
+                            "limit": scan_limit,
+                            "sort_by": "exit_time",
+                            "sort_order": "desc",
+                        },
+                    )
+                    if trades_resp.status_code != 200:
+                        continue
+                    rows.extend((trades_resp.json() or {}).get("trades", []) or [])
+
+            new_map: Dict[str, datetime] = {}
+            for t in rows:
+                st = str(t.get("status") or "").upper()
+                if st not in ("CLOSED", "FAILED"):
+                    continue
+                pair_name = str(t.get("pair") or "")
+                if not pair_name:
+                    continue
+                try:
+                    rpnl = float(t.get("realized_pnl") or 0.0)
+                except Exception:
+                    continue
+                notional = infer_trade_notional_usd(
+                    entry_price=float(t.get("entry_price") or 0.0),
+                    position_size=float(t.get("position_size") or 0.0),
+                    total_investment=float(t.get("total_investment") or 0.0),
+                    entry_notional=float(t.get("entry_notional") or 0.0),
+                )
+                if notional <= 0.0:
+                    continue
+                realized_pnl_pct = (rpnl / notional) * 100.0
+                if realized_pnl_pct >= min_realized_pct:
+                    continue
+                exit_time_raw = t.get("exit_time") or t.get("updated_at")
+                if not exit_time_raw:
+                    continue
+                try:
+                    exit_time = datetime.fromisoformat(
+                        str(exit_time_raw).replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except Exception:
+                    continue
+                if exit_time < cutoff:
+                    continue
+                until = exit_time + timedelta(hours=window_hours)
+                if until <= now:
+                    continue
+                key = self._normalized_pair_key(pair_name)
+                prev = new_map.get(key)
+                if prev is None or until > prev:
+                    new_map[key] = until
+            self._recent_negative_realized_blacklist_until = new_map
+        except Exception as e:
+            logger.warning("[PAIR COOLDOWN] Recent negative-realized blacklist refresh skipped: %s", e)
+
+    async def _mark_recent_negative_realized_blacklist(
+        self, pair: str, realized_pnl_pct: Optional[float] = None
+    ) -> None:
+        """Immediately blacklist pair cross-exchange after a weak realized close."""
+        try:
+            raw_enabled = await self._get_config_value(
+                "trading.block_pair_after_negative_realized_enabled", True
+            )
+            enabled = not (raw_enabled is False or str(raw_enabled).lower() in ("0", "false", "no"))
+            if not enabled:
+                return
+            window_hours = float(
+                await self._get_config_value("trading.block_pair_after_negative_realized_hours", 12) or 12
+            )
+            min_realized_pct = float(
+                await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.5)
+                or 0.5
+            )
+            if realized_pnl_pct is not None and float(realized_pnl_pct) >= min_realized_pct:
+                return
+            key = self._normalized_pair_key(pair)
+            until = datetime.utcnow() + timedelta(hours=window_hours)
+            prev = self._recent_negative_realized_blacklist_until.get(key)
+            if prev is None or until > prev:
+                self._recent_negative_realized_blacklist_until[key] = until
+                logger.warning(
+                    "🚫 [RECENT REALIZED GUARD] Added %s to %.1fh blacklist "
+                    "(realized_pnl_pct=%s%%, threshold<%.2f%%, until %s)",
+                    pair,
+                    window_hours,
+                    "n/a" if realized_pnl_pct is None else f"{float(realized_pnl_pct):.2f}",
+                    min_realized_pct,
+                    until.isoformat(),
+                )
+        except Exception as e:
+            logger.warning(
+                "[PAIR COOLDOWN] Failed to mark recent negative-realized blacklist for %s: %s",
+                pair,
+                e,
+            )
+
     def _mark_pair_cooldown(self, exchange_name: str, pair: str, minutes: Optional[int] = None) -> None:
         """Record a cooldown timestamp for a pair (PnL-FIX v3)."""
         try:
             mins = minutes if minutes is not None else self._pair_cooldown_minutes
-            key = (exchange_name, pair)
+            key = loss_cooldown_key(exchange_name, pair)
             self._pair_cooldown_until[key] = datetime.utcnow() + timedelta(minutes=mins)
+            global_key = self._normalized_pair_key(pair)
+            global_mins = max(0, int(self._global_pair_cooldown_minutes))
+            if global_key and global_mins > 0:
+                self._global_pair_cooldown_until[global_key] = datetime.utcnow() + timedelta(
+                    minutes=global_mins
+                )
             logger.info(
-                f"🧊 [PAIR COOLDOWN] Set {pair} on {exchange_name} to cooldown for {mins} min"
+                f"🧊 [PAIR COOLDOWN] Set {pair} on {exchange_name} to cooldown for {mins} min "
+                f"(global={global_mins} min)"
             )
         except Exception as e:
             logger.error(f"[PAIR COOLDOWN] Error marking cooldown for {pair}: {e}")
@@ -3741,9 +4357,438 @@ class TradingOrchestrator:
             logger.error(f"[CORRELATION CAP] Error checking cap for {pair}: {e}")
             return True  # fail-open
 
+    async def _check_no_negative_unrealized_on_same_pair(
+        self, exchange_name: str, pair: str
+    ) -> bool:
+        """
+        Block a new entry when any OPEN position on the **same normalized pair on any
+        exchange** has unrealized_pnl% at/below configured threshold (default 0.5%).
+        """
+        try:
+            enabled = await self._get_config_value(
+                "trading.block_new_entry_if_open_unrealized_negative", True
+            )
+            if enabled is False or str(enabled).lower() in ("0", "false", "no"):
+                return True
+            min_upnl_pct = float(
+                await self._get_config_value(
+                    "trading.block_new_entry_if_open_unrealized_below_pct", 0.5
+                )
+                or 0.5
+            )
+            active_trades = await self._get_active_trades_for_entry_guards()
+            for t in active_trades:
+                if not self._dashboard_pair_key_match(t.get("pair"), pair):
+                    continue
+                status = str(t.get("status") or "").upper()
+                if status == "PENDING":
+                    logger.warning(
+                        "🚫 [OPEN UPNL GATE] Blocking new entry on %s %s — existing pending trade %s on %s",
+                        exchange_name,
+                        pair,
+                        t.get("trade_id"),
+                        str(t.get("exchange", "") or "").strip().lower() or "?",
+                    )
+                    return False
+                try:
+                    u = float(t.get("unrealized_pnl") or 0.0)
+                except (TypeError, ValueError):
+                    u = 0.0
+                notional = infer_trade_notional_usd(
+                    entry_price=float(t.get("entry_price") or 0.0),
+                    position_size=float(t.get("position_size") or 0.0),
+                    total_investment=float(t.get("total_investment") or 0.0),
+                    entry_notional=float(t.get("entry_notional") or 0.0),
+                )
+                upnl_pct = (u / notional) * 100.0 if notional > 0.0 else None
+                # Require existing same-pair legs to be above threshold before allowing new entry.
+                # If pct cannot be computed, keep conservative legacy behavior for negative uPnL.
+                if (upnl_pct is not None and upnl_pct <= min_upnl_pct) or (upnl_pct is None and u < 0):
+                    oex = str(t.get("exchange", "") or "").strip().lower()
+                    logger.warning(
+                        "🚫 [OPEN UPNL GATE] Blocking new entry on %s %s — open trade %s on %s has "
+                        "unrealized_pnl=%.2f (%.2f%% <= %.2f%% threshold)",
+                        exchange_name,
+                        pair,
+                        t.get("trade_id"),
+                        oex or "?",
+                        u,
+                        0.0 if upnl_pct is None else upnl_pct,
+                        min_upnl_pct,
+                    )
+                    return False
+            return True
+        except Exception as e:
+            logger.error(
+                "[OPEN UPNL GATE] Failed to validate open unrealized PnL for %s %s: %s",
+                exchange_name,
+                pair,
+                e,
+            )
+            return True  # fail-open; other risk gates still apply
+
+    async def _get_active_trades_for_entry_guards(self) -> List[Dict[str, Any]]:
+        """
+        Fetch trade states that should block re-entry.
+
+        `/api/v1/trades/open` only returns OPEN rows; Redis queue flow can leave a
+        trade in PENDING for a short window. Include both so we never open a second
+        position on the same pair while the first one is still in flight.
+        """
+        active_rows: List[Dict[str, Any]] = []
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                open_resp = await client.get(f"{database_service_url}/api/v1/trades/open")
+                open_resp.raise_for_status()
+                active_rows.extend(open_resp.json().get("trades", []) or [])
+
+                pending_resp = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={"status": "PENDING", "limit": 500, "sort_by": "entry_time", "sort_order": "desc"},
+                )
+                pending_resp.raise_for_status()
+                active_rows.extend((pending_resp.json() or {}).get("trades", []) or [])
+        except Exception as e:
+            logger.warning("[ENTRY GUARD] Failed to fetch active trades (open+pending): %s", e)
+            raise
+
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for row in active_rows:
+            tid = str(row.get("trade_id") or "")
+            if tid:
+                deduped[tid] = row
+        return list(deduped.values()) if deduped else active_rows
+
+    @staticmethod
+    def _dashboard_pair_key_match(trade_pair: Optional[str], ui_pair: str) -> bool:
+        a = str(trade_pair or "").strip()
+        b = str(ui_pair or "").strip()
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return a.replace("/", "").upper() == b.replace("/", "").upper()
+
+    @staticmethod
+    def _normalized_pair_key(pair: str) -> str:
+        """Stable normalized pair key for cross-exchange entry reservations."""
+        return str(pair or "").replace("/", "").strip().upper()
+
+    async def _reserve_pair_entry(self, exchange_name: str, pair: str) -> bool:
+        """
+        Reserve a normalized pair while evaluating/placing a new entry.
+        Prevents same-cycle concurrent entries on the same pair across exchanges.
+        """
+        key = self._normalized_pair_key(pair)
+        if not key:
+            return False
+        async with self._pair_entry_reservation_lock:
+            if key in self._pair_entry_reservations:
+                logger.warning(
+                    "🚫 [PAIR RESERVATION] %s %s blocked: pair reservation already held",
+                    exchange_name,
+                    pair,
+                )
+                return False
+            self._pair_entry_reservations.add(key)
+            logger.info("🔒 [PAIR RESERVATION] Reserved %s for %s %s", key, exchange_name, pair)
+            return True
+
+    async def _release_pair_entry_reservation(self, pair: str) -> None:
+        key = self._normalized_pair_key(pair)
+        if not key:
+            return
+        async with self._pair_entry_reservation_lock:
+            if key in self._pair_entry_reservations:
+                self._pair_entry_reservations.remove(key)
+                logger.info("🔓 [PAIR RESERVATION] Released %s", key)
+
+    def _dashboard_entry_block_memory_reason(self, exchange_name: str, pair: str) -> Optional[str]:
+        """Cooldown / execution-downgrade (in-process), matching stored tuple keys loosely."""
+        ex_lo = str(exchange_name or "").strip().lower()
+        p = str(pair or "").strip()
+        now = datetime.utcnow()
+        pair_key = self._normalized_pair_key(p)
+        recent_until = self._recent_negative_realized_blacklist_until.get(pair_key)
+        if recent_until and recent_until > now:
+            return "recent_negative_realized_blacklist"
+        if recent_until and recent_until <= now:
+            self._recent_negative_realized_blacklist_until.pop(pair_key, None)
+        for store, label in (
+            (self._pair_execution_downgrade_until, "execution_downgrade"),
+            (self._pair_cooldown_until, "pair_cooldown"),
+            (self._hard_loss_cooldown_until, "hard_loss_cooldown"),
+        ):
+            for (ex_k, pair_k), until in list(store.items()):
+                if str(ex_k).lower() != ex_lo:
+                    continue
+                if not self._dashboard_pair_key_match(pair_k, p):
+                    continue
+                if until and until > now:
+                    return label
+        return None
+
+    async def _consecutive_realized_loss_streak(self, exchange_name: str, pair: str) -> int:
+        """Consecutive CLOSED/FAILED trades with realized_pnl < 0 (exit_time desc), including the latest close."""
+        ex_lo = str(exchange_name or "").strip().lower()
+        p = str(pair or "").strip()
+        streak = 0
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={
+                        "limit": "100",
+                        "exchange": ex_lo,
+                        "sort_by": "exit_time",
+                        "sort_order": "desc",
+                    },
+                )
+                if r.status_code != 200:
+                    return 0
+                rows = r.json().get("trades", []) or []
+        except Exception:
+            return 0
+        for t in rows:
+            if str(t.get("exchange", "")).lower() != ex_lo:
+                continue
+            if not self._dashboard_pair_key_match(t.get("pair"), p):
+                continue
+            st = str(t.get("status") or "").upper()
+            if st not in ("CLOSED", "FAILED"):
+                continue
+            try:
+                rpnl = float(t.get("realized_pnl") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if rpnl < 0:
+                streak += 1
+            else:
+                break
+        return streak
+
+    async def get_dashboard_pair_entry_blocks(
+        self, exchange_name: str, pairs: List[str]
+    ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+        """Reasons new long entries are likely blocked (dashboard red), not exhaustive vs full _check_pair_entry."""
+        blocks: Dict[str, str] = {}
+        block_details: Dict[str, Dict[str, Any]] = {}
+        ex_lo = str(exchange_name or "").strip().lower()
+        if not ex_lo or not pairs:
+            return blocks, block_details
+
+        for p in pairs:
+            if not p:
+                continue
+            ps = str(p)
+            mem = self._dashboard_entry_block_memory_reason(exchange_name, ps)
+            if mem:
+                blocks[ps] = mem
+                if mem == "recent_negative_realized_blacklist":
+                    pair_key = self._normalized_pair_key(ps)
+                    until = self._recent_negative_realized_blacklist_until.get(pair_key)
+                    min_realized_pct = float(
+                        await self._get_config_value(
+                            "trading.block_pair_after_realized_pnl_below_pct", 0.5
+                        )
+                        or 0.5
+                    )
+                    block_details[ps] = {
+                        "type": mem,
+                        "threshold_pct": min_realized_pct,
+                        "until": until.isoformat() if until else None,
+                        "message": (
+                            f"recent close realized PnL% below {min_realized_pct:.2f}%"
+                            + (f"; blocked until {until.isoformat()}" if until else "")
+                        ),
+                    }
+
+        open_trades: List[Dict[str, Any]] = []
+        hist_trades: List[Dict[str, Any]] = []
+        try:
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                ro = await client.get(f"{database_service_url}/api/v1/trades/open")
+                if ro.status_code == 200:
+                    open_trades = ro.json().get("trades", []) or []
+                # Recent *exits* on this venue (sort by exit_time). Default /trades uses
+                # entry_time desc so a loss closed 1h ago on an older position never appears
+                # in the first N rows — misses pairs like XLM while still flagging busy symbols.
+                rt = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={
+                        "limit": "800",
+                        "exchange": ex_lo,
+                        "sort_by": "exit_time",
+                        "sort_order": "desc",
+                    },
+                )
+                if rt.status_code == 200:
+                    hist_trades = rt.json().get("trades", []) or []
+                else:
+                    # Case mismatch in DB exchange column — retry without filter, trim in-process.
+                    rt2 = await client.get(
+                        f"{database_service_url}/api/v1/trades",
+                        params={"limit": "1200", "sort_by": "exit_time", "sort_order": "desc"},
+                    )
+                    if rt2.status_code == 200:
+                        all_rows = rt2.json().get("trades", []) or []
+                        hist_trades = [
+                            t
+                            for t in all_rows
+                            if str(t.get("exchange", "")).lower() == ex_lo
+                        ]
+        except Exception as e:
+            logger.warning("[DashboardEntryBlocks] DB fetch failed: %s", e)
+
+        # Match _check_pair_risk_management Layer 2 windowing (naive local clock).
+        two_hours_ago = datetime.now() - timedelta(hours=2)
+
+        layer1_min = int(
+            await self._get_config_value("trading.pair_risk_layer1_min_negative_positions_to_block", 2) or 2
+        )
+        layer2_min = int(await self._get_config_value("trading.pair_risk_layer2_min_loss_events", 2) or 2)
+        max_open_pp = int(await self._get_config_value("trading.max_open_trades_per_pair", 1) or 1)
+        force_single_open_per_pair = not (
+            str(await self._get_config_value("trading.force_single_open_per_pair", True)).lower()
+            in ("0", "false", "no")
+        )
+        raw_upnl_gate = await self._get_config_value(
+            "trading.block_new_entry_if_open_unrealized_negative", True
+        )
+        upnl_gate_active = not (
+            raw_upnl_gate is False or str(raw_upnl_gate).lower() in ("0", "false", "no")
+        )
+        upnl_gate_min_pct = float(
+            await self._get_config_value(
+                "trading.block_new_entry_if_open_unrealized_below_pct", 0.5
+            )
+            or 0.5
+        )
+
+        for p in pairs:
+            ps = str(p)
+            if ps in blocks:
+                continue
+            same_pair_opens = [
+                t
+                for t in open_trades
+                if str(t.get("exchange", "")).lower() == ex_lo
+                and self._dashboard_pair_key_match(t.get("pair"), ps)
+            ]
+            if upnl_gate_active:
+                for t in open_trades:
+                    if not self._dashboard_pair_key_match(t.get("pair"), ps):
+                        continue
+                    try:
+                        u_open = float(t.get("unrealized_pnl") or 0.0)
+                    except (TypeError, ValueError):
+                        u_open = 0.0
+                    n_open = infer_trade_notional_usd(
+                        entry_price=float(t.get("entry_price") or 0.0),
+                        position_size=float(t.get("position_size") or 0.0),
+                        total_investment=float(t.get("total_investment") or 0.0),
+                        entry_notional=float(t.get("entry_notional") or 0.0),
+                    )
+                    upnl_pct = (u_open / n_open) * 100.0 if n_open > 0.0 else None
+                    if (upnl_pct is not None and upnl_pct <= upnl_gate_min_pct) or (
+                        upnl_pct is None and u_open < 0
+                    ):
+                        blocks[ps] = "open_unrealized_negative"
+                        block_details[ps] = {
+                            "type": "open_unrealized_negative",
+                            "threshold_pct": upnl_gate_min_pct,
+                            "trade_id": t.get("trade_id"),
+                            "exchange": str(t.get("exchange", "")).lower(),
+                            "upnl_usd": u_open,
+                            "upnl_pct": upnl_pct,
+                            "message": (
+                                f"open same-pair leg must be > {upnl_gate_min_pct:.2f}% uPnL "
+                                f"(current={0.0 if upnl_pct is None else upnl_pct:.2f}%)"
+                            ),
+                        }
+                        break
+                if ps in blocks:
+                    continue
+            if max_open_pp > 0 and len(same_pair_opens) >= max_open_pp:
+                blocks[ps] = "max_open_trades_per_pair"
+                block_details[ps] = {
+                    "type": "max_open_trades_per_pair",
+                    "open_count": len(same_pair_opens),
+                    "max_open_trades_per_pair": max_open_pp,
+                    "message": f"{len(same_pair_opens)} open >= max {max_open_pp}",
+                }
+                continue
+            if force_single_open_per_pair and len(same_pair_opens) >= 1:
+                blocks[ps] = "force_single_open_per_pair"
+                block_details[ps] = {
+                    "type": "force_single_open_per_pair",
+                    "open_count": len(same_pair_opens),
+                    "message": f"{len(same_pair_opens)} active trade(s) on pair",
+                }
+                continue
+            neg_cnt = 0
+            for t in same_pair_opens:
+                try:
+                    u = float(t.get("unrealized_pnl") or 0.0)
+                except (TypeError, ValueError):
+                    u = 0.0
+                if u < 0:
+                    neg_cnt += 1
+            closed_loss_2h = 0
+            for t in hist_trades:
+                if str(t.get("exchange", "")).lower() != ex_lo:
+                    continue
+                if not self._dashboard_pair_key_match(t.get("pair"), ps):
+                    continue
+                st = str(t.get("status") or "").upper()
+                if st not in ("CLOSED", "FAILED"):
+                    continue
+                try:
+                    rpnl = float(t.get("realized_pnl") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if rpnl >= 0:
+                    continue
+                exit_time_str = t.get("exit_time") or t.get("updated_at")
+                if not exit_time_str:
+                    continue
+                try:
+                    exit_time = datetime.fromisoformat(str(exit_time_str).replace("Z", ""))
+                    if exit_time.tzinfo:
+                        exit_time = exit_time.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if exit_time >= two_hours_ago:
+                    closed_loss_2h += 1
+            combined = neg_cnt + closed_loss_2h
+            if combined >= layer2_min:
+                blocks[ps] = "multi_loss_block"
+                block_details[ps] = {
+                    "type": "multi_loss_block",
+                    "combined": combined,
+                    "open_negative_count": neg_cnt,
+                    "closed_loss_2h": closed_loss_2h,
+                    "threshold": layer2_min,
+                    "message": f"combined loss signals {combined} >= {layer2_min}",
+                }
+            elif neg_cnt >= layer1_min:
+                blocks[ps] = "open_position_loss"
+                block_details[ps] = {
+                    "type": "open_position_loss",
+                    "open_negative_count": neg_cnt,
+                    "threshold": layer1_min,
+                    "message": f"open negative positions {neg_cnt} >= {layer1_min}",
+                }
+
+        return blocks, block_details
+
     async def _check_pair_entry(self, exchange_name: str, pair: str) -> None:
         """Check if a pair should be entered - each strategy is independent with detailed logging"""
+        pair_reserved = False
         try:
+            pair_reserved = await self._reserve_pair_entry(exchange_name, pair)
+            if not pair_reserved:
+                return
             logger.info(f"🔍 [ENTRY CHECK] Starting entry evaluation for {pair} on {exchange_name}")
 
             # CONDITION CHECK 0a: Per-pair cooldown (PnL-FIX v3)
@@ -3752,6 +4797,10 @@ class TradingOrchestrator:
 
             # CONDITION CHECK 0b: Correlation basket cap (PnL-FIX v3)
             if not await self._check_correlation_cap(exchange_name, pair):
+                return
+
+            # CONDITION CHECK 0c: No entry if this normalized pair is underwater on any exchange
+            if not await self._check_no_negative_unrealized_on_same_pair(exchange_name, pair):
                 return
 
             # CONDITION CHECK 1: Risk Management
@@ -3840,6 +4889,34 @@ class TradingOrchestrator:
             c_signal = str(consensus.get('signal', 'hold')).lower()
             c_conf = float(consensus.get('confidence', 0) or 0)
             c_agreement = float(consensus.get('agreement', 0) or 0)
+            allow_forced_overrides = not (
+                str(await self._get_config_value("trading.allow_forced_buy_overrides", False)).lower()
+                in ("0", "false", "no")
+            )
+            max_signal_age_seconds = int(
+                await self._get_config_value("trading.max_signal_age_seconds", 90) or 90
+            )
+            raw_signals_ts = signals_data.get("timestamp")
+            try:
+                if raw_signals_ts:
+                    signals_ts = datetime.fromisoformat(str(raw_signals_ts).replace("Z", "+00:00"))
+                    if signals_ts.tzinfo:
+                        signals_ts = signals_ts.replace(tzinfo=None)
+                    signal_age = (datetime.utcnow() - signals_ts).total_seconds()
+                    if signal_age > max_signal_age_seconds:
+                        logger.warning(
+                            "[EntryGate] Reject %s %s: stale signal snapshot age=%.1fs > %ss",
+                            exchange_name,
+                            pair,
+                            signal_age,
+                            max_signal_age_seconds,
+                        )
+                        self._record_regime_entry_decision(
+                            exchange_name, stable_regime, "rejected", "stale_signal_snapshot"
+                        )
+                        return
+            except Exception:
+                pass
             c_primary_override = bool(consensus.get("primary_override", False))
             c_sell_veto_max = float(consensus.get("sell_veto_max", 0) or 0)
             rsi_checklist_override = bool(consensus.get("rsi_checklist_buy_override", False))
@@ -3874,6 +4951,13 @@ class TradingOrchestrator:
             fallback_min_conf = float(fallback_cfg.get("min_buy_strategy_confidence", 0.72) or 0.72)
             fallback_min_strength = float(fallback_cfg.get("min_buy_strategy_strength", 0.10) or 0.10)
             fallback_max_sell_signals = int(fallback_cfg.get("max_sell_signals", 0) or 0)
+            consensus_excluded_strategies = {"macd_momentum"}
+            consensus_strategies = {
+                name: data
+                for name, data in strategies.items()
+                if name not in consensus_excluded_strategies
+            }
+
             fallback_triggered = False
             fallback_strategy = None
             fallback_conf = 0.0
@@ -3881,7 +4965,7 @@ class TradingOrchestrator:
 
             buy_votes = []
             sell_votes = []
-            for strategy_name, signal_data in strategies.items():
+            for strategy_name, signal_data in consensus_strategies.items():
                 s_signal = str((signal_data or {}).get("signal", "")).lower()
                 s_conf = float((signal_data or {}).get("confidence", 0) or 0)
                 s_strength = float((signal_data or {}).get("strength", 0) or 0)
@@ -3891,9 +4975,18 @@ class TradingOrchestrator:
                     sell_votes.append((s_conf, s_strength, strategy_name))
 
             macd_signal_data = strategies.get("macd_momentum", {}) or {}
+            macd_validation = (macd_signal_data.get("validation", {}) or {})
+            macd_rule_triggered = bool(
+                macd_validation.get("trigger")
+                or macd_validation.get("macd_green_rsi_buy_ok")
+                or macd_signal_data.get("macd_green_rsi_buy_ok")
+            )
             macd_is_buy_override = (
                 macd_override_enabled
-                and str(macd_signal_data.get("signal", "hold")).lower() == "buy"
+                and (
+                    str(macd_signal_data.get("signal", "hold")).lower() == "buy"
+                    or macd_rule_triggered
+                )
             )
             rsi_override_strategy_data = strategies.get("rsi_oversold_override", {}) or {}
             rsi_is_buy_override = (
@@ -3969,6 +5062,25 @@ class TradingOrchestrator:
                 )
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", f"consensus_{c_signal}")
                 return
+            # Critical safety: unless explicitly enabled, do not allow generic forced BUY
+            # overrides to bypass HOLD/SELL consensus.
+            # Exception: macd_momentum override is an explicit hard-entry policy requested
+            # for all pairs when the MACD+RSI rule is satisfied.
+            if (
+                c_signal != "buy"
+                and (rsi_is_buy_override or rsi_checklist_is_buy_override)
+                and not allow_forced_overrides
+            ):
+                logger.warning(
+                    "[EntryGate] Reject %s %s: forced override blocked while consensus=%s (non-MACD override)",
+                    exchange_name,
+                    pair,
+                    c_signal,
+                )
+                self._record_regime_entry_decision(
+                    exchange_name, stable_regime, "rejected", "forced_override_blocked"
+                )
+                return
             if c_conf <= min_confidence and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
@@ -3993,7 +5105,7 @@ class TradingOrchestrator:
 
             # Choose highest-confidence BUY strategy for metadata only.
             buy_candidates = []
-            for strategy_name, signal_data in strategies.items():
+            for strategy_name, signal_data in consensus_strategies.items():
                 if str((signal_data or {}).get('signal', '')).lower() == 'buy':
                     buy_candidates.append(
                         (
@@ -4002,12 +5114,17 @@ class TradingOrchestrator:
                             strategy_name,
                         )
                     )
-            if not buy_candidates:
+            if not buy_candidates and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
                 logger.info(f"📄 [SUMMARY] Consensus BUY but no concrete BUY candidate found for {pair} on {exchange_name}")
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "no_buy_candidates")
                 return
-            buy_candidates.sort(reverse=True)
-            best_conf, best_strength, best_strategy = buy_candidates[0]
+            if buy_candidates:
+                buy_candidates.sort(reverse=True)
+                best_conf, best_strength, best_strategy = buy_candidates[0]
+            else:
+                # Override-only path: no consensus buy candidates because the
+                # overriding strategy is intentionally excluded from consensus.
+                best_conf, best_strength, best_strategy = 0.0, 0.0, "override"
             if fallback_triggered and fallback_strategy:
                 best_conf, best_strength, best_strategy = fallback_conf, fallback_strength, fallback_strategy
             if macd_is_buy_override:
@@ -4088,215 +5205,194 @@ class TradingOrchestrator:
             logger.error(f"Exception type: {type(e).__name__}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
+        finally:
+            if pair_reserved:
+                await self._release_pair_entry_reservation(pair)
 
     async def _check_pair_risk_management(self, exchange_name: str, pair: str) -> bool:
         """
-        Enhanced Risk Management v2.1.0: Multi-layered safety checks for trading pairs
-        
-        Checks multiple risk factors:
-        1. Current unrealized PnL (allows 2 negative positions for entry adjustment)
-        2. Recent realized losses and cooldown periods  
-        3. Historical performance analysis
-        4. Portfolio-level drawdown protection
-        
-        Returns False if any risk threshold is exceeded
+        Pair-level risk aligned with `trading.*` in config and `get_dashboard_pair_entry_blocks`.
         """
         try:
-            logger.info(f"🔍 [RISK MANAGEMENT v2.4.0] Enhanced protection analysis for {pair} on {exchange_name}")
-            
-            # Get all trades (open and recent closed) for comprehensive analysis
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                # Get open trades
-                response = await client.get(f"{database_service_url}/api/v1/trades/open")
-                response.raise_for_status()
-                open_trades = response.json()['trades']
-            
-                # Get recent closed trades for loss pattern analysis (within 2 hours only)
-                try:
-                    response = await client.get(f"{database_service_url}/api/v1/trades")
-                    response.raise_for_status()
-                    all_trades = response.json()['trades']
-                    
-                    # Filter closed trades to only those from last 2 hours with losses
-                    two_hours_ago = datetime.now() - timedelta(hours=2)
-                    recent_closed_trades = []
-                    
-                    for trade in all_trades:
-                        if (trade.get('status') in ['CLOSED', 'FAILED'] and 
-                            trade.get('exchange') == exchange_name and 
-                            trade.get('pair') == pair and
-                            trade.get('realized_pnl') is not None and
-                            float(trade.get('realized_pnl', 0)) < 0):  # Only negative PnL trades
-                            
-                            # Check if trade was closed within last 2 hours
-                            try:
-                                # Try exit_time first, fallback to updated_at
-                                exit_time_str = trade.get('exit_time') or trade.get('updated_at')
-                                if exit_time_str:
-                                    # Parse timestamp (handle both with and without timezone)
-                                    if 'T' in exit_time_str:
-                                        if '+' in exit_time_str:
-                                            exit_time = datetime.fromisoformat(exit_time_str.replace('Z', '+00:00'))
-                                        else:
-                                            exit_time = datetime.fromisoformat(exit_time_str.replace('Z', ''))
-                                        
-                                        # Convert to naive datetime for comparison (assume UTC)
-                                        if exit_time.tzinfo:
-                                            exit_time = exit_time.replace(tzinfo=None)
-                                        
-                                        # Only include if within last 2 hours
-                                        if exit_time >= two_hours_ago:
-                                            recent_closed_trades.append(trade)
-                            except Exception as time_parse_error:
-                                # If we can't parse time, skip this trade to be safe
-                                logger.debug(f"Could not parse exit time for trade {trade.get('trade_id')}: {time_parse_error}")
-                                continue
-                except Exception:
-                    recent_closed_trades = []  # Fallback if historical data unavailable
-            
-            # === LAYER 1: Current Unrealized PnL Check (Original Logic) ===
-            pair_open_trades = [
-                trade for trade in open_trades 
-                if trade.get('exchange') == exchange_name and trade.get('pair') == pair
-            ]
-            
-            negative_positions = []
-            total_unrealized_pnl = 0
-            
-            for trade in pair_open_trades:
-                try:
-                    unrealized_pnl = float(trade.get('unrealized_pnl', 0))
-                    total_unrealized_pnl += unrealized_pnl
-                    if unrealized_pnl < 0:
-                        negative_positions.append({
-                            'trade_id': trade.get('trade_id'),
-                            'unrealized_pnl': unrealized_pnl,
-                            'entry_price': trade.get('entry_price'),
-                            'position_size': trade.get('position_size')
-                        })
-                except (ValueError, TypeError):
-                    # If we can't parse PnL, assume it's negative for safety
-                    negative_positions.append({
-                        'trade_id': trade.get('trade_id'),
-                        'unrealized_pnl': -1,  # Assume negative
-                        'entry_price': trade.get('entry_price'),
-                        'position_size': trade.get('position_size')
-                    })
-            
-            # Check 1: Block if 1+ open positions are negative (enhanced protection)
-            if len(negative_positions) >= 1:
-                total_negative_pnl = sum(pos['unrealized_pnl'] for pos in negative_positions)
-                logger.warning(f"🚫 [LAYER 1] Unrealized PnL Block: {pair} on {exchange_name}")
-                logger.warning(f"   - Total open positions: {len(pair_open_trades)}")
-                logger.warning(f"   - Negative positions: {len(negative_positions)}")
-                logger.warning(f"   - Combined negative PnL: ${total_negative_pnl:.2f}")
-                logger.warning(f"   - Negative trades: {[pos['trade_id'][:8] for pos in negative_positions]}")
-                return False
-            
-            # === LAYER 2: Combined Loss Pattern Protection ===
-            # Look at BOTH concurrent open losing positions AND historical closed losses
-            
-            # A) Current open positions that are losing
-            current_losing_positions = []
-            for trade in pair_open_trades:
-                try:
-                    unrealized_pnl = float(trade.get('unrealized_pnl', 0))
-                    if unrealized_pnl < 0:  # Any negative position
-                        current_losing_positions.append({
-                            'trade_id': trade.get('trade_id'),
-                            'pnl': unrealized_pnl,
-                            'type': 'open_loss'
-                        })
-                except (ValueError, TypeError):
-                    pass
-            
-            # B) Historical closed losses (already filtered to negative PnL)
-            historical_losses = []
-            for trade in recent_closed_trades:
-                try:
-                    realized_pnl = float(trade.get('realized_pnl', 0))
-                    historical_losses.append({
-                        'trade_id': trade.get('trade_id'),
-                        'pnl': realized_pnl,
-                        'type': 'closed_loss'
-                    })
-                except (ValueError, TypeError):
-                    pass
-            
-            # Combine both types of losses
-            total_losses = current_losing_positions + historical_losses
-            
-            # Check 2: Block if 1 or more losses exist (current OR historical) - matches consecutive_loss_limit: 1
-            if len(total_losses) >= 1:
-                total_loss_amount = sum(loss['pnl'] for loss in total_losses)
-                open_loss_count = len(current_losing_positions)
-                closed_loss_count = len(historical_losses)
-                
-                logger.warning(f"🚫 [LAYER 2] Loss Protection Block: {pair} on {exchange_name}")
-                logger.warning(f"   - Losses detected: {len(total_losses)} (open: {open_loss_count}, closed: {closed_loss_count})")
-                logger.warning(f"   - Combined loss amount: ${total_loss_amount:.2f}")
-                logger.warning(f"   - Loss trades: {[loss['trade_id'][:8] for loss in total_losses]}")
-                logger.warning(f"   - Protection: consecutive_loss_limit=1 - blocking after ANY loss on this pair")
-                return False
-            
-            # Check 3: Block if single large loss exists
-            if recent_closed_trades:
-                largest_loss = min(float(trade.get('realized_pnl', 0)) for trade in recent_closed_trades)
-                if largest_loss < -20:  # More than $20 loss (configurable threshold)
-                    logger.warning(f"🚫 [LAYER 2] Large Loss Block: {pair} on {exchange_name}")
-                    logger.warning(f"   - Largest loss: ${largest_loss:.2f}")
-                    logger.warning(f"   - Risk: Pair showing severe adverse behavior")
-                    return False
-            
-            # === LAYER 3: Portfolio-Level Drawdown Protection ===
-            all_open_trades = open_trades  # All exchanges, all pairs
-            portfolio_unrealized_pnl = sum(
-                float(trade.get('unrealized_pnl', 0)) 
-                for trade in all_open_trades
-                if trade.get('unrealized_pnl') is not None
+            logger.info(f"🔍 [RISK MANAGEMENT v2.5.0] Protection analysis for {pair} on {exchange_name}")
+
+            ex_lo = str(exchange_name or "").strip().lower()
+            layer1_min = int(
+                await self._get_config_value("trading.pair_risk_layer1_min_negative_positions_to_block", 2) or 2
             )
-            
-            # Check 4: Block if portfolio drawdown exceeds threshold
-            if portfolio_unrealized_pnl < -100:  # More than $100 total unrealized loss
-                logger.warning(f"🚫 [LAYER 3] Portfolio Drawdown Block: {pair} on {exchange_name}")
-                logger.warning(f"   - Portfolio unrealized PnL: ${portfolio_unrealized_pnl:.2f}")
-                logger.warning(f"   - Risk: Prevent additional exposure during drawdown")
+            layer2_min = int(
+                await self._get_config_value("trading.pair_risk_layer2_min_loss_events", 2) or 2
+            )
+            max_open_pp = int(await self._get_config_value("trading.max_open_trades_per_pair", 1) or 1)
+            force_single_open_per_pair = not (
+                str(await self._get_config_value("trading.force_single_open_per_pair", True)).lower()
+                in ("0", "false", "no")
+            )
+
+            open_trades: List[Dict[str, Any]] = []
+            hist_trades: List[Dict[str, Any]] = []
+            open_trades = await self._get_active_trades_for_entry_guards()
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                rt = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={
+                        "limit": "800",
+                        "exchange": ex_lo,
+                        "sort_by": "exit_time",
+                        "sort_order": "desc",
+                    },
+                )
+                if rt.status_code == 200:
+                    hist_trades = rt.json().get("trades", []) or []
+                else:
+                    rt2 = await client.get(
+                        f"{database_service_url}/api/v1/trades",
+                        params={"limit": "1200", "sort_by": "exit_time", "sort_order": "desc"},
+                    )
+                    if rt2.status_code == 200:
+                        all_rows = rt2.json().get("trades", []) or []
+                        hist_trades = [
+                            t for t in all_rows if str(t.get("exchange", "")).lower() == ex_lo
+                        ]
+
+            two_hours_ago = datetime.utcnow() - timedelta(hours=2)
+
+            pair_open_trades = [
+                t
+                for t in open_trades
+                if str(t.get("exchange", "")).lower() == ex_lo
+                and self._dashboard_pair_key_match(t.get("pair"), pair)
+            ]
+
+            pending_same_pair = [
+                t for t in pair_open_trades if str(t.get("status") or "").upper() == "PENDING"
+            ]
+            if pending_same_pair:
+                logger.warning(
+                    "🚫 [LAYER 0] Pending entry block: %s on %s has %s pending trade(s)",
+                    pair,
+                    exchange_name,
+                    len(pending_same_pair),
+                )
                 return False
-            
-            # === LAYER 4: Exchange-Level Risk Assessment ===
+
+            if max_open_pp > 0 and len(pair_open_trades) >= max_open_pp:
+                logger.warning(
+                    f"🚫 [LAYER 0] Max open trades per pair: {pair} on {exchange_name} "
+                    f"({len(pair_open_trades)} >= {max_open_pp})"
+                )
+                return False
+            if force_single_open_per_pair and len(pair_open_trades) >= 1:
+                logger.warning(
+                    "🚫 [LAYER 0] Forced single-open-per-pair block: %s on %s already has %s active trade(s)",
+                    pair,
+                    exchange_name,
+                    len(pair_open_trades),
+                )
+                return False
+
+            neg_cnt = 0
+            for t in pair_open_trades:
+                try:
+                    u = float(t.get("unrealized_pnl") or 0.0)
+                except (TypeError, ValueError):
+                    u = 0.0
+                if u < 0:
+                    neg_cnt += 1
+
+            closed_loss_2h = 0
+            recent_closed_losses_2h: List[Dict[str, Any]] = []
+
+            for t in hist_trades:
+                if str(t.get("exchange", "")).lower() != ex_lo:
+                    continue
+                if not self._dashboard_pair_key_match(t.get("pair"), pair):
+                    continue
+                st = str(t.get("status") or "").upper()
+                if st not in ("CLOSED", "FAILED"):
+                    continue
+                try:
+                    rpnl = float(t.get("realized_pnl") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if rpnl >= 0:
+                    continue
+                exit_time_str = t.get("exit_time") or t.get("updated_at")
+                if not exit_time_str:
+                    continue
+                try:
+                    exit_time = datetime.fromisoformat(
+                        str(exit_time_str).replace("Z", "+00:00")
+                    )
+                    if exit_time.tzinfo:
+                        exit_time = exit_time.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if exit_time >= two_hours_ago:
+                    closed_loss_2h += 1
+                    recent_closed_losses_2h.append(t)
+
+            combined = neg_cnt + closed_loss_2h
+            if combined >= layer2_min:
+                logger.warning(
+                    f"🚫 [LAYER 2] Multi-loss block: {pair} on {exchange_name} "
+                    f"(open underwater: {neg_cnt}, closed losses (2h): {closed_loss_2h}, "
+                    f"threshold: {layer2_min})"
+                )
+                return False
+
+            if neg_cnt >= layer1_min:
+                logger.warning(
+                    f"🚫 [LAYER 1] Open underwater block: {pair} on {exchange_name} "
+                    f"({neg_cnt} negative unrealized >= {layer1_min})"
+                )
+                return False
+
+            if recent_closed_losses_2h:
+                largest_loss = min(float(t.get("realized_pnl", 0)) for t in recent_closed_losses_2h)
+                if largest_loss < -20:
+                    logger.warning(f"🚫 [LAYER 2b] Large loss (2h): {pair} on {exchange_name} (${largest_loss:.2f})")
+                    return False
+
+            all_open_trades = open_trades
+            portfolio_unrealized_pnl = sum(
+                float(trade.get("unrealized_pnl", 0))
+                for trade in all_open_trades
+                if trade.get("unrealized_pnl") is not None
+            )
+
+            if portfolio_unrealized_pnl < -100:
+                logger.warning(f"🚫 [LAYER 3] Portfolio drawdown: {pair} on {exchange_name} (${portfolio_unrealized_pnl:.2f})")
+                return False
+
             exchange_trades = [
-                trade for trade in all_open_trades 
-                if trade.get('exchange') == exchange_name
+                t for t in all_open_trades if str(t.get("exchange", "")).lower() == ex_lo
             ]
             exchange_unrealized_pnl = sum(
-                float(trade.get('unrealized_pnl', 0)) 
+                float(trade.get("unrealized_pnl", 0))
                 for trade in exchange_trades
-                if trade.get('unrealized_pnl') is not None
+                if trade.get("unrealized_pnl") is not None
             )
-            
-            # Check 5: Block if exchange showing poor performance
-            if len(exchange_trades) >= 3 and exchange_unrealized_pnl < -50:  # $50+ loss across 3+ trades
-                logger.warning(f"🚫 [LAYER 4] Exchange Performance Block: {pair} on {exchange_name}")
-                logger.warning(f"   - Exchange open trades: {len(exchange_trades)}")
-                logger.warning(f"   - Exchange unrealized PnL: ${exchange_unrealized_pnl:.2f}")
-                logger.warning(f"   - Risk: Exchange showing systematic issues")
+
+            if len(exchange_trades) >= 3 and exchange_unrealized_pnl < -50:
+                logger.warning(
+                    f"🚫 [LAYER 4] Exchange performance: {pair} on {exchange_name} "
+                    f"({len(exchange_trades)} opens, ${exchange_unrealized_pnl:.2f} unrealized)"
+                )
                 return False
-            
-            # === ALL CHECKS PASSED ===
-            logger.info(f"✅ [RISK MANAGEMENT v2.4.0] All layers passed for {pair} on {exchange_name}")
-            logger.info(f"   - Open positions: {len(pair_open_trades)} (negative: {len(negative_positions)})")
-            logger.info(f"   - Historical losses: {len(historical_losses) if 'historical_losses' in locals() else 0}")
-            logger.info(f"   - Portfolio PnL: ${portfolio_unrealized_pnl:.2f}")
-            logger.info(f"   - Exchange PnL: ${exchange_unrealized_pnl:.2f}")
-            logger.info(f"   - Status: APPROVED FOR TRADING")
+
+            logger.info(f"✅ [RISK MANAGEMENT v2.5.0] All layers passed for {pair} on {exchange_name}")
+            logger.info(
+                f"   - Opens this pair: {len(pair_open_trades)} (negative uPnL: {neg_cnt}); "
+                f"closed losses 2h: {closed_loss_2h}; portfolio uPnL: ${portfolio_unrealized_pnl:.2f}"
+            )
             return True
-            
+
         except Exception as e:
             logger.error(f"Error in risk management check for {pair} on {exchange_name}: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
-            # On error, be conservative and block the trade
             return False
             
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
@@ -5640,6 +6736,8 @@ class TradingOrchestrator:
             exit_fee_currency = exit_fee_info["currency"]
             
             realized_pnl = (exit_price - entry_price) * filled_amount - exit_fees - float(trade.get('fees', 0))
+            notional = entry_price * filled_amount if entry_price > 0 and filled_amount > 0 else 0.0
+            realized_pnl_pct = (realized_pnl / notional) * 100.0 if notional > 0 else 0.0
             trigger_price = float(trade.get("trigger_price") or entry_price)
             slippage_bps = 0.0
             if trigger_price > 0:
@@ -5759,14 +6857,47 @@ class TradingOrchestrator:
             }
             
             await self._update_trade_data(trade_id, exit_data)
+            await self._mark_recent_negative_realized_blacklist(
+                trade["pair"], realized_pnl_pct=realized_pnl_pct
+            )
 
-            # PnL-FIX v3: Longer cooldown after losing exits to prevent
-            # immediate re-entry on a pair that just produced a loss.
+            # Pair-rotation rule: remove/replace selected pair after large loss exits.
+            await self._rotate_pair_after_loss(
+                exchange_name=trade["exchange"],
+                pair=trade["pair"],
+                realized_pnl_pct=realized_pnl_pct,
+            )
+
+            # Extended cooldown only after N consecutive realized losses (config).
             try:
                 if realized_pnl < 0:
-                    self._mark_pair_cooldown(trade['exchange'], trade['pair'], minutes=90)
+                    need_ext = int(
+                        await self._get_config_value(
+                            "trading.pair_consecutive_losses_for_extended_cooldown", 2
+                        )
+                        or 2
+                    )
+                    ext_mins = int(
+                        await self._get_config_value(
+                            "trading.pair_loss_extended_cooldown_minutes", 90
+                        )
+                        or 90
+                    )
+                    streak = await self._consecutive_realized_loss_streak(
+                        trade["exchange"], trade["pair"]
+                    )
+                    if streak >= need_ext:
+                        self._mark_pair_cooldown(
+                            trade["exchange"], trade["pair"], minutes=ext_mins
+                        )
+                    else:
+                        self._mark_pair_cooldown(
+                            trade["exchange"], trade["pair"], minutes=self._pair_cooldown_minutes
+                        )
                 else:
-                    self._mark_pair_cooldown(trade['exchange'], trade['pair'], minutes=self._pair_cooldown_minutes)
+                    self._mark_pair_cooldown(
+                        trade["exchange"], trade["pair"], minutes=self._pair_cooldown_minutes
+                    )
             except Exception as _e:
                 logger.debug(f"[PAIR COOLDOWN] post-exit marking failed: {_e}")
 
@@ -6487,8 +7618,11 @@ class TradingOrchestrator:
             
             logger.info(f"[Trade {trade_id}] ❌ CANCELLED old order: {order_id}")
             
-            # Get actual available balance for the base asset
+            # Get actual available balance for the base asset.
+            # If balance lookup is temporarily unavailable, fall back to trade
+            # position size so trailing-stop maintenance keeps working.
             base_asset = pair.split('/')[0]
+            update_sell_amount: Optional[float] = None
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     balance_response = await client.get(f"http://exchange-service:8003/api/v1/account/balance/{exchange}")
@@ -6510,10 +7644,56 @@ class TradingOrchestrator:
                         logger.info(f"[Trade {trade_id}] Balance check: Available={available_amount}, Using={update_sell_amount}")
                     else:
                         logger.warning(f"[Trade {trade_id}] ⚠️ Could not get balance, using fallback amount")
-                        return {"success": False, "method": "cancel_and_recreate", "error": "Could not determine available balance"}
+                        async with httpx.AsyncClient(timeout=15.0) as db_client:
+                            trade_resp = await db_client.get(
+                                f"http://database-service:8002/api/v1/trades/{trade_id}"
+                            )
+                            if trade_resp.status_code == 200:
+                                trade_row = trade_resp.json() or {}
+                                update_sell_amount = float(trade_row.get("position_size") or 0.0)
+                                logger.info(
+                                    f"[Trade {trade_id}] 🔁 Fallback position_size from /trades/{{id}}: {update_sell_amount}"
+                                )
+                            else:
+                                open_resp = await db_client.get(
+                                    "http://database-service:8002/api/v1/trades/open"
+                                )
+                                if open_resp.status_code == 200:
+                                    open_rows = (open_resp.json() or {}).get("trades", []) or []
+                                    row = next(
+                                        (t for t in open_rows if str(t.get("trade_id")) == str(trade_id)),
+                                        None,
+                                    )
+                                    if row:
+                                        update_sell_amount = float(row.get("position_size") or 0.0)
+                                        logger.info(
+                                            f"[Trade {trade_id}] 🔁 Fallback position_size from /trades/open: {update_sell_amount}"
+                                        )
             except Exception as e:
                 logger.warning(f"[Trade {trade_id}] ⚠️ Balance check failed: {e}")
-                return {"success": False, "method": "cancel_and_recreate", "error": "Balance check failed"}
+                try:
+                    async with httpx.AsyncClient(timeout=15.0) as db_client:
+                        trade_resp = await db_client.get(
+                            f"http://database-service:8002/api/v1/trades/{trade_id}"
+                        )
+                        if trade_resp.status_code == 200:
+                            trade_row = trade_resp.json() or {}
+                            update_sell_amount = float(trade_row.get("position_size") or 0.0)
+                            logger.info(
+                                f"[Trade {trade_id}] 🔁 Fallback position_size after exception: {update_sell_amount}"
+                            )
+                except Exception:
+                    pass
+
+            if not update_sell_amount or update_sell_amount <= 0:
+                logger.error(
+                    f"[Trade {trade_id}] ❌ Trailing update fallback failed: invalid sell amount {update_sell_amount}"
+                )
+                return {
+                    "success": False,
+                    "method": "cancel_and_recreate",
+                    "error": "Could not determine available balance or position size",
+                }
             
             # Create new trailing stop order at higher exit price
             self._is_trailing_stop_order = True
@@ -6683,12 +7863,116 @@ class TradingOrchestrator:
             
             # 🚨 CRITICAL FIX: Check for filled orders that should close trades
             await self._check_filled_orders_for_trade_closure()
+
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning("⏱️ Maintenance truncated after filled-order reconciliation: wall budget exhausted")
+                return
+
+            # Enforce pair rotation even when trades were closed by fallback/sync paths.
+            await self._enforce_pair_rotation_from_recent_losses()
             
         except Exception as e:
             logger.error(f"Error in maintenance tasks: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
+
+    async def _enforce_pair_rotation_from_recent_losses(self) -> None:
+        """Safety-net: rotate pairs for recent losing closures regardless of close path."""
+        try:
+            loss_threshold_pct = float(
+                await self._get_config_value(
+                    "trading.pair_rotation.remove_pair_loss_threshold_pct", -1.0
+                )
+                or -1.0
+            )
+            scan_limit = int(
+                await self._get_config_value(
+                    "trading.pair_rotation.scan_recent_closed_limit", 2000
+                )
+                or 2000
+            )
+
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                ex_resp = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
+                if ex_resp.status_code != 200:
+                    return
+                exchanges = (ex_resp.json() or {}).get("exchanges", []) or []
+
+                for exchange_name in exchanges:
+                    trades_resp = await client.get(
+                        f"{database_service_url}/api/v1/trades",
+                        params={
+                            "limit": scan_limit,
+                            "exchange": exchange_name,
+                            "sort_by": "exit_time",
+                            "sort_order": "desc",
+                        },
+                    )
+                    if trades_resp.status_code != 200:
+                        continue
+                    recent_trades = (trades_resp.json() or {}).get("trades", []) or []
+                    rotated_pairs_this_pass: set[str] = set()
+                    for t in recent_trades:
+                        if str(t.get("status", "")).upper() != "CLOSED":
+                            continue
+                        if not is_macd_momentum_strategy(t.get("strategy")):
+                            continue
+                        trade_id = str(t.get("trade_id") or "")
+                        if not trade_id or trade_id in self._pair_rotation_processed_trade_ids:
+                            continue
+                        pair = str(t.get("pair") or "")
+                        if not pair or pair in rotated_pairs_this_pass:
+                            # Avoid rotating same pair repeatedly in one scan pass.
+                            self._pair_rotation_processed_trade_ids.add(trade_id)
+                            continue
+
+                        try:
+                            entry_price = float(t.get("entry_price") or 0.0)
+                            position_size = float(t.get("position_size") or 0.0)
+                            realized_pnl = float(t.get("realized_pnl") or 0.0)
+                            total_investment = float(t.get("total_investment") or 0.0)
+                            entry_notional = float(t.get("entry_notional") or 0.0)
+                        except Exception:
+                            self._pair_rotation_processed_trade_ids.add(trade_id)
+                            continue
+
+                        notional = infer_trade_notional_usd(
+                            entry_price=entry_price,
+                            position_size=position_size,
+                            total_investment=total_investment,
+                            entry_notional=entry_notional,
+                        )
+                        if notional <= 0:
+                            self._pair_rotation_processed_trade_ids.add(trade_id)
+                            continue
+                        realized_pnl_pct = (realized_pnl / notional) * 100.0
+
+                        if realized_pnl_pct <= loss_threshold_pct:
+                            logger.warning(
+                                "[PairRotation] Safety-net trigger from closed trade %s: %s %s pnl=%.2f%% <= %.2f%%",
+                                trade_id,
+                                exchange_name,
+                                pair,
+                                realized_pnl_pct,
+                                loss_threshold_pct,
+                            )
+                            await self._rotate_pair_after_loss(
+                                exchange_name=exchange_name,
+                                pair=pair,
+                                realized_pnl_pct=realized_pnl_pct,
+                            )
+                            rotated_pairs_this_pass.add(pair)
+                        self._pair_rotation_processed_trade_ids.add(trade_id)
+
+            # Bound memory usage.
+            max_processed = 5000
+            if len(self._pair_rotation_processed_trade_ids) > max_processed:
+                self._pair_rotation_processed_trade_ids = set(
+                    list(self._pair_rotation_processed_trade_ids)[-max_processed:]
+                )
+        except Exception as e:
+            logger.warning("[PairRotation] Safety-net scan skipped due to error: %s", e)
     
     async def _check_filled_orders_for_trade_closure(self) -> None:
         """🚨 CRITICAL FIX: Check for filled orders that should close trades but haven't been processed"""
@@ -8740,6 +10024,20 @@ async def get_trading_status():
         ),
     )
 
+
+@app.post("/api/v1/trading/pairs/entry-blocks")
+async def post_pair_entry_blocks(body: PairEntryBlocksRequest):
+    """Per-pair soft blocks for dashboard (cooldown, recent loss, open loss, downgrade)."""
+    try:
+        blocks, block_details = await orchestrator.get_dashboard_pair_entry_blocks(
+            body.exchange, body.pairs or []
+        )
+        return {"exchange": body.exchange, "blocks": blocks, "block_details": block_details}
+    except Exception as e:
+        logger.error("pair entry blocks: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Trading Operations Endpoints
 @app.post("/api/v1/trading/cycle/entry")
 async def run_entry_cycle():
@@ -8801,9 +10099,8 @@ telegram_hourly_report_task: Optional[asyncio.Task] = None
 
 
 async def _build_telegram_stats_message(last_day_trade_limit: int = 15) -> Tuple[str, int]:
-    """Build Telegram message with portfolio stats + last 24h closed trades."""
+    """Build Telegram message with portfolio stats + today's closed trades (same rule as Daily Closed in portfolio)."""
     now_utc = datetime.utcnow()
-    start_24h = now_utc - timedelta(hours=24)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         summary_resp = await client.get(f"{database_service_url}/api/v1/portfolio/summary")
@@ -8816,12 +10113,13 @@ async def _build_telegram_stats_message(last_day_trade_limit: int = 15) -> Tuple
                 "page": 1,
                 "limit": max(1, min(last_day_trade_limit, 50)),
                 "status": "CLOSED",
-                "start_date": start_24h.isoformat()
+                "daily_closed_only": True,
             },
         )
         history_resp.raise_for_status()
         history_data = history_resp.json()
-        trades_24h = history_data.get("trades", []) or []
+        daily_closed_trade_rows = history_data.get("trades", []) or []
+        daily_closed_total = int(history_data.get("total") or len(daily_closed_trade_rows))
 
     total_balance = _safe_float(summary.get("total_balance"))
     available_balance = _safe_float(summary.get("available_balance"))
@@ -8844,13 +10142,18 @@ async def _build_telegram_stats_message(last_day_trade_limit: int = 15) -> Tuple
         f"📂 <b>Open Trades:</b> {int(summary.get('active_trades') or 0)}",
         f"🔄 <b>Unrealized PnL:</b> {_format_usd(summary.get('total_unrealized_pnl'))}",
         "",
-        f"🧾 <b>Last 24h Closed Trades ({len(trades_24h)}):</b>",
+        (
+            f"🧾 <b>Daily Closed Trades ({daily_closed_total})</b> — "
+            f"<i>newest {len(daily_closed_trade_rows)} shown</i>"
+            if daily_closed_total > len(daily_closed_trade_rows)
+            else f"🧾 <b>Daily Closed Trades ({daily_closed_total}):</b>"
+        ),
     ]
 
-    if not trades_24h:
-        header_lines.append("No closed trades in the last 24 hours.")
+    if not daily_closed_trade_rows:
+        header_lines.append("No trades closed yet today.")
     else:
-        for trade in trades_24h:
+        for trade in daily_closed_trade_rows:
             pair = str(trade.get("pair") or "N/A")
             exchange = str(trade.get("exchange") or "N/A")
             realized_pnl = _safe_float(trade.get("realized_pnl"))
@@ -8860,7 +10163,7 @@ async def _build_telegram_stats_message(last_day_trade_limit: int = 15) -> Tuple
 
     header_lines.append("")
     header_lines.append(f"⏱️ <i>Generated: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
-    return "\n".join(header_lines), len(trades_24h)
+    return "\n".join(header_lines), daily_closed_total
 
 
 async def _send_telegram_stats_report(last_day_trade_limit: int = 15) -> Dict[str, Any]:

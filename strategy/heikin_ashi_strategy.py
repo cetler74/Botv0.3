@@ -89,6 +89,13 @@ class HeikinAshiStrategy(BaseStrategy):
         self.require_ema_confluence = strat_cfg.get('require_ema_confluence', False)  # FINAL FIX: Use False as fallback instead of True
         self.ema_fast_period = strat_cfg.get('ema_fast_period', 9)
         self.ema_slow_period = strat_cfg.get('ema_slow_period', 21)
+        # PnL-FIX v12: Stricter macro gate — previously `should_buy = macro_buy OR signal_buy`
+        # allowed pure 1h impulse entries while 4h was still HOLD (chop / counter-trend longs).
+        self.require_macro_buy_vote = strat_cfg.get('require_macro_buy_vote', False)
+        # 4h close must be above 4h EMA(slow) when True (structural uptrend alignment).
+        self.require_macro_price_above_slow_ema = strat_cfg.get(
+            'require_macro_price_above_slow_ema', False
+        )
         # PnL-FIX v8 (F4): Instant-loss filter on the execution timeframe.
         # Live data showed ARC/USD, API3/USD, AAVE/USD heikin_ashi entries
         # all hit SL with peak == entry (i.e. price went straight down from
@@ -663,6 +670,33 @@ class HeikinAshiStrategy(BaseStrategy):
             exec_buy   = exec_sig[0]   == 'buy'
 
             should_buy = macro_buy or signal_buy
+
+            # PnL-FIX v12 — require 4h to actually vote BUY (not 1h-only confluence).
+            if should_buy and self.require_macro_buy_vote:
+                if not macro_buy:
+                    should_buy = False
+                    logger.info(
+                        f"[HeikinAshiStrategy] HOLD {pair} — require_macro_buy_vote: "
+                        f"macro={macro_sig[0]} (need 4h BUY), signal={signal_sig[0]}, exec={exec_sig[0]}"
+                    )
+
+            # PnL-FIX v12 — 4h structural filter: spot longs only when price sits above macro EMA slow.
+            if should_buy and self.require_macro_price_above_slow_ema:
+                macro_pack = macro_sig[2] if len(macro_sig) > 2 and isinstance(macro_sig[2], dict) else {}
+                cp_m = macro_pack.get('current_price')
+                es_m = macro_pack.get('ema_slow')
+                try:
+                    if cp_m is None or es_m is None or float(cp_m) <= float(es_m):
+                        should_buy = False
+                        logger.info(
+                            f"[HeikinAshiStrategy] HOLD {pair} — macro not above EMA_slow "
+                            f"(close={cp_m}, ema_slow={es_m})"
+                        )
+                except (TypeError, ValueError):
+                    should_buy = False
+                    logger.info(
+                        f"[HeikinAshiStrategy] HOLD {pair} — macro EMA_slow filter skipped (bad values)"
+                    )
 
             if should_buy:
                 # Pick indicator pack from the most reliable BUY-voting TF

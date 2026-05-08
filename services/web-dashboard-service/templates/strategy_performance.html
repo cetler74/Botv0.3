@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>Strategy Performance - Trading Bot Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        .card-hover { transition: transform 0.2s ease-in-out; }
+        .card-hover:hover { transform: translateY(-2px); }
+        .pill-btn {
+            padding: 0.45rem 0.85rem;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            background: #f3f4f6;
+            color: #374151;
+            border: 1px solid #e5e7eb;
+        }
+        .pill-btn.active {
+            background: #4f46e5;
+            color: #ffffff;
+            border-color: #4f46e5;
+        }
+        .pill-btn:hover { background: #e5e7eb; }
+        .pill-btn.active:hover { background: #4338ca; }
+        .text-profit { color: #16a34a; }
+        .text-loss { color: #dc2626; }
+    </style>
+</head>
+<body class="bg-gray-50">
+    {% set page_title = "Strategy Performance" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
+
+    <div class="bg-gray-100 border-b border-gray-200 px-4 sm:px-6 lg:px-8 py-3">
+        <div class="max-w-7xl mx-auto flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div class="flex flex-wrap gap-2" id="windowButtons" role="group" aria-label="Time window">
+                <button type="button" class="pill-btn" data-window="today">Today</button>
+                <button type="button" class="pill-btn" data-window="yesterday">Yesterday</button>
+                <button type="button" class="pill-btn" data-window="last_24h">Last 24h</button>
+                <button type="button" class="pill-btn active" data-window="last_7d">Last 7 days</button>
+                <button type="button" class="pill-btn" data-window="last_30d">Last 30 days</button>
+                <button type="button" class="pill-btn" data-window="last_90d">Last 90 days</button>
+                <button type="button" class="pill-btn" data-window="month_to_date">Month to date</button>
+                <button type="button" class="pill-btn" data-window="custom">Custom</button>
+            </div>
+            <button type="button" onclick="refreshData()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium min-h-[44px]">
+                <i class="fas fa-sync-alt mr-1"></i>Refresh
+            </button>
+        </div>
+
+        <div id="customDateRow" class="max-w-7xl mx-auto mt-3 hidden flex-col sm:flex-row gap-3 sm:items-end">
+            <div>
+                <label class="block text-xs font-medium text-gray-600">Start (UTC)</label>
+                <input id="customStart" type="datetime-local" class="mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-600">End (UTC)</label>
+                <input id="customEnd" type="datetime-local" class="mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm">
+            </div>
+            <button type="button" onclick="applyCustomRange()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium">
+                Apply range
+            </button>
+        </div>
+
+        <div class="max-w-7xl mx-auto mt-3 text-xs text-gray-500" id="windowSummary"></div>
+    </div>
+
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div id="loading" class="text-center py-8">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+            <p class="mt-4 text-gray-600">Loading strategy performance...</p>
+        </div>
+
+        <div id="content" class="hidden">
+            <div class="bg-white rounded-lg shadow-md p-4 sm:p-6 mb-8">
+                <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-gray-900">
+                        <i class="fas fa-chart-line text-indigo-600 mr-2"></i>
+                        Per-strategy timeline
+                    </h2>
+                    <div class="flex flex-wrap gap-2" id="metricButtons" role="group" aria-label="Chart metric">
+                        <button type="button" class="pill-btn active" data-metric="daily_pnl">Daily realized PnL</button>
+                        <button type="button" class="pill-btn" data-metric="cumulative_pnl">Cumulative PnL</button>
+                        <button type="button" class="pill-btn" data-metric="trade_count">Daily trade count</button>
+                    </div>
+                </div>
+                <div class="relative" style="height: 320px;">
+                    <canvas id="strategyChart"></canvas>
+                </div>
+                <p class="text-xs text-gray-500 mt-2">Series are based on closed trades grouped by UTC day of <code>exit_time</code>.</p>
+            </div>
+
+            <h2 class="text-lg font-semibold text-gray-900 mb-3">
+                <i class="fas fa-table text-indigo-600 mr-2"></i>
+                Per-strategy stats (windowed)
+            </h2>
+            <div id="cards" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+
+            <p class="text-xs text-gray-500 mt-4">
+                "Pairs (snapshot)" and "Analysis runs (session)" are reported by the strategy service for the current process and
+                are not affected by the time window selection above.
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const state = {
+            window: 'last_7d',
+            customStart: null,
+            customEnd: null,
+            metric: 'daily_pnl',
+            data: null,
+        };
+
+        let chart = null;
+
+        function fmtCurrency(n) {
+            const x = Number(n || 0);
+            const sign = x < 0 ? '-' : '';
+            return sign + '$' + Math.abs(x).toFixed(2);
+        }
+
+        function pnlClass(n) {
+            const x = Number(n || 0);
+            if (x > 0) return 'text-profit';
+            if (x < 0) return 'text-loss';
+            return 'text-gray-700';
+        }
+
+        function formatStrategyName(name) {
+            return String(name || 'unknown')
+                .split('_')
+                .map(p => p.charAt(0).toUpperCase() + p.slice(1))
+                .join(' ');
+        }
+
+        function setActiveButton(group, attr, value) {
+            document.querySelectorAll(`#${group} [data-${attr}]`).forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute(`data-${attr}`) === value);
+            });
+        }
+
+        function bindWindowButtons() {
+            document.querySelectorAll('#windowButtons [data-window]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const win = btn.getAttribute('data-window');
+                    state.window = win;
+                    setActiveButton('windowButtons', 'window', win);
+                    const customRow = document.getElementById('customDateRow');
+                    if (win === 'custom') {
+                        customRow.classList.remove('hidden');
+                        customRow.classList.add('flex');
+                        return;
+                    }
+                    customRow.classList.add('hidden');
+                    customRow.classList.remove('flex');
+                    fetchData();
+                });
+            });
+        }
+
+        function bindMetricButtons() {
+            document.querySelectorAll('#metricButtons [data-metric]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const m = btn.getAttribute('data-metric');
+                    state.metric = m;
+                    setActiveButton('metricButtons', 'metric', m);
+                    renderChart();
+                });
+            });
+        }
+
+        function applyCustomRange() {
+            const s = document.getElementById('customStart').value;
+            const e = document.getElementById('customEnd').value;
+            if (!s || !e) {
+                alert('Please pick both start and end (UTC).');
+                return;
+            }
+            state.customStart = new Date(s + 'Z').toISOString();
+            state.customEnd = new Date(e + 'Z').toISOString();
+            fetchData();
+        }
+
+        async function fetchData() {
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('content').classList.add('hidden');
+
+            const params = new URLSearchParams();
+            params.set('window', state.window);
+            if (state.window === 'custom' && state.customStart && state.customEnd) {
+                params.set('start', state.customStart);
+                params.set('end', state.customEnd);
+            }
+
+            try {
+                const r = await fetch('/api/strategy-performance/range?' + params.toString());
+                if (!r.ok) {
+                    const text = await r.text();
+                    throw new Error('HTTP ' + r.status + ' ' + text);
+                }
+                state.data = await r.json();
+                render();
+            } catch (err) {
+                console.error(err);
+                document.getElementById('loading').innerHTML =
+                    '<div class="text-red-600"><i class="fas fa-exclamation-triangle mb-2"></i><p>Error loading strategy performance</p></div>';
+            }
+        }
+
+        function render() {
+            document.getElementById('loading').classList.add('hidden');
+            document.getElementById('content').classList.remove('hidden');
+
+            const win = (state.data && state.data.window) || {};
+            const sumEl = document.getElementById('windowSummary');
+            if (win.start && win.end) {
+                sumEl.textContent = `Window (UTC): ${win.start} -> ${win.end}`;
+            } else {
+                sumEl.textContent = '';
+            }
+
+            renderCards();
+            renderChart();
+        }
+
+        function renderCards() {
+            const container = document.getElementById('cards');
+            const strategies = (state.data && state.data.strategies) || {};
+            const names = Object.keys(strategies).sort();
+
+            if (!names.length) {
+                container.innerHTML =
+                    '<div class="md:col-span-2 lg:col-span-3 text-center text-gray-500 p-6 bg-white rounded-lg shadow">No strategy activity in this window.</div>';
+                return;
+            }
+
+            container.innerHTML = names.map(sname => {
+                const s = strategies[sname] || {};
+                const wr = Number(s.win_rate_percentage || 0);
+                let color = 'gray';
+                if ((s.closed_trades || 0) === 0) color = 'gray';
+                else if (wr >= 60) color = 'green';
+                else if (wr >= 50) color = 'blue';
+                else if (wr >= 40) color = 'yellow';
+                else color = 'red';
+
+                return `
+                    <div class="bg-white border-l-4 border-${color}-500 p-4 rounded-r-lg shadow-sm card-hover">
+                        <div class="mb-2">
+                            <h4 class="font-semibold text-gray-900 text-sm">${formatStrategyName(sname)}</h4>
+                        </div>
+                        <div class="space-y-1">
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Total:</span><span class="font-medium">${s.total_trades || 0}</span></div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Open:</span><span class="font-medium">${s.open_trades || 0}</span></div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Closed with profit:</span><span class="font-medium text-profit">${s.winning_trades || 0}</span></div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Closed with loss:</span><span class="font-medium text-loss">${s.losing_trades || 0}</span></div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Total profit:</span><span class="font-medium text-profit">${fmtCurrency(s.total_profit)}</span></div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Total loss:</span><span class="font-medium text-loss">${fmtCurrency(Math.abs(s.total_loss || 0))}</span></div>
+                            <div class="flex justify-between text-sm" title="Pairs in the latest in-memory snapshot where this strategy was applicable. Not windowed.">
+                                <span class="text-gray-600">Pairs (snapshot, session):</span><span class="font-medium">${s.analysis_runs || 0}</span>
+                            </div>
+                            <div class="flex justify-between text-sm" title="Successful generate_signal() calls since the strategy service started. Not windowed.">
+                                <span class="text-gray-600">Analysis runs (session):</span><span class="font-medium">${s.cumulative_analysis_runs != null ? s.cumulative_analysis_runs : 0}</span>
+                            </div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">Win Rate:</span><span class="font-medium ${pnlClass(wr - 50)}">${wr.toFixed(1)}%</span></div>
+                            <div class="flex justify-between text-sm"><span class="text-gray-600">PnL:</span><span class="font-medium ${pnlClass(s.total_pnl)}">${fmtCurrency(s.total_pnl)}</span></div>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        function buildChartData() {
+            const strategies = (state.data && state.data.strategies) || {};
+            const allDays = new Set();
+            for (const sname of Object.keys(strategies)) {
+                for (const pt of (strategies[sname].series || [])) {
+                    if (pt.day) allDays.add(pt.day);
+                }
+            }
+            const labels = Array.from(allDays).sort();
+
+            const palette = [
+                '#2563eb','#16a34a','#dc2626','#9333ea','#f59e0b',
+                '#0ea5e9','#ec4899','#14b8a6','#475569','#84cc16'
+            ];
+
+            const datasets = [];
+            let i = 0;
+            for (const sname of Object.keys(strategies).sort()) {
+                const series = strategies[sname].series || [];
+                if (!series.length) continue;
+                const byDay = {};
+                for (const pt of series) byDay[pt.day] = pt;
+
+                let cum = 0;
+                const ys = labels.map(day => {
+                    const pt = byDay[day];
+                    if (state.metric === 'daily_pnl') {
+                        return pt ? Number(pt.realized_pnl) : 0;
+                    }
+                    if (state.metric === 'trade_count') {
+                        return pt ? Number(pt.trade_count) : 0;
+                    }
+                    cum += pt ? Number(pt.realized_pnl) : 0;
+                    return Number(cum.toFixed(6));
+                });
+
+                const color = palette[i % palette.length];
+                i++;
+                const isBar = (state.metric === 'trade_count');
+                datasets.push({
+                    label: formatStrategyName(sname),
+                    data: ys,
+                    borderColor: color,
+                    backgroundColor: color + (isBar ? 'cc' : '33'),
+                    tension: 0.25,
+                    fill: false,
+                    type: isBar ? 'bar' : 'line',
+                    pointRadius: isBar ? 0 : 2,
+                });
+            }
+
+            return { labels, datasets };
+        }
+
+        function metricYAxisFormat(value) {
+            if (state.metric === 'trade_count') return Math.round(value);
+            const n = Number(value);
+            const sign = n < 0 ? '-' : '';
+            return sign + '$' + Math.abs(n).toFixed(2);
+        }
+
+        function renderChart() {
+            const ctx = document.getElementById('strategyChart');
+            if (!ctx || typeof Chart === 'undefined') return;
+
+            const { labels, datasets } = buildChartData();
+
+            if (chart) chart.destroy();
+
+            const isBar = (state.metric === 'trade_count');
+            chart = new Chart(ctx, {
+                type: isBar ? 'bar' : 'line',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'nearest', axis: 'x', intersect: false },
+                    plugins: {
+                        legend: { position: 'bottom', labels: { boxWidth: 12 } },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => {
+                                    const v = ctx.parsed.y;
+                                    return `${ctx.dataset.label}: ${metricYAxisFormat(v)}`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: { title: { display: true, text: 'Day (UTC)' } },
+                        y: {
+                            title: {
+                                display: true,
+                                text: state.metric === 'trade_count'
+                                    ? 'Trades'
+                                    : (state.metric === 'cumulative_pnl' ? 'Cumulative PnL (USD)' : 'Daily realized PnL (USD)')
+                            },
+                            ticks: { callback: (v) => metricYAxisFormat(v) }
+                        }
+                    }
+                }
+            });
+        }
+
+        function refreshData() {
+            fetchData();
+        }
+
+        bindWindowButtons();
+        bindMetricButtons();
+        fetchData();
+    </script>
+</body>
+</html>

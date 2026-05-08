@@ -64,7 +64,6 @@ class TradingConfig(BaseModel):
     max_concurrent_trades: int
     position_size_percentage: float
     stop_loss_percentage: float
-    take_profit_percentage: float
 ```
 
 ---

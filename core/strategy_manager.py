@@ -40,7 +40,10 @@ class StrategyManager:
             'vwma_hull': 'VWMAHullStrategy',
             'heikin_ashi': 'HeikinAshiStrategy', 
             'multi_timeframe_confluence': 'MultiTimeframeConfluenceStrategy',
-            'engulfing_multi_tf': 'EngulfingMultiTimeframeStrategy'
+            'engulfing_multi_tf': 'EngulfingMultiTimeframeStrategy',
+            'rsi_oversold_checklist': 'RSIOversoldChecklistStrategy',
+            'rsi_oversold_override': 'RSIOversoldOverrideStrategy',
+            'macd_momentum': 'MACDMomentumStrategy',
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
@@ -49,25 +52,41 @@ class StrategyManager:
             'vwma_hull': 'strategy.vwma_hull_strategy',
             'heikin_ashi': 'strategy.heikin_ashi_strategy',
             'multi_timeframe_confluence': 'strategy.multi_timeframe_confluence_strategy',
-            'engulfing_multi_tf': 'strategy.engulfing_multi_tf'
+            'engulfing_multi_tf': 'strategy.engulfing_multi_tf',
+            'rsi_oversold_checklist': 'strategy.rsi_oversold_checklist_strategy',
+            'rsi_oversold_override': 'strategy.rsi_oversold_override_strategy',
+            'macd_momentum': 'strategy.macd_momentum_strategy',
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         for strategy_name, strategy_config in strategies_config.items():
+            if not isinstance(strategy_config, dict):
+                logger.debug(f"Skipping non-strategy config block: {strategy_name}")
+                continue
             if not strategy_config.get('enabled', False):
                 continue
             try:
                 module_name = strategy_module_map.get(strategy_name)
                 if not module_name:
-                    logger.error(f"No module mapping for strategy: {strategy_name}")
+                    # Some config blocks under `strategies` are controls/policies
+                    # (e.g. regime_stability), not executable strategy modules.
+                    logger.warning(f"Strategy enabled but no executable module mapping: {strategy_name}")
                     continue
                 class_name = strategy_classes[strategy_name]
                 module = importlib.import_module(module_name)
                 strategy_class = getattr(module, class_name)
-                strategy_instance = strategy_class(
-                    config=strategy_config,
-                    exchange=self.exchange_manager,
-                    database=self.database_manager
-                )
+                try:
+                    strategy_instance = strategy_class(
+                        config=strategy_config,
+                        exchange=self.exchange_manager,
+                        database=self.database_manager,
+                        redis_client=None,
+                    )
+                except TypeError:
+                    strategy_instance = strategy_class(
+                        config=strategy_config,
+                        exchange=self.exchange_manager,
+                        database=self.database_manager
+                    )
                 self.strategies[strategy_name] = {
                     'instance': strategy_instance,
                     'config': strategy_config,

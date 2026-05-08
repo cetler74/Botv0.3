@@ -256,6 +256,24 @@ class Dashboard {
         const totalUnrealizedPnl = data.total_unrealized_pnl || 0;
         totalUnrealizedPnlElement.textContent = this.formatCurrency(totalUnrealizedPnl);
         totalUnrealizedPnlElement.className = `h4 ${this.getPnlClass(totalUnrealizedPnl)}`;
+        const winUn = Number(data.unrealized_pnl_winning ?? 0);
+        const loseUn = Number(data.unrealized_pnl_losing ?? 0);
+        const winCt = Number(data.open_positions_in_profit ?? 0);
+        const loseCt = Number(data.open_positions_in_loss ?? 0);
+        const uw = document.getElementById('unrealized-winning-pnl');
+        const ul = document.getElementById('unrealized-losing-pnl');
+        const uwc = document.getElementById('unrealized-winning-count');
+        const ulc = document.getElementById('unrealized-losing-count');
+        if (uw) {
+            uw.textContent = this.formatCurrency(winUn);
+            uw.className = `font-mono ${this.getPnlClass(winUn)}`;
+        }
+        if (ul) {
+            ul.textContent = this.formatCurrency(loseUn);
+            ul.className = `font-mono ${this.getPnlClass(loseUn)}`;
+        }
+        if (uwc) uwc.textContent = `(${winCt})`;
+        if (ulc) ulc.textContent = `(${loseCt})`;
         // Update win rate
         const winRate = data.win_rate || 0;
         winRateElement.textContent = `${winRate.toFixed(1)}%`;

@@ -24,16 +24,19 @@ class EnhancedDashboard {
         this.currentTradesPage = 1;
         this.tradesPerPage = 20;
         this.totalTrades = 0;
+        this.dailyPnlChart = null;
+        /** Monotonic counter so staggered portfolio UI timeouts do not mix payloads. */
+        this._portfolioUiSeq = 0;
+        /** Throttle OPEN-trades fetch used to backfill unrealized win/loss when API is incomplete. */
+        this._lastUnrealizedReconcileMs = 0;
         
         // Trading configuration
         this.tradingConfig = {
             profit_protection: {
-                trigger_percentage: 0.007,
-                activation_threshold: 0.007
+                activation_threshold: 0.005
             },
             trailing_stop: {
-                trigger_percentage: 0.005,
-                activation_threshold: 0.005,
+                activation_threshold: 0.003,
                 step_percentage: 0.003
             }
         };
@@ -56,6 +59,7 @@ class EnhancedDashboard {
         console.log('Dashboard initializing - loading data immediately...');
         this.fetchBotStatus();
         this.updatePortfolio();
+        this.updateDailyPnlChart();
         this.refreshRecentTrades();
         this.updateExchangeStatus();
         this.updateBybitWebSocketStatus();
@@ -550,6 +554,7 @@ const bText = (bCells[columnIndex] && bCells[columnIndex].textContent ? bCells[c
     }
 
     updatePortfolioUI(data) {
+        const uiSeq = ++this._portfolioUiSeq;
         const elements = {
             'total-balance': this.calculateTotalPortfolio(data),
             'available-balance': this.calculateAvailableBalance(data),
@@ -567,6 +572,7 @@ const bText = (bCells[columnIndex] && bCells[columnIndex].textContent ? bCells[c
         // Update each element with animation
         Object.entries(elements).forEach(([id, value], index) => {
             setTimeout(() => {
+                if (uiSeq !== this._portfolioUiSeq) return;
                 const element = document.getElementById(id);
                 if (element) {
                     const tradeCountFields = ['open-trades', 'total-trades-count', 'daily-opened-trades', 'daily-closed-trades'];
@@ -578,6 +584,7 @@ const bText = (bCells[columnIndex] && bCells[columnIndex].textContent ? bCells[c
                     element.style.transition = 'transform 0.2s ease';
                     
                     setTimeout(() => {
+                        if (uiSeq !== this._portfolioUiSeq) return;
                         element.textContent = displayValue;
                         element.style.transform = 'scale(1)';
                         
@@ -597,8 +604,175 @@ const bText = (bCells[columnIndex] && bCells[columnIndex].textContent ? bCells[c
             }, index * 50);
         });
 
+        this.updateUnrealizedPnlBreakdown(data, uiSeq);
+
         // Update tooltips
         this.updateTooltips(data);
+    }
+
+    aggregateOpenUnrealizedFromTrades(trades) {
+        let winAmt = 0;
+        let loseAmt = 0;
+        let winCt = 0;
+        let loseCt = 0;
+        for (const t of trades || []) {
+            if (String(t.status || '').toUpperCase() !== 'OPEN') continue;
+            const u = Number(t.unrealized_pnl);
+            if (Number.isNaN(u)) continue;
+            if (u > 0) {
+                winAmt += u;
+                winCt += 1;
+            } else if (u < 0) {
+                loseAmt += u;
+                loseCt += 1;
+            }
+        }
+        return { winAmt, loseAmt, winCt, loseCt, sumParts: winAmt + loseAmt };
+    }
+
+    applyUnrealizedBreakdownDom(winAmt, loseAmt, winCt, loseCt, uiSeq) {
+        if (uiSeq !== this._portfolioUiSeq) return;
+        const winPnlEl = document.getElementById('unrealized-winning-pnl');
+        const losePnlEl = document.getElementById('unrealized-losing-pnl');
+        const winCtEl = document.getElementById('unrealized-winning-count');
+        const loseCtEl = document.getElementById('unrealized-losing-count');
+
+        if (winPnlEl) {
+            winPnlEl.textContent = this.formatCurrency(winAmt, 2);
+            winPnlEl.className = `font-mono font-semibold ${this.getPnlClass(winAmt)}`;
+        }
+        if (losePnlEl) {
+            losePnlEl.textContent = this.formatCurrency(loseAmt, 2);
+            losePnlEl.className = `font-mono font-semibold ${this.getPnlClass(loseAmt)}`;
+        }
+        if (winCtEl) {
+            winCtEl.textContent = `(${winCt} open)`;
+        }
+        if (loseCtEl) {
+            loseCtEl.textContent = `(${loseCt} open)`;
+        }
+    }
+
+    async reconcileUnrealizedFromOpenTrades(uiSeq, minIntervalMs = 3000) {
+        const now = Date.now();
+        if (this._lastUnrealizedReconcileMs > 0 && now - this._lastUnrealizedReconcileMs < minIntervalMs) {
+            return;
+        }
+        this._lastUnrealizedReconcileMs = now;
+        try {
+            const params = new URLSearchParams({
+                page: '1',
+                limit: '500',
+                status: 'OPEN',
+                sort_by: 'entry_time',
+                sort_order: 'desc',
+            });
+            const response = await fetch(`/api/trades?${params}`);
+            if (!response.ok) return;
+            const payload = await response.json();
+            const trades = payload.trades || [];
+            const agg = this.aggregateOpenUnrealizedFromTrades(trades);
+            this.applyUnrealizedBreakdownDom(agg.winAmt, agg.loseAmt, agg.winCt, agg.loseCt, uiSeq);
+        } catch (e) {
+            console.warn('Unrealized PnL reconcile from open trades failed:', e);
+        }
+    }
+
+    updateUnrealizedPnlBreakdown(data, uiSeq) {
+        const totalUr = Number(data.total_unrealized_pnl ?? 0);
+        let winAmt = Number(data.unrealized_pnl_winning ?? 0);
+        let loseAmt = Number(data.unrealized_pnl_losing ?? 0);
+        let winCt = Number(data.open_positions_in_profit ?? 0);
+        let loseCt = Number(data.open_positions_in_loss ?? 0);
+
+        const hasBreakdownFields =
+            Object.prototype.hasOwnProperty.call(data, 'unrealized_pnl_winning') &&
+            Object.prototype.hasOwnProperty.call(data, 'open_positions_in_profit');
+        const sumParts = winAmt + loseAmt;
+        const openBucketsEmpty = winCt + loseCt === 0;
+        const drift = Math.abs(totalUr - sumParts);
+        const needsReconcile =
+            !hasBreakdownFields ||
+            (openBucketsEmpty && Math.abs(totalUr) > 0.005 && drift > 0.02);
+
+        this.applyUnrealizedBreakdownDom(winAmt, loseAmt, winCt, loseCt, uiSeq);
+
+        if (needsReconcile) {
+            void this.reconcileUnrealizedFromOpenTrades(uiSeq);
+        }
+    }
+
+    async updateDailyPnlChart() {
+        try {
+            const response = await fetch('/api/v1/pnl/daily');
+            if (!response.ok) return;
+            const data = await response.json();
+            const rows = Array.isArray(data.daily_pnl) ? data.daily_pnl : [];
+            this.renderDailyPnlChart(rows);
+        } catch (error) {
+            console.error('Error fetching daily PnL chart data:', error);
+        }
+    }
+
+    renderDailyPnlChart(dailyRows) {
+        const canvas = document.getElementById('daily-pnl-chart');
+        if (!canvas || typeof Chart === 'undefined') return;
+
+        const labels = dailyRows.map((row) => {
+            const dt = new Date(row.date);
+            return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        });
+
+        const values = dailyRows.map((row) => Number(row.realized_pnl || 0));
+        const bgColors = values.map((v) => (v >= 0 ? 'rgba(16, 185, 129, 0.75)' : 'rgba(239, 68, 68, 0.75)'));
+        const borderColors = values.map((v) => (v >= 0 ? 'rgba(16, 185, 129, 1)' : 'rgba(239, 68, 68, 1)'));
+
+        if (this.dailyPnlChart) {
+            this.dailyPnlChart.destroy();
+        }
+
+        this.dailyPnlChart = new Chart(canvas, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Daily PnL (USD)',
+                    data: values,
+                    backgroundColor: bgColors,
+                    borderColor: borderColors,
+                    borderWidth: 1.2,
+                    borderRadius: 6
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                const value = Number(context.raw || 0);
+                                return `PnL: $${value.toFixed(2)}`;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        grid: { color: 'rgba(229, 231, 235, 0.8)' },
+                        ticks: {
+                            callback: function(value) {
+                                return `$${Number(value).toFixed(0)}`;
+                            }
+                        }
+                    },
+                    x: {
+                        grid: { display: false }
+                    }
+                }
+            }
+        });
     }
 
     updateOrdersStatus(data) {
@@ -1217,7 +1391,8 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
         const statusClass = trade.status === 'OPEN' ? 'badge-success' : 
                            trade.status === 'CLOSED' ? 'badge-secondary' : 'badge-warning';
         
-        const pnlClass = this.getPnlClass(trade.realized_pnl);
+        const displayPnl = this.displayTradePnl(trade);
+        const pnlClass = this.getPnlClass(displayPnl);
         const unrealizedPnlClass = this.getPnlClass(trade.unrealized_pnl);
 
         return `
@@ -1243,11 +1418,11 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
                     ${this.truncateText(trade.exit_reason || 'N/A', 30)}
                 </td>
                 <td class="text-right font-mono ${pnlClass}">
-                    ${this.formatCurrency(trade.realized_pnl || 0)}
+                    ${this.formatCurrency(displayPnl)}
                     ${this.calculatePnlPercentage(trade)}
                 </td>
                 <td class="text-right font-mono ${unrealizedPnlClass}">
-                    ${this.calculatePnlPercentage(trade)}
+                    ${trade.status === 'OPEN' ? this.formatCurrency(trade.unrealized_pnl || 0) : '—'}
                 </td>
                 <td class="profit-trigger-col">
                     <div class="enhanced-badge ${trade.profit_protection === 'active' ? 'badge-success' : 'badge-danger'}">
@@ -1634,7 +1809,8 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         const statusClass = trade.status === 'OPEN' ? 'badge-success' : 
                            trade.status === 'CLOSED' ? 'badge-danger' : 'badge-warning';
         
-        const pnlClass = this.getPnlClass(trade.unrealized_pnl);
+        const displayPnl = this.displayTradePnl(trade);
+        const pnlClass = this.getPnlClass(displayPnl);
         
         // Apply row styling for CLOSED trades (faded out)
         const rowClass = trade.status === 'CLOSED' ? 'opacity-60 bg-gray-50' : '';
@@ -1668,8 +1844,8 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                 <td class="fee-col text-right font-mono text-red-600" title="Total fees in USD">
                     ${trade.total_fees_usd ? this.formatCurrency(trade.total_fees_usd, 2) : this.formatCurrency(trade.fees || 0, 2)}
                 </td>
-                <td class="text-right font-mono ${pnlClass}">
-                    ${this.formatCurrency(trade.unrealized_pnl || 0, 2)}
+                <td class="text-right font-mono ${pnlClass}" title="${String(trade.status || '').toUpperCase() === 'CLOSED' ? 'Realized PnL (net of fees)' : 'Unrealized PnL'}">
+                    ${this.formatCurrency(displayPnl, 2)}
                     ${this.calculatePnlPercentage(trade)}
                 </td>
                 <td>
@@ -1689,8 +1865,8 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                             Exit: ${this.formatCurrency(trade.profit_protection_trigger, 4)}
                         </div>
                     ` : trade.profit_protection === 'inactive' && trade.entry_price ? `
-                        <div class="text-xs text-gray-600 mt-1">
-                            Activates: ${this.formatCurrency(trade.entry_price * (1 + this.tradingConfig.profit_protection.trigger_percentage), 4)} (+${(this.tradingConfig.profit_protection.trigger_percentage * 100).toFixed(1)}%)
+                        <div class="text-xs text-gray-600 mt-1" title="Matches orchestrator: profit protection arms when peak PnL% >= trading.profit_protection.activation_threshold.">
+                            Activates: ${this.formatCurrency(trade.entry_price * (1 + (this.tradingConfig.profit_protection.activation_threshold ?? 0.005)), 4)} (+${((this.tradingConfig.profit_protection.activation_threshold ?? 0.005) * 100).toFixed(1)}%)
                         </div>
                     ` : ''}
                 </td>
@@ -1706,7 +1882,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                             Trailing: ${(this.tradingConfig.trailing_stop.step_percentage * 100).toFixed(2)}% distance
                         </div>
                     ` : trade.trail_stop === 'inactive' && trade.entry_price ? `
-                        <div class="text-xs text-gray-600 mt-1">
+                        <div class="text-xs text-gray-600 mt-1" title="PnL% where trailing logic starts; on-exchange trail limit may require a higher peak (breakeven_floor + step) before placement.">
                             Activates: ${this.formatCurrency(trade.entry_price * (1 + this.tradingConfig.trailing_stop.activation_threshold), 4)} (+${(this.tradingConfig.trailing_stop.activation_threshold * 100).toFixed(1)}%)
                         </div>
                     ` : ''}
@@ -1867,6 +2043,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         // Update data every 30 seconds
         this.updateInterval = setInterval(() => {
             this.updatePortfolio();
+            this.updateDailyPnlChart();
             this.fetchBotStatus();
             this.refreshRecentTrades();
             this.updateExchangeStatus();
@@ -1877,6 +2054,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         
         // Initial updates
         this.updatePortfolio();
+        this.updateDailyPnlChart();
         this.refreshTradeHistory();
         this.refreshRecentTrades();
         this.updateExchangeStatus();
@@ -1998,9 +2176,18 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         return 'text-neutral';
     }
 
+    /** Dollar PnL shown in the main PnL column: realized after exit, else mark-to-market unrealized. */
+    displayTradePnl(trade) {
+        const st = String(trade.status || '').toUpperCase();
+        if (st === 'CLOSED') {
+            return Number(trade.realized_pnl ?? 0);
+        }
+        return Number(trade.unrealized_pnl ?? 0);
+    }
+
     calculatePnlPercentage(trade) {
         if (!trade.entry_price || !trade.position_size) return '';
-        const pnl = trade.realized_pnl || trade.unrealized_pnl || 0;
+        const pnl = this.displayTradePnl(trade);
         const percentage = (pnl / (trade.entry_price * trade.position_size)) * 100;
         return ` (${percentage > 0 ? '+' : ''}${percentage.toFixed(2)}%)`;
     }
@@ -2039,10 +2226,30 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
     /** Resolve snapshot whether API pair uses BASE/QUOTE or concatenated form. */
     getPairSnapshot(exSnaps, pair) {
         if (!exSnaps || !pair) return null;
-        if (exSnaps[pair]) return exSnaps[pair];
-        const compact = String(pair).replace('/', '');
-        if (compact !== pair && exSnaps[compact]) return exSnaps[compact];
+        const p = String(pair);
+        const variants = new Set([p, p.replace(/\//g, '')]);
+        if (!p.includes('/') && p.length >= 7 && p.endsWith('USDC')) variants.add(`${p.slice(0, -4)}/USDC`);
+        if (!p.includes('/') && p.length >= 6 && p.endsWith('USD') && !p.endsWith('USDC')) variants.add(`${p.slice(0, -3)}/USD`);
+        for (const v of variants) {
+            if (v && exSnaps[v]) return exSnaps[v];
+        }
         return null;
+    }
+
+    /** Map portfolio exchange slug → keys used in strategy-service pair_last_snapshots. */
+    resolveExchangeSnapshots(snapByExchange, exLower) {
+        if (!snapByExchange || !exLower) return {};
+        const k = String(exLower).toLowerCase();
+        if (snapByExchange[k]) return snapByExchange[k];
+        const alias = {
+            'crypto.com': 'cryptocom',
+            'crypto_com': 'cryptocom',
+            'binanceus': 'binanceus',
+        }[k];
+        if (alias && snapByExchange[alias]) return snapByExchange[alias];
+        const norm = k.replace(/[^a-z0-9]/g, '');
+        if (norm !== k && snapByExchange[norm]) return snapByExchange[norm];
+        return {};
     }
 
     renderPairSnapshotHtml(pair, snap) {
@@ -2110,12 +2317,25 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                 if (s.outcome === 'failed') oc = 'text-red-600';
                 else if (s.outcome === 'buy_signal' || s.outcome === 'sell_signal') oc = 'text-green-700';
                 else if (s.outcome === 'weak_buy' || s.outcome === 'weak_sell') oc = 'text-amber-700';
+                let validationHtml = '';
+                if (s && s.strategy === 'macd_momentum' && s.validation && typeof s.validation === 'object') {
+                    const v = s.validation;
+                    const fmt = (x, n = 4) => (x == null || Number.isNaN(Number(x))) ? '—' : Number(x).toFixed(n);
+                    const fmt2 = (x) => (x == null || Number.isNaN(Number(x))) ? '—' : Number(x).toFixed(2);
+                    const boolTxt = (x) => (x === true ? 'true' : (x === false ? 'false' : '—'));
+                    validationHtml = `<div class="text-[11px] text-slate-700 mt-1 bg-slate-50 border border-slate-200 rounded px-2 py-1">
+                        MACD values used: macd=${esc(fmt(v.exec_macd))}, signal=${esc(fmt(v.exec_macd_signal))}, hist=${esc(fmt(v.hist_now))}, prev_hist=${esc(fmt(v.hist_prev))}, trend_macd=${esc(fmt(v.trend_macd))}, trend_signal=${esc(fmt(v.trend_macd_signal))}<br>
+                        Rule checks: green_2bar_up=${esc(boolTxt(v.green_consecutive_increasing))}, rsi_window_ok=${esc(boolTxt(v.rsi_window_ok))}, lookback=${esc(v.lookback != null ? String(v.lookback) : '—')}, threshold=${esc(fmt2(v.threshold))}, hist_ts=${esc(v.hist_ts || '—')}<br>
+                        RSI values used: rsi15=${esc(fmt2(v.exec_rsi))}, rsi1h=${esc(fmt2(v.trend_rsi))}, rsi_window=${esc(Array.isArray(v.rsi_window) ? JSON.stringify(v.rsi_window) : '[]')}
+                    </div>`;
+                }
                 stratHtml += `<li class="border-l-2 border-gray-200 pl-2">
                     <span class="font-medium text-gray-800">${esc(this.formatStrategyName(s.strategy))}</span>
                     <span class="text-gray-600"> ${esc(s.signal)}</span>
                     <span class="text-gray-500"> conf ${s.confidence != null ? s.confidence : '—'}</span>
                     <span class="${oc} font-medium"> (${esc(s.outcome)})</span>
                     <div class="text-gray-600 mt-0.5">${esc(s.reason)}</div>
+                    ${validationHtml}
                 </li>`;
             });
             stratHtml += '</ul>';
@@ -2137,21 +2357,40 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
 
     async updateExchangeStatus() {
         try {
-            // Get exchange performance data
-            const performanceResponse = await fetch('/api/v1/performance/metrics');
-            if (!performanceResponse.ok) return;
+            const [performanceResponse, portfolioResponse, exchangeInfoResponse] = await Promise.all([
+                fetch('/api/v1/performance/metrics'),
+                fetch('/api/portfolio'),
+                fetch('/api/exchange-information'),
+            ]);
+            if (!performanceResponse.ok || !portfolioResponse.ok) return;
             const performanceData = await performanceResponse.json();
-
-            // Get exchange balances
-            const portfolioResponse = await fetch('/api/portfolio');
-            if (!portfolioResponse.ok) return;
             const portfolioData = await portfolioResponse.json();
 
+            const exchangeInfoByKey = {};
+            let exchangeInfoOk = false;
+            if (exchangeInfoResponse.ok) {
+                try {
+                    const ei = await exchangeInfoResponse.json();
+                    const exMap = ei.exchanges || {};
+                    Object.keys(exMap).forEach((k) => {
+                        exchangeInfoByKey[String(k).toLowerCase()] = exMap[k];
+                    });
+                    exchangeInfoOk = true;
+                } catch (e) {
+                    console.warn('exchange-information parse failed', e);
+                }
+            }
+
             let snapData = {};
+            let snapByExchange = {};
             try {
                 const snapResponse = await fetch('/api/v1/strategy/pair-snapshots');
                 if (snapResponse.ok) {
                     snapData = await snapResponse.json();
+                    // New API: { snapshots: { exchange: { pair: ... } }, ... }; legacy: top-level exchange keys
+                    snapByExchange = (snapData.snapshots && typeof snapData.snapshots === 'object')
+                        ? snapData.snapshots
+                        : snapData;
                 }
             } catch (e) {
                 console.warn('pair-snapshots fetch failed', e);
@@ -2174,20 +2413,79 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                 }
             }
 
+            const ENTRY_BLOCK_LABEL = {
+                execution_downgrade: 'execution pause (slippage)',
+                pair_cooldown: 're-entry cooldown',
+                open_position_loss: 'open position underwater',
+                recent_closed_loss_2h: 'recent loss — new buys blocked (~2h)',
+                multi_loss_block: 'multiple loss signals (~2h / open)',
+                max_open_trades_per_pair: 'max concurrent opens on pair',
+            };
+
+            const entryBlocksByEx = {};
+            await Promise.all(
+                exchangesList.map(async (ex) => {
+                    const exK = String(ex).toLowerCase();
+                    const plist = exchangePairs[ex] || [];
+                    if (!plist.length) {
+                        entryBlocksByEx[exK] = { ok: true, blocks: {} };
+                        return;
+                    }
+                    try {
+                        const r = await fetch('/api/trading/pair-entry-blocks', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ exchange: ex, pairs: plist }),
+                        });
+                        if (r.ok) {
+                            const j = await r.json();
+                            entryBlocksByEx[exK] = {
+                                ok: true,
+                                blocks: j.blocks || {},
+                                blockDetails: j.block_details || {},
+                            };
+                        } else {
+                            entryBlocksByEx[exK] = { ok: false, blocks: {}, blockDetails: {} };
+                        }
+                    } catch (e) {
+                        console.warn('pair-entry-blocks', ex, e);
+                        entryBlocksByEx[exK] = { ok: false, blocks: {}, blockDetails: {} };
+                    }
+                }),
+            );
+
             const exchangeStatusContainer = document.getElementById('exchange-status');
             if (!exchangeStatusContainer) return;
 
             const exchanges = portfolioData.exchanges || {};
-            const exchangeBreakdown = performanceData.exchange_breakdown || {};
+            const rawBreakdown = performanceData.exchange_breakdown || {};
+            const exchangeBreakdown = {};
+            Object.entries(rawBreakdown).forEach(([k, v]) => {
+                exchangeBreakdown[String(k).toLowerCase()] = v;
+            });
 
-            const exchangeCards = Object.keys(exchanges).map(exchange => {
+            const exchangeCards = Object.keys(exchanges).map((exchange) => {
+                const esc = (x) => this.escapeHtml(x ?? '');
+                const exLower = String(exchange || '').toLowerCase();
                 const balance = exchanges[exchange];
-                const performance = exchangeBreakdown[exchange] || {};
+                const performance = exchangeBreakdown[exLower] || {};
                 const successRate = performance.success_rate || 0;
                 const totalOrders = performance.total || 0;
                 const filledOrders = performance.filled || 0;
                 const pairs = exchangePairs[exchange] || [];
-                
+                const blSet = new Set(
+                    (exchangeInfoByKey[exLower]?.blacklisted_pairs || []).map((p) => String(p).toLowerCase()),
+                );
+                const eb = entryBlocksByEx[exLower] || { ok: false, blocks: {}, blockDetails: {} };
+                const exKey = exLower;
+                const exSnaps = this.resolveExchangeSnapshots(snapByExchange, exKey);
+                const regimeForPair = (pair) => {
+                    const snap = this.getPairSnapshot(exSnaps, pair);
+                    return String(
+                        (snap && (snap.stable_regime || snap.market_regime || snap.detected_regime)) || 'unknown',
+                    );
+                };
+
                 // Determine status color based on filled orders and success rate
                 let statusColor = 'gray';
                 let statusText = 'Unknown';
@@ -2215,13 +2513,39 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                     statusText = 'No Data';
                 }
 
-                // Format pairs display - show all pairs (summary line)
-                const pairsDisplay = pairs.length > 0 
-                    ? pairs.join(', ')
-                    : 'No pairs selected';
-
-                const exKey = (exchange || '').toLowerCase();
-                const exSnaps = snapData[exKey] || {};
+                // Pairs: red = config blacklist OR orchestrator soft-block (recent loss / cooldown / …); green = tradable.
+                const showPairColors = exchangeInfoOk || eb.ok;
+                const pairsTitle = pairs.length
+                    ? pairs
+                          .map((p) => {
+                              const br = eb.blocks[p] || eb.blocks[String(p)];
+                              const bd = (eb.blockDetails && (eb.blockDetails[p] || eb.blockDetails[String(p)])) || null;
+                              const extra = bd && bd.message ? `: ${bd.message}` : '';
+                              const suf = br ? ` [${ENTRY_BLOCK_LABEL[br] || br}${extra}]` : '';
+                              const regime = regimeForPair(p);
+                              return `${p} (${regime})${suf}`;
+                          })
+                          .join(', ')
+                    : '';
+                const pairsDisplay =
+                    pairs.length > 0
+                        ? pairs
+                              .map((p) => {
+                                  const isBl = blSet.has(String(p).toLowerCase());
+                                  const br = eb.blocks[p] || eb.blocks[String(p)];
+                                  const isBlocked = Boolean(br);
+                                  let cls = 'text-gray-700';
+                                  if (showPairColors) {
+                                      cls =
+                                          isBl || isBlocked
+                                              ? 'text-red-600 font-semibold'
+                                              : 'text-green-700';
+                                  }
+                                  const regime = regimeForPair(p);
+                                  return `<span class="${cls}">${esc(p)}</span><span class="text-xs text-indigo-700 ml-1">(${esc(regime)})</span>`;
+                              })
+                              .join('<span class="text-gray-400">, </span>')
+                        : 'No pairs selected';
                 const perPairDetails = pairs.length
                     ? `<details class="mt-3 text-left group">
                         <summary class="text-xs text-blue-600 cursor-pointer font-medium list-none flex items-center gap-1">
@@ -2244,7 +2568,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                                     <div class="w-2 h-2 rounded-full bg-${statusColor}-500 mr-2"></div>
                                     <span>${statusText}</span>
                                 </div>
-                                <div class="text-xs text-gray-500 mt-1" title="${pairs.join(', ')}">
+                                <div class="text-xs text-gray-500 mt-1" title="${esc(pairsTitle)}">
                                     ${pairs.length} pairs: ${pairsDisplay}
                                 </div>
                                 ${perPairDetails}
@@ -2448,8 +2772,28 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                                 <span class="font-medium">${stats.open_trades}</span>
                             </div>
                             <div class="flex justify-between text-sm">
-                                <span class="text-gray-600">Analyzed:</span>
+                                <span class="text-gray-600">Closed with profit:</span>
+                                <span class="font-medium text-green-600">${stats.winning_trades ?? 0}</span>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Closed with loss:</span>
+                                <span class="font-medium text-red-600">${stats.losing_trades ?? 0}</span>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Total profit:</span>
+                                <span class="font-medium text-profit">${this.formatCurrency(stats.total_profit ?? 0, 2)}</span>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Total loss:</span>
+                                <span class="font-medium text-loss">${this.formatCurrency(Math.abs(stats.total_loss ?? 0), 2)}</span>
+                            </div>
+                            <div class="flex justify-between text-sm" title="Pairs in the latest in-memory snapshot where this strategy was applicable (not a lifetime count).">
+                                <span class="text-gray-600">Pairs (snapshot):</span>
                                 <span class="font-medium">${stats.analysis_runs || 0}</span>
+                            </div>
+                            <div class="flex justify-between text-sm" title="Successful generate_signal() calls for this strategy since the strategy service process started.">
+                                <span class="text-gray-600">Analysis runs (session):</span>
+                                <span class="font-medium">${stats.cumulative_analysis_runs != null ? stats.cumulative_analysis_runs : 0}</span>
                             </div>
                             <div class="flex justify-between text-sm">
                                 <span class="text-gray-600">Win Rate:</span>

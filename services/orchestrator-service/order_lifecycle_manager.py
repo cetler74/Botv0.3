@@ -191,6 +191,22 @@ class OrderLifecycleManager:
         except Exception as e:
             logger.error(f"❌ Error updating trade {trade_id} exit_id: {e}")
             return False
+
+    async def update_trade(self, trade_id: str, update_data: Dict[str, Any]) -> bool:
+        """Generic trade update compatibility method for TrailingStopManager."""
+        try:
+            payload = dict(update_data or {})
+            payload.setdefault("updated_at", datetime.utcnow().isoformat())
+            response = await self.http_client.put(
+                f"{self.database_url}/api/v1/trades/{trade_id}",
+                json=payload,
+            )
+            response.raise_for_status()
+            logger.info(f"✅ Updated trade {trade_id} with fields: {list(payload.keys())}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error updating trade {trade_id}: {e}")
+            return False
     
     async def close_trade(self, trade_id: str, exit_price: float, exit_time: datetime, 
                          realized_pnl: float = None, exit_reason: str = "orchestrator_closure", 

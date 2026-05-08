@@ -120,6 +120,194 @@ CREATE TABLE IF NOT EXISTS trading.market_data_cache (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Real-time price ticks (price-feed service; must match services/price-feed-service INSERT columns)
+CREATE TABLE IF NOT EXISTS trading.real_time_prices (
+    id SERIAL PRIMARY KEY,
+    exchange VARCHAR(50) NOT NULL,
+    pair VARCHAR(20) NOT NULL,
+    price DECIMAL(20, 8) NOT NULL,
+    bid DECIMAL(20, 8),
+    ask DECIMAL(20, 8),
+    volume_24h DECIMAL(20, 8),
+    price_change_24h DECIMAL(10, 6),
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    source VARCHAR(20) DEFAULT 'websocket',
+    sequence_id BIGINT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_real_time_prices_exchange_pair ON trading.real_time_prices(exchange, pair);
+CREATE INDEX IF NOT EXISTS idx_real_time_prices_timestamp ON trading.real_time_prices(timestamp);
+CREATE INDEX IF NOT EXISTS idx_real_time_prices_sequence ON trading.real_time_prices(sequence_id);
+
+-- Latest price lookup for trailing-stop / price-feed fallbacks
+CREATE OR REPLACE FUNCTION trading.get_latest_price(
+    exchange_name VARCHAR(50),
+    pair_name VARCHAR(20)
+) RETURNS DECIMAL(20, 8) AS $$
+DECLARE
+    latest_price DECIMAL(20, 8);
+BEGIN
+    SELECT price INTO latest_price
+    FROM trading.real_time_prices
+    WHERE exchange = exchange_name AND pair = pair_name
+    ORDER BY timestamp DESC, sequence_id DESC NULLS LAST
+    LIMIT 1;
+    RETURN COALESCE(latest_price, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+ALTER TABLE trading.trades
+ADD COLUMN IF NOT EXISTS trailing_stop_history JSONB DEFAULT '[]'::jsonb,
+ADD COLUMN IF NOT EXISTS price_updates_count INTEGER DEFAULT 0,
+ADD COLUMN IF NOT EXISTS last_price_update TIMESTAMP WITH TIME ZONE,
+ADD COLUMN IF NOT EXISTS websocket_price_source BOOLEAN DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS trading.websocket_status (
+    id SERIAL PRIMARY KEY,
+    exchange VARCHAR(50) NOT NULL UNIQUE,
+    status VARCHAR(20) NOT NULL,
+    last_message_time TIMESTAMP WITH TIME ZONE,
+    connection_start_time TIMESTAMP WITH TIME ZONE,
+    reconnection_count INTEGER DEFAULT 0,
+    error_message TEXT,
+    latency_ms INTEGER,
+    message_count BIGINT DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS trading.trailing_stops (
+    id SERIAL PRIMARY KEY,
+    trade_id UUID NOT NULL REFERENCES trading.trades(trade_id) ON DELETE CASCADE,
+    exchange VARCHAR(50) NOT NULL,
+    pair VARCHAR(20) NOT NULL,
+    trailing_enabled BOOLEAN DEFAULT FALSE,
+    trailing_trigger_percentage DECIMAL(10, 6),
+    trailing_step_percentage DECIMAL(10, 6),
+    max_trail_distance_percentage DECIMAL(10, 6),
+    is_active BOOLEAN DEFAULT FALSE,
+    current_stop_price DECIMAL(20, 8),
+    highest_price_seen DECIMAL(20, 8),
+    lowest_price_seen DECIMAL(20, 8),
+    entry_price DECIMAL(20, 8) NOT NULL,
+    current_price DECIMAL(20, 8),
+    position_side VARCHAR(10) DEFAULT 'long',
+    profit_protection_enabled BOOLEAN DEFAULT FALSE,
+    profit_lock_percentage DECIMAL(10, 6),
+    profit_protection_active BOOLEAN DEFAULT FALSE,
+    last_price_update TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_adjustment TIMESTAMP WITH TIME ZONE,
+    adjustment_count INTEGER DEFAULT 0,
+    triggered_at TIMESTAMP WITH TIME ZONE,
+    recovery_data JSONB,
+    websocket_connected BOOLEAN DEFAULT TRUE,
+    price_source VARCHAR(50) DEFAULT 'websocket',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_trailing_stops_trade_id ON trading.trailing_stops(trade_id);
+CREATE INDEX IF NOT EXISTS idx_trailing_stops_exchange_pair ON trading.trailing_stops(exchange, pair);
+CREATE INDEX IF NOT EXISTS idx_trailing_stops_active ON trading.trailing_stops(is_active);
+CREATE INDEX IF NOT EXISTS idx_trailing_stops_updated ON trading.trailing_stops(updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trailing_stops_trade_unique ON trading.trailing_stops(trade_id);
+CREATE INDEX IF NOT EXISTS idx_websocket_status_exchange ON trading.websocket_status(exchange);
+CREATE INDEX IF NOT EXISTS idx_websocket_status_updated ON trading.websocket_status(updated_at);
+
+CREATE OR REPLACE FUNCTION trading.update_trailing_stop(
+    trade_uuid UUID,
+    current_market_price DECIMAL(20, 8)
+) RETURNS BOOLEAN AS $$
+DECLARE
+    trailing_record RECORD;
+    new_stop_price DECIMAL(20, 8);
+    new_highest_price DECIMAL(20, 8);
+    price_improved BOOLEAN := FALSE;
+    adjustment_made BOOLEAN := FALSE;
+BEGIN
+    SELECT * INTO trailing_record
+    FROM trading.trailing_stops
+    WHERE trade_id = trade_uuid;
+    IF NOT FOUND OR NOT trailing_record.trailing_enabled THEN
+        RETURN FALSE;
+    END IF;
+    UPDATE trading.trailing_stops
+    SET current_price = current_market_price,
+        last_price_update = CURRENT_TIMESTAMP
+    WHERE trade_id = trade_uuid;
+    IF trailing_record.position_side = 'long' THEN
+        IF current_market_price > trailing_record.highest_price_seen THEN
+            new_highest_price := current_market_price;
+            price_improved := TRUE;
+            new_stop_price := current_market_price * (1 - trailing_record.trailing_step_percentage / 100);
+            IF new_stop_price > trailing_record.current_stop_price THEN
+                adjustment_made := TRUE;
+            END IF;
+        END IF;
+    END IF;
+    IF adjustment_made THEN
+        UPDATE trading.trailing_stops
+        SET current_stop_price = new_stop_price,
+            highest_price_seen = COALESCE(new_highest_price, highest_price_seen),
+            last_adjustment = CURRENT_TIMESTAMP,
+            adjustment_count = adjustment_count + 1
+        WHERE trade_id = trade_uuid;
+        UPDATE trading.trades
+        SET trail_stop_trigger = new_stop_price,
+            highest_price = COALESCE(new_highest_price, highest_price),
+            price_updates_count = price_updates_count + 1,
+            last_price_update = CURRENT_TIMESTAMP
+        WHERE trade_id = trade_uuid;
+    END IF;
+    RETURN adjustment_made;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION trading.should_trigger_trailing_stop(
+    trade_uuid UUID,
+    current_market_price DECIMAL(20, 8)
+) RETURNS BOOLEAN AS $$
+DECLARE
+    trailing_record RECORD;
+BEGIN
+    SELECT * INTO trailing_record
+    FROM trading.trailing_stops
+    WHERE trade_id = trade_uuid AND is_active = TRUE;
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+    IF trailing_record.position_side = 'long' THEN
+        RETURN current_market_price <= trailing_record.current_stop_price;
+    END IF;
+    IF trailing_record.position_side = 'short' THEN
+        RETURN current_market_price >= trailing_record.current_stop_price;
+    END IF;
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE VIEW trading.active_trailing_stops AS
+SELECT
+    ts.*,
+    t.position_size,
+    t.strategy,
+    t.status AS trade_status,
+    rtp.price AS latest_market_price,
+    rtp.timestamp AS latest_price_time,
+    ws.status AS websocket_status,
+    CASE
+        WHEN ts.position_side = 'long' THEN
+            ROUND(((ts.current_price - ts.entry_price) / ts.entry_price * 100)::numeric, 4)
+        ELSE
+            ROUND(((ts.entry_price - ts.current_price) / ts.entry_price * 100)::numeric, 4)
+    END AS current_pnl_percentage
+FROM trading.trailing_stops ts
+JOIN trading.trades t ON ts.trade_id = t.trade_id
+LEFT JOIN trading.real_time_prices rtp ON (ts.exchange = rtp.exchange AND ts.pair = rtp.pair)
+LEFT JOIN trading.websocket_status ws ON ts.exchange = ws.exchange
+WHERE ts.is_active = TRUE AND t.status = 'OPEN';
+
 -- Strategy performance tracking table
 CREATE TABLE IF NOT EXISTS trading.strategy_performance (
     id SERIAL PRIMARY KEY,

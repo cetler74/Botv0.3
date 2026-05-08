@@ -45,7 +45,7 @@ from psycopg2.pool import SimpleConnectionPool
 from contextlib import asynccontextmanager
 import uuid
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -122,6 +122,23 @@ class Trade(BaseModel):
     current_price: Optional[float] = None
     entry_id: Optional[str] = None
 
+
+class MacdAnalysisLogIn(BaseModel):
+    log_ts: datetime
+    exchange: Optional[str] = None
+    pair: str
+    hist_now: Optional[float] = None
+    hist_prev: Optional[float] = None
+    green_consecutive_increasing: Optional[bool] = None
+    hist_candle_ts: Optional[datetime] = None
+    lookback: Optional[int] = None
+    threshold: Optional[float] = None
+    rsi_window_ts: Optional[List[str]] = None
+    rsi_window: Optional[List[float]] = None
+    trigger: Optional[bool] = None
+    source: str = "strategy-service-live"
+    raw_line: Optional[str] = None
+
 class Balance(BaseModel):
     exchange: str
     balance: float
@@ -184,6 +201,10 @@ class PortfolioSummary(BaseModel):
     daily_closed_trades: int
     win_rate: float
     exchanges: Dict[str, Dict[str, Any]]
+    unrealized_pnl_winning: float = 0.0
+    unrealized_pnl_losing: float = 0.0
+    open_positions_in_profit: int = 0
+    open_positions_in_loss: int = 0
 
 class HealthResponse(BaseModel):
     status: str
@@ -1287,6 +1308,7 @@ async def initialize_database():
 
         # Auto-heal critical fee-tracking columns required by trade update flow.
         await ensure_trade_fee_columns(db_manager)
+        await ensure_macd_analysis_log_table(db_manager)
         
         # Initialize materializer (Phase 3)
         materializer = EventMaterializer(db_manager)
@@ -1316,6 +1338,49 @@ async def ensure_trade_fee_columns(manager: "DatabaseManager") -> None:
         logger.info("✅ Ensured fee-tracking columns exist on trading.trades")
     except Exception as e:
         logger.error(f"Failed ensuring fee-tracking columns on trading.trades: {e}")
+        raise
+
+
+async def ensure_macd_analysis_log_table(manager: "DatabaseManager") -> None:
+    """Ensure persistence table for MACD validation snapshots exists."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.strategy_macd_analysis_log (
+                id BIGSERIAL PRIMARY KEY,
+                log_ts TIMESTAMPTZ,
+                exchange TEXT,
+                pair TEXT NOT NULL,
+                hist_now DOUBLE PRECISION,
+                hist_prev DOUBLE PRECISION,
+                green_consecutive_increasing BOOLEAN,
+                hist_candle_ts TIMESTAMPTZ,
+                lookback INTEGER,
+                threshold DOUBLE PRECISION,
+                rsi_window_ts JSONB,
+                rsi_window JSONB,
+                trigger BOOLEAN,
+                source TEXT NOT NULL DEFAULT 'strategy-service-live',
+                raw_line TEXT,
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (log_ts, pair, hist_candle_ts, hist_now, hist_prev, trigger, source)
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_strategy_macd_log_ts
+            ON trading.strategy_macd_analysis_log (log_ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_strategy_macd_pair
+            ON trading.strategy_macd_analysis_log (pair);
+            CREATE INDEX IF NOT EXISTS idx_strategy_macd_exchange
+            ON trading.strategy_macd_analysis_log (exchange);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_strategy_macd_pair_exchange_candle_source
+            ON trading.strategy_macd_analysis_log (exchange, pair, hist_candle_ts, source)
+            WHERE hist_candle_ts IS NOT NULL;
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured strategy_macd_analysis_log table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring strategy_macd_analysis_log table: {e}")
         raise
 
 # API Endpoints
@@ -1593,6 +1658,78 @@ async def get_trades(
         logger.error(f"Failed to get trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/v1/trades/stats/monthly-realized")
+async def get_monthly_realized_stats(months: int = Query(14, ge=1, le=120)):
+    """
+    Per-calendar-month aggregates of closed trades (UTC month boundaries on exit_time).
+    Used by the monthly profit goal dashboard.
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        monthly_query = """
+            SELECT
+                (date_trunc('month', exit_time AT TIME ZONE 'UTC'))::date AS month_start,
+                COUNT(*)::int AS closed_count,
+                COALESCE(SUM(realized_pnl), 0) AS realized_sum
+            FROM trading.trades
+            WHERE status = 'CLOSED' AND exit_time IS NOT NULL
+            GROUP BY 1
+            ORDER BY 1 DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(monthly_query, (months,))
+        total_row = await db_manager.execute_single_query(
+            """
+            SELECT
+                COALESCE(SUM(realized_pnl), 0) AS total_realized,
+                COUNT(*)::int AS closed_count
+            FROM trading.trades
+            WHERE status = 'CLOSED' AND exit_time IS NOT NULL
+            """
+        )
+        out_months: List[Dict[str, Any]] = []
+        for r in rows or []:
+            ms = r.get("month_start")
+            if hasattr(ms, "isoformat"):
+                d0 = ms.isoformat()
+            else:
+                d0 = str(ms) if ms is not None else ""
+            y_m = d0[:7] if len(d0) >= 7 else d0
+            rc = r.get("closed_count") or 0
+            rs = r.get("realized_sum")
+            if isinstance(rs, Decimal):
+                rs = float(rs)
+            else:
+                rs = float(rs or 0)
+            cc = int(rc) if rc is not None else 0
+            avg = (rs / cc) if cc else 0.0
+            out_months.append(
+                {
+                    "year_month": y_m,
+                    "month_start": d0,
+                    "closed_count": cc,
+                    "realized_sum": rs,
+                    "avg_realized": round(avg, 6),
+                }
+            )
+        tr = total_row or {}
+        tot = tr.get("total_realized")
+        if isinstance(tot, Decimal):
+            tot = float(tot)
+        else:
+            tot = float(tot or 0)
+        cct = tr.get("closed_count")
+        cct = int(cct) if cct is not None else 0
+        return {
+            "months": out_months,
+            "total_realized_all_time": tot,
+            "closed_trade_count_all": cct,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get monthly realized stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/trades/open")
 async def get_open_trades(exchange: Optional[str] = None):
     """Get open trades"""
@@ -1764,7 +1901,11 @@ async def get_trade_history(
     max_pnl: Optional[float] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    exclude_exit_reason: Optional[str] = None
+    exclude_exit_reason: Optional[str] = None,
+    daily_closed_only: bool = Query(
+        False,
+        description="If true, only trades with exit_time >= CURRENT_DATE (matches portfolio daily_closed_trades).",
+    ),
 ):
     """Get trade history with pagination and filtering"""
     if not db_manager:
@@ -1817,14 +1958,17 @@ async def get_trade_history(
             base_query += " AND realized_pnl <= %s"
             params.append(str(max_pnl))
             
-        # Add date filters
-        if start_date:
-            base_query += " AND entry_time >= %s"
-            params.append(start_date)
-            
-        if end_date:
-            base_query += " AND entry_time <= %s"
-            params.append(end_date)
+        # Add date filters (entry_time; use daily_closed_only for exit-time / portfolio alignment)
+        if daily_closed_only:
+            base_query += " AND exit_time >= CURRENT_DATE"
+        else:
+            if start_date:
+                base_query += " AND entry_time >= %s"
+                params.append(start_date)
+
+            if end_date:
+                base_query += " AND entry_time <= %s"
+                params.append(end_date)
             
         # Add exclude exit reason filter (for filtering out dust trades)
         if exclude_exit_reason:
@@ -2978,13 +3122,35 @@ async def get_portfolio_summary():
                 COUNT(CASE WHEN status = 'CLOSED' AND realized_pnl > 0 THEN 1 END) as winning_trades,
                 COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_trades,
                 COUNT(CASE WHEN entry_time >= CURRENT_DATE AND status != 'FAILED' THEN 1 END) as daily_total_trades,
-                COUNT(CASE WHEN entry_time >= CURRENT_DATE AND status = 'CLOSED' THEN 1 END) as daily_closed_trades,
-                COALESCE(SUM(CASE WHEN status = 'OPEN' THEN unrealized_pnl ELSE 0 END), 0) as total_unrealized_pnl
+                COUNT(CASE WHEN status = 'CLOSED' AND exit_time >= CURRENT_DATE THEN 1 END) as daily_closed_trades,
+                COALESCE(SUM(CASE WHEN status = 'OPEN' THEN COALESCE(unrealized_pnl, 0) ELSE 0 END), 0) as total_unrealized_pnl,
+                COALESCE(SUM(CASE
+                    WHEN status = 'OPEN' AND COALESCE(unrealized_pnl, 0) > 0 THEN unrealized_pnl
+                    ELSE 0
+                END), 0) as unrealized_pnl_winning,
+                COALESCE(SUM(CASE
+                    WHEN status = 'OPEN' AND COALESCE(unrealized_pnl, 0) < 0 THEN unrealized_pnl
+                    ELSE 0
+                END), 0) as unrealized_pnl_losing,
+                COUNT(CASE WHEN status = 'OPEN' AND COALESCE(unrealized_pnl, 0) > 0 THEN 1 END) as open_positions_in_profit,
+                COUNT(CASE WHEN status = 'OPEN' AND COALESCE(unrealized_pnl, 0) < 0 THEN 1 END) as open_positions_in_loss
             FROM trading.trades
         """
         trade_result = await db_manager.execute_single_query(trade_query)
         if not trade_result:
-            trade_result = {"total_trades": 0, "active_trades": 0, "winning_trades": 0, "closed_trades": 0, "daily_total_trades": 0, "daily_closed_trades": 0, "total_unrealized_pnl": 0}
+            trade_result = {
+                "total_trades": 0,
+                "active_trades": 0,
+                "winning_trades": 0,
+                "closed_trades": 0,
+                "daily_total_trades": 0,
+                "daily_closed_trades": 0,
+                "total_unrealized_pnl": 0,
+                "unrealized_pnl_winning": 0,
+                "unrealized_pnl_losing": 0,
+                "open_positions_in_profit": 0,
+                "open_positions_in_loss": 0,
+            }
         # Calculate win rate
         win_rate = 0
         if trade_result['closed_trades'] > 0:
@@ -3068,13 +3234,17 @@ async def get_portfolio_summary():
             available_balance=balance_result['available_balance'] or 0,
             total_pnl=pnl_result['total_realized_pnl'] or 0,
             daily_pnl=pnl_result['daily_realized_pnl'] or 0,
-            total_unrealized_pnl=trade_result['total_unrealized_pnl'] or 0,
+            total_unrealized_pnl=float(trade_result['total_unrealized_pnl'] or 0),
             active_trades=trade_result['active_trades'] or 0,
             total_trades=trade_result['total_trades'] or 0,
             daily_total_trades=trade_result['daily_total_trades'] or 0,
             daily_closed_trades=trade_result['daily_closed_trades'] or 0,
             win_rate=win_rate,
-            exchanges=exchange_dict
+            exchanges=exchange_dict,
+            unrealized_pnl_winning=float(trade_result.get('unrealized_pnl_winning') or 0),
+            unrealized_pnl_losing=float(trade_result.get('unrealized_pnl_losing') or 0),
+            open_positions_in_profit=int(trade_result.get('open_positions_in_profit') or 0),
+            open_positions_in_loss=int(trade_result.get('open_positions_in_loss') or 0),
         )
     except Exception as e:
         logger.error(f"Failed to get portfolio summary: {e}")
@@ -3329,6 +3499,7 @@ async def get_all_strategy_performance():
                 COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open_trades,
                 COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_trades,
                 COUNT(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 THEN 1 END) as winning_trades,
+                COUNT(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) < 0 THEN 1 END) as losing_trades,
                 ROUND(
                     COUNT(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 THEN 1 END)::numeric / 
                     NULLIF(COUNT(CASE WHEN status = 'CLOSED' THEN 1 END), 0) * 100, 1
@@ -3338,6 +3509,14 @@ async def get_all_strategy_performance():
                         COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0)
                         ELSE 0 END), 2
                 ) as total_pnl,
+                ROUND(
+                    SUM(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 
+                        THEN COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) ELSE 0 END), 2
+                ) as total_profit,
+                ROUND(
+                    SUM(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) < 0 
+                        THEN COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) ELSE 0 END), 2
+                ) as total_loss,
                 ROUND(
                     AVG(CASE WHEN status = 'CLOSED' AND COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) > 0 
                         THEN COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0) END), 2
@@ -3370,9 +3549,12 @@ async def get_all_strategy_performance():
                 "open_trades": int(row['open_trades'] or 0),
                 "closed_trades": int(row['closed_trades'] or 0),
                 "winning_trades": int(row['winning_trades'] or 0),
+                "losing_trades": int(row['losing_trades'] or 0),
                 "win_rate": win_rate,
                 "win_rate_percentage": float(row['win_rate_percentage'] or 0),
                 "total_pnl": float(row['total_pnl'] or 0),
+                "total_profit": float(row['total_profit'] or 0),
+                "total_loss": float(row['total_loss'] or 0),
                 "avg_winning_trade": float(row['avg_winning_trade'] or 0),
                 "avg_losing_trade": float(row['avg_losing_trade'] or 0),
                 "profit_factor": (
@@ -3387,6 +3569,286 @@ async def get_all_strategy_performance():
     except Exception as e:
         logger.error(f"Failed to calculate strategy performance: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/macd-analysis-logs")
+async def create_macd_analysis_log(payload: MacdAnalysisLogIn):
+    """Persist one MACD validation snapshot row."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.strategy_macd_analysis_log (
+                log_ts,
+                exchange,
+                pair,
+                hist_now,
+                hist_prev,
+                green_consecutive_increasing,
+                hist_candle_ts,
+                lookback,
+                threshold,
+                rsi_window_ts,
+                rsi_window,
+                trigger,
+                source,
+                raw_line
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (exchange, pair, hist_candle_ts, source)
+            WHERE hist_candle_ts IS NOT NULL
+            DO UPDATE SET
+                log_ts = EXCLUDED.log_ts,
+                hist_now = EXCLUDED.hist_now,
+                hist_prev = EXCLUDED.hist_prev,
+                green_consecutive_increasing = EXCLUDED.green_consecutive_increasing,
+                lookback = EXCLUDED.lookback,
+                threshold = EXCLUDED.threshold,
+                rsi_window_ts = EXCLUDED.rsi_window_ts,
+                rsi_window = EXCLUDED.rsi_window,
+                trigger = EXCLUDED.trigger,
+                raw_line = EXCLUDED.raw_line,
+                ingested_at = NOW()
+            RETURNING id
+        """
+        params = (
+            payload.log_ts,
+            payload.exchange,
+            payload.pair,
+            payload.hist_now,
+            payload.hist_prev,
+            payload.green_consecutive_increasing,
+            payload.hist_candle_ts,
+            payload.lookback,
+            payload.threshold,
+            Json(payload.rsi_window_ts or []),
+            Json(payload.rsi_window or []),
+            payload.trigger,
+            payload.source,
+            payload.raw_line,
+        )
+        inserted = await db_manager.execute_single_query(query, params)
+        return {"status": "ok", "inserted": bool(inserted), "id": (inserted or {}).get("id")}
+    except Exception as e:
+        logger.error(f"Failed to create macd analysis log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/macd-analysis-logs")
+async def get_macd_analysis_logs(
+    exchange: Optional[str] = Query(None),
+    pair: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=5000),
+):
+    """Read MACD validation logs for dashboard/audit usage."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["log_ts >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [hours]
+        if exchange:
+            where.append("LOWER(COALESCE(exchange, '')) = LOWER(%s)")
+            params.append(exchange)
+        if pair:
+            where.append("REPLACE(UPPER(pair), '/', '') = REPLACE(UPPER(%s), '/', '')")
+            params.append(pair)
+        params.append(limit)
+        query = f"""
+            SELECT
+                id, log_ts, exchange, pair, hist_now, hist_prev,
+                green_consecutive_increasing, hist_candle_ts, lookback, threshold,
+                rsi_window_ts, rsi_window, trigger, source, raw_line, ingested_at
+            FROM trading.strategy_macd_analysis_log
+            WHERE {" AND ".join(where)}
+            ORDER BY log_ts DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(query, tuple(params))
+        return {"rows": rows, "count": len(rows)}
+    except Exception as e:
+        logger.error(f"Failed to get macd analysis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/strategy-performance/range")
+async def get_strategy_performance_range(
+    start: str = Query(..., description="ISO8601 UTC inclusive start"),
+    end: str = Query(..., description="ISO8601 UTC exclusive end"),
+):
+    """
+    Per-strategy aggregates and daily series for trades whose closed exit_time
+    falls within [start, end). entry_time within the same window is used for
+    total_trades/open_trades counts so the cards match the user's selection.
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+
+    def _parse_iso(s: str) -> datetime:
+        try:
+            v = str(s).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(v)
+            if dt.tzinfo is None:
+                from datetime import timezone as _tz
+                dt = dt.replace(tzinfo=_tz.utc)
+            return dt
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid datetime '{s}': {exc}")
+
+    start_dt = _parse_iso(start)
+    end_dt = _parse_iso(end)
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="`end` must be greater than `start`")
+
+    try:
+        pnl_expr = "COALESCE(realized_pnl, (exit_price::numeric - entry_price::numeric) * position_size::numeric, 0)"
+
+        agg_query = f"""
+            SELECT
+                strategy,
+                COUNT(*) FILTER (WHERE entry_time >= %s AND entry_time < %s) AS total_trades,
+                COUNT(*) FILTER (
+                    WHERE status = 'OPEN' AND entry_time >= %s AND entry_time < %s
+                ) AS open_trades,
+                COUNT(*) FILTER (
+                    WHERE status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                ) AS closed_trades,
+                COUNT(*) FILTER (
+                    WHERE status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                      AND {pnl_expr} > 0
+                ) AS winning_trades,
+                COUNT(*) FILTER (
+                    WHERE status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                      AND {pnl_expr} < 0
+                ) AS losing_trades,
+                ROUND(
+                    COALESCE(SUM(CASE WHEN status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                        THEN {pnl_expr} END), 0)::numeric, 2
+                ) AS total_pnl,
+                ROUND(
+                    COALESCE(SUM(CASE WHEN status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                        AND {pnl_expr} > 0 THEN {pnl_expr} END), 0)::numeric, 2
+                ) AS total_profit,
+                ROUND(
+                    COALESCE(SUM(CASE WHEN status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                        AND {pnl_expr} < 0 THEN {pnl_expr} END), 0)::numeric, 2
+                ) AS total_loss,
+                ROUND(
+                    AVG(CASE WHEN status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                        AND {pnl_expr} > 0 THEN {pnl_expr} END)::numeric, 2
+                ) AS avg_winning_trade,
+                ROUND(
+                    AVG(CASE WHEN status = 'CLOSED' AND exit_time >= %s AND exit_time < %s
+                        AND {pnl_expr} < 0 THEN {pnl_expr} END)::numeric, 2
+                ) AS avg_losing_trade
+            FROM trading.trades
+            WHERE strategy IS NOT NULL AND strategy != ''
+              AND (
+                  (entry_time >= %s AND entry_time < %s)
+                  OR (exit_time >= %s AND exit_time < %s)
+              )
+            GROUP BY strategy
+            ORDER BY strategy
+        """
+
+        agg_params: List[Any] = []
+        # 10 start/end placeholder pairs in SELECT + 2 pairs in WHERE.
+        for _ in range(10):
+            agg_params.extend([start_dt, end_dt])
+        agg_params.extend([start_dt, end_dt, start_dt, end_dt])
+
+        rows = await db_manager.execute_query(agg_query, tuple(agg_params))
+
+        series_query = f"""
+            SELECT
+                strategy,
+                (date_trunc('day', exit_time AT TIME ZONE 'UTC'))::date AS day,
+                COUNT(*)::int AS trade_count,
+                COALESCE(SUM({pnl_expr}), 0) AS realized_pnl
+            FROM trading.trades
+            WHERE strategy IS NOT NULL AND strategy != ''
+              AND status = 'CLOSED'
+              AND exit_time >= %s AND exit_time < %s
+            GROUP BY strategy, day
+            ORDER BY strategy, day
+        """
+        series_rows = await db_manager.execute_query(series_query, (start_dt, end_dt))
+
+        series_by_strategy: Dict[str, List[Dict[str, Any]]] = {}
+        for sr in series_rows or []:
+            sname = sr.get("strategy") or "unknown"
+            day_val = sr.get("day")
+            if hasattr(day_val, "isoformat"):
+                day_iso = day_val.isoformat()
+            else:
+                day_iso = str(day_val) if day_val is not None else ""
+            rp = sr.get("realized_pnl")
+            if isinstance(rp, Decimal):
+                rp_val = float(rp)
+            else:
+                rp_val = float(rp or 0)
+            series_by_strategy.setdefault(sname, []).append(
+                {
+                    "day": day_iso,
+                    "realized_pnl": round(rp_val, 6),
+                    "trade_count": int(sr.get("trade_count") or 0),
+                }
+            )
+
+        def _f(v: Any) -> float:
+            try:
+                if v is None:
+                    return 0.0
+                if isinstance(v, Decimal):
+                    return float(v)
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        strategies_out: Dict[str, Any] = {}
+        all_names = set(series_by_strategy.keys())
+        for r in rows or []:
+            all_names.add(r.get("strategy") or "unknown")
+
+        rows_by_name = {(r.get("strategy") or "unknown"): r for r in (rows or [])}
+
+        for sname in sorted(all_names):
+            r = rows_by_name.get(sname, {})
+            closed = int(r.get("closed_trades") or 0)
+            winning = int(r.get("winning_trades") or 0)
+            losing = int(r.get("losing_trades") or 0)
+            avg_win = _f(r.get("avg_winning_trade"))
+            avg_loss = _f(r.get("avg_losing_trade"))
+            wr_pct = (winning / closed * 100.0) if closed else 0.0
+
+            strategies_out[sname] = {
+                "total_trades": int(r.get("total_trades") or 0),
+                "open_trades": int(r.get("open_trades") or 0),
+                "closed_trades": closed,
+                "winning_trades": winning,
+                "losing_trades": losing,
+                "win_rate": (winning / closed) if closed else 0.0,
+                "win_rate_percentage": round(wr_pct, 1),
+                "total_pnl": _f(r.get("total_pnl")),
+                "total_profit": _f(r.get("total_profit")),
+                "total_loss": _f(r.get("total_loss")),
+                "avg_winning_trade": avg_win,
+                "avg_losing_trade": avg_loss,
+                "profit_factor": (
+                    abs(avg_loss) / abs(avg_win) if avg_win and avg_loss else 0.0
+                ),
+                "series": series_by_strategy.get(sname, []),
+            }
+
+        return {
+            "window": {"start": start_dt.isoformat(), "end": end_dt.isoformat()},
+            "strategies": strategies_out,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to calculate windowed strategy performance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Reconciliation: pull exchange data and synchronize DB (definitive fix path)
 @app.post("/api/v1/trades/reconcile/{exchange}/{symbol}")

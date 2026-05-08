@@ -160,7 +160,7 @@
                     </div>
                 </div>
             </div>
-
+            <p id="closedTradeHint" class="text-sm text-gray-500 mb-6 text-center" style="min-height:1.25rem;"></p>
 
 
             <!-- Optimization Recommendations -->
@@ -315,7 +315,8 @@
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                     <div class="text-center">
                         <div class="text-2xl font-bold text-gray-900" id="maxDrawdown">--</div>
-                        <div class="text-sm text-gray-600">Max Drawdown</div>
+                        <div class="text-xs text-gray-500" id="maxDrawdownNote"></div>
+                        <div class="text-sm text-gray-600">Max Drawdown (cumulative realized)</div>
                     </div>
                     <div class="text-center">
                         <div class="text-2xl font-bold text-gray-900" id="sharpeRatio">--</div>
@@ -368,8 +369,23 @@
             document.getElementById('totalPnl').textContent = `$${data.total_pnl.toFixed(2)}`;
             document.getElementById('tradesPerCycle').textContent = data.trades_per_cycle.toFixed(3);
 
-            // Update risk metrics
-            document.getElementById('maxDrawdown').textContent = `${(data.max_drawdown * 100).toFixed(1)}%`;
+            const hint = document.getElementById('closedTradeHint');
+            if (hint && data.closed_trade_count != null) {
+                hint.textContent =
+                    `Based on ${data.closed_trade_count} closed trade(s), ordered by exit time (full history).`;
+            }
+
+            // Update risk metrics (max_drawdown is dollars; max_drawdown_pct vs peak cumulative profit)
+            document.getElementById('maxDrawdown').textContent = `$${Number(data.max_drawdown || 0).toFixed(2)}`;
+            const mddp = data.max_drawdown_pct;
+            const noteEl = document.getElementById('maxDrawdownNote');
+            if (noteEl) {
+                const p = Number(mddp);
+                noteEl.textContent =
+                    mddp != null && !Number.isNaN(p) && p > 0
+                        ? `${(p * 100).toFixed(1)}% of peak cumulative profit`
+                        : '';
+            }
             document.getElementById('sharpeRatio').textContent = data.sharpe_ratio.toFixed(2);
             document.getElementById('balanceUtilization').textContent = `${(data.balance_utilization * 100).toFixed(1)}%`;
 

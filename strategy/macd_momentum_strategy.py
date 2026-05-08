@@ -2,7 +2,8 @@
 MACD Momentum strategy tuned for crypto intraday execution.
 
 Design:
-- Uses 1h MACD for trend bias and 15m MACD for execution timing.
+- MACD line vs signal for bias: execution chart (e.g. 15m) or trend chart (e.g. 1h), per parameters.
+- Histogram, EMA, volume, ADX on the execution timeframe.
 - Applies volume and EMA filters to reduce false breakouts.
 - Emits buy/sell/hold signals only; exits remain orchestrator-managed
   (profit protection + trailing stop + global risk controls).
@@ -63,6 +64,9 @@ class MACDMomentumStrategy(BaseStrategy):
         self.use_volume_confirmation = bool(params.get("use_volume_confirmation", True))
         self.adx_boost_threshold = float(params.get("adx_boost_threshold", self.adx_threshold))
         self.adx_confidence_boost = float(params.get("adx_confidence_boost", 0.06))
+        # When True, block buy/sell unless ADX(execution TF) >= adx_threshold (YAML
+        # adx_threshold finally acts as a hard gate, not only a boost reference).
+        self.enforce_adx_threshold = bool(params.get("enforce_adx_threshold", False))
         self.skip_sideways_regime = bool(params.get("skip_sideways_regime", True))
         self.dynamic_volume_enabled = bool(params.get("dynamic_volume_enabled", True))
         self.dynamic_volume_floor = float(params.get("dynamic_volume_floor", 1.05))
@@ -73,6 +77,12 @@ class MACDMomentumStrategy(BaseStrategy):
         self.use_rsi_buy_filter = bool(params.get("use_rsi_buy_filter", True))
         self.rsi_period = int(params.get("rsi_period", 14))
         self.rsi_buy_max = float(params.get("rsi_buy_max", 50.0))
+        self.macd_green_rsi_lookback = int(params.get("macd_green_rsi_lookback", 5))
+        self.macd_green_rsi_buy_threshold = float(params.get("macd_green_rsi_buy_threshold", 35.0))
+        self.macd_green_rsi_force_buy_override = bool(params.get("macd_green_rsi_force_buy_override", True))
+        # "trend" = higher-TF MACD vs signal (1h when present); "execution" = same chart as triggers (15m).
+        self.long_macd_bias_timeframe = str(params.get("long_macd_bias_timeframe", "trend")).lower()
+        self.short_macd_bias_timeframe = str(params.get("short_macd_bias_timeframe", "trend")).lower()
 
         self._current_ohlcv = None
 
@@ -186,10 +196,11 @@ class MACDMomentumStrategy(BaseStrategy):
             if any(x is None for x in (exec_macd, exec_signal, exec_hist, trend_macd, trend_signal)):
                 return "hold", 0.0, 0.0
 
-            if len(exec_macd) < 3 or len(exec_signal) < 2 or len(exec_hist) < 3:
+            if len(exec_macd) < 4 or len(exec_signal) < 3 or len(exec_hist) < 4:
                 return "hold", 0.0, 0.0
 
-            # 15m execution trigger.
+            # Strategy-service already drops the in-progress candle for each timeframe.
+            # Use the latest available row as the latest CLOSED candle.
             macd_now = float(exec_macd.iloc[-1])
             macd_prev = float(exec_macd.iloc[-2])
             sig_now = float(exec_signal.iloc[-1])
@@ -208,12 +219,16 @@ class MACDMomentumStrategy(BaseStrategy):
             hist_flipped_negative = hist_prev >= 0.0 and hist_now < 0.0
             bullish_divergence, bearish_divergence = self._detect_divergence(exec_df, exec_hist) if self.enable_divergence_detection else (False, False)
 
-            # 1h trend filter.
+            # Higher-TF trend (typically 1h): MACD vs signal for optional long/short bias.
             trend_macd_now = float(trend_macd.iloc[-1])
             trend_sig_now = float(trend_signal.iloc[-1])
-            # Soft bias: MACD relationship to signal line only (no zero-line hard gate).
             trend_bullish = trend_macd_now > trend_sig_now
             trend_bearish = trend_macd_now < trend_sig_now
+            # Execution TF (15m): MACD vs signal — primary bias when *_macd_bias_timeframe is "execution".
+            exec_bias_bullish = macd_now > sig_now
+            exec_bias_bearish = macd_now < sig_now
+            long_macd_bias_ok = trend_bullish if self.long_macd_bias_timeframe == "trend" else exec_bias_bullish
+            short_macd_bias_ok = trend_bearish if self.short_macd_bias_timeframe == "trend" else exec_bias_bearish
 
             # Price + volume filters on execution timeframe.
             ema_exec = ta.ema(exec_df["close"], length=self.ema_filter_period)
@@ -231,6 +246,7 @@ class MACDMomentumStrategy(BaseStrategy):
             adx_col = next((c for c in adx_df.columns if str(c).startswith("ADX")) if adx_df is not None else (), None)
             adx_now = float(adx_df[adx_col].iloc[-1]) if adx_col and not pd.isna(adx_df[adx_col].iloc[-1]) else 0.0
             adx_boost_active = adx_now >= self.adx_boost_threshold
+            adx_entry_ok = (not self.enforce_adx_threshold) or (adx_now >= self.adx_threshold)
             exec_rsi_series = ta.rsi(exec_df["close"], length=self.rsi_period)
             trend_rsi_series = ta.rsi(trend_df["close"], length=self.rsi_period)
             exec_rsi_now = (
@@ -248,6 +264,51 @@ class MACDMomentumStrategy(BaseStrategy):
                 if self.use_rsi_buy_filter
                 else True
             )
+            macd_green_rsi_buy_ok = False
+            macd_rsi_window_values = []
+            macd_rsi_window_timestamps = []
+            macd_green_consecutive_ok = (hist_now > 0.0 and hist_prev > 0.0 and hist_now > hist_prev)
+            lookback = max(1, self.macd_green_rsi_lookback)
+            # Rule order is explicit by design:
+            # 1) current MACD histogram must be green (> 0),
+            # 2) require 2 consecutive green bars with increasing histogram,
+            # 3) then evaluate RSI<threshold over the recent closed RSI window.
+            if (
+                macd_green_consecutive_ok
+                and exec_rsi_series is not None
+                and len(exec_rsi_series) >= lookback
+                and len(exec_hist) >= lookback
+            ):
+                # Last N fully closed RSI values ending at latest closed candle.
+                recent_rsi = exec_rsi_series.iloc[-lookback:]
+                macd_rsi_window_values = [
+                    round(float(v), 2)
+                    for v in recent_rsi.tolist()
+                    if not pd.isna(v)
+                ]
+                macd_rsi_window_timestamps = [
+                    ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+                    for ts in recent_rsi.index.tolist()
+                ]
+                macd_green_rsi_buy_ok = bool(
+                    not recent_rsi.empty
+                    and (recent_rsi < self.macd_green_rsi_buy_threshold).any()
+                )
+            self.logger.info(
+                "[MACDMomentumStrategy] %s macd_rsi_rule hist_now=%.6f hist_prev=%.6f "
+                "green_consecutive_increasing=%s hist_ts=%s lookback=%s threshold=%.2f "
+                "rsi_window_ts=%s rsi_window=%s trigger=%s",
+                pair or self.state.pair,
+                hist_now,
+                hist_prev,
+                macd_green_consecutive_ok,
+                exec_df.index[-1].isoformat() if hasattr(exec_df.index[-1], "isoformat") else str(exec_df.index[-1]),
+                lookback,
+                self.macd_green_rsi_buy_threshold,
+                macd_rsi_window_timestamps,
+                macd_rsi_window_values,
+                macd_green_rsi_buy_ok,
+            )
 
             signal = "hold"
             confidence = 0.0
@@ -259,6 +320,8 @@ class MACDMomentumStrategy(BaseStrategy):
                 or hist_flipped_positive
                 or (bullish_cross and hist_expanding_up)
             )
+            macd_green_oversold_setup = exec_bias_bullish and macd_green_rsi_buy_ok
+            long_setup_ok = long_hist_ok or macd_green_oversold_setup
             short_hist_ok = (
                 (hist_falling_two_bars and (not self.require_hist_negative_for_short or hist_now < 0.0))
                 or hist_flipped_negative
@@ -268,26 +331,71 @@ class MACDMomentumStrategy(BaseStrategy):
             long_volume_ok = (not self.use_volume_confirmation) or volume_ok
             short_volume_ok = (not self.use_volume_confirmation) or volume_ok
 
-            if trend_bullish and price_above_ema and long_hist_ok and long_volume_ok and rsi_buy_ok:
+            if self.macd_green_rsi_force_buy_override and macd_green_rsi_buy_ok:
+                signal = "buy"
+                confidence = max(self.min_confidence_score, 0.85)
+                strength = max(min(1.0, abs(hist_now) * 8), 0.7)
+                reasons = ["macd_green_rsi_force_buy_override", "macd_green_rsi<35"]
+                if exec_bias_bullish:
+                    reasons.append("exec_tf_bull_bias")
+                if adx_boost_active:
+                    confidence = min(1.0, confidence + self.adx_confidence_boost)
+                    reasons.append("adx_boost")
+            elif (
+                long_macd_bias_ok
+                and price_above_ema
+                and long_setup_ok
+                and long_volume_ok
+                and (rsi_buy_ok or macd_green_rsi_buy_ok)
+                and adx_entry_ok
+            ):
                 signal = "buy"
                 confidence = self.min_confidence_score
                 strength = min(1.0, abs(hist_now) * 8)
-                reasons = ["trend_1h_bull_bias", "price>ema", "hist_long_setup"]
+                reasons = (
+                    ["trend_1h_bull_bias", "price>ema", "hist_long_setup"]
+                    if self.long_macd_bias_timeframe == "trend"
+                    else ["exec_tf_bull_bias", "price>ema", "hist_long_setup"]
+                )
                 if volume_ok:
                     reasons.append("vol_ok")
                 if self.use_rsi_buy_filter:
                     reasons.append("rsi_buy_ok")
+                if macd_green_rsi_buy_ok:
+                    reasons.append("macd_green_rsi<35")
+                if macd_green_oversold_setup:
+                    reasons.append("macd_green_oversold_setup")
                 if adx_boost_active:
                     confidence = min(1.0, confidence + self.adx_confidence_boost)
                     reasons.append("adx_boost")
                 if bullish_divergence:
                     confidence = min(1.0, confidence + self.divergence_confidence_boost)
                     reasons.append("bull_divergence")
-            elif trend_bearish and price_below_ema and short_hist_ok and short_volume_ok:
+            elif (
+                long_macd_bias_ok
+                and price_above_ema
+                and long_setup_ok
+                and long_volume_ok
+                and (rsi_buy_ok or macd_green_rsi_buy_ok)
+                and not adx_entry_ok
+                and self.enforce_adx_threshold
+            ):
+                self.logger.info(
+                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 "
+                    "reason=adx_below_threshold adx=%.2f need>=%.2f",
+                    pair or self.state.pair,
+                    adx_now,
+                    self.adx_threshold,
+                )
+            elif short_macd_bias_ok and price_below_ema and short_hist_ok and short_volume_ok and adx_entry_ok:
                 signal = "sell"
                 confidence = max(0.5, self.min_confidence_score - 0.05)
                 strength = min(1.0, abs(hist_now) * 8)
-                reasons = ["trend_1h_bear_bias", "price<ema", "hist_short_setup"]
+                reasons = (
+                    ["trend_1h_bear_bias", "price<ema", "hist_short_setup"]
+                    if self.short_macd_bias_timeframe == "trend"
+                    else ["exec_tf_bear_bias", "price<ema", "hist_short_setup"]
+                )
                 if volume_ok:
                     reasons.append("vol_ok")
                 if adx_boost_active:
@@ -296,6 +404,21 @@ class MACDMomentumStrategy(BaseStrategy):
                 if bearish_divergence:
                     confidence = min(1.0, confidence + self.divergence_confidence_boost)
                     reasons.append("bear_divergence")
+            elif (
+                short_macd_bias_ok
+                and price_below_ema
+                and short_hist_ok
+                and short_volume_ok
+                and not adx_entry_ok
+                and self.enforce_adx_threshold
+            ):
+                self.logger.info(
+                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 "
+                    "reason=adx_below_threshold adx=%.2f need>=%.2f",
+                    pair or self.state.pair,
+                    adx_now,
+                    self.adx_threshold,
+                )
 
             self.state.indicators.update(
                 {
@@ -305,11 +428,14 @@ class MACDMomentumStrategy(BaseStrategy):
                     "trend_macd": trend_macd_now,
                     "trend_macd_signal": trend_sig_now,
                     "adx": adx_now,
+                    "adx_entry_ok": adx_entry_ok,
+                    "enforce_adx_threshold": self.enforce_adx_threshold,
                     "volume_ratio": (current_volume / avg_volume) if avg_volume > 0 else 0.0,
                     "required_volume_multiplier": required_volume_multiplier,
                     "ema_exec": ema_now,
                     "hist_rising_two_bars": hist_rising_two_bars,
                     "hist_falling_two_bars": hist_falling_two_bars,
+                    "long_setup_ok": long_setup_ok,
                     "hist_flipped_positive": hist_flipped_positive,
                     "hist_flipped_negative": hist_flipped_negative,
                     "bullish_divergence": bullish_divergence,
@@ -317,6 +443,24 @@ class MACDMomentumStrategy(BaseStrategy):
                     "exec_rsi": exec_rsi_now,
                     "trend_rsi": trend_rsi_now,
                     "rsi_buy_ok": rsi_buy_ok,
+                    "macd_green_oversold_setup": macd_green_oversold_setup,
+                    "macd_green_rsi_buy_ok": macd_green_rsi_buy_ok,
+                    "macd_green_rsi_force_buy_override": self.macd_green_rsi_force_buy_override,
+                    "macd_green_rsi_lookback": lookback,
+                    "macd_green_rsi_threshold": self.macd_green_rsi_buy_threshold,
+                    "macd_green_consecutive_increasing": macd_green_consecutive_ok,
+                    "macd_hist_prev": hist_prev,
+                    "macd_hist_ts": (
+                        exec_df.index[-1].isoformat()
+                        if hasattr(exec_df.index[-1], "isoformat")
+                        else str(exec_df.index[-1])
+                    ),
+                    "macd_rsi_window_values": macd_rsi_window_values,
+                    "macd_rsi_window_timestamps": macd_rsi_window_timestamps,
+                    "exec_bias_bullish": exec_bias_bullish,
+                    "exec_bias_bearish": exec_bias_bearish,
+                    "long_macd_bias_ok": long_macd_bias_ok,
+                    "short_macd_bias_ok": short_macd_bias_ok,
                 }
             )
             self.state.last_signal = signal

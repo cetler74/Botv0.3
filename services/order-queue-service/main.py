@@ -355,10 +355,23 @@ class OrderQueueManager:
             return None
     
     async def get_current_price(self, exchange: str, symbol: str) -> Optional[float]:
-        """Spot price: ticker-live → price-feed (subscribe+GET) → REST ticker (aligns with orchestrator)."""
+        """
+        Spot price for entries (freshness-first):
+        1) exchange-service ticker-live (fresh cache gate),
+        2) exchange-service REST ticker (direct exchange query),
+        3) optional price-feed check for diagnostics only (not authoritative for entry fills).
+        """
         api_exchange = exchange.replace('crypto.com', 'cryptocom')
         # Symbol as in pair e.g. BTC/USDC for live + feed paths
         exchange_symbol = symbol if '/' in symbol else symbol
+        max_anchor_deviation_pct = 0.02
+
+        logger.info(
+            "🔎 [PRICE_FETCH_START] exchange=%s symbol=%s live_stale_threshold_seconds=%s",
+            exchange,
+            symbol,
+            5,
+        )
 
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
@@ -366,15 +379,92 @@ class OrderQueueManager:
                     f"{EXCHANGE_SERVICE_URL}/api/v1/market/ticker-live/{api_exchange}/{exchange_symbol}",
                     params={"stale_threshold_seconds": 5},
                 )
+                logger.info(
+                    "🔎 [PRICE_FETCH_LIVE] exchange=%s symbol=%s status=%s",
+                    exchange,
+                    symbol,
+                    live.status_code,
+                )
                 if live.status_code == 200:
                     data = live.json()
                     p = data.get('last') or data.get('close') or data.get('price')
                     if p and float(p) > 0:
-                        logger.info(f"📊 Price (ticker-live) {symbol} on {exchange}: {p}")
-                        return float(p)
+                        px = float(p)
+                        anchored = await self._anchor_price_to_recent_close(
+                            api_exchange, exchange_symbol, px, max_anchor_deviation_pct
+                        )
+                        logger.info(f"📊 Price (ticker-live) {symbol} on {exchange}: {anchored}")
+                        return anchored
+                elif live.status_code == 204:
+                    logger.warning(
+                        "⚠️ [PRICE_FETCH_LIVE_STALE] exchange=%s symbol=%s "
+                        "reason=no fresh live tick; falling back to REST ticker",
+                        exchange,
+                        symbol,
+                    )
+                else:
+                    logger.warning(
+                        "⚠️ [PRICE_FETCH_LIVE_NON200] exchange=%s symbol=%s status=%s; "
+                        "falling back to REST ticker",
+                        exchange,
+                        symbol,
+                        live.status_code,
+                    )
         except Exception as e:
-            logger.debug(f"ticker-live failed for {symbol}: {e}")
+            logger.warning(
+                "⚠️ [PRICE_FETCH_LIVE_ERROR] exchange=%s symbol=%s error=%s; "
+                "falling back to REST ticker",
+                exchange,
+                symbol,
+                e,
+            )
 
+        try:
+            if api_exchange == 'cryptocom':
+                if symbol == 'XLM/USDC':
+                    ticker_symbol = 'XLMUSD'
+                else:
+                    ticker_symbol = symbol.replace('/USDC', 'USD').replace('/', '')
+            else:
+                ticker_symbol = symbol.replace('/', '')
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                logger.info(
+                    "🔎 [PRICE_FETCH_REST_ATTEMPT] exchange=%s symbol=%s api_symbol=%s",
+                    exchange,
+                    symbol,
+                    ticker_symbol,
+                )
+                response = await client.get(
+                    f"{EXCHANGE_SERVICE_URL}/api/v1/market/ticker/{api_exchange}/{ticker_symbol}"
+                )
+                logger.info(
+                    "🔎 [PRICE_FETCH_REST] exchange=%s symbol=%s api_symbol=%s status=%s",
+                    exchange,
+                    symbol,
+                    ticker_symbol,
+                    response.status_code,
+                )
+
+                if response.status_code == 200:
+                    ticker = response.json()
+                    price = ticker.get('last') or ticker.get('close') or ticker.get('price')
+                    if price:
+                        px = float(price)
+                        anchored = await self._anchor_price_to_recent_close(
+                            api_exchange, exchange_symbol, px, max_anchor_deviation_pct
+                        )
+                        logger.info(f"📊 Price (REST ticker) {symbol} on {exchange}: {anchored}")
+                        return anchored
+
+                logger.warning(
+                    f"⚠️ REST ticker failed for {symbol} on {exchange}: {response.status_code}"
+                )
+        except Exception as e:
+            logger.error(f"❌ Error getting REST ticker price: {e}")
+
+        # Optional diagnostic-only check from price-feed.
+        # We still reject entry when live+REST both fail to avoid stale simulated fills.
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(
@@ -394,43 +484,67 @@ class OrderQueueManager:
                     data = r.json()
                     p = data.get('price')
                     if p and float(p) > 0:
-                        logger.info(
-                            f"📊 Price (price-feed) {symbol} on {exchange}: {p} "
-                            f"(cache_hit={data.get('cache_hit')})"
+                        px = float(p)
+                        anchored = await self._anchor_price_to_recent_close(
+                            api_exchange, exchange_symbol, px, max_anchor_deviation_pct
                         )
-                        return float(p)
+                        logger.warning(
+                            "⚠️ [ENTRY PRICE REJECTED] %s on %s has only price-feed quote %.8f "
+                            "(cache_hit=%s) but no fresh live/REST ticker; skipping order",
+                            symbol,
+                            exchange,
+                            anchored,
+                            data.get("cache_hit"),
+                        )
         except Exception as e:
-            logger.debug(f"price-feed failed for {symbol}: {e}")
+            logger.debug(f"price-feed diagnostic lookup failed for {symbol}: {e}")
 
+        logger.error(
+            "❌ [PRICE_FETCH_REJECTED] exchange=%s symbol=%s reason=no fresh live or REST ticker price",
+            exchange,
+            symbol,
+        )
+        return None
+
+    async def _anchor_price_to_recent_close(
+        self,
+        api_exchange: str,
+        exchange_symbol: str,
+        price: float,
+        max_deviation_pct: float,
+    ) -> float:
+        """Clamp outlier snapshots to recent 1m close anchor."""
         try:
-            if api_exchange == 'cryptocom':
-                if symbol == 'XLM/USDC':
-                    ticker_symbol = 'XLMUSD'
-                else:
-                    ticker_symbol = symbol.replace('/USDC', 'USD').replace('/', '')
-            else:
-                ticker_symbol = symbol.replace('/', '')
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(
-                    f"{EXCHANGE_SERVICE_URL}/api/v1/market/ticker/{api_exchange}/{ticker_symbol}"
+            if price <= 0:
+                return price
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(
+                    f"{EXCHANGE_SERVICE_URL}/api/v1/market/ohlcv/{api_exchange}/{exchange_symbol}",
+                    params={"timeframe": "1m", "limit": 3},
                 )
-
-                if response.status_code == 200:
-                    ticker = response.json()
-                    price = ticker.get('last') or ticker.get('close') or ticker.get('price')
-                    if price:
-                        logger.info(f"📊 Price (REST ticker) {symbol} on {exchange}: {price}")
-                        return float(price)
-
+            if r.status_code != 200:
+                return price
+            payload = r.json() or {}
+            closes = ((payload.get("data") or {}).get("close") or [])
+            if not closes:
+                return price
+            anchor = float(closes[-1] or 0.0)
+            if anchor <= 0:
+                return price
+            deviation = abs(price - anchor) / anchor
+            if deviation > max_deviation_pct:
                 logger.warning(
-                    f"⚠️ REST ticker failed for {symbol} on {exchange}: {response.status_code}"
+                    "⚠️ [SIM PRICE ANCHOR] Outlier for %s/%s: %.8f (anchor %.8f, dev %.2f%%) -> using anchor",
+                    api_exchange,
+                    exchange_symbol,
+                    price,
+                    anchor,
+                    deviation * 100.0,
                 )
-                return None
-
-        except Exception as e:
-            logger.error(f"❌ Error getting current price: {e}")
-            return None
+                return anchor
+            return price
+        except Exception:
+            return price
     
     async def get_available_balance(self, exchange: str, symbol: str) -> Optional[float]:
         """Get available balance for the base currency of the symbol"""

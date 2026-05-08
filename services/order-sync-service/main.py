@@ -892,7 +892,11 @@ async def get_performance_metrics():
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Get all orders from database
-            db_response = await client.get(f"{database_service_url}/api/v1/orders")
+            # Default DB API limit is 100; request a large page so metrics reflect real volume.
+            db_response = await client.get(
+                f"{database_service_url}/api/v1/orders",
+                params={"limit": 50000, "offset": 0},
+            )
             if db_response.status_code != 200:
                 raise HTTPException(status_code=500, detail="Failed to get orders from database")
             
@@ -901,17 +905,30 @@ async def get_performance_metrics():
             # Calculate comprehensive metrics
             total_orders = len(orders)
             
-            # Filter by order type
-            limit_orders = [o for o in orders if o.get('order_type') == 'limit']
-            market_orders = [o for o in orders if o.get('order_type') == 'market']
+            # Filter by order type (case-insensitive)
+            limit_orders = [o for o in orders if str(o.get("order_type") or "").lower() == "limit"]
+            market_orders = [o for o in orders if str(o.get("order_type") or "").lower() == "market"]
             
-            # Calculate status breakdown
+            # Calculate status breakdown (DB uses uppercase statuses, e.g. FILLED / PENDING)
+            def _order_status_upper(o: dict) -> str:
+                return str(o.get("status") or "").strip().upper()
+
             def get_status_metrics(order_list):
-                filled = [o for o in order_list if o.get('status') == 'filled']
-                pending = [o for o in order_list if o.get('status') == 'pending']
-                cancelled = [o for o in order_list if o.get('status') == 'cancelled']
-                failed = [o for o in order_list if o.get('status') == 'failed']
-                expired = [o for o in order_list if o.get('status') == 'expired']
+                filled = [
+                    o for o in order_list
+                    if _order_status_upper(o) in ("FILLED", "CLOSED", "COMPLETED")
+                ]
+                pending = [
+                    o for o in order_list
+                    if _order_status_upper(o)
+                    in ("PENDING", "OPEN", "NEW", "ACKNOWLEDGED", "PARTIALLY_FILLED")
+                ]
+                cancelled = [
+                    o for o in order_list
+                    if _order_status_upper(o) in ("CANCELLED", "CANCELED")
+                ]
+                failed = [o for o in order_list if _order_status_upper(o) in ("FAILED", "REJECTED")]
+                expired = [o for o in order_list if _order_status_upper(o) == "EXPIRED"]
                 
                 total = len(order_list)
                 success_rate = (len(filled) / total * 100) if total > 0 else 0
@@ -933,7 +950,9 @@ async def get_performance_metrics():
             exchange_metrics = {}
             exchanges = ['cryptocom', 'binance', 'bybit']
             for exchange in exchanges:
-                exchange_orders = [o for o in orders if o.get('exchange') == exchange]
+                exchange_orders = [
+                    o for o in orders if str(o.get("exchange") or "").strip().lower() == exchange
+                ]
                 exchange_metrics[exchange] = get_status_metrics(exchange_orders)
             
             # Time-based analysis

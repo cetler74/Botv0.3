@@ -57,6 +57,40 @@ class MarketRegimeDetector:
         self.bb_squeeze_threshold = 0.012  # 1.2% Bollinger Band squeeze (crypto-optimized)
         self.volume_spike_multiplier = 2.5 # Volume spike for crypto's explosive moves
         self.price_range_sideways = 0.03   # 3% price range for sideways market (tighter for crypto)
+        # Require trend persistence over recent candles so one-bar flips don't
+        # immediately classify as trending_up/down.
+        self.trend_lookback_bars = 4
+        self.trend_min_aligned_bars = 3
+        self.require_latest_trend_alignment = True
+        self.require_consecutive_trend_bars = False
+
+    def configure(self, cfg: Dict[str, any]) -> None:
+        """Allow strategy-service to tune detector behavior from config."""
+        if not isinstance(cfg, dict):
+            return
+        self.trend_lookback_bars = max(3, min(6, int(cfg.get("trend_lookback_bars", self.trend_lookback_bars) or self.trend_lookback_bars)))
+        self.trend_min_aligned_bars = max(2, min(self.trend_lookback_bars, int(cfg.get("trend_min_aligned_bars", self.trend_min_aligned_bars) or self.trend_min_aligned_bars)))
+        self.require_latest_trend_alignment = bool(cfg.get("require_latest_trend_alignment", self.require_latest_trend_alignment))
+        self.require_consecutive_trend_bars = bool(cfg.get("require_consecutive_trend_bars", self.require_consecutive_trend_bars))
+
+    @staticmethod
+    def _tail_true_count(mask: pd.Series, bars: int) -> int:
+        if mask is None or getattr(mask, "empty", True):
+            return 0
+        tail = mask.fillna(False).astype(bool).tail(max(1, bars)).tolist()
+        return sum(1 for v in tail if v)
+
+    @staticmethod
+    def _tail_true_streak(mask: pd.Series, bars: int) -> int:
+        if mask is None or getattr(mask, "empty", True):
+            return 0
+        streak = 0
+        for v in reversed(mask.fillna(False).astype(bool).tail(max(1, bars)).tolist()):
+            if v:
+                streak += 1
+            else:
+                break
+        return streak
         
     def detect_regime(self, ohlcv: pd.DataFrame, pair: str = "Unknown") -> Tuple[MarketRegime, Dict[str, any]]:
         """
@@ -86,7 +120,7 @@ class MarketRegimeDetector:
             }
             
             # 1. Trend Analysis (ADX + EMAs)
-            trend_analysis = self._analyze_trend(indicators, analysis)
+            trend_analysis = self._analyze_trend(indicators, ohlcv, analysis)
             
             # 2. Reversal Zone Analysis (RSI + Price levels)
             reversal_analysis = self._analyze_reversal_conditions(indicators, ohlcv, analysis)
@@ -205,7 +239,7 @@ class MarketRegimeDetector:
         
         return indicators
     
-    def _analyze_trend(self, indicators: Dict, analysis: Dict) -> Dict:
+    def _analyze_trend(self, indicators: Dict, ohlcv: pd.DataFrame, analysis: Dict) -> Dict:
         """Analyze trending conditions.
 
         PnL-FIX v4: Previous code required strong_adx (>35) AND ema_separation>2%
@@ -225,6 +259,19 @@ class MarketRegimeDetector:
         moderate_trend = adx > self.adx_trend_threshold     # >20
         trend_direction = indicators['ema_trend']
         ema_separation = abs(indicators['ema_fast'] - indicators['ema_slow']) / indicators['ema_slow']
+        adx_series = ta.adx(ohlcv['high'], ohlcv['low'], ohlcv['close'], length=14)
+        adx_line = adx_series['ADX_14'] if adx_series is not None and 'ADX_14' in adx_series else pd.Series(dtype=float)
+        ema_fast_series = ta.ema(ohlcv['close'], length=9)
+        ema_slow_series = ta.ema(ohlcv['close'], length=21)
+        up_align_mask = (ema_fast_series > ema_slow_series) & (adx_line > self.adx_trend_threshold)
+        down_align_mask = (ema_fast_series < ema_slow_series) & (adx_line > self.adx_trend_threshold)
+        lookback = max(1, min(self.trend_lookback_bars, len(ohlcv)))
+        up_aligned_bars = self._tail_true_count(up_align_mask, lookback)
+        down_aligned_bars = self._tail_true_count(down_align_mask, lookback)
+        up_streak = self._tail_true_streak(up_align_mask, lookback)
+        down_streak = self._tail_true_streak(down_align_mask, lookback)
+        latest_up_aligned = bool(up_align_mask.fillna(False).iloc[-1]) if len(up_align_mask) else False
+        latest_down_aligned = bool(down_align_mask.fillna(False).iloc[-1]) if len(down_align_mask) else False
 
         conditions['strong_adx'] = strong_trend
         conditions['moderate_adx'] = moderate_trend
@@ -232,6 +279,23 @@ class MarketRegimeDetector:
         conditions['ema_separation_wide'] = ema_separation > 0.02    # 2%+
         conditions['ema_separation_mild'] = ema_separation > 0.003   # 0.3%+
         conditions['ema_separation_value'] = ema_separation
+        conditions['trend_lookback_bars'] = lookback
+        conditions['trend_min_aligned_bars'] = self.trend_min_aligned_bars
+        conditions['up_aligned_bars'] = up_aligned_bars
+        conditions['down_aligned_bars'] = down_aligned_bars
+        conditions['up_alignment_streak'] = up_streak
+        conditions['down_alignment_streak'] = down_streak
+        conditions['latest_up_aligned'] = latest_up_aligned
+        conditions['latest_down_aligned'] = latest_down_aligned
+
+        def _persistence_ok(direction: str) -> bool:
+            aligned = up_aligned_bars if direction == "up" else down_aligned_bars
+            latest = latest_up_aligned if direction == "up" else latest_down_aligned
+            streak = up_streak if direction == "up" else down_streak
+            count_ok = aligned >= self.trend_min_aligned_bars
+            latest_ok = (not self.require_latest_trend_alignment) or latest
+            streak_ok = (not self.require_consecutive_trend_bars) or (streak >= self.trend_min_aligned_bars)
+            return count_ok and latest_ok and streak_ok
 
         def _score_trending(regime_key: str):
             if strong_trend and conditions['ema_separation_wide']:
@@ -248,9 +312,9 @@ class MarketRegimeDetector:
                 # Moderate trend — enough to prefer trend strategies
                 analysis['regime_scores'][regime_key] = 0.55 + (adx - 20) * 0.005
 
-        if trend_direction == "up":
+        if trend_direction == "up" and _persistence_ok("up"):
             _score_trending('trending_up')
-        elif trend_direction == "down":
+        elif trend_direction == "down" and _persistence_ok("down"):
             _score_trending('trending_down')
 
         analysis['conditions']['trend'] = conditions
@@ -531,5 +595,9 @@ class MarketRegimeDetector:
                 if "multi_timeframe_confluence" not in strategies:
                     strategies.append("multi_timeframe_confluence")
                     logger.info(f"➕ Added Multi-Timeframe Confluence for CRO/USD with relaxed parameters")
+
+        # Hard rule: macd_momentum must be evaluated in every regime.
+        if "macd_momentum" not in strategies:
+            strategies.append("macd_momentum")
         
         return strategies

@@ -2,6 +2,23 @@
 
 This directory contains comprehensive tests for the trading bot microservices architecture.
 
+## Strategy / TA tests (`pandas_ta`)
+
+`test_ta_indicator_parity.py` and `test_regime_detector_synthetic.py` import **`pandas_ta`**, the same library used by `strategy/market_regime_detector.py` and strategies. If it is not installed, pytest **skips those files** (you will see one skip per file at collection, not “many” unrelated failures).
+
+Use **one** Python for both install and pytest:
+
+```bash
+python3 -m pip install -r requirements-test.txt
+PYTHONPATH=. python3 -m pytest tests/unit/test_ta_indicator_parity.py tests/unit/test_regime_detector_synthetic.py -q
+```
+
+- **Apple `python3` (Xcode CLT, often 3.9):** `requirements-test.txt` installs **`pandas-ta-openbb` 0.4.20** (supports 3.9–3.11). Check with `python3 -c "import sys; print(sys.executable)"`.
+- **Homebrew `python3` (often 3.13):** installs **`pandas-ta-openbb` ≥0.4.23** (same `import pandas_ta`). Prefer `/opt/homebrew/bin/python3` if both Apple and Brew exist.
+- **Python 3.12** (e.g. `/opt/homebrew/opt/python@3.12/bin/python3.12`): installs upstream **`pandas-ta`**, aligned with `strategy-service` Docker.
+
+`test_session_vwap.py` only needs **pandas** and always runs without `pandas_ta`.
+
 ## Test Structure
 
 ```

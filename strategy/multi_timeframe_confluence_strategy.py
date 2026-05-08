@@ -23,6 +23,7 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any, Union
 
 from strategy.base_strategy import BaseStrategy
+from strategy import vwap_utils
 from strategy.strategy_pnl_enhanced import calculate_unrealized_pnl, check_profit_protection, check_profit_protection_enhanced
 from strategy.condition_logger import ConditionLogger
 
@@ -40,7 +41,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
     - ADX (Average Directional Index) for sideways market detection
     - Bollinger Bands for support/resistance levels
     - RSI for overbought/oversold conditions
-    - VWAP for fair value reference
+    - VWAP for fair value: ``vwap_mode=rolling`` (N-bar) or ``session_utc`` (cumulative from session midnight)
     """
     
     def __init__(self, config: Any, exchange=None, database=None, redis_client=None, exchange_name=None):
@@ -61,6 +62,9 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         self.bb_period = self._get_config_param('bb_period', 20)
         self.bb_std = self._get_config_param('bb_std', 2)
         self.vwap_period = self._get_config_param('vwap_period', 20)
+        _vm = str(self._get_config_param('vwap_mode', 'rolling') or 'rolling').lower().strip()
+        self.vwap_mode = 'session_utc' if _vm in ('session_utc', 'session', 'utc_session') else 'rolling'
+        self.vwap_session_tz = str(self._get_config_param('vwap_session_timezone', 'UTC') or 'UTC')
         self.stop_loss_pct = self._get_config_param('stop_loss_pct', 0.02)  # 2%
         self.take_profit_pct = self._get_config_param('take_profit_pct', 0.05)  # 5%
         
@@ -98,7 +102,8 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
                    f"bullish momentum threshold={self.bullish_momentum_threshold}, "
                    f"min confluence={self.min_confluence}, max daily volatility={self.max_daily_volatility_pct}% (default), "
                    f"asset-specific overrides={len(self.asset_volatility_overrides)} pairs, "
-                   f"stop loss={self.stop_loss_pct:.1%}, ATR multiplier={self.atr_stop_loss_multiplier}")
+                   f"stop loss={self.stop_loss_pct:.1%}, ATR multiplier={self.atr_stop_loss_multiplier}, "
+                   f"vwap_mode={self.vwap_mode} tz={self.vwap_session_tz}")
     
     def _get_config_param(self, param_name: str, default_value: Any) -> Any:
         """Get a parameter from the config."""
@@ -216,7 +221,7 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
             'bb_upper': f"HOURLY_BB_UPPER_{pair}_{self.hourly_timeframe}",
             'bb_middle': f"HOURLY_BB_MIDDLE_{pair}_{self.hourly_timeframe}",
             'bb_lower': f"HOURLY_BB_LOWER_{pair}_{self.hourly_timeframe}",
-            'vwap': f"HOURLY_VWAP_{pair}_{self.hourly_timeframe}",
+            'vwap': f"HOURLY_VWAP_{pair}_{self.hourly_timeframe}_{self.vwap_mode}_{self.vwap_session_tz}_{self.vwap_period}",
             'ema_9': f"HOURLY_EMA9_{pair}_{self.hourly_timeframe}",
             'ema_21': f"HOURLY_EMA21_{pair}_{self.hourly_timeframe}"
         }
@@ -312,12 +317,19 @@ class MultiTimeframeConfluenceStrategy(BaseStrategy):
         
         return df
     
+    def _calculate_rolling_vwap(self, df: pd.DataFrame) -> pd.Series:
+        """N-bar volume-weighted typical price (not cumulative session VWAP)."""
+        return vwap_utils.rolling_vwap_hlc3(df, self.vwap_period)
+
+    def _calculate_session_vwap(self, df: pd.DataFrame) -> pd.Series:
+        """Cumulative session VWAP from ``vwap_session_tz`` midnight."""
+        return vwap_utils.session_vwap_hlc3(df, self.vwap_session_tz)
+
     def _calculate_vwap(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate Volume Weighted Average Price."""
-        typical_price = (df['high'] + df['low'] + df['close']) / 3
-        vwap = (typical_price * df['volume']).rolling(window=self.vwap_period).sum() / \
-               df['volume'].rolling(window=self.vwap_period).sum()
-        return vwap
+        """Volume-weighted typical price per ``vwap_mode``."""
+        if self.vwap_mode == 'session_utc':
+            return self._calculate_session_vwap(df)
+        return self._calculate_rolling_vwap(df)
     
     def _calculate_atr_stop_loss(self, current_price: float) -> float:
         """Calculate ATR-based stop loss for more dynamic risk management"""

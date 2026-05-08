@@ -234,6 +234,8 @@ strategy_instances = {}
 signal_cache = {}
 # Last strategy evaluation per exchange → pair (for dashboard Exchange Status)
 pair_last_snapshots: Dict[str, Dict[str, Any]] = {}
+# Successful generate_signal() calls per strategy since process start (for dashboard)
+strategy_cumulative_runs: Dict[str, int] = {}
 # Align with orchestrator default entry bar (see trading.min_confidence_threshold in config)
 SNAPSHOT_ENTRY_CONFIDENCE = 0.3
 strategy_manager = None
@@ -321,6 +323,36 @@ exchange_adapter = ExchangeAdapter(exchange_service_url)
 market_regime_detector = MarketRegimeDetector()
 
 
+def _bump_strategy_cumulative_run(strategy_name: str) -> None:
+    global strategy_cumulative_runs
+    strategy_cumulative_runs[strategy_name] = strategy_cumulative_runs.get(strategy_name, 0) + 1
+
+
+def _pair_snapshot_aliases(pair: str) -> List[str]:
+    """Dashboard / DB may use BASE/QUOTE or BASEQUOTE; store snapshots under all sensible keys."""
+    if not pair:
+        return []
+    p = str(pair).strip()
+    seen = set()
+    out: List[str] = []
+    for cand in (p, p.replace("/", "")):
+        if cand and cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    if "/" not in p:
+        if len(p) >= 7 and p.endswith("USDC"):
+            slash = f"{p[:-4]}/USDC"
+            if slash not in seen:
+                seen.add(slash)
+                out.append(slash)
+        elif len(p) >= 6 and p.endswith("USD") and not p.endswith("USDC"):
+            slash = f"{p[:-3]}/USD"
+            if slash not in seen:
+                seen.add(slash)
+                out.append(slash)
+    return out
+
+
 def _record_pair_strategy_snapshot(
     exchange_name: str,
     pair: str,
@@ -336,7 +368,7 @@ def _record_pair_strategy_snapshot(
         pair_last_snapshots[ex] = {}
     now = datetime.utcnow().isoformat() + "Z"
     if analysis_status != "success" or not results:
-        pair_last_snapshots[ex][pair] = {
+        snap = {
             "timestamp": now,
             "analysis_status": analysis_status,
             "summary": detail or "No analysis data",
@@ -344,6 +376,8 @@ def _record_pair_strategy_snapshot(
             "consensus": {},
             "strategies": [],
         }
+        for pk in _pair_snapshot_aliases(pair):
+            pair_last_snapshots[ex][pk] = snap
         return
 
     strategies_out: List[Dict[str, Any]] = []
@@ -383,6 +417,33 @@ def _record_pair_strategy_snapshot(
         elif sig == "hold":
             outcome = "hold"
             reason = "HOLD — no directional entry from this strategy."
+            if name == "macd_momentum":
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    hist_now = indicators.get("exec_macd_hist")
+                    hist_prev = indicators.get("macd_hist_prev")
+                    exec_macd = indicators.get("exec_macd")
+                    exec_macd_signal = indicators.get("exec_macd_signal")
+                    exec_rsi = indicators.get("exec_rsi")
+                    trend_rsi = indicators.get("trend_rsi")
+                    lookback = indicators.get("macd_green_rsi_lookback")
+                    threshold = indicators.get("macd_green_rsi_threshold")
+                    green2 = indicators.get("macd_green_consecutive_increasing")
+                    rsi_ok = indicators.get("macd_green_rsi_buy_ok")
+                    hist_ts = indicators.get("macd_hist_ts")
+                    reason = (
+                        "HOLD — MACD rule not satisfied"
+                        + (
+                            f": hist={float(hist_now):.4f}, prev={float(hist_prev):.4f}, "
+                            f"macd={float(exec_macd):.4f}, signal={float(exec_macd_signal):.4f}, "
+                            f"green_2bar_up={bool(green2)}, rsi_window_ok={bool(rsi_ok)}, "
+                            f"rsi15={float(exec_rsi):.2f}, rsi1h={float(trend_rsi):.2f}, "
+                            f"lookback={int(lookback) if lookback is not None else '—'}, "
+                            f"threshold={float(threshold):.2f}, ts={hist_ts or '—'}"
+                            if all(v is not None for v in (hist_now, hist_prev, exec_macd, exec_macd_signal, exec_rsi, trend_rsi, threshold))
+                            else ""
+                        )
+                    )
             if name == "rsi_oversold_checklist":
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 checklist_buy = bool(indicators.get("checklist_buy", False))
@@ -434,6 +495,27 @@ def _record_pair_strategy_snapshot(
                 "strength": round(strength, 4),
                 "outcome": outcome,
                 "reason": reason,
+                "validation": (
+                    {
+                        "hist_now": ((sr.get("state") or {}).get("indicators") or {}).get("exec_macd_hist"),
+                        "hist_prev": ((sr.get("state") or {}).get("indicators") or {}).get("macd_hist_prev"),
+                        "exec_macd": ((sr.get("state") or {}).get("indicators") or {}).get("exec_macd"),
+                        "exec_macd_signal": ((sr.get("state") or {}).get("indicators") or {}).get("exec_macd_signal"),
+                        "trend_macd": ((sr.get("state") or {}).get("indicators") or {}).get("trend_macd"),
+                        "trend_macd_signal": ((sr.get("state") or {}).get("indicators") or {}).get("trend_macd_signal"),
+                        "exec_rsi": ((sr.get("state") or {}).get("indicators") or {}).get("exec_rsi"),
+                        "trend_rsi": ((sr.get("state") or {}).get("indicators") or {}).get("trend_rsi"),
+                        "lookback": ((sr.get("state") or {}).get("indicators") or {}).get("macd_green_rsi_lookback"),
+                        "threshold": ((sr.get("state") or {}).get("indicators") or {}).get("macd_green_rsi_threshold"),
+                        "green_consecutive_increasing": ((sr.get("state") or {}).get("indicators") or {}).get("macd_green_consecutive_increasing"),
+                        "rsi_window_ok": ((sr.get("state") or {}).get("indicators") or {}).get("macd_green_rsi_buy_ok"),
+                        "hist_ts": ((sr.get("state") or {}).get("indicators") or {}).get("macd_hist_ts"),
+                        "rsi_window": ((sr.get("state") or {}).get("indicators") or {}).get("macd_rsi_window_values"),
+                        "rsi_window_ts": ((sr.get("state") or {}).get("indicators") or {}).get("macd_rsi_window_timestamps"),
+                    }
+                    if name == "macd_momentum"
+                    else None
+                ),
             }
         )
 
@@ -459,7 +541,7 @@ def _record_pair_strategy_snapshot(
             f"{s['strategy']}: {s['signal']} ({s['confidence']:.2f}) — {s['reason']}"
         )
 
-    pair_last_snapshots[ex][pair] = {
+    snap = {
         "timestamp": now,
         "analysis_status": "success",
         "summary": " ".join(parts),
@@ -473,6 +555,8 @@ def _record_pair_strategy_snapshot(
         },
         "strategies": strategies_out,
     }
+    for pk in _pair_snapshot_aliases(pair):
+        pair_last_snapshots[ex][pk] = snap
 
 
 class StrategyManager:
@@ -490,12 +574,72 @@ class StrategyManager:
         self._initialize_strategies()
         self._load_regime_stability_config()
 
+    async def _persist_macd_analysis_log(
+        self,
+        exchange_name: str,
+        pair: str,
+        strategy_result: Dict[str, Any],
+    ) -> None:
+        """Persist MACD validation values for each fresh macd_momentum analysis."""
+        try:
+            indicators = ((strategy_result or {}).get("state") or {}).get("indicators") or {}
+            # Skip empty rows (e.g., early-regime short-circuit) to avoid misleading null-only records.
+            if indicators.get("exec_macd_hist") is None or indicators.get("macd_hist_prev") is None:
+                return
+            payload = {
+                "log_ts": (strategy_result or {}).get("timestamp") or datetime.utcnow().isoformat(),
+                "exchange": exchange_name,
+                "pair": pair,
+                "hist_now": indicators.get("exec_macd_hist"),
+                "hist_prev": indicators.get("macd_hist_prev"),
+                "green_consecutive_increasing": indicators.get("macd_green_consecutive_increasing"),
+                "hist_candle_ts": indicators.get("macd_hist_ts"),
+                "lookback": indicators.get("macd_green_rsi_lookback"),
+                "threshold": indicators.get("macd_green_rsi_threshold"),
+                "rsi_window_ts": indicators.get("macd_rsi_window_timestamps") or [],
+                "rsi_window": indicators.get("macd_rsi_window_values") or [],
+                "trigger": indicators.get("macd_green_rsi_buy_ok"),
+                "source": "strategy-service-live",
+                "raw_line": (
+                    f"[MACDMomentumStrategy] {pair} macd_rsi_rule "
+                    f"hist_now={indicators.get('exec_macd_hist')} "
+                    f"hist_prev={indicators.get('macd_hist_prev')} "
+                    f"green_consecutive_increasing={indicators.get('macd_green_consecutive_increasing')} "
+                    f"hist_ts={indicators.get('macd_hist_ts')} "
+                    f"lookback={indicators.get('macd_green_rsi_lookback')} "
+                    f"threshold={indicators.get('macd_green_rsi_threshold')} "
+                    f"rsi_window_ts={indicators.get('macd_rsi_window_timestamps') or []} "
+                    f"rsi_window={indicators.get('macd_rsi_window_values') or []} "
+                    f"trigger={indicators.get('macd_green_rsi_buy_ok')}"
+                ),
+            }
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                await client.post(
+                    f"{database_service_url}/api/v1/analytics/macd-analysis-logs",
+                    json=payload,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist macd analysis log for %s on %s: %s",
+                pair,
+                exchange_name,
+                e,
+            )
+
     def _load_regime_stability_config(self) -> None:
         """Load optional regime stability tuning from strategy config."""
         try:
             cfg = self.config.get("regime_stability")
             if isinstance(cfg, dict):
                 self._regime_stability_cfg.update(cfg)
+                market_regime_detector.configure(cfg)
+                logger.info(
+                    "Regime detector trend persistence configured: lookback=%s aligned=%s latest=%s consecutive=%s",
+                    market_regime_detector.trend_lookback_bars,
+                    market_regime_detector.trend_min_aligned_bars,
+                    market_regime_detector.require_latest_trend_alignment,
+                    market_regime_detector.require_consecutive_trend_bars,
+                )
         except Exception as e:
             logger.warning(f"Failed to load regime stability config; using defaults: {e}")
 
@@ -734,6 +878,7 @@ class StrategyManager:
             }
             
             # STEP 2: Run analysis only for applicable strategies
+            pair_specific_entry = await self._load_pair_specific_config_entry(pair, exchange_name)
             allowlist_set = set(strategy_allowlist) if strategy_allowlist else None
             strategies_analyzed = 0
             for strategy_name in applicable_strategies:
@@ -769,8 +914,10 @@ class StrategyManager:
                     logger.info(f"🔧 [STRATEGY INIT] Initializing {strategy_name} for {pair}")
                     await strategy_instance.initialize(pair)
                     
-                    # Apply pair-specific configuration overrides
-                    await self._apply_pair_specific_config(strategy_instance, strategy_name, pair, exchange_name)
+                    # Apply pair-specific configuration overrides (entry loaded once per pair analysis)
+                    self._apply_pair_strategy_overrides(
+                        strategy_instance, strategy_name, pair, pair_specific_entry
+                    )
                     
                     # Update strategy with market data (use primary timeframe)
                     if primary_timeframe in market_data:
@@ -828,6 +975,10 @@ class StrategyManager:
                         'selected_for_regime': market_regime.value,
                         'state': clean_state
                     }
+                    if strategy_name == "macd_momentum":
+                        await self._persist_macd_analysis_log(
+                            exchange_name, pair, analysis_results['strategies'][strategy_name]
+                        )
                     
                     # Log the final result
                     signal_emoji = "🟢" if signal == "buy" else "🔴" if signal == "sell" else "⚪"
@@ -838,6 +989,7 @@ class StrategyManager:
                     # Update last analysis time
                     strategy_data['last_analysis'] = datetime.utcnow()
                     strategies_analyzed += 1
+                    _bump_strategy_cumulative_run(strategy_name)
                     
                 except Exception as e:
                     logger.error(f"Error analyzing {pair} with {strategy_name}: {e}")
@@ -977,8 +1129,11 @@ class StrategyManager:
                 strength = float(result.get('strength', 0) or 0)
                 selected_for_regime = result.get('selected_for_regime', 'unknown')
 
-                # Independent override strategy does not contribute to weighted
-                # consensus voting. It is handled by explicit RSI override logic.
+                # Independent/non-consensus strategies do not contribute to
+                # weighted consensus voting.
+                # - RSI overrides are handled by explicit RSI override logic.
+                # - MACD momentum runs for telemetry/standalone visibility but
+                #   must not influence consensus voting.
                 if strategy_name == "rsi_oversold_override":
                     valid_signals.append({
                         'strategy': strategy_name,
@@ -991,6 +1146,17 @@ class StrategyManager:
                     })
                     continue
                 if strategy_name == "rsi_oversold_checklist":
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
+                if strategy_name == "macd_momentum":
                     valid_signals.append({
                         'strategy': strategy_name,
                         'signal': signal,
@@ -1111,6 +1277,7 @@ class StrategyManager:
                 primary_overrode = False
 
             # ---------- Step 4: RSI 15m oversold override --------------------------------
+            # Operator note: overrides run after SELL veto — see operator/README.md
             rsi_oversold_override = bool(ctx.get("rsi_15m_oversold_buy_override", False))
             rsi_checklist_override = bool(ctx.get("rsi_checklist_buy_override", False))
             rsi_15m_value = float(ctx.get("rsi_15m_value", 50.0) or 50.0)
@@ -1199,72 +1366,91 @@ class StrategyManager:
                 'participating_strategies': 0
             }
             
-    async def _apply_pair_specific_config(self, strategy_instance, strategy_name: str, pair: str, exchange_name: str) -> None:
-        """Apply pair-specific configuration overrides to a strategy instance"""
+    async def _load_pair_specific_config_entry(
+        self, pair: str, exchange_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load one entry from pair_specific_configs if the pair exists and exchange matches."""
+        config_url = f"{config_service_url}/api/v1/config/all"
         try:
-            # Get all config data first  
-            config_url = f"{config_service_url}/api/v1/config/all"
-            
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(config_url)
-                
-                if response.status_code == 200:
-                    config_data = response.json()
-                    pair_configs = config_data.get('pair_specific_configs', {})
-                    
-                    # Check for exact pair match
-                    if pair in pair_configs:
-                        pair_config = pair_configs[pair]
-                        
-                        # Verify exchange match
-                        if exchange_name and pair_config.get('exchange') != exchange_name:
-                            logger.debug(f"Exchange mismatch for pair {pair}: expected {exchange_name}, found {pair_config.get('exchange')}")
-                            return
-                            
-                        # Get strategy-specific overrides
-                        strategy_overrides = pair_config.get('market_conditions', {}).get('strategy_overrides', {})
-                        overrides = strategy_overrides.get(strategy_name, {})
-                        
-                        if overrides:
-                            logger.info(f"🎛️ [PAIR CONFIG] Applying {len(overrides)} overrides for {strategy_name} on {pair}")
-                            
-                            # Apply overrides to strategy parameters
-                            for param_name, param_value in overrides.items():
-                                if hasattr(strategy_instance, param_name):
-                                    old_value = getattr(strategy_instance, param_name)
-                                    setattr(strategy_instance, param_name, param_value)
-                                    logger.info(f"  📝 {param_name}: {old_value} → {param_value}")
-                                else:
-                                    logger.warning(f"  ❌ Parameter {param_name} not found in {strategy_name}")
-                        else:
-                            logger.debug(f"No specific overrides for {strategy_name} on {pair}")
-                    else:
-                        logger.debug(f"No pair-specific configuration for {pair}")
-                        
-                else:
-                    logger.warning(f"Failed to get config data: {response.status_code}")
-                    
         except Exception as e:
-            logger.error(f"Error applying pair-specific config for {pair}/{strategy_name}: {e}")
+            logger.error(f"Error fetching pair-specific config for {pair}: {e}")
+            return None
+        if response.status_code != 200:
+            logger.warning(f"Failed to get config data: {response.status_code}")
+            return None
+        pair_configs = response.json().get("pair_specific_configs") or {}
+        pair_config = pair_configs.get(pair)
+        if not pair_config:
+            logger.debug(f"No pair-specific configuration for {pair}")
+            return None
+        if exchange_name and pair_config.get("exchange") != exchange_name:
+            logger.debug(
+                f"Exchange mismatch for pair {pair}: expected {exchange_name}, "
+                f"found {pair_config.get('exchange')}"
+            )
+            return None
+        return pair_config
+
+    def _apply_pair_strategy_overrides(
+        self,
+        strategy_instance,
+        strategy_name: str,
+        pair: str,
+        pair_config: Optional[Dict[str, Any]],
+    ) -> None:
+        """Apply strategy_overrides from a pre-resolved pair_specific block to the instance."""
+        if not pair_config:
+            return
+        overrides = (
+            pair_config.get("market_conditions", {})
+            .get("strategy_overrides", {})
+            .get(strategy_name, {})
+        )
+        if not overrides:
+            logger.debug(f"No specific overrides for {strategy_name} on {pair}")
+            return
+        logger.info(
+            f"🎛️ [PAIR CONFIG] Applying {len(overrides)} overrides for {strategy_name} on {pair}"
+        )
+        for param_name, param_value in overrides.items():
+            if hasattr(strategy_instance, param_name):
+                old_value = getattr(strategy_instance, param_name)
+                setattr(strategy_instance, param_name, param_value)
+                logger.info(f"  📝 {param_name}: {old_value} → {param_value}")
+            else:
+                logger.warning(f"  ❌ Parameter {param_name} not found in {strategy_name}")
             
     async def _get_market_data_for_strategy(self, exchange_name: str, symbol: str,
                                            timeframes: List[str] = ['1h', '4h', '15m']) -> Dict[str, pd.DataFrame]:  # PnL-FIX v4
         """Get market data for strategy analysis"""
         try:
             market_data = {}
+            # Hard freshness gate: do not analyze on stale OHLCV snapshots.
+            # If exchange data lags too much, we skip that timeframe and fail-safe to no entry.
+            tf_seconds_map = {
+                '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
+                '1h': 3600, '2h': 7200, '4h': 14400,
+                '6h': 21600, '12h': 43200, '1d': 86400,
+            }
             
             for timeframe in timeframes:
                 # Retry logic for handling temporary timeout errors
                 max_retries = 3
                 response: Optional[httpx.Response] = None
 
-                # PnL-FIX v4: Per-timeframe candle limits.
-                # heikin_ashi gates on ``min_candles_tf >= 100`` and we drop
-                # the in-progress bar below — so we must request at least 110
-                # to land on 100+ closed candles. 4h → 150 gives ≈25 days.
-                # Fast TFs → 110 keeps Bybit REST throttle pressure low while
-                # clearing the 100-candle gate after the partial-bar drop.
-                ohlcv_limit = 150 if timeframe in ('4h', '1d') else 110
+                # Per-timeframe candle limits.
+                # We drop the in-progress (unclosed) last candle below, so the
+                # effective usable count is (limit - 1). RSI checklist uses
+                # EMA200 and requires >205 candles, therefore 1h/15m must fetch
+                # materially more than 110.
+                if timeframe in ("4h", "1d"):
+                    ohlcv_limit = 150
+                elif timeframe in ("1h", "15m"):
+                    ohlcv_limit = 240
+                else:
+                    ohlcv_limit = 110
 
                 for retry in range(max_retries):
                     try:
@@ -1347,11 +1533,7 @@ class StrategyManager:
                             # returns the currently-building bar. That partial bar
                             # poisons `df['volume'].iloc[-1]` and makes every
                             # volume veto fail, forcing HOLD across the bot.
-                            tf_seconds = {
-                                '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
-                                '1h': 3600, '2h': 7200, '4h': 14400,
-                                '6h': 21600, '12h': 43200, '1d': 86400,
-                            }.get(timeframe, 0)
+                            tf_seconds = tf_seconds_map.get(timeframe, 0)
                             if tf_seconds and len(df) >= 2:
                                 last_ts = df.index[-1]
                                 now_utc = pd.Timestamp.utcnow().tz_localize(None) if last_ts.tzinfo is None else pd.Timestamp.utcnow()
@@ -1359,6 +1541,40 @@ class StrategyManager:
                                 # the last row is still being built — drop it.
                                 if (last_ts + pd.Timedelta(seconds=tf_seconds)) > now_utc:
                                     df = df.iloc[:-1]
+
+                            # After dropping potentially in-progress candle, reject stale snapshots.
+                            if tf_seconds and len(df) >= 1:
+                                last_closed_open_ts = df.index[-1]
+                                if getattr(last_closed_open_ts, "tzinfo", None) is not None:
+                                    now_naive = pd.Timestamp.utcnow()
+                                    try:
+                                        last_closed_open_ts = last_closed_open_ts.tz_convert("UTC").tz_localize(None)
+                                    except Exception:
+                                        last_closed_open_ts = last_closed_open_ts.tz_localize(None)
+                                else:
+                                    now_naive = pd.Timestamp.utcnow().tz_localize(None)
+
+                                # Latest closed bar close time = open + timeframe seconds.
+                                last_closed_close_ts = last_closed_open_ts + pd.Timedelta(seconds=tf_seconds)
+                                age_seconds = max(
+                                    0.0, float((now_naive - last_closed_close_ts).total_seconds())
+                                )
+                                # Allow up to 2 bars of lag + 60s jitter.
+                                max_age_seconds = float((2 * tf_seconds) + 60)
+                                if age_seconds > max_age_seconds:
+                                    logger.warning(
+                                        "🚫 [DATA FRESHNESS] Stale %s candles for %s on %s: "
+                                        "last_closed_open=%s last_closed_close=%s age=%.0fs max=%.0fs. "
+                                        "Skipping timeframe to prevent stale-trade decisions.",
+                                        timeframe,
+                                        symbol,
+                                        exchange_name,
+                                        last_closed_open_ts.isoformat() if hasattr(last_closed_open_ts, "isoformat") else str(last_closed_open_ts),
+                                        last_closed_close_ts.isoformat() if hasattr(last_closed_close_ts, "isoformat") else str(last_closed_close_ts),
+                                        age_seconds,
+                                        max_age_seconds,
+                                    )
+                                    continue
 
                             market_data[timeframe] = df
                             logger.info(f"✅ [DATA FETCH] Got {len(df)} {timeframe} candles for {symbol} on {exchange_name}")
@@ -1597,6 +1813,13 @@ async def continuous_strategy_analysis():
                     
                 except Exception as e:
                     logger.error(f"❌ Error analyzing {pair} on {exchange}: {e}")
+                    _record_pair_strategy_snapshot(
+                        exchange,
+                        pair,
+                        None,
+                        analysis_status="error",
+                        detail=str(e)[:2000],
+                    )
                     continue
             
             # Wait before next analysis cycle
@@ -2013,8 +2236,13 @@ async def get_cache_stats():
 
 @app.get("/api/v1/pair-snapshots")
 async def get_pair_snapshots():
-    """Latest strategy evaluation per exchange and pair (for dashboard Exchange Status)."""
-    return pair_last_snapshots
+    """Latest per-pair snapshot + cumulative per-strategy run counts (process lifetime)."""
+    return {
+        "snapshots": pair_last_snapshots,
+        "strategy_cumulative_runs": dict(
+            sorted(strategy_cumulative_runs.items(), key=lambda x: x[0])
+        ),
+    }
 
 
 # Startup and shutdown events
@@ -2036,6 +2264,7 @@ async def shutdown_event():
     # Clear any cached data
     signal_cache.clear()
     pair_last_snapshots.clear()
+    strategy_cumulative_runs.clear()
     strategies.clear()
     strategy_instances.clear()
     logger.info("Strategy Service shutdown complete")

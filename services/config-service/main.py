@@ -127,7 +127,6 @@ class TradingConfig(BaseModel):
     max_daily_loss: float
     max_total_loss: float
     stop_loss_percentage: float
-    take_profit_percentage: float
 
 class StrategyConfig(BaseModel):
     enabled: bool
@@ -382,6 +381,7 @@ async def get_trading_config():
         "cycle_interval_seconds",
         "exit_cycle_first",
         "max_cycle_duration",
+        "entry_loop_reserve_seconds",
         "exit_check_concurrency",
         "exit_price_prefetch_concurrency",
     ):

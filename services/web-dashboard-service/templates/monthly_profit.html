@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>Monthly Realized PnL - Trading Bot Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/mobile.css">
+    <style>
+        .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .card-hover { transition: transform 0.2s ease-in-out; }
+        .card-hover:hover { transform: translateY(-2px); }
+    </style>
+</head>
+<body class="bg-gray-50">
+    {% set page_title = "Monthly Realized PnL" %}
+    {% include 'partials/app_nav_bar_standalone.html' %}
+    <div class="bg-gray-100 border-b border-gray-200 px-4 sm:px-6 lg:px-8 py-2 flex justify-end">
+        <button type="button" onclick="refreshData()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium min-h-[44px]">
+            <i class="fas fa-sync-alt mr-1"></i>Refresh
+        </button>
+    </div>
+
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div id="loading" class="text-center py-8">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+            <p class="mt-4 text-gray-600">Loading monthly summary...</p>
+        </div>
+
+        <div id="content" class="hidden">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+                    <p class="text-sm font-medium text-gray-600">Monthly goal (USD)</p>
+                    <p id="targetUsd" class="text-3xl font-bold text-indigo-700">--</p>
+                    <p class="text-xs text-gray-500 mt-1">From <code class="bg-gray-100 px-1 rounded">trading.monthly_profit_target_usd</code> in config</p>
+                </div>
+                <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+                    <p class="text-sm font-medium text-gray-600">All-time realized (closed)</p>
+                    <p id="totalRealized" class="text-3xl font-bold text-gray-900">--</p>
+                    <p id="totalClosedHint" class="text-xs text-gray-500 mt-1"></p>
+                </div>
+                <div class="bg-white rounded-lg shadow-md p-6 card-hover">
+                    <p class="text-sm font-medium text-gray-600">Current month vs goal</p>
+                    <p id="currentMonthVsGoal" class="text-2xl font-bold text-gray-900">--</p>
+                    <div class="w-full bg-gray-200 rounded-full h-3 mt-3">
+                        <div id="currentMonthBar" class="bg-indigo-600 h-3 rounded-full transition-all" style="width: 0%"></div>
+                    </div>
+                    <p id="currentMonthDetail" class="text-xs text-gray-500 mt-2"></p>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md overflow-hidden">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">
+                        <i class="fas fa-table text-indigo-600 mr-2"></i>
+                        Realized PnL by calendar month (UTC, exit_time)
+                    </h2>
+                    <p class="text-sm text-gray-500 mt-1">Most recent months first. Progress compares monthly realized sum to the goal.</p>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Month</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Realized</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Closes</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Avg / close</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">vs goal</th>
+                            </tr>
+                        </thead>
+                        <tbody id="monthlyBody" class="bg-white divide-y divide-gray-200"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function fmtUsd(n) {
+            const x = Number(n);
+            if (Number.isNaN(x)) return '--';
+            const sign = x < 0 ? '-' : '';
+            return sign + '$' + Math.abs(x).toFixed(2);
+        }
+
+        function progressBarClass(pct) {
+            if (pct >= 100) return 'bg-green-600';
+            if (pct >= 50) return 'bg-indigo-600';
+            if (pct >= 0) return 'bg-amber-500';
+            return 'bg-red-500';
+        }
+
+        function pctOfGoal(realized, target) {
+            const t = Number(target);
+            if (!t || t <= 0) return 0;
+            return (Number(realized) / t) * 100;
+        }
+
+        async function fetchMonthly() {
+            const response = await fetch('/api/v1/monthly-profit-summary?months=24');
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.json();
+        }
+
+        function render(data) {
+            document.getElementById('loading').classList.add('hidden');
+            document.getElementById('content').classList.remove('hidden');
+
+            const target = Number(data.target_usd != null ? data.target_usd : 1000);
+            document.getElementById('targetUsd').textContent = fmtUsd(target);
+
+            const totalR = data.total_realized_all_time;
+            document.getElementById('totalRealized').textContent = fmtUsd(totalR);
+            const nClosed = data.closed_trade_count_all;
+            document.getElementById('totalClosedHint').textContent =
+                nClosed != null ? `${nClosed} closed trade(s) in database` : '';
+
+            const months = data.months || [];
+            const now = new Date();
+            const ymNow = now.getUTCFullYear() + '-' + String(now.getUTCMonth() + 1).padStart(2, '0');
+
+            let current = months.find(m => m.year_month === ymNow);
+            if (!current && months.length) {
+                current = months[0];
+            }
+
+            if (current) {
+                const realized = Number(current.realized_sum);
+                const pg = pctOfGoal(realized, target);
+                const barW = Math.max(0, Math.min(100, pg));
+                document.getElementById('currentMonthVsGoal').textContent =
+                    fmtUsd(realized) + ' / ' + fmtUsd(target);
+                const bar = document.getElementById('currentMonthBar');
+                bar.style.width = barW + '%';
+                bar.className = 'h-3 rounded-full transition-all ' + progressBarClass(pg);
+                document.getElementById('currentMonthDetail').textContent =
+                    `Month ${current.year_month}: ${current.closed_count} close(s), avg ${fmtUsd(current.avg_realized)}`;
+            } else {
+                document.getElementById('currentMonthVsGoal').textContent = 'No closed trades yet';
+                document.getElementById('currentMonthDetail').textContent = '';
+            }
+
+            const tbody = document.getElementById('monthlyBody');
+            tbody.innerHTML = '';
+            if (!months.length) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = '<td colspan="5" class="px-6 py-4 text-sm text-gray-500">No closed trades with exit_time.</td>';
+                tbody.appendChild(tr);
+                return;
+            }
+
+            months.forEach(m => {
+                const realized = Number(m.realized_sum);
+                const pctGoal = pctOfGoal(realized, target);
+                const barW = Math.max(0, Math.min(100, pctGoal));
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${m.year_month}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-right ${realized >= 0 ? 'text-green-700' : 'text-red-700'}">${fmtUsd(realized)}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-right text-gray-700">${m.closed_count}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-right text-gray-700">${fmtUsd(m.avg_realized)}</td>
+                    <td class="px-6 py-4 text-sm text-gray-700">
+                        <div class="flex items-center gap-2">
+                            <div class="flex-1 bg-gray-200 rounded-full h-2 min-w-[4rem]">
+                                <div class="h-2 rounded-full ${progressBarClass(pctGoal)}" style="width: ${barW}%"></div>
+                            </div>
+                            <span class="text-xs whitespace-nowrap">${pctGoal.toFixed(0)}%</span>
+                        </div>
+                    </td>`;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function refreshData() {
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('content').classList.add('hidden');
+            try {
+                const data = await fetchMonthly();
+                render(data);
+            } catch (e) {
+                console.error(e);
+                document.getElementById('loading').innerHTML =
+                    '<div class="text-red-600"><i class="fas fa-exclamation-triangle mb-2"></i><p>Error loading monthly data</p></div>';
+            }
+        }
+
+        refreshData();
+    </script>
+</body>
+</html>

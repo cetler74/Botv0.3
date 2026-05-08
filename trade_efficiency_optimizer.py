@@ -328,7 +328,6 @@ trading:
   max_trades_per_exchange: 5  # Increased from typical 2-3
   min_exchange_balance: 50.0  # Keep reasonable minimum
   stop_loss_percentage: 3.5  # Keep risk management
-  take_profit_percentage: 5.0
 
 # STRATEGY PARAMETERS - Dramatically relaxed for efficiency
 strategies:

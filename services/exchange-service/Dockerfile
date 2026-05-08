@@ -8,12 +8,15 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
+# Build context is repo root (see docker-compose) so we can bundle shared config
+COPY services/exchange-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code (trailing / required when multiple *.py match)
-COPY *.py ./
+RUN mkdir -p /app/config
+COPY config/config.yaml /app/config/config.yaml
+
+# Application modules (trailing / required when multiple *.py match)
+COPY services/exchange-service/*.py ./
 
 # Expose port
 EXPOSE 8003
@@ -23,4 +26,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8003/health || exit 1
 
 # Run the application
-CMD ["python", "main.py"] 
+CMD ["python", "main.py"]
