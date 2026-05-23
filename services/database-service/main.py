@@ -50,6 +50,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import os
+from hyperliquid_ledger import compute_hyperliquid_balance_amounts
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
 
 # Import centralized trade closure service
@@ -1200,6 +1201,84 @@ async def get_simulation_settings_cached() -> Dict[str, float]:
     return {"starting_balance_per_exchange_usd": 2000.0, "fee_rate_per_side": 0.0005}
 
 
+async def get_hyperliquid_perps_settings_cached() -> Dict[str, Any]:
+    """HL perps venue settings from config-service."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{config_service_url}/api/v1/config/hyperliquid-perps")
+            if r.status_code == 200:
+                data = r.json() or {}
+                return {
+                    "starting_balance_usd": float(data.get("starting_balance_usd", 5000.0)),
+                    "wallet_address": str(data.get("wallet_address") or "").strip(),
+                    "mode": str(data.get("mode", "paper")),
+                }
+    except Exception as e:
+        logger.debug("get_hyperliquid_perps_settings_cached: %s", e)
+    return {"starting_balance_usd": 5000.0, "wallet_address": "", "mode": "paper"}
+
+
+async def get_derived_hyperliquid_balance() -> Dict[str, float]:
+    """Paper HL equity from perp_paper_trades (separate from spot trading.trades ledger)."""
+    hl = await get_hyperliquid_perps_settings_cached()
+    starting = float(hl["starting_balance_usd"])
+
+    summary = await db_manager.execute_single_query(
+        """
+        SELECT
+            COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS total_realized_pnl,
+            COALESCE(SUM(realized_pnl) FILTER (
+                WHERE status = 'CLOSED' AND exit_time >= CURRENT_DATE
+            ), 0) AS daily_realized_pnl,
+            COALESCE(SUM(unrealized_pnl) FILTER (WHERE status = 'OPEN'), 0) AS unrealized_pnl,
+            COALESCE(SUM(margin_used) FILTER (WHERE status = 'OPEN'), 0) AS margin_used
+        FROM trading.perp_paper_trades
+        WHERE LOWER(venue) = 'hyperliquid'
+        """
+    ) or {}
+
+    return compute_hyperliquid_balance_amounts(
+        starting_balance_usd=starting,
+        total_realized_pnl=float(summary.get("total_realized_pnl") or 0),
+        unrealized_pnl=float(summary.get("unrealized_pnl") or 0),
+        margin_used=float(summary.get("margin_used") or 0),
+        daily_realized_pnl=float(summary.get("daily_realized_pnl") or 0),
+    )
+
+
+async def sync_hyperliquid_balance_row() -> None:
+    """Upsert trading.balance row for hyperliquid from derived perp ledger (simulation)."""
+    if not db_manager:
+        return
+    if not await is_simulation_mode():
+        return
+    try:
+        v = await get_derived_hyperliquid_balance()
+        query = """
+            INSERT INTO trading.balance (exchange, balance, available_balance, total_pnl, daily_pnl, timestamp)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (exchange) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                available_balance = EXCLUDED.available_balance,
+                total_pnl = EXCLUDED.total_pnl,
+                daily_pnl = EXCLUDED.daily_pnl,
+                timestamp = EXCLUDED.timestamp,
+                updated_at = CURRENT_TIMESTAMP
+        """
+        await db_manager.execute_query(
+            query,
+            (
+                "hyperliquid",
+                v["balance"],
+                v["available_balance"],
+                v["total_pnl"],
+                v["daily_pnl"],
+            ),
+        )
+    except Exception as e:
+        logger.debug("sync_hyperliquid_balance_row: %s", e)
+
+
 async def is_simulation_mode() -> bool:
     """Return True if the trading mode is 'simulation'."""
     try:
@@ -1309,6 +1388,7 @@ async def seed_simulation_balances_if_needed() -> None:
             query,
             (SIMULATION_DEFAULT_BALANCE_USD, SIMULATION_DEFAULT_BALANCE_USD),
         )
+        await sync_hyperliquid_balance_row()
     except Exception as e:
         logger.warning("seed_simulation_balances_if_needed: update failed: %s", e)
 
@@ -2029,7 +2109,16 @@ async def get_perp_paper_summary():
         closed = float(summary.get("closed_trades") or 0)
         wins = float(summary.get("winning_trades") or 0)
         summary["win_rate"] = (wins / closed * 100.0) if closed > 0 else 0.0
-        return {"summary": summary, "by_side": by_side, "by_strategy": by_strategy}
+
+        await sync_hyperliquid_balance_row()
+        hl_balance = await get_derived_hyperliquid_balance()
+        summary["equity"] = hl_balance["equity"]
+        summary["available_balance"] = hl_balance["available_balance"]
+        summary["starting_balance"] = hl_balance["starting_balance"]
+        summary["margin_used"] = hl_balance["margin_used"]
+        summary["balance_source"] = hl_balance["balance_source"]
+
+        return {"summary": summary, "by_side": by_side, "by_strategy": by_strategy, "balance": hl_balance}
     except Exception as e:
         logger.error(f"Failed to get perp paper summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -3261,6 +3350,13 @@ async def get_all_balances():
     try:
         if await is_simulation_mode():
             derived = await get_derived_exchange_balances()
+            hl_derived = await get_derived_hyperliquid_balance()
+            derived["hyperliquid"] = {
+                "balance": hl_derived["balance"],
+                "available_balance": hl_derived["available_balance"],
+                "total_pnl": hl_derived["total_pnl"],
+                "daily_pnl": hl_derived["daily_pnl"],
+            }
             now = datetime.utcnow().isoformat()
             balances = [
                 {
@@ -3299,6 +3395,36 @@ async def get_balance(exchange_name: str):
     await seed_simulation_balances_if_needed()
 
     try:
+        ex_key = exchange_name.lower().strip()
+        if ex_key == "hyperliquid":
+            if await is_simulation_mode():
+                await sync_hyperliquid_balance_row()
+                v = await get_derived_hyperliquid_balance()
+                return {
+                    "exchange": "hyperliquid",
+                    "balance": v["balance"],
+                    "available_balance": v["available_balance"],
+                    "equity": v["equity"],
+                    "margin_used": v["margin_used"],
+                    "starting_balance": v["starting_balance"],
+                    "unrealized_pnl": v["unrealized_pnl"],
+                    "total_pnl": v["total_pnl"],
+                    "daily_pnl": v["daily_pnl"],
+                    "balance_source": v["balance_source"],
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            query = """
+                SELECT * FROM trading.balance
+                WHERE exchange = %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
+            balance = await db_manager.execute_single_query(query, (ex_key,))
+            if not balance:
+                raise HTTPException(status_code=404, detail="Hyperliquid balance not found")
+            balance["balance_source"] = "hyperliquid_wallet"
+            return balance
+
         if await is_simulation_mode():
             derived = await get_derived_exchange_balances()
             v = derived.get(exchange_name)

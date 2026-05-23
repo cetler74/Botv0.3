@@ -547,6 +547,22 @@ async def get_simulation_settings():
         "fee_rate_per_side": float(sim.get('fee_rate_per_side', 0.0005)),
     }
 
+
+@app.get("/api/v1/config/hyperliquid-perps")
+async def get_hyperliquid_perps_settings():
+    """Hyperliquid perps venue settings (balance, wallet, paper engine)."""
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    hl = (config_data.get("trading", {}) or {}).get("hyperliquid_perps", {}) or {}
+    return {
+        "enabled": bool(hl.get("enabled", False)),
+        "mode": str(hl.get("mode", "paper")),
+        "starting_balance_usd": float(hl.get("starting_balance_usd", 5000.0)),
+        "wallet_address": str(hl.get("wallet_address") or "").strip(),
+        "fee_rate_per_side": float(hl.get("fee_rate_per_side", 0.001)),
+        "allow_live_orders": bool(hl.get("allow_live_orders", False)),
+    }
+
 @app.get("/api/v1/config/pair_specific/{pair}/{strategy_name}")
 async def get_pair_specific_config(pair: str, strategy_name: str, exchange: Optional[str] = None):
     """Get pair-specific configuration overrides for a strategy"""

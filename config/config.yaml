@@ -1655,6 +1655,10 @@ trading:
     # mirrored strategy signals, but never sends live orders.
     enabled: true
     mode: paper
+    # Dedicated HL venue equity (separate from spot starting_balance_per_exchange_usd).
+    starting_balance_usd: 5000.0
+    wallet_address: "${HYPERLIQUID_WALLET_ADDRESS}"
+    fee_rate_per_side: 0.001
     allow_live_orders: false
     default_leverage: 2.0
     max_margin_per_trade: 25.0
@@ -1665,7 +1669,17 @@ trading:
     stop_loss_pct: 1.5
     take_profit_pct: 2.5
     max_holding_minutes: 240
+    # HL-native pair selector (metaAndAssetCtxs: dayNtlVlm, open interest, impact spread).
+    # allowed_symbols is an optional cap on the HL universe; leave empty to rank all HL perps.
     allowed_symbols: [BTC, ETH, SOL, XRP, LINK, AVAX, DOGE, NEAR, ARB, OP, SUI, APT]
+    pair_selector:
+      enabled: true
+      max_pairs: 12
+      update_interval_minutes: 15
+      min_day_notional_volume: 1000000
+      min_open_interest: 50000
+      max_impact_spread_pct: 0.5
+      blacklisted_coins: []
     mirror_source_exchanges: [binance, bybit, cryptocom]
   # PnL-FIX v5 — Position-sizer diversification overcap.
   # Hard ceiling on a single position relative to the equal-weight slot budget

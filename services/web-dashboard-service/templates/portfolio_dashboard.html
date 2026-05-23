@@ -3,28 +3,28 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Portfolio Intelligence</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260521" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260521">
+    <title>Hyperliquid Paper Perps</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260528" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260528">
 </head>
 <body>
     <header class="pi-topbar">
         <div class="pi-brand">
-            <div class="pi-brand-mark"><i class="fas fa-chart-line"></i></div>
+            <div class="pi-brand-mark pi-brand-hl"><i class="fas fa-water"></i></div>
             <div>
-                <h1>Portfolio Intelligence</h1>
-                <p>Crypto pairs, PnL, signals, and token context</p>
+                <h1>Hyperliquid Paper Perps</h1>
+                <p>Perpetual paper trading · mirrored spot signals</p>
             </div>
         </div>
         <div class="pi-topbar-center">
             <span class="pi-live"><span></span>Live</span>
-            <span class="pi-pill" id="exchange-pill-binance">Binance</span>
-            <span class="pi-pill" id="exchange-pill-bybit">Bybit</span>
-            <span class="pi-pill" id="exchange-pill-cryptocom">Crypto.com</span>
-            <span class="pi-credit-pill" id="coinstats-credit-pill">External data: loading</span>
+            <span class="pi-pill pi-pill-hl" id="hl-mode-pill">HL: Paper</span>
+            <span class="pi-pill" id="hl-engine-pill">Engine: …</span>
+            <span class="pi-pill" id="hl-mirror-pill">Mirror: …</span>
+            <span class="pi-pill" id="hl-orchestrator-pill">Orchestrator: …</span>
         </div>
         <div class="pi-actions">
-            <a href="/legacy-dashboard" class="pi-link">Legacy</a>
+            <a href="/legacy-dashboard" class="pi-link">Spot Legacy</a>
             <button class="pi-btn pi-btn-start" data-control="start"><i class="fas fa-play"></i> Start</button>
             <button class="pi-btn pi-btn-stop" data-control="stop"><i class="fas fa-pause"></i> Stop</button>
             <button class="pi-btn pi-btn-danger" data-control="emergency"><i class="fas fa-stop-circle"></i> Emergency</button>
@@ -32,110 +32,123 @@
     </header>
 
     <main class="pi-shell">
-        <section class="pi-hero">
+        <section class="pi-hero pi-hero-hl">
             <div class="pi-hero-main">
-                <p class="pi-eyebrow">Total Portfolio</p>
-                <div class="pi-portfolio-value" id="total-portfolio">$0.00</div>
+                <p class="pi-eyebrow">Hyperliquid venue · <span id="hl-balance-source">paper</span></p>
+                <div class="pi-portfolio-value" id="hero-equity">$0.00</div>
                 <div class="pi-portfolio-sub">
+                    <span id="hero-available">Available: $0.00</span>
                     <span id="trading-status">Status: loading</span>
                     <span id="updated-at">Updating...</span>
                 </div>
             </div>
             <div class="pi-kpi-grid">
                 <article class="pi-kpi">
-                    <span>Daily PnL</span>
-                    <strong id="daily-pnl">$0.00</strong>
+                    <span>Margin in use</span>
+                    <strong id="hero-margin-used">$0.00</strong>
                 </article>
                 <article class="pi-kpi">
-                    <span>Total PnL</span>
-                    <strong id="total-pnl">$0.00</strong>
+                    <span>Open notional</span>
+                    <strong id="hero-open-notional">$0.00</strong>
                 </article>
                 <article class="pi-kpi">
-                    <span>Invested</span>
-                    <strong id="invested-amount">$0.00</strong>
+                    <span>Open longs</span>
+                    <strong id="perp-open-longs">0</strong>
                 </article>
                 <article class="pi-kpi">
-                    <span>Open Trades</span>
-                    <strong id="open-trades">0</strong>
+                    <span>Open shorts</span>
+                    <strong id="perp-open-shorts">0</strong>
                 </article>
                 <article class="pi-kpi">
-                    <span>Win Rate</span>
-                    <strong id="win-rate">0.0%</strong>
+                    <span>Open margin</span>
+                    <strong id="perp-open-margin">$0.00</strong>
                 </article>
                 <article class="pi-kpi">
-                    <span>Unrealized</span>
-                    <strong id="unrealized-pnl">$0.00</strong>
+                    <span>Realized PnL</span>
+                    <strong id="perp-realized-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Unrealized PnL</span>
+                    <strong id="perp-unrealized-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Win rate</span>
+                    <strong id="perp-win-rate">0.0%</strong>
                 </article>
             </div>
         </section>
 
-        <section class="pi-grid">
-            <article class="pi-panel pi-positions">
-                <div class="pi-panel-head">
-                    <div>
-                        <p class="pi-eyebrow">Active Pairs</p>
-                        <h2>Positions & Watchlist</h2>
-                    </div>
-                    <span id="position-count" class="pi-muted">0 pairs</span>
+        <section class="pi-panel pi-positions pi-hl-watchlist">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Hyperliquid · Pair universe</p>
+                    <h2>Pairs under analysis</h2>
                 </div>
-                <div class="pi-table-wrap">
-                    <table class="pi-table">
-                        <thead>
-                            <tr>
-                                <th>Pair</th>
-                                <th>Exchange</th>
-                                <th>Price</th>
-                                <th>24h</th>
-                                <th>Position</th>
-                                <th>Realized</th>
-                                <th>Unrealized</th>
-                                <th>Strategy</th>
-                                <th>Signal</th>
-                            </tr>
-                        </thead>
-                        <tbody id="positions-body">
-                            <tr><td colspan="9" class="pi-empty">Loading positions...</td></tr>
-                        </tbody>
-                    </table>
+                <div class="pi-head-actions">
+                    <label class="pi-toggle">
+                        <input type="checkbox" id="watchlist-active-only" />
+                        Active only
+                    </label>
+                    <span id="watchlist-count" class="pi-muted">0 coins</span>
                 </div>
-            </article>
-
-            <aside class="pi-panel pi-news">
-                <div class="pi-panel-head">
-                    <div>
-                        <p class="pi-eyebrow">Token News</p>
-                        <h2>Market Context</h2>
-                    </div>
-                    <span class="pi-muted">Cached</span>
-                </div>
-                <div id="news-list" class="pi-news-list">
-                    <div class="pi-empty">Loading token news...</div>
-                </div>
-            </aside>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table">
+                    <thead>
+                        <tr>
+                            <th>Coin</th>
+                            <th>Perp pair</th>
+                            <th>HL price</th>
+                            <th>Status</th>
+                            <th>Open</th>
+                            <th>Side</th>
+                            <th>Unrealized</th>
+                        </tr>
+                    </thead>
+                    <tbody id="hl-watchlist-body">
+                        <tr><td colspan="7" class="pi-empty">Loading watchlist...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <p class="pi-perp-subline pi-rules-hint" id="entry-rules-hint">Entry rules loading...</p>
         </section>
 
-        <section class="pi-research-band">
-            <article class="pi-panel pi-token-panel">
-                <div class="pi-panel-head">
-                    <div>
-                        <p class="pi-eyebrow">Research Desk</p>
-                        <h2>Token Intelligence</h2>
-                    </div>
-                    <span class="pi-muted">CoinStats / Internal</span>
+        <section class="pi-panel pi-perp-panel" id="perp-paper-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Paper trades</p>
+                    <h2>Active &amp; closed positions</h2>
                 </div>
-                <div id="token-cards" class="pi-token-grid"></div>
-            </article>
-
-            <article class="pi-panel pi-chart-panel">
-                <div class="pi-panel-head">
-                    <div>
-                        <p class="pi-eyebrow">Performance</p>
-                        <h2>Daily PnL</h2>
-                    </div>
-                    <span class="pi-muted">Last 7 days</span>
-                </div>
-                <div id="daily-pnl-bars" class="pi-bars"></div>
-            </article>
+                <span class="pi-muted" id="perp-trades-meta">Loading...</span>
+            </div>
+            <div class="pi-filter-bar" role="group" aria-label="Trade status filter">
+                <button type="button" class="pi-filter-btn active" data-trade-filter="open">Open</button>
+                <button type="button" class="pi-filter-btn" data-trade-filter="closed">Closed</button>
+                <button type="button" class="pi-filter-btn" data-trade-filter="all">All</button>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-perp-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Coin</th>
+                            <th>Side</th>
+                            <th>Status</th>
+                            <th>Entry</th>
+                            <th>Exit</th>
+                            <th>Margin</th>
+                            <th>Notional</th>
+                            <th>Realized</th>
+                            <th>Unrealized</th>
+                            <th>Strategy</th>
+                            <th>Exit reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="perp-paper-trades-body">
+                        <tr><td colspan="12" class="pi-empty">Loading paper trades...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </section>
 
         <section class="pi-system-strip" id="system-strip">
@@ -143,6 +156,6 @@
         </section>
     </main>
 
-    <script src="/static/js/portfolio-dashboard.js?v=20260521"></script>
+    <script src="/static/js/portfolio-dashboard.js?v=20260528"></script>
 </body>
 </html>

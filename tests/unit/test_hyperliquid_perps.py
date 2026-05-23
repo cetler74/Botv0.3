@@ -2,6 +2,8 @@ import os
 import sys
 from datetime import datetime, timedelta
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ORCH = os.path.join(ROOT, "services", "orchestrator-service")
 if ORCH not in sys.path:
@@ -9,6 +11,7 @@ if ORCH not in sys.path:
 
 from hyperliquid_perps import (  # noqa: E402
     calculate_perp_pnl,
+    perp_side_fee,
     pair_to_hyperliquid_coin,
     pnl_percentage,
     position_sides_from_signal,
@@ -27,6 +30,11 @@ def test_position_sides_from_signal():
     assert position_sides_from_signal("buy") == "long"
     assert position_sides_from_signal("sell") == "short"
     assert position_sides_from_signal("hold") is None
+
+
+def test_perp_side_fee():
+    assert perp_side_fee(50.0, 0.001) == pytest.approx(0.05)
+    assert perp_side_fee(0.0, 0.001) == 0.0
 
 
 def test_side_aware_pnl():

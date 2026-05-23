@@ -1,4 +1,4 @@
-const state = { payload: null };
+const state = { payload: null, tradeFilter: 'open', watchlistActiveOnly: false };
 
 const money = (value) => {
   const n = Number(value || 0);
@@ -9,164 +9,230 @@ const pct = (value) => `${Number(value || 0).toFixed(1)}%`;
 const num = (value, digits = 2) => Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: digits });
 const cls = (value) => Number(value || 0) < 0 ? 'negative' : Number(value || 0) > 0 ? 'positive' : '';
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function setText(id, value, toneValue = null) {
   const el = document.getElementById(id);
   if (!el) return;
   el.textContent = value;
   el.classList.remove('positive', 'negative');
-  if (toneValue !== null) el.classList.add(cls(toneValue));
+  if (toneValue !== null) {
+    const toneClass = cls(toneValue);
+    if (toneClass) el.classList.add(toneClass);
+  }
 }
 
-function renderSummary(data) {
+function safeRender(section, fn, data) {
+  try {
+    fn(data);
+  } catch (err) {
+    console.error(`[hl-dashboard] ${section} render failed:`, err);
+  }
+}
+
+function statusLabel(status) {
+  const key = String(status || '').toLowerCase();
+  const map = {
+    open: 'Open position',
+    under_analysis: 'Under analysis',
+    active: 'Under analysis',
+    mirroring: 'Under analysis',
+    selected: 'Under analysis',
+    allowed_no_mirror: 'Under analysis',
+    no_price: 'No price',
+  };
+  return map[key] || 'Under analysis';
+}
+
+function statusClass(status) {
+  const key = String(status || '').toLowerCase();
+  if (key === 'open') return 'hot';
+  if (key === 'no_price') return 'risk';
+  return 'watch';
+}
+
+function renderHyperliquidTopbar(data) {
+  const hl = data.hyperliquid || {};
+  const cfg = hl.config || {};
+  const health = {};
+  (data.exchangeStatus || []).forEach((s) => { health[String(s.exchange || '').toLowerCase()] = s.status || ''; });
+
+  const modeEl = document.getElementById('hl-mode-pill');
+  if (modeEl) {
+    modeEl.textContent = `HL: ${String(cfg.mode || 'paper').toUpperCase()}`;
+    modeEl.classList.add('pi-pill-hl');
+  }
+  const engineEl = document.getElementById('hl-engine-pill');
+  if (engineEl) {
+    engineEl.textContent = cfg.enabled ? 'Engine: ON' : 'Engine: OFF';
+    engineEl.classList.toggle('ok', cfg.enabled);
+    engineEl.classList.toggle('bad', !cfg.enabled);
+  }
+  const mirrorEl = document.getElementById('hl-mirror-pill');
+  if (mirrorEl) {
+    const mirrors = (cfg.mirrorSourceExchanges || []).join(' · ') || 'none';
+    mirrorEl.textContent = `Mirror: ${mirrors}`;
+    mirrorEl.title = 'Spot exchanges scanned for signals';
+  }
+  const orchEl = document.getElementById('hl-orchestrator-pill');
+  if (orchEl) {
+    const st = health.orchestrator || 'unknown';
+    orchEl.textContent = `Orchestrator: ${st.includes('healthy') ? 'OK' : st}`;
+    orchEl.classList.toggle('ok', st.includes('healthy'));
+    orchEl.classList.toggle('bad', st.includes('unreachable'));
+  }
+}
+
+function renderHero(data) {
   const p = data.portfolio || {};
-  setText('total-portfolio', money(p.totalPortfolio));
-  setText('daily-pnl', money(p.dailyPnl), p.dailyPnl);
-  setText('total-pnl', money(p.totalPnl), p.totalPnl);
-  setText('invested-amount', money(p.investedAmount));
-  setText('open-trades', String(p.openTrades || 0));
-  setText('win-rate', pct((p.winRate || 0) * (p.winRate <= 1 ? 100 : 1)));
-  setText('unrealized-pnl', money(p.unrealizedPnl), p.unrealizedPnl);
+  const summary = (data.paperPerps || {}).summary || {};
+  const source = String(p.balanceSource || summary.balance_source || 'paper_derived');
+  setText('hl-balance-source', source.replace(/_/g, ' '));
+  setText('hero-equity', money(p.equity ?? summary.equity ?? summary.balance));
+  setText('hero-available', `Available: ${money(p.availableBalance ?? summary.available_balance)}`);
+  setText('hero-margin-used', money(p.marginUsed ?? summary.margin_used ?? p.openMargin));
+  setText('hero-open-notional', money(p.openNotional ?? summary.open_notional ?? summary.openNotional));
+  setText('perp-open-longs', String(p.openLongs ?? 0));
+  setText('perp-open-shorts', String(p.openShorts ?? 0));
+  setText('perp-open-margin', money(p.openMargin ?? summary.open_margin));
+  setText('perp-realized-pnl', money(p.realizedPnl ?? summary.realized_pnl), p.realizedPnl ?? summary.realized_pnl);
+  setText('perp-unrealized-pnl', money(p.unrealizedPnl ?? summary.unrealized_pnl), p.unrealizedPnl ?? summary.unrealized_pnl);
+  setText('perp-win-rate', pct(p.winRate ?? summary.win_rate ?? 0));
+
   const trading = data.tradingStatus || {};
-  setText('trading-status', `Status: ${trading.status || trading.trading_status || 'unknown'}`);
+  setText('trading-status', `Bot: ${trading.status || trading.trading_status || 'unknown'}`);
   setText('updated-at', `Updated ${new Date(data.timestamp).toLocaleTimeString()}`);
 }
 
-function renderExchangeStatus(data) {
-  const map = {};
-  (data.exchangeStatus || []).forEach(s => { map[String(s.exchange || '').toLowerCase()] = s.status || 'unknown'; });
-  [['binance', 'exchange-pill-binance'], ['bybit', 'exchange-pill-bybit'], ['cryptocom', 'exchange-pill-cryptocom']].forEach(([name, id]) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const status = map[name] || 'healthy';
-    el.classList.remove('ok', 'warn', 'bad');
-    el.classList.add(status.includes('healthy') ? 'ok' : status.includes('unreachable') ? 'bad' : 'warn');
-  });
-  const strip = document.getElementById('system-strip');
-  if (strip) {
-    strip.innerHTML = (data.exchangeStatus || []).map(s => `<span class="pi-health-pill">${s.exchange}: ${s.status}</span>`).join('');
-  }
-}
-
-function renderExternalStatus(data) {
-  const usage = ((data.externalData || {}).coinstats || {});
-  const el = document.getElementById('coinstats-credit-pill');
+function renderEntryRulesHint(data) {
+  const rules = ((data.hyperliquid || {}).config || {}).entryRules || {};
+  const el = document.getElementById('entry-rules-hint');
   if (!el) return;
-  el.classList.remove('watch', 'paused');
-  if (!usage.enabled) {
-    el.textContent = 'CoinStats: disabled';
-    return;
-  }
-  if (!usage.configured) {
-    el.textContent = 'CoinStats: API key missing';
-    el.classList.add('watch');
-    return;
-  }
-  const used = Number(usage.usedCredits || 0);
-  const limit = Number(usage.configuredMonthlyLimit || usage.totalCredits || 20000);
-  el.textContent = `CoinStats: ${num(used, 0)} / ${num(limit, 0)} credits`;
-  if (usage.budgetStatus === 'paused') el.classList.add('paused');
-  if (usage.budgetStatus === 'watch') el.classList.add('watch');
+  el.textContent = [
+    `Min conf long ${pct((rules.minConfidenceLong || 0) * (rules.minConfidenceLong <= 1 ? 100 : 1))}`,
+    `short ${pct((rules.minConfidenceShort || 0) * (rules.minConfidenceShort <= 1 ? 100 : 1))}`,
+    `max ${rules.maxOpenPositions || 0} open`,
+    `margin ≤ ${money(rules.maxMarginPerTrade)}`,
+    `SL ${rules.stopLossPct}% / TP ${rules.takeProfitPct}%`,
+  ].join(' · ');
 }
 
-function renderPositions(data) {
-  const body = document.getElementById('positions-body');
-  const rows = data.positions || [];
-  setText('position-count', `${rows.length} pairs`);
+function renderHyperliquidWatchlist(data) {
+  const body = document.getElementById('hl-watchlist-body');
+  const countEl = document.getElementById('watchlist-count');
+  let rows = ((data.hyperliquid || {}).watchlist || []).slice();
+  if (state.watchlistActiveOnly) {
+    rows = rows.filter((r) => {
+      const s = String(r.status || '').toLowerCase();
+      return s === 'open' || s === 'under_analysis' || s === 'active' || s === 'mirroring' || s === 'selected';
+    });
+  }
+  if (countEl) {
+    const total = ((data.hyperliquid || {}).watchlist || []).length;
+    countEl.textContent = state.watchlistActiveOnly
+      ? `${rows.length} of ${total} coins`
+      : `${total} coins`;
+  }
   if (!body) return;
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="9" class="pi-empty">No tracked pairs available.</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="pi-empty">No Hyperliquid pairs selected.</td></tr>';
     return;
   }
-  body.innerHTML = rows.map(row => `
+  body.innerHTML = rows.map((row) => {
+    const side = row.openSide ? String(row.openSide).toLowerCase() : '—';
+    const sideClass = side === 'long' ? 'pi-side-long' : side === 'short' ? 'pi-side-short' : '';
+    return `
     <tr>
-      <td><span class="pi-token-dot"></span><span class="pi-pair">${row.pair || '-'}</span></td>
-      <td>${row.exchange || '-'}${row.marketType === 'perpetual' ? ` · ${row.positionSide || '-'} ${num(row.leverage || 1, 1)}x` : ''}</td>
-      <td>${row.price ? money(row.price) : '-'}</td>
-      <td class="${cls(row.priceChange24h)}">${pct(row.priceChange24h)}</td>
-      <td>${row.positionSize ? num(row.positionSize, 6) : '-'}</td>
-      <td class="${cls(row.realizedPnl)}">${money(row.realizedPnl)}</td>
-      <td class="${cls(row.unrealizedPnl)}">${money(row.unrealizedPnl)}</td>
-      <td>${row.strategy || '-'}</td>
-      <td><span class="pi-signal">${row.signal || row.status || 'watch'}</span></td>
-    </tr>
-  `).join('');
-}
-
-function renderNews(data) {
-  const list = document.getElementById('news-list');
-  const news = data.news || [];
-  if (!list) return;
-  if (!news.length) {
-    list.innerHTML = '<div class="pi-empty">No recent token news found for tracked pairs.</div>';
-    return;
-  }
-  list.innerHTML = news.map(item => {
-    const tagClass = item.sentiment === 'risk' ? 'risk' : item.affectsOpenPosition ? 'hot' : '';
-    const href = item.url || '#';
-    return `
-      <article class="pi-news-item">
-        <a href="${href}" target="_blank" rel="noopener">${item.headline}</a>
-        <div class="pi-news-meta">
-          <span>${item.source || item.provider || 'News'}</span>
-          <span>${item.publishedAt || ''}</span>
-          <span class="pi-tag ${tagClass}">${item.affectsOpenPosition ? 'Affects open position' : item.relevance || 'Relevant'}</span>
-          <span>${(item.tokens || []).join(', ')}</span>
-        </div>
-      </article>`;
+      <td><span class="pi-pair">${escapeHtml(row.coin)}</span></td>
+      <td>${escapeHtml(row.pair || `${row.coin}/USD-PERP`)}</td>
+      <td>${row.midPrice ? money(row.midPrice) : '—'}</td>
+      <td><span class="pi-tag ${statusClass(row.status)}">${escapeHtml(statusLabel(row.status))}</span></td>
+      <td>${row.hasOpenPosition ? 'Yes' : '—'}</td>
+      <td>${side !== '—' ? `<span class="pi-tag ${sideClass}">${side}</span>` : '—'}</td>
+      <td class="${cls(row.unrealizedPnl)}">${row.hasOpenPosition ? money(row.unrealizedPnl) : '—'}</td>
+    </tr>`;
   }).join('');
 }
 
-function sparkBars(seed) {
-  const base = String(seed || 'BTC').split('').reduce((sum, ch) => sum + ch.charCodeAt(0), 0);
-  return Array.from({ length: 12 }, (_, i) => `<span style="height:${18 + ((base + i * 11) % 42)}%"></span>`).join('');
+function formatTradeTime(value) {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function renderTokens(data) {
-  const wrap = document.getElementById('token-cards');
-  const tokens = data.tokenResearch || [];
-  if (!wrap) return;
-  if (!tokens.length) {
-    wrap.innerHTML = '<div class="pi-empty">Token research is waiting for tracked pair data.</div>';
-    return;
-  }
-  wrap.innerHTML = tokens.slice(0, 8).map(t => `
-    <article class="pi-token-card">
-      <div class="pi-token-top">
-        <div>
-          <div class="pi-token-symbol">${t.token}</div>
-          <div class="pi-muted">${t.name || t.token}${t.rank ? ` · Rank ${t.rank}` : ''}</div>
-        </div>
-        <span class="pi-tag ${t.isOpen ? 'hot' : ''}">${t.signal || 'watch'}</span>
-      </div>
-      <div class="pi-token-price">${t.price ? money(t.price) : money((t.realizedPnl || 0) + (t.unrealizedPnl || 0))}</div>
-      <div class="${cls(t.priceChange1d)}">${pct(t.priceChange1d)} 24h</div>
-      <div class="pi-spark">${sparkBars(t.token)}</div>
-      <p class="pi-token-note">${t.whyItMatters || 'Market context is cached for this token.'}</p>
-    </article>
-  `).join('');
+function tradesForFilter(data) {
+  const pt = data.perpTrades || {};
+  const open = pt.open || [];
+  const closed = pt.closed || [];
+  if (state.tradeFilter === 'open') return open;
+  if (state.tradeFilter === 'closed') return closed;
+  return [...open, ...closed].sort((a, b) => {
+    const ta = new Date(a.exit_time || a.entry_time || 0).getTime();
+    const tb = new Date(b.exit_time || b.entry_time || 0).getTime();
+    return tb - ta;
+  });
 }
 
-function renderDailyPnl(data) {
-  const wrap = document.getElementById('daily-pnl-bars');
-  let rows = data.dailyPnl || [];
-  if (!Array.isArray(rows)) rows = [];
-  rows = rows.slice(-14);
-  if (!wrap) return;
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="pi-empty">Daily PnL history unavailable.</div>';
+function renderPerpTrades(data) {
+  const pt = data.perpTrades || {};
+  const summary = (data.paperPerps || {}).summary || {};
+  setText('perp-trades-meta', `${pt.totalOpen ?? 0} open · ${pt.totalClosed ?? summary.closed_trades ?? 0} closed`);
+
+  document.querySelectorAll('[data-trade-filter]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tradeFilter === state.tradeFilter);
+  });
+
+  const body = document.getElementById('perp-paper-trades-body');
+  if (!body) return;
+  const trades = tradesForFilter(data);
+  if (!trades.length) {
+    const msg = state.tradeFilter === 'open'
+      ? 'No open paper perpetual positions.'
+      : state.tradeFilter === 'closed'
+        ? 'No closed paper perpetual trades yet.'
+        : 'No paper perpetual trades recorded.';
+    body.innerHTML = `<tr><td colspan="12" class="pi-empty">${msg}</td></tr>`;
     return;
   }
-  const maxAbs = Math.max(...rows.map(r => Math.abs(Number(r.realized_pnl || r.pnl || r.value || 0))), 1);
-  wrap.innerHTML = rows.map(r => {
-    const value = Number(r.realized_pnl || r.pnl || r.value || 0);
-    const height = Math.max(4, Math.round((Math.abs(value) / maxAbs) * 160));
-    const label = String(r.date || '').slice(5) || '';
+  body.innerHTML = trades.map((t) => {
+    const status = String(t.status || '').toUpperCase();
+    const isOpen = status === 'OPEN';
+    const realized = Number(t.realized_pnl ?? t.realizedPnl ?? 0);
+    const unrealized = Number(t.unrealized_pnl ?? t.unrealizedPnl ?? 0);
+    const time = isOpen ? (t.entry_time ?? t.entryTime) : (t.exit_time ?? t.exitTime ?? t.entry_time ?? t.entryTime);
+    const side = String(t.position_side ?? t.positionSide ?? '-').toLowerCase();
+    const sideClass = side === 'long' ? 'pi-side-long' : side === 'short' ? 'pi-side-short' : '';
     return `
-      <div class="pi-bar-day" title="${label}: ${money(value)}">
-        <div class="pi-bar-track"><div class="pi-bar ${value < 0 ? 'negative' : ''}" style="height:${height}px"></div></div>
-        <span class="pi-bar-label">${label}</span>
-      </div>`;
+    <tr>
+      <td>${escapeHtml(formatTradeTime(time))}</td>
+      <td><span class="pi-pair">${escapeHtml(t.coin || t.symbol || '-')}</span></td>
+      <td><span class="pi-tag ${sideClass}">${escapeHtml(side)}</span></td>
+      <td><span class="pi-signal">${escapeHtml(status || '-')}</span></td>
+      <td>${money(t.entry_price ?? t.entryPrice)}</td>
+      <td>${isOpen ? '—' : money(t.exit_price ?? t.exitPrice)}</td>
+      <td>${money(t.margin_used ?? t.marginUsed)}</td>
+      <td>${money(t.notional_size ?? t.notionalSize)}</td>
+      <td class="${cls(realized)}">${money(realized)}</td>
+      <td class="${cls(unrealized)}">${money(unrealized)}</td>
+      <td>${escapeHtml(t.source_strategy ?? t.sourceStrategy ?? '-')}</td>
+      <td class="pi-muted-cell">${escapeHtml(t.exit_reason ?? t.exitReason ?? (isOpen ? '' : ''))}</td>
+    </tr>`;
   }).join('');
+}
+
+function renderSystemStrip(data) {
+  const strip = document.getElementById('system-strip');
+  if (!strip) return;
+  strip.innerHTML = (data.exchangeStatus || [])
+    .map((s) => `<span class="pi-health-pill">${escapeHtml(s.exchange)}: ${escapeHtml(s.status)}</span>`)
+    .join('');
 }
 
 async function controlBot(action) {
@@ -181,17 +247,16 @@ async function loadDashboard() {
   if (!response.ok) throw new Error('Dashboard payload failed');
   const data = await response.json();
   state.payload = data;
-  renderSummary(data);
-  renderExchangeStatus(data);
-  renderExternalStatus(data);
-  renderPositions(data);
-  renderNews(data);
-  renderTokens(data);
-  renderDailyPnl(data);
+  safeRender('topbar', renderHyperliquidTopbar, data);
+  safeRender('hero', renderHero, data);
+  safeRender('entryRules', renderEntryRulesHint, data);
+  safeRender('watchlist', renderHyperliquidWatchlist, data);
+  safeRender('trades', renderPerpTrades, data);
+  safeRender('system', renderSystemStrip, data);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('[data-control]').forEach(btn => {
+  document.querySelectorAll('[data-control]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try { await controlBot(btn.dataset.control); }
@@ -199,10 +264,28 @@ document.addEventListener('DOMContentLoaded', () => {
       finally { btn.disabled = false; }
     });
   });
-  loadDashboard().catch(err => {
+
+  document.querySelectorAll('[data-trade-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.tradeFilter = btn.dataset.tradeFilter || 'open';
+      if (state.payload) renderPerpTrades(state.payload);
+    });
+  });
+
+  const activeOnly = document.getElementById('watchlist-active-only');
+  if (activeOnly) {
+    activeOnly.addEventListener('change', () => {
+      state.watchlistActiveOnly = activeOnly.checked;
+      if (state.payload) renderHyperliquidWatchlist(state.payload);
+    });
+  }
+
+  loadDashboard().catch((err) => {
     console.error(err);
-    const body = document.getElementById('positions-body');
-    if (body) body.innerHTML = '<tr><td colspan="9" class="pi-empty">Failed to load dashboard data.</td></tr>';
+    const wl = document.getElementById('hl-watchlist-body');
+    if (wl) wl.innerHTML = '<tr><td colspan="7" class="pi-empty">Failed to load watchlist.</td></tr>';
+    const tb = document.getElementById('perp-paper-trades-body');
+    if (tb) tb.innerHTML = '<tr><td colspan="12" class="pi-empty">Failed to load paper trades.</td></tr>';
   });
   setInterval(() => loadDashboard().catch(console.error), 30000);
 });

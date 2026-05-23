@@ -91,12 +91,16 @@ from pair_loss_policy import (
 from hyperliquid_perps import (
     calculate_perp_pnl,
     filter_allowed_coin,
+    find_mirror_spot_pair,
+    perp_side_fee,
     pair_to_hyperliquid_coin,
     pnl_percentage,
     position_sides_from_signal,
     select_mirrored_signal,
     should_close_paper_perp,
 )
+from hyperliquid_pair_selector import select_top_hyperliquid_perps
+from hyperliquid_balance import fetch_hyperliquid_wallet_balance
 
 
 # Create custom registry to avoid conflicts
@@ -618,6 +622,9 @@ class TradingOrchestrator:
         self.cycle_count = 0
         self.active_trades_dict = {}
         self.pair_selections = {}
+        self.hyperliquid_pair_selections: List[str] = []
+        self.hyperliquid_pair_pairs: List[str] = []
+        self._hyperliquid_pair_selection_updated_at: Optional[datetime] = None
         self.balances = {}
         self.start_time = None
         self.exiting_trades = set()  # Track trades currently being exited to prevent duplicates
@@ -4954,11 +4961,15 @@ class TradingOrchestrator:
         if not bool(cfg.get("enabled", False)):
             return
         mode = str(cfg.get("mode", "paper")).lower()
-        if mode != "paper":
-            logger.warning("[HyperliquidPaper] mode=%s is not implemented; skipping", mode)
-            return
         if bool(cfg.get("allow_live_orders", False)):
             logger.error("[HyperliquidPaper] allow_live_orders=true is ignored by paper engine; no live orders are sent")
+
+        await self._refresh_hyperliquid_pair_selections(cfg)
+        await self._refresh_hyperliquid_balance(cfg)
+
+        if mode != "paper":
+            logger.debug("[HyperliquidPaper] mode=%s — balance refreshed; paper mirror skipped", mode)
+            return
 
         mids = await self._fetch_hyperliquid_mids()
         if not mids:
@@ -4969,11 +4980,133 @@ class TradingOrchestrator:
             return
         await self._mirror_strategy_signals_to_hyperliquid(mids, cfg, deadline=deadline)
 
+    async def _refresh_hyperliquid_pair_selections(self, cfg: Dict[str, Any]) -> None:
+        """Run HL-native pair selector and persist to database (exchange=hyperliquid)."""
+        global_selector = ((self._config or {}).get("pair_selector") or {}) if hasattr(self, "_config") else {}
+        sel_interval = int((cfg.get("pair_selector") or {}).get("update_interval_minutes", 15) or 15)
+        now = datetime.utcnow()
+        if self._hyperliquid_pair_selection_updated_at and self.hyperliquid_pair_selections:
+            elapsed = (now - self._hyperliquid_pair_selection_updated_at).total_seconds()
+            if elapsed < sel_interval * 60:
+                return
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                result = await select_top_hyperliquid_perps(cfg, global_selector, client=client)
+            coins = list(result.get("selected_coins") or [])
+            pairs = list(result.get("selected_pairs") or [f"{c}/USD-PERP" for c in coins])
+            if not coins:
+                logger.warning("[HyperliquidPaper] HL pair selector returned no coins")
+                return
+
+            self.hyperliquid_pair_selections = coins
+            self.hyperliquid_pair_pairs = pairs
+            self._hyperliquid_pair_selection_updated_at = now
+
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    f"{database_service_url}/api/v1/pairs/hyperliquid",
+                    json=pairs,
+                )
+                if resp.status_code not in (200, 201):
+                    logger.warning(
+                        "[HyperliquidPaper] Failed to persist HL pair selection: %s %s",
+                        resp.status_code,
+                        _http_response_log_snippet(resp),
+                    )
+                else:
+                    logger.info(
+                        "[HyperliquidPaper] HL pair selector stored %s coins: %s",
+                        len(coins),
+                        coins,
+                    )
+        except Exception as e:
+            logger.warning("[HyperliquidPaper] HL pair selector failed: %s", e)
+
+    async def _refresh_hyperliquid_balance(self, cfg: Dict[str, Any]) -> None:
+        """Sync Hyperliquid venue balance: paper-derived or live clearinghouse wallet."""
+        try:
+            trading_mode = str(
+                ((self._config or {}).get("trading") or {}).get("mode", "simulation")
+            ).lower()
+            hl_mode = str(cfg.get("mode", "paper")).lower()
+            wallet = str(cfg.get("wallet_address") or "").strip()
+            if wallet.startswith("${") and wallet.endswith("}"):
+                env_key = wallet[2:-1]
+                wallet = str(os.getenv(env_key, "") or "").strip()
+
+            balance_payload: Optional[Dict[str, float]] = None
+            balance_source = "paper_derived"
+
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                if trading_mode != "live" or hl_mode == "paper" or not wallet:
+                    bal_resp = await client.get(f"{database_service_url}/api/v1/balances/hyperliquid")
+                    if bal_resp.status_code == 200:
+                        data = bal_resp.json() or {}
+                        balance_payload = {
+                            "balance": float(data.get("balance") or 0),
+                            "available_balance": float(data.get("available_balance") or 0),
+                            "total_pnl": float(data.get("total_pnl") or 0),
+                            "daily_pnl": float(data.get("daily_pnl") or 0),
+                        }
+                        balance_source = str(data.get("balance_source") or "paper_derived")
+                elif wallet:
+                    live = await fetch_hyperliquid_wallet_balance(wallet, client=client)
+                    balance_payload = {
+                        "balance": live["balance"],
+                        "available_balance": live["available_balance"],
+                        "total_pnl": live.get("total_pnl", 0.0),
+                        "daily_pnl": live.get("daily_pnl", 0.0),
+                    }
+                    balance_source = "hyperliquid_wallet"
+
+                if not balance_payload:
+                    return
+
+                put_resp = await client.put(
+                    f"{database_service_url}/api/v1/balances/hyperliquid",
+                    json={
+                        "exchange": "hyperliquid",
+                        "balance": balance_payload["balance"],
+                        "available_balance": balance_payload["available_balance"],
+                        "total_pnl": balance_payload["total_pnl"],
+                        "daily_pnl": balance_payload["daily_pnl"],
+                        "timestamp": datetime.utcnow().isoformat(),
+                    },
+                )
+                if put_resp.status_code not in (200, 201):
+                    logger.warning(
+                        "[HyperliquidPaper] balance persist failed: %s %s",
+                        put_resp.status_code,
+                        _http_response_log_snippet(put_resp),
+                    )
+                else:
+                    logger.info(
+                        "[HyperliquidPaper] HL balance synced (%s) equity=%.2f available=%.2f",
+                        balance_source,
+                        balance_payload["balance"],
+                        balance_payload["available_balance"],
+                    )
+        except Exception as e:
+            logger.warning("[HyperliquidPaper] HL balance refresh failed: %s", e)
+
+    async def _fetch_hyperliquid_available_balance(self) -> float:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{database_service_url}/api/v1/balances/hyperliquid")
+                if resp.status_code != 200:
+                    return 0.0
+                data = resp.json() or {}
+                return float(data.get("available_balance") or 0.0)
+        except Exception:
+            return 0.0
+
     async def _update_hyperliquid_paper_positions(self, mids: Dict[str, float], cfg: Dict[str, Any]) -> None:
         try:
             stop_loss_pct = float(cfg.get("stop_loss_pct", 1.5) or 1.5)
             take_profit_pct = float(cfg.get("take_profit_pct", 2.5) or 2.5)
             max_holding_minutes = int(cfg.get("max_holding_minutes", 240) or 240)
+            fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
             async with httpx.AsyncClient(timeout=20.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
                 if open_resp.status_code != 200:
@@ -4987,6 +5120,7 @@ class TradingOrchestrator:
                         continue
                     entry_price = float(trade.get("entry_price") or 0.0)
                     size = float(trade.get("position_size") or 0.0)
+                    notional = float(trade.get("notional_size") or 0.0) or (entry_price * size)
                     side = str(trade.get("position_side") or "long").lower()
                     fees = float(trade.get("fees") or 0.0) + float(trade.get("funding") or 0.0)
                     unrealized = calculate_perp_pnl(side, entry_price, current_price, size, fees)
@@ -5002,12 +5136,19 @@ class TradingOrchestrator:
                         "unrealized_pnl": unrealized,
                     }
                     if exit_reason:
+                        exit_notional = current_price * size
+                        total_fees = fees + perp_side_fee(exit_notional, fee_rate)
+                        realized = calculate_perp_pnl(
+                            side, entry_price, current_price, size, total_fees
+                        )
                         payload.update(
                             {
                                 "status": "CLOSED",
                                 "exit_price": current_price,
                                 "exit_time": datetime.utcnow().isoformat() + "+00:00",
-                                "realized_pnl": unrealized,
+                                "realized_pnl": realized,
+                                "fees": total_fees,
+                                "unrealized_pnl": realized,
                                 "exit_reason": exit_reason,
                             }
                         )
@@ -5025,19 +5166,32 @@ class TradingOrchestrator:
         deadline: Optional[float] = None,
     ) -> None:
         try:
-            allowed_symbols = cfg.get("allowed_symbols") or []
             leverage = float(cfg.get("default_leverage", 2.0) or 2.0)
             max_margin = float(cfg.get("max_margin_per_trade", 25.0) or 25.0)
             max_notional = float(cfg.get("max_notional_per_trade", 50.0) or 50.0)
             max_open = int(cfg.get("max_open_positions", 5) or 5)
             min_long_conf = float(cfg.get("min_confidence_long", 0.55) or 0.55)
             min_short_conf = float(cfg.get("min_confidence_short", 0.55) or 0.55)
-            exchanges = [str(x) for x in cfg.get("mirror_source_exchanges", []) or []]
-            if not exchanges:
-                exchanges = list(self.pair_selections.keys())
+            fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
+            mirror_exchanges = [str(x) for x in cfg.get("mirror_source_exchanges", []) or []]
+            if not mirror_exchanges:
+                mirror_exchanges = list(self.pair_selections.keys())
+
+            hl_coins = list(self.hyperliquid_pair_selections or [])
+            if not hl_coins:
+                allowed_fallback = cfg.get("allowed_symbols") or []
+                hl_coins = [str(c).upper() for c in allowed_fallback if str(c).strip()]
+                logger.warning(
+                    "[HyperliquidPaper] No HL selector output; falling back to allowed_symbols (%s)",
+                    len(hl_coins),
+                )
+            if not hl_coins:
+                return
             if max_margin <= 0 or max_notional <= 0 or leverage <= 0:
                 logger.warning("[HyperliquidPaper] Invalid sizing config; skipping")
                 return
+
+            available_balance = await self._fetch_hyperliquid_available_balance()
 
             async with httpx.AsyncClient(timeout=30.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
@@ -5050,112 +5204,132 @@ class TradingOrchestrator:
                     return
 
                 opened = 0
-                for exchange_name in exchanges:
-                    for pair in self.pair_selections.get(exchange_name, []) or []:
-                        if deadline is not None and time.monotonic() >= deadline:
-                            return
-                        if len(open_trades or []) + opened >= max_open:
-                            return
+                for coin in hl_coins:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return
+                    if len(open_trades or []) + opened >= max_open:
+                        return
 
-                        coin = pair_to_hyperliquid_coin(pair)
-                        if not filter_allowed_coin(coin, allowed_symbols):
-                            continue
-                        price = mids.get(coin)
-                        if not price:
-                            continue
+                    coin = str(coin).upper()
+                    price = mids.get(coin)
+                    if not price:
+                        continue
 
-                        strategy_pair = pair.replace("/", "")
-                        try:
-                            signals_url = f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}"
-                            signals_resp = await client.get(signals_url, timeout=60.0)
-                            if signals_resp.status_code != 200:
-                                continue
-                            signals_data = signals_resp.json()
-                        except Exception as e:
-                            logger.debug("[HyperliquidPaper] Signal fetch failed for %s %s: %s", exchange_name, pair, e)
-                            continue
-
-                        mirrored = select_mirrored_signal(signals_data)
-                        if not mirrored:
-                            continue
-                        side = position_sides_from_signal(mirrored.get("signal"))
-                        if side not in {"long", "short"}:
-                            continue
-                        conf = float(mirrored.get("confidence") or 0.0)
-                        if side == "long" and conf < min_long_conf:
-                            continue
-                        if side == "short" and conf < min_short_conf:
-                            continue
-                        if (coin, side) in open_keys:
-                            continue
-
-                        margin_used = min(max_margin, max_notional / leverage)
-                        notional = min(max_notional, margin_used * leverage)
-                        size = notional / price
-                        if size <= 0:
-                            continue
-                        trade_id = str(uuid.uuid4())
-                        payload = {
-                            "trade_id": trade_id,
-                            "venue": "hyperliquid",
-                            "coin": coin,
-                            "pair": f"{coin}/USD-PERP",
-                            "source_exchange": exchange_name,
-                            "source_pair": pair,
-                            "source_strategy": mirrored.get("strategy") or "unknown",
-                            "source_signal": mirrored.get("signal"),
-                            "position_side": side,
-                            "leverage": leverage,
-                            "margin_used": margin_used,
-                            "notional_size": notional,
-                            "position_size": size,
-                            "entry_price": price,
-                            "current_price": price,
-                            "status": "OPEN",
-                            "entry_time": datetime.utcnow().isoformat() + "+00:00",
-                            "unrealized_pnl": 0.0,
-                            "realized_pnl": 0.0,
-                            "fees": 0.0,
-                            "funding": 0.0,
-                            "confidence": conf,
-                            "strength": float(mirrored.get("strength") or 0.0),
-                            "consensus_confidence": float(mirrored.get("consensus_confidence") or 0.0),
-                            "consensus_agreement": float(mirrored.get("consensus_agreement") or 0.0),
-                            "mode": "paper",
-                            "metadata": {
-                                "paper_only": True,
-                                "no_live_orders": True,
-                                "cycle": self.cycle_count,
-                                "stable_regime": (signals_data or {}).get("stable_regime"),
-                                "market_regime": (signals_data or {}).get("market_regime"),
-                            },
-                        }
-                        create_resp = await client.post(
-                            f"{database_service_url}/api/v1/perps/paper-trades",
-                            json=payload,
+                    exchange_name, pair = find_mirror_spot_pair(
+                        coin, mirror_exchanges, self.pair_selections
+                    )
+                    if not exchange_name or not pair:
+                        logger.debug(
+                            "[HyperliquidPaper] No mirror spot pair for HL coin %s on %s",
+                            coin,
+                            mirror_exchanges,
                         )
-                        if create_resp.status_code in (200, 201):
-                            open_keys.add((coin, side))
-                            opened += 1
-                            logger.warning(
-                                "[HyperliquidPaper] Opened PAPER %s %s from %s %s strategy=%s conf=%.2f notional=%.2f lev=%.1fx",
-                                side,
-                                coin,
-                                exchange_name,
-                                pair,
-                                payload["source_strategy"],
-                                conf,
-                                notional,
-                                leverage,
-                            )
-                        else:
-                            logger.warning(
-                                "[HyperliquidPaper] DB create failed for %s %s: %s %s",
-                                side,
-                                coin,
-                                create_resp.status_code,
-                                _http_response_log_snippet(create_resp),
-                            )
+                        continue
+
+                    strategy_pair = pair.replace("/", "")
+                    try:
+                        signals_url = f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}"
+                        signals_resp = await client.get(signals_url, timeout=60.0)
+                        if signals_resp.status_code != 200:
+                            continue
+                        signals_data = signals_resp.json()
+                    except Exception as e:
+                        logger.debug("[HyperliquidPaper] Signal fetch failed for %s %s: %s", exchange_name, pair, e)
+                        continue
+
+                    mirrored = select_mirrored_signal(signals_data)
+                    if not mirrored:
+                        continue
+                    side = position_sides_from_signal(mirrored.get("signal"))
+                    if side not in {"long", "short"}:
+                        continue
+                    conf = float(mirrored.get("confidence") or 0.0)
+                    if side == "long" and conf < min_long_conf:
+                        continue
+                    if side == "short" and conf < min_short_conf:
+                        continue
+                    if (coin, side) in open_keys:
+                        continue
+
+                    margin_used = min(max_margin, max_notional / leverage)
+                    if available_balance > 0 and margin_used > available_balance:
+                        logger.debug(
+                            "[HyperliquidPaper] Insufficient HL available (%.2f) for margin %.2f on %s",
+                            available_balance,
+                            margin_used,
+                            coin,
+                        )
+                        continue
+                    notional = min(max_notional, margin_used * leverage)
+                    size = notional / price
+                    if size <= 0:
+                        continue
+                    entry_fee = perp_side_fee(notional, fee_rate)
+                    trade_id = str(uuid.uuid4())
+                    payload = {
+                        "trade_id": trade_id,
+                        "venue": "hyperliquid",
+                        "coin": coin,
+                        "pair": f"{coin}/USD-PERP",
+                        "source_exchange": exchange_name,
+                        "source_pair": pair,
+                        "source_strategy": mirrored.get("strategy") or "unknown",
+                        "source_signal": mirrored.get("signal"),
+                        "position_side": side,
+                        "leverage": leverage,
+                        "margin_used": margin_used,
+                        "notional_size": notional,
+                        "position_size": size,
+                        "entry_price": price,
+                        "current_price": price,
+                        "status": "OPEN",
+                        "entry_time": datetime.utcnow().isoformat() + "+00:00",
+                        "unrealized_pnl": -entry_fee,
+                        "realized_pnl": 0.0,
+                        "fees": entry_fee,
+                        "funding": 0.0,
+                        "confidence": conf,
+                        "strength": float(mirrored.get("strength") or 0.0),
+                        "consensus_confidence": float(mirrored.get("consensus_confidence") or 0.0),
+                        "consensus_agreement": float(mirrored.get("consensus_agreement") or 0.0),
+                        "mode": "paper",
+                        "metadata": {
+                            "paper_only": True,
+                            "no_live_orders": True,
+                            "cycle": self.cycle_count,
+                            "hl_selector": True,
+                            "stable_regime": (signals_data or {}).get("stable_regime"),
+                            "market_regime": (signals_data or {}).get("market_regime"),
+                        },
+                    }
+                    create_resp = await client.post(
+                        f"{database_service_url}/api/v1/perps/paper-trades",
+                        json=payload,
+                    )
+                    if create_resp.status_code in (200, 201):
+                        open_keys.add((coin, side))
+                        opened += 1
+                        if available_balance > 0:
+                            available_balance = max(0.0, available_balance - margin_used)
+                        logger.warning(
+                            "[HyperliquidPaper] Opened PAPER %s %s from %s %s strategy=%s conf=%.2f notional=%.2f lev=%.1fx",
+                            side,
+                            coin,
+                            exchange_name,
+                            pair,
+                            payload["source_strategy"],
+                            conf,
+                            notional,
+                            leverage,
+                        )
+                    else:
+                        logger.warning(
+                            "[HyperliquidPaper] DB create failed for %s %s: %s %s",
+                            side,
+                            coin,
+                            create_resp.status_code,
+                            _http_response_log_snippet(create_resp),
+                        )
         except Exception as e:
             logger.warning("[HyperliquidPaper] Signal mirror skipped: %s", e)
     

@@ -31,6 +31,13 @@ def position_sides_from_signal(signal: str) -> Optional[str]:
     return None
 
 
+def perp_side_fee(notional: float, fee_rate_per_side: float) -> float:
+    """Taker-style fee for one fill (entry or exit) on notional USD."""
+    if notional <= 0 or fee_rate_per_side <= 0:
+        return 0.0
+    return float(notional) * float(fee_rate_per_side)
+
+
 def calculate_perp_pnl(
     position_side: str,
     entry_price: float,
@@ -168,4 +175,20 @@ def should_close_paper_perp(
 def filter_allowed_coin(coin: str, allowed_symbols: Iterable[str]) -> bool:
     allowed = {str(x).upper().strip() for x in (allowed_symbols or []) if str(x).strip()}
     return not allowed or str(coin or "").upper().strip() in allowed
+
+
+def find_mirror_spot_pair(
+    coin: str,
+    mirror_exchanges: Iterable[str],
+    pair_selections: Dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Pick a spot pair on mirror exchanges to fetch strategy signals for an HL coin."""
+    target = str(coin or "").upper().strip()
+    if not target:
+        return None, None
+    for exchange_name in mirror_exchanges:
+        for pair in pair_selections.get(exchange_name) or []:
+            if pair_to_hyperliquid_coin(str(pair)) == target:
+                return str(exchange_name), str(pair)
+    return None, None
 

@@ -70,7 +70,9 @@ services:
 
   # Database Service
   database-service:
-    build: ./services/database-service
+    build:
+      context: .
+      dockerfile: services/database-service/Dockerfile
     container_name: trading-bot-database
     ports:
       - "127.0.0.1:8002:8002"
