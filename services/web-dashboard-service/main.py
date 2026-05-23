@@ -1634,6 +1634,38 @@ async def get_active_trades():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/perps/paper-summary")
+async def get_perps_paper_summary():
+    """Get Hyperliquid paper-perp comparison metrics."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(f"{database_service_url}/api/v1/perps/paper-summary")
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error getting paper-perp summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/paper-trades")
+async def get_perps_paper_trades(status: Optional[str] = None, limit: int = 100):
+    """Get Hyperliquid paper-perp trades."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            params: Dict[str, Any] = {"limit": limit}
+            if status:
+                params["status"] = status
+            response = await client.get(
+                f"{database_service_url}/api/v1/perps/paper-trades",
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error getting paper-perp trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/dashboard/portfolio-intelligence")
 async def get_portfolio_intelligence():
     """One-call dashboard payload for the portfolio intelligence UI."""
@@ -1649,18 +1681,26 @@ async def get_portfolio_intelligence():
             default={},
             params={"status": "OPEN", "limit": 100},
         )
+        perps_summary_task = _fetch_json(client, f"{database_service_url}/api/v1/perps/paper-summary", default={})
+        perps_open_task = _fetch_json(
+            client,
+            f"{database_service_url}/api/v1/perps/paper-trades/open",
+            default={},
+        )
         selected_pair_tasks = {
             exchange: _fetch_json(client, f"{database_service_url}/api/v1/pairs/{exchange}", default={})
             for exchange in ("binance", "bybit", "cryptocom")
         }
 
-        portfolio, profitability, bot_status, daily_pnl, active_trades_payload, db_open_payload = await asyncio.gather(
+        portfolio, profitability, bot_status, daily_pnl, active_trades_payload, db_open_payload, perps_summary, perps_open = await asyncio.gather(
             portfolio_task,
             profitability_task,
             bot_status_task,
             daily_pnl_task,
             active_trades_task,
             db_open_trades_task,
+            perps_summary_task,
+            perps_open_task,
         )
         selected_pairs_payloads = {
             exchange: await task for exchange, task in selected_pair_tasks.items()
@@ -1731,14 +1771,42 @@ async def get_portfolio_intelligence():
                 "lastUpdate": trade.get("updated_at") or trade.get("entry_time") or trade.get("created_at"),
             }
 
+        for trade in (perps_open or {}).get("trades", []) or []:
+            coin = str(trade.get("coin") or "").upper()
+            if not coin:
+                continue
+            key = ("hyperliquid-paper", f"{coin}/USD-PERP:{trade.get('position_side')}")
+            rows_by_key[key] = {
+                "exchange": "hyperliquid-paper",
+                "pair": f"{coin}/USD-PERP",
+                "token": coin,
+                "marketType": "perpetual",
+                "positionSide": trade.get("position_side"),
+                "leverage": _safe_float(trade.get("leverage")),
+                "isOpen": True,
+                "positionSize": _safe_float(trade.get("position_size")),
+                "entryPrice": _safe_float(trade.get("entry_price")),
+                "price": _safe_float(trade.get("current_price") or trade.get("entry_price")),
+                "realizedPnl": _safe_float(trade.get("realized_pnl")),
+                "unrealizedPnl": _safe_float(trade.get("unrealized_pnl")),
+                "strategy": trade.get("source_strategy") or "paper-perp",
+                "signal": f"paper {trade.get('position_side', '')}".strip(),
+                "status": trade.get("status") or "OPEN",
+                "lastUpdate": trade.get("updated_at") or trade.get("entry_time") or trade.get("created_at"),
+            }
+
         position_rows = list(rows_by_key.values())[:18]
         ticker_tasks = [
             _fetch_ticker_snapshot(client, row["exchange"], row["pair"])
             for row in position_rows
-            if row.get("exchange") and row.get("pair")
+            if row.get("exchange") and row.get("pair") and row.get("exchange") != "hyperliquid-paper"
         ]
         ticker_results = await asyncio.gather(*ticker_tasks, return_exceptions=True)
-        for row, ticker in zip(position_rows, ticker_results):
+        ticker_iter = iter(ticker_results)
+        for row in position_rows:
+            if row.get("exchange") == "hyperliquid-paper":
+                continue
+            ticker = next(ticker_iter, {})
             if isinstance(ticker, Exception) or not isinstance(ticker, dict):
                 ticker = {}
             row["price"] = _safe_float(ticker.get("last") or ticker.get("price") or ticker.get("close"))
@@ -1841,11 +1909,17 @@ async def get_portfolio_intelligence():
             "totalTrades": _safe_int((portfolio or {}).get("total_trades") or (profitability or {}).get("total_trades")),
             "winRate": _safe_float((portfolio or {}).get("win_rate") or (profitability or {}).get("win_rate"), 0),
         }
+        paper_summary = (perps_summary or {}).get("summary", {}) if isinstance(perps_summary, dict) else {}
 
         return {
             "timestamp": _iso_now(),
             "uiVersion": dashboard_ui_version,
             "portfolio": summary,
+            "paperPerps": {
+                "summary": paper_summary,
+                "bySide": (perps_summary or {}).get("by_side", []) if isinstance(perps_summary, dict) else [],
+                "byStrategy": (perps_summary or {}).get("by_strategy", []) if isinstance(perps_summary, dict) else [],
+            },
             "positions": position_rows,
             "trackedPairs": tracked_pairs,
             "tokenResearch": token_research,

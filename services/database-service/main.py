@@ -123,6 +123,39 @@ class Trade(BaseModel):
     entry_id: Optional[str] = None
 
 
+class PerpPaperTrade(BaseModel):
+    trade_id: str
+    venue: str = "hyperliquid"
+    coin: str
+    pair: Optional[str] = None
+    source_exchange: Optional[str] = None
+    source_pair: Optional[str] = None
+    source_strategy: str
+    source_signal: str
+    position_side: str
+    leverage: float = 2.0
+    margin_used: float
+    notional_size: float
+    position_size: float
+    entry_price: float
+    current_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    status: str = "OPEN"
+    entry_time: datetime
+    exit_time: Optional[datetime] = None
+    unrealized_pnl: Optional[float] = 0.0
+    realized_pnl: Optional[float] = 0.0
+    fees: Optional[float] = 0.0
+    funding: Optional[float] = 0.0
+    confidence: Optional[float] = 0.0
+    strength: Optional[float] = 0.0
+    consensus_confidence: Optional[float] = 0.0
+    consensus_agreement: Optional[float] = 0.0
+    mode: str = "paper"
+    exit_reason: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class MacdAnalysisLogIn(BaseModel):
     log_ts: datetime
     exchange: Optional[str] = None
@@ -1309,6 +1342,7 @@ async def initialize_database():
         # Auto-heal critical fee-tracking columns required by trade update flow.
         await ensure_trade_fee_columns(db_manager)
         await ensure_macd_analysis_log_table(db_manager)
+        await ensure_perp_paper_trades_table(db_manager)
         
         # Initialize materializer (Phase 3)
         materializer = EventMaterializer(db_manager)
@@ -1381,6 +1415,63 @@ async def ensure_macd_analysis_log_table(manager: "DatabaseManager") -> None:
         logger.info("✅ Ensured strategy_macd_analysis_log table exists")
     except Exception as e:
         logger.error(f"Failed ensuring strategy_macd_analysis_log table: {e}")
+        raise
+
+
+async def ensure_perp_paper_trades_table(manager: "DatabaseManager") -> None:
+    """Ensure isolated paper-trade table for Hyperliquid perpetual strategy review."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.perp_paper_trades (
+                trade_id UUID PRIMARY KEY,
+                venue TEXT NOT NULL DEFAULT 'hyperliquid',
+                coin TEXT NOT NULL,
+                pair TEXT,
+                source_exchange TEXT,
+                source_pair TEXT,
+                source_strategy TEXT NOT NULL,
+                source_signal TEXT NOT NULL,
+                position_side TEXT NOT NULL CHECK (position_side IN ('long', 'short')),
+                leverage DOUBLE PRECISION NOT NULL DEFAULT 2.0,
+                margin_used DOUBLE PRECISION NOT NULL,
+                notional_size DOUBLE PRECISION NOT NULL,
+                position_size DOUBLE PRECISION NOT NULL,
+                entry_price DOUBLE PRECISION NOT NULL,
+                current_price DOUBLE PRECISION,
+                exit_price DOUBLE PRECISION,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                entry_time TIMESTAMPTZ NOT NULL,
+                exit_time TIMESTAMPTZ,
+                unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                realized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                fees DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                funding DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                strength DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                consensus_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                consensus_agreement DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                mode TEXT NOT NULL DEFAULT 'paper',
+                exit_reason TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_perp_paper_trades_status
+            ON trading.perp_paper_trades (status);
+            CREATE INDEX IF NOT EXISTS idx_perp_paper_trades_coin_status
+            ON trading.perp_paper_trades (coin, status);
+            CREATE INDEX IF NOT EXISTS idx_perp_paper_trades_entry_time
+            ON trading.perp_paper_trades (entry_time DESC);
+            CREATE INDEX IF NOT EXISTS idx_perp_paper_trades_source_strategy
+            ON trading.perp_paper_trades (source_strategy);
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured perp_paper_trades table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring perp_paper_trades table: {e}")
         raise
 
 # API Endpoints
@@ -1729,6 +1820,220 @@ async def get_monthly_realized_stats(months: int = Query(14, ge=1, le=120)):
     except Exception as e:
         logger.error(f"Failed to get monthly realized stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/perps/paper-trades")
+async def create_perp_paper_trade(trade: PerpPaperTrade):
+    """Create an isolated paper perpetual trade."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.perp_paper_trades (
+                trade_id, venue, coin, pair, source_exchange, source_pair,
+                source_strategy, source_signal, position_side, leverage,
+                margin_used, notional_size, position_size, entry_price,
+                current_price, exit_price, status, entry_time, exit_time,
+                unrealized_pnl, realized_pnl, fees, funding, confidence,
+                strength, consensus_confidence, consensus_agreement, mode,
+                exit_reason, metadata
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+        """
+        await db_manager.execute_query(
+            query,
+            (
+                trade.trade_id,
+                trade.venue,
+                trade.coin.upper(),
+                trade.pair,
+                trade.source_exchange,
+                trade.source_pair,
+                trade.source_strategy,
+                trade.source_signal,
+                trade.position_side.lower(),
+                trade.leverage,
+                trade.margin_used,
+                trade.notional_size,
+                trade.position_size,
+                trade.entry_price,
+                trade.current_price or trade.entry_price,
+                trade.exit_price,
+                normalize_status(trade.status, "trade"),
+                trade.entry_time,
+                trade.exit_time,
+                trade.unrealized_pnl or 0.0,
+                trade.realized_pnl or 0.0,
+                trade.fees or 0.0,
+                trade.funding or 0.0,
+                trade.confidence or 0.0,
+                trade.strength or 0.0,
+                trade.consensus_confidence or 0.0,
+                trade.consensus_agreement or 0.0,
+                trade.mode,
+                trade.exit_reason,
+                Json(trade.metadata or {}),
+            ),
+        )
+        return {"trade_id": trade.trade_id, "status": "created"}
+    except Exception as e:
+        logger.error(f"Failed to create perp paper trade: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/paper-trades")
+async def get_perp_paper_trades(
+    status: Optional[str] = None,
+    coin: Optional[str] = None,
+    position_side: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """List isolated paper perpetual trades."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where_conditions = []
+        params: List[Any] = []
+        if status:
+            where_conditions.append("status = %s")
+            params.append(normalize_status(status, "trade"))
+        if coin:
+            where_conditions.append("coin = %s")
+            params.append(coin.upper())
+        if position_side:
+            where_conditions.append("position_side = %s")
+            params.append(position_side.lower())
+
+        where_sql = (" WHERE " + " AND ".join(where_conditions)) if where_conditions else ""
+        trades = await db_manager.execute_query(
+            f"""
+            SELECT *, coin AS symbol
+            FROM trading.perp_paper_trades
+            {where_sql}
+            ORDER BY entry_time DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params + [limit, offset]),
+        )
+        total_row = await db_manager.execute_single_query(
+            f"SELECT COUNT(*) AS total FROM trading.perp_paper_trades{where_sql}",
+            tuple(params) if params else (),
+        )
+        return {"trades": trades, "total": total_row.get("total", 0) if total_row else 0}
+    except Exception as e:
+        logger.error(f"Failed to get perp paper trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/paper-trades/open")
+async def get_open_perp_paper_trades(coin: Optional[str] = None):
+    """List open isolated paper perpetual trades."""
+    return await get_perp_paper_trades(status="OPEN", coin=coin, limit=1000, offset=0)
+
+
+@app.put("/api/v1/perps/paper-trades/{trade_id}")
+async def update_perp_paper_trade(trade_id: str, update_data: Dict[str, Any]):
+    """Update an isolated paper perpetual trade."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        allowed = {
+            "current_price", "exit_price", "status", "exit_time", "unrealized_pnl",
+            "realized_pnl", "fees", "funding", "exit_reason", "metadata",
+        }
+        set_clauses = []
+        params = []
+        for key, value in update_data.items():
+            if key not in allowed:
+                continue
+            if key == "status":
+                value = normalize_status(value, "trade")
+            if key == "metadata":
+                value = Json(value or {})
+            set_clauses.append(f"{key} = %s")
+            params.append(value)
+        if not set_clauses:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
+        params.append(trade_id)
+        await db_manager.execute_query(
+            f"""
+            UPDATE trading.perp_paper_trades
+            SET {', '.join(set_clauses)}, updated_at = CURRENT_TIMESTAMP
+            WHERE trade_id = %s
+            """,
+            tuple(params),
+        )
+        return {"message": "Perp paper trade updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update perp paper trade {trade_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/paper-summary")
+async def get_perp_paper_summary():
+    """Aggregate paper-perp performance for dashboard comparison."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        summary = await db_manager.execute_single_query(
+            """
+            SELECT
+                COUNT(*) AS total_trades,
+                COUNT(*) FILTER (WHERE status = 'OPEN') AS open_trades,
+                COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
+                COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
+                COALESCE(SUM(unrealized_pnl) FILTER (WHERE status = 'OPEN'), 0) AS unrealized_pnl,
+                COALESCE(SUM(margin_used) FILTER (WHERE status = 'OPEN'), 0) AS open_margin,
+                COALESCE(SUM(notional_size) FILTER (WHERE status = 'OPEN'), 0) AS open_notional,
+                COUNT(*) FILTER (WHERE status = 'CLOSED' AND realized_pnl > 0) AS winning_trades,
+                COUNT(*) FILTER (WHERE status = 'CLOSED' AND realized_pnl < 0) AS losing_trades
+            FROM trading.perp_paper_trades
+            """
+        ) or {}
+        by_side = await db_manager.execute_query(
+            """
+            SELECT
+                position_side,
+                COUNT(*) AS total_trades,
+                COUNT(*) FILTER (WHERE status = 'OPEN') AS open_trades,
+                COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
+                COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
+                COALESCE(SUM(unrealized_pnl) FILTER (WHERE status = 'OPEN'), 0) AS unrealized_pnl
+            FROM trading.perp_paper_trades
+            GROUP BY position_side
+            ORDER BY position_side
+            """
+        )
+        by_strategy = await db_manager.execute_query(
+            """
+            SELECT
+                source_strategy,
+                position_side,
+                COUNT(*) AS total_trades,
+                COUNT(*) FILTER (WHERE status = 'OPEN') AS open_trades,
+                COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
+                COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
+                COALESCE(SUM(unrealized_pnl) FILTER (WHERE status = 'OPEN'), 0) AS unrealized_pnl
+            FROM trading.perp_paper_trades
+            GROUP BY source_strategy, position_side
+            ORDER BY realized_pnl DESC, total_trades DESC
+            LIMIT 50
+            """
+        )
+        closed = float(summary.get("closed_trades") or 0)
+        wins = float(summary.get("winning_trades") or 0)
+        summary["win_rate"] = (wins / closed * 100.0) if closed > 0 else 0.0
+        return {"summary": summary, "by_side": by_side, "by_strategy": by_strategy}
+    except Exception as e:
+        logger.error(f"Failed to get perp paper summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/v1/trades/open")
 async def get_open_trades(exchange: Optional[str] = None):

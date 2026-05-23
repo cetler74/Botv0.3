@@ -1650,6 +1650,23 @@ trading:
   simulation:
     starting_balance_per_exchange_usd: 2000.0
     fee_rate_per_side: 0.001
+  hyperliquid_perps:
+    # Parallel perpetual paper engine. Uses live Hyperliquid market prices and
+    # mirrored strategy signals, but never sends live orders.
+    enabled: true
+    mode: paper
+    allow_live_orders: false
+    default_leverage: 2.0
+    max_margin_per_trade: 25.0
+    max_notional_per_trade: 50.0
+    max_open_positions: 5
+    min_confidence_long: 0.55
+    min_confidence_short: 0.55
+    stop_loss_pct: 1.5
+    take_profit_pct: 2.5
+    max_holding_minutes: 240
+    allowed_symbols: [BTC, ETH, SOL, XRP, LINK, AVAX, DOGE, NEAR, ARB, OP, SUI, APT]
+    mirror_source_exchanges: [binance, bybit, cryptocom]
   # PnL-FIX v5 — Position-sizer diversification overcap.
   # Hard ceiling on a single position relative to the equal-weight slot budget
   # (= available_balance / remaining_slots). 1.5 = at most 50% above equal

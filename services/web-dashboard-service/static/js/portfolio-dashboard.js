@@ -80,7 +80,7 @@ function renderPositions(data) {
   body.innerHTML = rows.map(row => `
     <tr>
       <td><span class="pi-token-dot"></span><span class="pi-pair">${row.pair || '-'}</span></td>
-      <td>${row.exchange || '-'}</td>
+      <td>${row.exchange || '-'}${row.marketType === 'perpetual' ? ` · ${row.positionSide || '-'} ${num(row.leverage || 1, 1)}x` : ''}</td>
       <td>${row.price ? money(row.price) : '-'}</td>
       <td class="${cls(row.priceChange24h)}">${pct(row.priceChange24h)}</td>
       <td>${row.positionSize ? num(row.positionSize, 6) : '-'}</td>
