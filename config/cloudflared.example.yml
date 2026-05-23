@@ -1,0 +1,16 @@
+# Example Cloudflare Tunnel ingress for the trading bot web dashboard.
+# Copy to ~/.cloudflared/config.yml only if you run a named tunnel with a local config
+# (not the token-only flow from Zero Trust). Replace <TUNNEL-UUID> after:
+#   cloudflared tunnel create bot-dashboard
+#
+# Public hostname must also be added in Zero Trust → Networks → Tunnels → Public hostname
+# when using dashboard-managed tunnels (token install).
+
+tunnel: <TUNNEL-UUID>
+credentials-file: /Users/<you>/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  # Use a subdomain on your own zone — not *.workers.dev
+  - hostname: bot.portugalexpatdirectory.com
+    service: http://127.0.0.1:8006
+  - service: http_status:404

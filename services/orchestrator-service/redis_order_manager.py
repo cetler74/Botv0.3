@@ -16,7 +16,20 @@ logger = logging.getLogger(__name__)
 
 class RedisOrderManager:
     """Manages order processing via Redis queues"""
-    
+
+    @staticmethod
+    def _build_entry_reason(strategy_name: str, signal: Dict[str, Any]) -> str:
+        base = (
+            f"Queue-based {strategy_name} strategy signal "
+            f"[stable_regime={signal.get('stable_regime', 'unknown')}, "
+            f"policy={signal.get('policy_version', 'unversioned')}, "
+            f"gate={signal.get('entry_gate_reason', 'unknown')}]"
+        )
+        summary = (signal.get("strategy_gate_summary") or "").strip()
+        if summary:
+            return f"{base} TA: {summary}"
+        return base
+
     def __init__(self, redis_url: str = "redis://redis:6379"):
         self.redis_url = redis_url
         self.redis_client: Optional[redis.Redis] = None
@@ -432,11 +445,7 @@ class RedisOrderManager:
                 "status": "PENDING", 
                 "entry_time": datetime.utcnow().isoformat(),
                 "exchange": exchange_name,
-                "entry_reason": (
-                    f"Queue-based {strategy_name} strategy signal "
-                    f"[stable_regime={signal.get('stable_regime', 'unknown')}, "
-                    f"policy={signal.get('policy_version', 'unversioned')}]"
-                ),
+                "entry_reason": self._build_entry_reason(strategy_name, signal),
                 "position_size": position_size,
                 "strategy": strategy_name,
                 "metadata": {

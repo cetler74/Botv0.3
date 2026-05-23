@@ -272,13 +272,43 @@ class BaseStrategy(ABC):
             merged.update(overrides)
         return merged
 
+    def _ensure_regime_param_baseline(self) -> None:
+        """Snapshot tunable attrs once so regime switches restore YAML defaults."""
+        if getattr(self, "_regime_param_baseline", None):
+            return
+        baseline: Dict[str, Any] = {}
+        all_keys: set = set()
+        for regime_overrides in self._get_regime_overrides().values():
+            all_keys.update(regime_overrides.keys())
+        for key in all_keys:
+            target_attr = key
+            if not hasattr(self, target_attr):
+                alias = self._regime_param_alias_map.get(key)
+                if alias and hasattr(self, alias):
+                    target_attr = alias
+                else:
+                    continue
+            baseline[target_attr] = getattr(self, target_attr)
+        self._regime_param_baseline = baseline
+
     def _apply_regime_overrides(self, market_regime: Optional[str] = None) -> Dict[str, Any]:
         """Re-assign ``self.<attr>`` for every override key matching an
         existing attribute (or its alias). Safe to call on every
         ``generate_signal()``; does nothing if no overrides are configured.
 
+        Restores baseline parameters before applying the current regime so
+        values from a prior regime (e.g. trending_up min_confidence) do not leak.
+
         Returns the set of overrides that were actually applied (key -> value).
         """
+        self._ensure_regime_param_baseline()
+        baseline = getattr(self, "_regime_param_baseline", {}) or {}
+        for attr, value in baseline.items():
+            try:
+                setattr(self, attr, value)
+            except Exception:
+                pass
+
         regime = (market_regime or getattr(self.state, 'market_regime', None) or 'unknown')
         regime = str(regime).lower()
         overrides = self._get_regime_overrides().get(regime)

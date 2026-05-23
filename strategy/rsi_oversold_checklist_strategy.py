@@ -113,6 +113,12 @@ class RSIOversoldChecklistStrategy(BaseStrategy):
         self.require_rsi_slope = bool(params.get("require_rsi_slope", False))
         self.rsi_slope_confidence_boost = float(params.get("rsi_slope_confidence_boost", 0.015))
         self.rsi_slope_strength_boost = float(params.get("rsi_slope_strength_boost", 0.015))
+        self.max_hold_hours = float(params.get("max_hold_hours", 0) or 0)
+        self.blocked_entry_regimes = {
+            str(r).strip().lower()
+            for r in (params.get("blocked_entry_regimes") or [])
+            if str(r).strip()
+        }
 
         self._current_ohlcv = None
 
@@ -165,6 +171,16 @@ class RSIOversoldChecklistStrategy(BaseStrategy):
         exchange_adapter=None,
     ) -> Tuple[str, float, float]:
         try:
+            self._apply_regime_overrides(getattr(self.state, "market_regime", None))
+            regime_lc = str(getattr(self.state, "market_regime", None) or "").strip().lower()
+            if regime_lc and regime_lc in self.blocked_entry_regimes:
+                self.logger.info(
+                    "[RSIOversoldChecklistStrategy] %s HOLD — blocked_entry_regime=%s",
+                    pair,
+                    regime_lc,
+                )
+                return "hold", 0.0, 0.0
+
             if isinstance(market_data, dict):
                 exec_df = market_data.get("15m")
                 trend_df = market_data.get("1h")

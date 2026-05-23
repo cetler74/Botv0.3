@@ -5,6 +5,7 @@ Analyzes complete trading history and provides comprehensive optimization recomm
 """
 
 import asyncio
+import os
 import httpx
 import json
 import yaml
@@ -28,11 +29,10 @@ class OptimizationResult:
 
 class EnhancedStrategyOptimizer:
     def __init__(self):
-        # Use localhost for external execution
-        self.orchestrator_url = "http://localhost:8005"
-        self.database_url = "http://localhost:8002"
-        self.config_url = "http://localhost:8001"
-        self.exchange_url = "http://localhost:8003"
+        self.orchestrator_url = os.getenv("ORCHESTRATOR_SERVICE_URL", "http://orchestrator-service:8005")
+        self.database_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+        self.config_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
+        self.exchange_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
         
     async def get_complete_trading_data(self) -> Dict[str, Any]:
         """Get complete trading data including all historical trades and current status"""
@@ -467,4 +467,4 @@ async def main():
         print(f"   Medium: {result['summary']['medium_priority']}")
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())

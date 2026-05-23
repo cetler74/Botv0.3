@@ -40,12 +40,18 @@ import uvicorn
 import uuid
 import time
 import numpy as np
+import pandas as pd
 from urllib.parse import quote
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
 
 # Add the project root to the path to import core modules
 sys.path.append('/app')
 from core.strategy_manager import StrategyManager
+from core.pair_filters import (
+    filter_stablecoin_pairs_with_bases,
+    is_stablecoin_pair,
+    load_stablecoin_bases_from_config,
+)
 from redis_order_manager import RedisOrderManager
 from redis_realtime_order_manager import redis_realtime_manager
 from core.database_manager import DatabaseManager
@@ -612,6 +618,8 @@ class TradingOrchestrator:
         self._hard_loss_cooldown_until: Dict[Tuple[str, str], datetime] = {}
         self._recent_negative_realized_blacklist_until: Dict[str, datetime] = {}
         self._pair_rotation_processed_trade_ids: set[str] = set()
+        self._macd_continuation_pending_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._strategy_expectancy_cache: Dict[str, Tuple[datetime, bool, str]] = {}
         # Global in-process pair entry reservation (across exchanges) to prevent
         # same-cycle dual opens on the same instrument.
         self._pair_entry_reservation_lock = asyncio.Lock()
@@ -713,6 +721,82 @@ class TradingOrchestrator:
         except Exception:
             pass
 
+    async def _record_entry_gate_event(
+        self,
+        exchange_name: str,
+        pair: str,
+        reason: str,
+        signals_data: Optional[Dict[str, Any]] = None,
+        resolved_policy: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist rejected-entry snapshots for post-hoc missed-trade analysis."""
+        try:
+            signals_data = signals_data or {}
+            consensus = signals_data.get("consensus", {}) or {}
+            strategies = signals_data.get("strategies", {}) or {}
+            strategy_snapshot = {}
+            for name, data in strategies.items():
+                data = data or {}
+                strategy_snapshot[name] = {
+                    "signal": data.get("signal"),
+                    "confidence": data.get("confidence"),
+                    "strength": data.get("strength"),
+                    "market_regime": data.get("market_regime"),
+                    "selected_for_regime": data.get("selected_for_regime"),
+                }
+            stable_regime = str(
+                (resolved_policy or {}).get("stable_regime")
+                or consensus.get("stable_regime")
+                or signals_data.get("stable_regime")
+                or "unknown"
+            )
+            payload = {
+                "exchange": exchange_name,
+                "pair": pair,
+                "reason": reason,
+                "details": details or {},
+                "stable_regime": stable_regime,
+                "policy_version": (resolved_policy or {}).get("policy_version"),
+                "policy_mode": (resolved_policy or {}).get("mode"),
+                "consensus": {
+                    "signal": consensus.get("signal"),
+                    "confidence": consensus.get("confidence"),
+                    "agreement": consensus.get("agreement"),
+                    "strength": consensus.get("strength"),
+                    "market_regime": consensus.get("market_regime"),
+                    "stable_regime": consensus.get("stable_regime"),
+                    "sell_veto_max": consensus.get("sell_veto_max"),
+                },
+                "strategies": strategy_snapshot,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            event = {
+                "aggregate_id": f"{exchange_name}:{pair}",
+                "aggregate_type": "entry_gate",
+                "event_type": "entry_rejected",
+                "payload": payload,
+            }
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                await client.post(f"{database_service_url}/api/v1/events", json=event)
+        except Exception as e:
+            logger.debug(
+                "[EntryGate] rejected-entry telemetry skipped for %s %s: %s",
+                exchange_name,
+                pair,
+                e,
+            )
+
+    @staticmethod
+    def _float_config(value: Any, default: float) -> float:
+        """Parse numeric config while preserving intentional zero values."""
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     async def _mark_trade_triggered_exit(
         self,
         trade_id: str,
@@ -794,6 +878,561 @@ class TradingOrchestrator:
             logger.warning("[AdaptiveSizing] Failed to compute pair multiplier for %s %s: %s", exchange_name, pair, e)
             return 1.0
 
+    async def _long_entry_regime_allowed(self, stable_regime: str) -> bool:
+        """Consensus-path SPOT-long regime allowlist (trading.long_entry_allowed_regimes)."""
+        cfg = await self._get_config_value("trading.long_entry_allowed_regimes", {})
+        if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+            return True
+        allowed = {str(r).strip().lower() for r in (cfg.get("regimes") or [])}
+        regime_lc = str(stable_regime or "").strip().lower()
+        return regime_lc in allowed
+
+    async def _standalone_entry_regime_allowed(
+        self, strategy_name: str, stable_regime: str
+    ) -> bool:
+        """Per-strategy regime allowlist for standalone entry paths (macd/checklist/scalper)."""
+        regime_lc = str(stable_regime or "").strip().lower()
+        root = await self._get_config_value("trading.standalone_entry_regimes", {})
+        if not isinstance(root, dict):
+            root = {}
+        strat_cfg = root.get(strategy_name) or {}
+        if not isinstance(strat_cfg, dict):
+            strat_cfg = {}
+        if strat_cfg.get("enabled") is False:
+            return False
+        regimes = strat_cfg.get("regimes")
+        if regimes is None and strategy_name == "macd_momentum":
+            macd_cfg = await self._get_config_value("trading.macd_buy_override", {})
+            if isinstance(macd_cfg, dict) and macd_cfg.get("allowed_regimes") is not None:
+                regimes = macd_cfg.get("allowed_regimes")
+        if regimes is None:
+            return await self._long_entry_regime_allowed(stable_regime)
+        allowed = {str(r).strip().lower() for r in regimes if str(r).strip()}
+        return regime_lc in allowed
+
+    async def _standalone_entry_exchange_allowed(
+        self, strategy_name: str, exchange_name: str
+    ) -> bool:
+        """Per-strategy exchange allowlist for standalone entries."""
+        root = await self._get_config_value("trading.standalone_entry_regimes", {})
+        if not isinstance(root, dict):
+            root = {}
+        strat_cfg = root.get(strategy_name) or {}
+        if not isinstance(strat_cfg, dict):
+            strat_cfg = {}
+        allowed_ex = strat_cfg.get("allowed_exchanges")
+        if allowed_ex is None:
+            params = await self._get_config_value(
+                f"strategies.{strategy_name}.parameters", {}
+            )
+            if isinstance(params, dict):
+                allowed_ex = params.get("allowed_exchanges")
+        if not allowed_ex:
+            return True
+        allowed = {str(x).strip().lower() for x in allowed_ex if str(x).strip()}
+        return str(exchange_name or "").strip().lower() in allowed
+
+    async def _standalone_entry_gate_allowed(
+        self, strategy_name: str, stable_regime: str, exchange_name: str
+    ) -> bool:
+        """Regime + exchange allowlists for standalone strategy entries."""
+        if not await self._standalone_entry_regime_allowed(strategy_name, stable_regime):
+            return False
+        if not await self._standalone_entry_exchange_allowed(strategy_name, exchange_name):
+            return False
+        if not await self._strategy_stable_regime_allowed(strategy_name, stable_regime):
+            return False
+        return True
+
+    async def _strategy_expectancy_allows_entry(self, strategy_name: str) -> Tuple[bool, str]:
+        """Block strategies with negative recent realized expectancy."""
+        if not strategy_name:
+            return True, "no_strategy"
+        try:
+            cfg = await self._get_config_value("trading.strategy_expectancy_guard", {})
+            if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+                return True, "disabled"
+
+            cache_seconds = float(cfg.get("cache_seconds", 300) or 300)
+            cached = self._strategy_expectancy_cache.get(strategy_name)
+            now = datetime.utcnow()
+            if cached and (now - cached[0]).total_seconds() < cache_seconds:
+                return cached[1], cached[2]
+
+            lookback_days = float(cfg.get("lookback_days", 7) or 7)
+            min_closed_trades = int(cfg.get("min_closed_trades", 5) or 5)
+            min_total_pnl = float(cfg.get("min_total_pnl_usd", 0.0) or 0.0)
+            allow_unproven = {
+                str(x).strip()
+                for x in (cfg.get("allow_unproven_strategies") or [])
+                if str(x).strip()
+            }
+            cutoff = now - timedelta(days=lookback_days)
+
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={
+                        "limit": 1200,
+                        "sort_by": "exit_time",
+                        "sort_order": "desc",
+                    },
+                )
+                resp.raise_for_status()
+                rows = (resp.json() or {}).get("trades", []) or []
+
+            closed = []
+            for row in rows:
+                if str(row.get("strategy") or "") != strategy_name:
+                    continue
+                if str(row.get("status") or "").upper() != "CLOSED":
+                    continue
+                exit_raw = row.get("exit_time")
+                if not exit_raw:
+                    continue
+                try:
+                    exit_dt = datetime.fromisoformat(str(exit_raw).replace("Z", "+00:00"))
+                    if exit_dt.tzinfo:
+                        exit_dt = exit_dt.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if exit_dt >= cutoff:
+                    closed.append(row)
+
+            trade_count = len(closed)
+            pnl = sum(float(row.get("realized_pnl") or 0.0) for row in closed)
+            if trade_count < min_closed_trades:
+                allowed = strategy_name in allow_unproven or trade_count == 0
+                reason = (
+                    f"insufficient_sample trades={trade_count} min={min_closed_trades}"
+                    if allowed
+                    else f"blocked_insufficient_sample trades={trade_count} min={min_closed_trades}"
+                )
+            else:
+                allowed = pnl >= min_total_pnl
+                reason = (
+                    f"recent_expectancy_ok trades={trade_count} pnl={pnl:.2f}"
+                    if allowed
+                    else f"recent_expectancy_negative trades={trade_count} pnl={pnl:.2f}"
+                )
+
+            self._strategy_expectancy_cache[strategy_name] = (now, allowed, reason)
+            return allowed, reason
+        except Exception as exc:
+            logger.warning(
+                "[StrategyExpectancyGuard] check skipped for %s: %s",
+                strategy_name,
+                exc,
+            )
+            return True, "check_error_allow"
+
+    async def _strategy_stable_regime_allowed(
+        self, strategy_name: str, stable_regime: str
+    ) -> bool:
+        """Align orchestrator stable_regime with strategy parameters allowed/blocked regimes."""
+        params = await self._get_config_value(
+            f"strategies.{strategy_name}.parameters", {}
+        )
+        if not isinstance(params, dict):
+            params = {}
+        regime_lc = str(stable_regime or "").strip().lower()
+        allowed = params.get("allowed_regimes")
+        if allowed is not None:
+            allowed_set = {str(r).strip().lower() for r in allowed if str(r).strip()}
+            if allowed_set and regime_lc not in allowed_set:
+                return False
+        blocked = params.get("blocked_regimes")
+        if blocked is not None:
+            blocked_set = {str(r).strip().lower() for r in blocked if str(r).strip()}
+            if blocked_set and regime_lc in blocked_set:
+                return False
+        return True
+
+    async def _standalone_entry_quality_qualifies(
+        self,
+        strategy_name: str,
+        strategy_data: Dict[str, Any],
+        stable_regime: str,
+    ) -> bool:
+        """Per-strategy min confidence/strength for standalone BUY (replaces blind gate bypass)."""
+        if str((strategy_data or {}).get("signal", "hold")).lower() != "buy":
+            return False
+        if strategy_name == "macd_momentum":
+            macd_override_cfg = await self._get_config_value("trading.macd_buy_override", {})
+            if not isinstance(macd_override_cfg, dict):
+                macd_override_cfg = {}
+            return await self._macd_override_qualifies(
+                strategy_data, macd_override_cfg, stable_regime
+            )
+        root = await self._get_config_value("trading.standalone_entry_quality", {})
+        if not isinstance(root, dict) or not root.get("enabled", True):
+            return True
+        strat_cfg = root.get(strategy_name) or {}
+        if not isinstance(strat_cfg, dict):
+            strat_cfg = {}
+        min_conf = float(strat_cfg.get("min_confidence", 0.70) or 0.70)
+        min_strength = float(strat_cfg.get("min_strength", 0.30) or 0.30)
+        conf = float((strategy_data or {}).get("confidence", 0) or 0)
+        strength = float((strategy_data or {}).get("strength", 0) or 0)
+        return conf >= min_conf and strength >= min_strength
+
+    async def _fetch_live_ticker(
+        self, exchange_name: str, pair: str
+    ) -> Optional[Dict[str, Any]]:
+        """Last/bid/ask from ticker-live (WS cache) with REST ticker fallback."""
+        enc_sym = pair.replace("/", "")
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                live = await client.get(
+                    f"{exchange_service_url}/api/v1/market/ticker-live/{exchange_name}/{enc_sym}"
+                )
+                if live.status_code == 200:
+                    data = live.json() or {}
+                    if data.get("last") or data.get("bid"):
+                        return data
+                rest = await client.get(
+                    f"{exchange_service_url}/api/v1/market/ticker/{exchange_name}/{pair}"
+                )
+                if rest.status_code == 200:
+                    return rest.json() or {}
+        except Exception as e:
+            logger.debug(
+                "[EntryGate] ticker fetch failed for %s %s: %s",
+                exchange_name,
+                pair,
+                e,
+            )
+        return None
+
+    async def _passes_standalone_pair_guards(
+        self, strategy_name: str, exchange_name: str, pair: str
+    ) -> bool:
+        """Min price / spread / exchange suitability for standalone entries."""
+        root = await self._get_config_value("trading.standalone_pair_guards", {})
+        if not isinstance(root, dict) or not root.get("enabled", True):
+            return True
+        strat_cfg = root.get(strategy_name) or root.get("default") or {}
+        if not isinstance(strat_cfg, dict):
+            strat_cfg = {}
+        allowed_ex = strat_cfg.get("allowed_exchanges")
+        if allowed_ex is not None:
+            allowed_set = {str(x).strip().lower() for x in allowed_ex if str(x).strip()}
+            if allowed_set and str(exchange_name or "").strip().lower() not in allowed_set:
+                logger.info(
+                    "[EntryGate] Reject %s %s: %s not in standalone_pair_guards allowed_exchanges",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                )
+                return False
+        min_price = float(strat_cfg.get("min_last_price_usd", 0) or 0)
+        max_spread = float(
+            strat_cfg.get(
+                "max_spread_percentage",
+                root.get("max_spread_percentage", 0.32),
+            )
+            or 0.32
+        )
+        td = await self._fetch_live_ticker(exchange_name, pair)
+        if not td:
+            if min_price > 0:
+                logger.info(
+                    "[EntryGate] Reject %s %s: no ticker for min_price guard (%.4f)",
+                    exchange_name,
+                    pair,
+                    min_price,
+                )
+                return False
+            return True
+        last = float(td.get("last") or 0.0)
+        bid = float(td.get("bid") or td.get("best_bid") or 0.0)
+        ask = float(td.get("ask") or td.get("best_ask") or 0.0)
+        if min_price > 0 and last > 0 and last < min_price:
+            logger.info(
+                "[EntryGate] Reject %s %s: last %.8f < min_last_price_usd %.4f (%s)",
+                exchange_name,
+                pair,
+                last,
+                min_price,
+                strategy_name,
+            )
+            return False
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = max(last, (ask + bid) / 2.0)
+            spread_pct = ((ask - bid) / mid) * 100.0
+            if spread_pct > max_spread:
+                logger.info(
+                    "[EntryGate] Reject %s %s: spread %.3f%% > %.3f%% (%s)",
+                    exchange_name,
+                    pair,
+                    spread_pct,
+                    max_spread,
+                    strategy_name,
+                )
+                return False
+        return True
+
+    async def _standalone_entry_spread_ok(
+        self, exchange_name: str, pair: str, max_spread_pct: float
+    ) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                t = await client.get(
+                    f"{exchange_service_url}/api/v1/market/ticker-live/{exchange_name}/{pair}"
+                )
+            if t.status_code != 200:
+                return True
+            td = t.json() or {}
+            bid = float(td.get("bid") or td.get("best_bid") or 0.0)
+            ask = float(td.get("ask") or td.get("best_ask") or 0.0)
+            last = float(td.get("last") or 0.0)
+            if bid > 0 and ask > 0 and ask >= bid:
+                spread_pct = ((ask - bid) / max(last, (ask + bid) / 2.0)) * 100.0
+                if spread_pct > max_spread_pct:
+                    logger.info(
+                        "[EntryGate] Reject %s %s: standalone spread %.3f%% > %.3f%%",
+                        exchange_name,
+                        pair,
+                        spread_pct,
+                        max_spread_pct,
+                    )
+                    return False
+        except Exception:
+            pass
+        return True
+
+    async def _is_pair_blacklisted_for_entry(
+        self, exchange_name: str, pair: str
+    ) -> Tuple[bool, str]:
+        """Hard block: dynamic blacklist, rotation temp ban, recent weak realized close."""
+        try:
+            from core.dynamic_blacklist_manager import blacklist_manager
+
+            global_bl = await blacklist_manager.get_active_blacklist()
+            if pair in global_bl:
+                return True, "dynamic_blacklist"
+            now = datetime.utcnow()
+            rot_key = f"{exchange_name}|{pair}"
+            rot_until = self._pair_rotation_blacklist_until.get(rot_key)
+            if rot_until and rot_until > now:
+                return True, "pair_rotation_temp_blacklist"
+            cluster_key = self._entry_cluster_key(pair)
+            neg_until = self._recent_negative_realized_blacklist_until.get(cluster_key)
+            if neg_until and neg_until > now:
+                return True, "recent_negative_realized_blacklist"
+            loss_pairs = await self._get_recent_loss_blacklist_pairs(exchange_name)
+            if pair in loss_pairs:
+                return True, "recent_loss_rotation_blacklist"
+        except Exception as e:
+            logger.debug("[EntryGate] Blacklist check skipped for %s %s: %s", exchange_name, pair, e)
+        return False, ""
+
+    @staticmethod
+    def _format_strategy_gate_summary(
+        strategy_name: str, strategy_data: Optional[Dict[str, Any]]
+    ) -> str:
+        """Compact TA gate summary for DB entry_reason audit."""
+        if not strategy_data:
+            return ""
+        indicators = ((strategy_data.get("state") or {}).get("indicators") or {})
+        if not isinstance(indicators, dict):
+            return ""
+        parts: List[str] = []
+        if strategy_name == "macd_momentum":
+            parts.extend(
+                [
+                    f"hist={indicators.get('exec_macd_hist')}",
+                    f"hist_prev={indicators.get('macd_hist_prev')}",
+                    f"hist_rising2={indicators.get('hist_rising_two_bars')}",
+                    f"rsi15={indicators.get('exec_rsi')}",
+                    f"rsi_gate={indicators.get('rsi_any_of_last_n_below')}",
+                    f"1h_macd_ok={indicators.get('long_macd_bias_ok')}",
+                    f"above_ema={indicators.get('price_above_ema')}",
+                    f"vol_ok={indicators.get('long_volume_ok')}",
+                    f"cont={indicators.get('continuation_long_ok')}",
+                    f"cont_confirm={indicators.get('continuation_confirm_ok')}",
+                ]
+            )
+        elif strategy_name == "rsi_oversold_checklist":
+            parts.extend(
+                [
+                    f"checklist={indicators.get('checklist_buy')}",
+                    f"rsi_reclaim={indicators.get('rsi_reclaimed_30')}",
+                    f"rsi15={indicators.get('exec_rsi_15m')}",
+                    f"above_ema20={indicators.get('price_above_ema20')}",
+                    f"vol_ok={indicators.get('volume_ok')}",
+                    f"macro_ok={indicators.get('macro_trend_ok')}",
+                ]
+            )
+        elif strategy_name == "macd_ema_vwap_scalper":
+            parts.extend(
+                [
+                    f"above_ema200={indicators.get('fully_above_ema200')}",
+                    f"vwap_pull={indicators.get('pulled_to_vwap')}",
+                    f"macd_cross={indicators.get('macd_bullish_cross')}",
+                    f"1h_ema200={indicators.get('trend_above_ema200_ok')}",
+                ]
+            )
+        elif strategy_name == "supertrend":
+            parts.extend(
+                [
+                    f"trend={indicators.get('trend')}",
+                    f"trend_prev={indicators.get('trend_prev')}",
+                    f"bullish_flip={indicators.get('bullish_flip')}",
+                    f"trend_1h={indicators.get('trend_1h')}",
+                    f"trend_1h_ok={indicators.get('trend_1h_ok')}",
+                    f"adx={indicators.get('adx')}",
+                    f"adx_ok={indicators.get('adx_ok')}",
+                    f"vol_ok={indicators.get('vol_ok')}",
+                    f"up={indicators.get('up')}",
+                    f"dn={indicators.get('dn')}",
+                    f"atr={indicators.get('atr')}",
+                ]
+            )
+        elif strategy_name == "swing_hull_rsi_ema":
+            parts.extend(
+                [
+                    f"hull_bullish={indicators.get('hull_bullish')}",
+                    f"n1={indicators.get('n1')}",
+                    f"n2={indicators.get('n2')}",
+                    f"ema_cross_down={indicators.get('ema_cross_down')}",
+                    f"ema_fast={indicators.get('ema_fast')}",
+                    f"rsi={indicators.get('rsi')}",
+                ]
+            )
+        else:
+            sig = strategy_data.get("signal")
+            parts.append(f"signal={sig}")
+        return " | ".join(str(p) for p in parts if p is not None)
+
+    async def _macd_continuation_confirmation_ready(
+        self,
+        exchange_name: str,
+        pair: str,
+        macd_strategy_data: Dict[str, Any],
+    ) -> bool:
+        """Delay MACD continuation entries until price proves follow-through."""
+        indicators = ((macd_strategy_data.get("state") or {}).get("indicators") or {})
+        if not isinstance(indicators, dict):
+            return True
+
+        is_continuation = bool(indicators.get("continuation_long_ok")) and not bool(
+            indicators.get("long_entry_ok")
+        )
+        key = (str(exchange_name or "").lower(), str(pair or "").upper())
+        if not is_continuation:
+            self._macd_continuation_pending_entries.pop(key, None)
+            return True
+
+        cfg = await self._get_config_value("trading.macd_continuation_entry_confirmation", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if not bool(cfg.get("enabled", True)):
+            return True
+
+        confirm_pct = float(cfg.get("confirm_pct", 0.0025) or 0.0025)
+        timeout_minutes = float(cfg.get("timeout_minutes", 30.0) or 30.0)
+        max_chase_pct = float(cfg.get("max_chase_pct", 0.009) or 0.009)
+        now = datetime.utcnow()
+
+        try:
+            current_price = await self._get_current_price(exchange_name, pair)
+        except Exception as exc:
+            logger.warning(
+                "[MACDContinuationConfirm] %s %s: price unavailable, holding signal: %s",
+                exchange_name,
+                pair,
+                exc,
+            )
+            return False
+        if current_price <= 0:
+            return False
+
+        pending = self._macd_continuation_pending_entries.get(key)
+        if not pending or now >= pending.get("expires_at", now):
+            signal_price = float(indicators.get("price_now") or current_price)
+            if signal_price <= 0:
+                signal_price = current_price
+            trigger_price = signal_price * (1.0 + confirm_pct)
+            self._macd_continuation_pending_entries[key] = {
+                "signal_price": signal_price,
+                "trigger_price": trigger_price,
+                "created_at": now,
+                "expires_at": now + timedelta(minutes=timeout_minutes),
+            }
+            logger.warning(
+                "[MACDContinuationConfirm] %s %s: staged pending continuation entry "
+                "signal=%.8f trigger=%.8f (+%.2f%%), timeout=%.0fm",
+                exchange_name,
+                pair,
+                signal_price,
+                trigger_price,
+                confirm_pct * 100.0,
+                timeout_minutes,
+            )
+            return False
+
+        signal_price = float(pending.get("signal_price") or current_price)
+        trigger_price = float(pending.get("trigger_price") or 0.0)
+        chase_limit = signal_price * (1.0 + max_chase_pct)
+        if current_price >= trigger_price and current_price <= chase_limit:
+            logger.warning(
+                "[MACDContinuationConfirm] %s %s: confirmed continuation entry "
+                "current=%.8f trigger=%.8f",
+                exchange_name,
+                pair,
+                current_price,
+                trigger_price,
+            )
+            self._macd_continuation_pending_entries.pop(key, None)
+            return True
+        if current_price > chase_limit:
+            logger.warning(
+                "[MACDContinuationConfirm] %s %s: rejecting chase current=%.8f > limit=%.8f",
+                exchange_name,
+                pair,
+                current_price,
+                chase_limit,
+            )
+            self._macd_continuation_pending_entries.pop(key, None)
+            return False
+
+        logger.info(
+            "[MACDContinuationConfirm] %s %s: waiting current=%.8f < trigger=%.8f",
+            exchange_name,
+            pair,
+            current_price,
+            trigger_price,
+        )
+        return False
+
+    async def _macd_override_qualifies(
+        self,
+        macd_strategy_data: Dict[str, Any],
+        macd_override_cfg: Dict[str, Any],
+        stable_regime: str,
+    ) -> bool:
+        """Standalone macd_momentum BUY: enabled, regime, min confidence/strength."""
+        if not isinstance(macd_override_cfg, dict):
+            macd_override_cfg = {}
+        if not bool(macd_override_cfg.get("enabled", True)):
+            return False
+        if str((macd_strategy_data or {}).get("signal", "hold")).lower() != "buy":
+            return False
+        regime_lc = str(stable_regime or "").strip().lower()
+        allowed_regimes = macd_override_cfg.get("allowed_regimes")
+        if allowed_regimes is not None:
+            allowed = {str(r).strip().lower() for r in allowed_regimes}
+            if regime_lc not in allowed:
+                return False
+        elif regime_lc == "trending_down":
+            return False
+        min_conf = float(macd_override_cfg.get("min_confidence", 0.65) or 0.65)
+        min_strength = float(macd_override_cfg.get("min_strength", 0.25) or 0.25)
+        conf = float((macd_strategy_data or {}).get("confidence", 0) or 0)
+        strength = float((macd_strategy_data or {}).get("strength", 0) or 0)
+        return conf >= min_conf and strength >= min_strength
+
     async def _passes_entry_quality_gate(
         self,
         exchange_name: str,
@@ -808,18 +1447,106 @@ class TradingOrchestrator:
                 return True
             consensus = signals_data.get("consensus", {}) or {}
             strategies = signals_data.get("strategies", {}) or {}
-            consensus_excluded_strategies = {"macd_momentum"}
+            # Keep this aligned with strategy-service consensus weighting:
+            # these strategies are independent entry lanes and should not vote
+            # in the legacy consensus basket.
+            consensus_excluded_strategies = {
+                "macd_momentum",
+                "rsi_oversold_checklist",
+                "macd_ema_vwap_scalper",
+                "supertrend",
+                "swing_hull_rsi_ema",
+            }
             consensus_strategies = {
                 name: data
                 for name, data in strategies.items()
                 if name not in consensus_excluded_strategies
             }
-            rsi_checklist_override = bool(consensus.get("rsi_checklist_buy_override", False))
-            if rsi_checklist_override:
-                logger.warning(
-                    "[EntryGate] RSI checklist override active for %s %s: bypassing entry quality gate",
+            stable_regime_l = str((resolved_policy or {}).get("stable_regime", "") or "").strip().lower()
+            sq_root = await self._get_config_value("trading.standalone_entry_quality", {})
+            if not isinstance(sq_root, dict):
+                sq_root = {}
+            max_standalone_spread = float(
+                sq_root.get(
+                    "max_spread_percentage",
+                    gate.get("max_spread_percentage", 0.40),
+                )
+                or 0.40
+            )
+            standalone_buy_strategies = (
+                "rsi_oversold_checklist",
+                "macd_ema_vwap_scalper",
+                "supertrend",
+                "swing_hull_rsi_ema",
+                "macd_momentum",
+                "pullback_long_scalping",
+                "breakout_retest_long",
+                "vwap_bounce_scalping",
+                "small_size_momentum_scalp",
+            )
+            for strat_name in standalone_buy_strategies:
+                strat_raw = strategies.get(strat_name, {}) or {}
+                if str(strat_raw.get("signal", "hold")).lower() != "buy":
+                    continue
+                if not await self._standalone_entry_quality_qualifies(
+                    strat_name, strat_raw, stable_regime_l
+                ):
+                    logger.info(
+                        "[EntryGate] Reject %s %s: %s BUY failed standalone_entry_quality "
+                        "(conf=%.2f str=%.2f stable_regime=%s)",
+                        exchange_name,
+                        pair,
+                        strat_name,
+                        float(strat_raw.get("confidence", 0) or 0),
+                        float(strat_raw.get("strength", 0) or 0),
+                        stable_regime_l or "unknown",
+                    )
+                    await self._record_entry_gate_event(
+                        exchange_name,
+                        pair,
+                        "standalone_entry_quality",
+                        signals_data,
+                        resolved_policy,
+                        {
+                            "strategy": strat_name,
+                            "confidence": float(strat_raw.get("confidence", 0) or 0),
+                            "strength": float(strat_raw.get("strength", 0) or 0),
+                        },
+                    )
+                    return False
+                if not await self._standalone_entry_spread_ok(
+                    exchange_name, pair, max_standalone_spread
+                ):
+                    await self._record_entry_gate_event(
+                        exchange_name,
+                        pair,
+                        "standalone_spread",
+                        signals_data,
+                        resolved_policy,
+                        {"strategy": strat_name, "max_spread_pct": max_standalone_spread},
+                    )
+                    return False
+                if not await self._passes_standalone_pair_guards(
+                    strat_name, exchange_name, pair
+                ):
+                    await self._record_entry_gate_event(
+                        exchange_name,
+                        pair,
+                        "standalone_pair_guard",
+                        signals_data,
+                        resolved_policy,
+                        {"strategy": strat_name},
+                    )
+                    return False
+                logger.info(
+                    "[EntryGate] %s %s: %s BUY passed standalone_entry_quality "
+                    "(conf=%.2f str=%.2f stable_regime=%s)",
                     exchange_name,
                     pair,
+                    strat_name,
+                    float(strat_raw.get("confidence", 0) or 0),
+                    float(strat_raw.get("strength", 0) or 0),
+                    stable_regime_l or "unknown",
                 )
                 return True
             rsi_oversold_override = bool(consensus.get("rsi_15m_oversold_buy_override", False))
@@ -833,25 +1560,16 @@ class TradingOrchestrator:
             macd_override_cfg = await self._get_config_value("trading.macd_buy_override", {})
             if not isinstance(macd_override_cfg, dict):
                 macd_override_cfg = {}
-            macd_override_enabled = bool(macd_override_cfg.get("enabled", True))
             macd_strategy_data = strategies.get("macd_momentum", {}) or {}
             macd_signal = str((macd_strategy_data.get("signal", "hold"))).lower()
-            macd_validation = (macd_strategy_data.get("validation", {}) or {})
-            macd_rule_triggered = bool(
-                macd_validation.get("trigger")
-                or macd_validation.get("macd_green_rsi_buy_ok")
-                or macd_strategy_data.get("macd_green_rsi_buy_ok")
-            )
-            if macd_override_enabled and (macd_signal == "buy" or macd_rule_triggered):
-                logger.warning(
-                    "[EntryGate] MACD override active for %s %s: bypassing entry quality gate "
-                    "(signal=%s, rule_triggered=%s)",
+            if bool(macd_override_cfg.get("enabled", True)) and macd_signal == "buy":
+                logger.info(
+                    "[EntryGate] %s %s: MACD BUY does not qualify for standalone quality "
+                    "(stable_regime=%s — applying full entry quality gate)",
                     exchange_name,
                     pair,
-                    macd_signal,
-                    macd_rule_triggered,
+                    stable_regime_l or "unknown",
                 )
-                return True
             entry_policy = (resolved_policy or {}).get("entry", {}) or {}
             min_consensus_conf = float(entry_policy.get("min_consensus_confidence", gate.get("min_consensus_confidence", 0.62)) or 0.62)
             min_agreement_pct = float(entry_policy.get("min_agreement_percentage", gate.get("min_agreement_percentage", 66.0)) or 66.0)
@@ -894,20 +1612,76 @@ class TradingOrchestrator:
 
             c_conf = float(consensus.get("confidence") or 0.0)
             c_agree = float(consensus.get("agreement") or 0.0)
+            if c_signal := str(consensus.get("signal", "hold")).lower():
+                if c_signal != "buy" and not buy_votes and not fallback_override:
+                    logger.info(
+                        "[EntryGate] Reject %s %s: no standalone BUY and no legacy consensus BUY "
+                        "(consensus=%s conf=%.2f agreement=%.1f%%)",
+                        exchange_name,
+                        pair,
+                        c_signal,
+                        c_conf,
+                        c_agree,
+                    )
+                    await self._record_entry_gate_event(
+                        exchange_name,
+                        pair,
+                        "no_standalone_or_consensus_buy",
+                        signals_data,
+                        resolved_policy,
+                        {
+                            "consensus_signal": c_signal,
+                            "consensus_confidence": c_conf,
+                            "consensus_agreement": c_agree,
+                        },
+                    )
+                    return False
             if c_conf < min_consensus_conf and not fallback_override:
                 logger.info("[EntryGate] Reject %s %s: consensus confidence %.2f < %.2f", exchange_name, pair, c_conf, min_consensus_conf)
+                await self._record_entry_gate_event(
+                    exchange_name,
+                    pair,
+                    "consensus_confidence",
+                    signals_data,
+                    resolved_policy,
+                    {"actual": c_conf, "required": min_consensus_conf},
+                )
                 return False
             if c_agree < min_agreement_pct and not fallback_override:
                 logger.info("[EntryGate] Reject %s %s: agreement %.1f < %.1f", exchange_name, pair, c_agree, min_agreement_pct)
+                await self._record_entry_gate_event(
+                    exchange_name,
+                    pair,
+                    "consensus_agreement",
+                    signals_data,
+                    resolved_policy,
+                    {"actual": c_agree, "required": min_agreement_pct},
+                )
                 return False
 
             buy_signals = [s for s in consensus_strategies.values() if (s or {}).get("signal") == "buy"]
             if len(buy_signals) < min_buy_strategies and not fallback_override:
                 logger.info("[EntryGate] Reject %s %s: buy strategies %s < %s", exchange_name, pair, len(buy_signals), min_buy_strategies)
+                await self._record_entry_gate_event(
+                    exchange_name,
+                    pair,
+                    "buy_strategy_count",
+                    signals_data,
+                    resolved_policy,
+                    {"actual": len(buy_signals), "required": min_buy_strategies},
+                )
                 return False
             avg_strength = sum(float((s or {}).get("strength") or 0.0) for s in buy_signals) / max(1, len(buy_signals))
             if avg_strength < min_avg_buy_strength and not fallback_override:
                 logger.info("[EntryGate] Reject %s %s: avg buy strength %.2f < %.2f", exchange_name, pair, avg_strength, min_avg_buy_strength)
+                await self._record_entry_gate_event(
+                    exchange_name,
+                    pair,
+                    "avg_buy_strength",
+                    signals_data,
+                    resolved_policy,
+                    {"actual": avg_strength, "required": min_avg_buy_strength},
+                )
                 return False
 
             # spread sanity gate
@@ -921,12 +1695,20 @@ class TradingOrchestrator:
                     last = float(td.get("last") or 0.0)
                     if bid > 0 and ask > 0 and ask >= bid:
                         spread_pct = ((ask - bid) / max(last, (ask + bid) / 2.0)) * 100.0
-                        if spread_pct > max_spread_pct:
-                            logger.info(
-                                "[EntryGate] Reject %s %s: spread %.3f%% > %.3f%%",
-                                exchange_name, pair, spread_pct, max_spread_pct
-                            )
-                            return False
+                if spread_pct > max_spread_pct:
+                    logger.info(
+                        "[EntryGate] Reject %s %s: spread %.3f%% > %.3f%%",
+                        exchange_name, pair, spread_pct, max_spread_pct
+                    )
+                    await self._record_entry_gate_event(
+                        exchange_name,
+                        pair,
+                        "consensus_spread",
+                        signals_data,
+                        resolved_policy,
+                        {"actual": spread_pct, "required": max_spread_pct},
+                    )
+                    return False
             except Exception:
                 pass
             return True
@@ -1438,6 +2220,31 @@ class TradingOrchestrator:
                         
                         # Check if pairs exist and are not empty
                         if all_pairs and len(all_pairs) > 0:
+                            filtered_pairs = await self._filter_stablecoin_pairs(all_pairs)
+                            if len(filtered_pairs) < max_pairs:
+                                logger.info(
+                                    "Exchange %s: only %s pairs after stablecoin filter; regenerating selection",
+                                    exchange_name,
+                                    len(filtered_pairs),
+                                )
+                                await self._generate_and_store_pairs(
+                                    client, exchange_name, max_pairs, base_currency
+                                )
+                                continue
+
+                            if filtered_pairs != all_pairs:
+                                db_response = await client.post(
+                                    f"{database_service_url}/api/v1/pairs/{exchange_name}",
+                                    json=filtered_pairs[:max_pairs],
+                                )
+                                if db_response.status_code in (200, 201):
+                                    logger.info(
+                                        "Persisted stablecoin-filtered pairs for %s (%s removed)",
+                                        exchange_name,
+                                        len(all_pairs) - len(filtered_pairs),
+                                    )
+                                all_pairs = filtered_pairs
+
                             # Enforce max_pairs limit
                             if len(all_pairs) > max_pairs:
                                 logger.warning(f"Exchange {exchange_name} has {len(all_pairs)} pairs, limiting to {max_pairs} as per configuration")
@@ -1545,6 +2352,8 @@ class TradingOrchestrator:
                 
                 all_selected_pairs = combined_pairs[:target_pool_size]
                 logger.info(f"Using {len(all_selected_pairs)} combined pairs for {exchange_name}")
+
+            all_selected_pairs = await self._filter_stablecoin_pairs(all_selected_pairs)
             
             # Ensure CRO/USD is always first for crypto.com
             if exchange_name.lower() == "cryptocom" and "CRO/USD" not in all_selected_pairs:
@@ -1558,7 +2367,10 @@ class TradingOrchestrator:
                     logger.info(f"✅ Moved CRO/USD to first position for cryptocom")
             
             # Filter out blacklisted pairs (exchange-scoped).
-            selected_pairs = [pair for pair in all_selected_pairs if pair not in exchange_blacklisted_pairs]
+            selected_pairs = [
+                pair for pair in all_selected_pairs if pair not in exchange_blacklisted_pairs
+            ]
+            selected_pairs = await self._filter_stablecoin_pairs(selected_pairs)
             
             # Get replacement pairs if we have blacklisted pairs
             if len(exchange_blacklisted_pairs) > 0:
@@ -1633,6 +2445,11 @@ class TradingOrchestrator:
                 )
                 or 2000
             )
+            blacklist_all_strategies = bool(
+                await self._get_config_value(
+                    "trading.pair_rotation.blacklist_all_strategies", True
+                )
+            )
             cutoff = datetime.utcnow() - timedelta(hours=cooldown_hours)
 
             async with httpx.AsyncClient(timeout=45.0) as client:
@@ -1653,7 +2470,13 @@ class TradingOrchestrator:
             for t in recent_trades:
                 if str(t.get("status", "")).upper() != "CLOSED":
                     continue
-                if not is_macd_momentum_strategy(t.get("strategy")):
+                all_strategies = await self._get_config_value(
+                    "trading.pair_rotation.blacklist_all_strategies", True
+                )
+                if not (
+                    all_strategies is True
+                    or str(all_strategies).lower() in ("1", "true", "yes")
+                ) and not is_macd_momentum_strategy(t.get("strategy")):
                     continue
                 pair = str(t.get("pair") or "")
                 if not pair:
@@ -1760,6 +2583,63 @@ class TradingOrchestrator:
         # Final fallback
         logger.warning(f"[PositionConfig] Using fallback config for {strategy_name}: 10%, $200")
         return 0.10, 200.0
+
+    async def _check_strategy_max_open_trades(self, strategy_name: str) -> bool:
+        """Return True if another open trade for this strategy is allowed."""
+        if not strategy_name:
+            return True
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                cfg_resp = await client.get(f"{config_service_url}/api/v1/config/trading")
+                cfg_resp.raise_for_status()
+                cfg = cfg_resp.json().get("strategy_max_open_trades") or {}
+                if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+                    return True
+                limit = cfg.get(strategy_name)
+                if limit is None:
+                    return True
+                limit = int(limit)
+                if limit <= 0:
+                    return True
+
+                open_resp = await client.get(f"{database_service_url}/api/v1/trades/open")
+                open_resp.raise_for_status()
+                open_trades = open_resp.json().get("trades", []) or []
+                count = sum(
+                    1 for t in open_trades
+                    if str(t.get("strategy") or "") == strategy_name
+                )
+                if count >= limit:
+                    logger.warning(
+                        "[EntryGate] Strategy max open trades block: %s has %d/%d open",
+                        strategy_name,
+                        count,
+                        limit,
+                    )
+                    return False
+                return True
+        except Exception as e:
+            logger.error(
+                "Error checking strategy max open trades for %s: %s",
+                strategy_name,
+                e,
+            )
+            return False
+
+    async def _get_stablecoin_bases(self):
+        if getattr(self, "_stablecoin_bases_cache", None) is not None:
+            return self._stablecoin_bases_cache
+        bases = await load_stablecoin_bases_from_config(config_service_url)
+        self._stablecoin_bases_cache = bases
+        return bases
+
+    async def _filter_stablecoin_pairs(self, pairs: List[str]) -> List[str]:
+        stable_bases = await self._get_stablecoin_bases()
+        return filter_stablecoin_pairs_with_bases(pairs, stable_bases)
+
+    async def _is_stablecoin_pair(self, pair: str) -> bool:
+        stable_bases = await self._get_stablecoin_bases()
+        return bool(stable_bases) and is_stablecoin_pair(pair, stable_bases)
 
     def _apply_trading_loop_tunings(self, trading: Optional[Dict[str, Any]] = None) -> None:
         """Refresh cycle_interval / max_cycle_duration / exit_cycle_first from config (in-memory or caller)."""
@@ -2704,6 +3584,48 @@ class TradingOrchestrator:
             )
             if pp_activation_decimal < 0:
                 pp_activation_decimal = 0.005
+            entry_reason_lc = str(trade.get("entry_reason") or "").lower()
+            is_macd_continuation_trade = (
+                str(trade.get("strategy") or "").lower() == "macd_momentum"
+                and (
+                    "continuation_long" in entry_reason_lc
+                    or "rsi_gate=false" in entry_reason_lc
+                )
+            )
+            if is_macd_continuation_trade:
+                cont_risk_cfg = trading_config.get("macd_continuation_risk", {}) or {}
+                pp_activation_decimal = float(
+                    cont_risk_cfg.get("profit_activation_threshold", pp_activation_decimal)
+                    or pp_activation_decimal
+                )
+                trailing_trigger_decimal = float(
+                    cont_risk_cfg.get("trailing_activation_threshold", trailing_trigger_decimal)
+                    or trailing_trigger_decimal
+                )
+                trailing_step_decimal = float(
+                    cont_risk_cfg.get("trailing_step_percentage", trailing_step_decimal)
+                    or trailing_step_decimal
+                )
+                tightened_step_decimal = float(
+                    cont_risk_cfg.get("tightened_step_percentage", tightened_step_decimal)
+                    or tightened_step_decimal
+                )
+                breakeven_floor_decimal = float(
+                    cont_risk_cfg.get("breakeven_floor_percentage", breakeven_floor_decimal)
+                    or breakeven_floor_decimal
+                )
+                trailing_trigger_pct = trailing_trigger_decimal * 100
+                trailing_step_pct = trailing_step_decimal * 100
+                tightened_step_pct = tightened_step_decimal * 100
+                logger.warning(
+                    "[Trade %s] [MACDContinuationRisk] Using continuation risk profile: "
+                    "pp=%.3f%% trail=%.3f%% step=%.3f%% floor=%.3f%%",
+                    trade_id,
+                    pp_activation_decimal * 100.0,
+                    trailing_trigger_pct,
+                    trailing_step_pct,
+                    breakeven_floor_decimal * 100.0,
+                )
             profit_protection_activation_pct = pp_activation_decimal * 100
             # Lock level = breakeven floor (same value that clamps the real trailing stop).
             profit_guarantee_pct_cfg = breakeven_floor_decimal * 100
@@ -2972,6 +3894,70 @@ class TradingOrchestrator:
                         f"[Trade {trade_id}] [ProfitProtection] 🚩 PRICE-BREACH EXIT: "
                         f"current ${current_price:.6f} <= trigger ${pp_trigger_px:.6f} "
                         f"(PnL {pnl_percentage:.2f}%) — routing to critical market exit"
+                    )
+
+            # RSI checklist: max hold — close stale legs (e.g. multi-day ADI) regardless of SL.
+            if (
+                not should_exit
+                and position_size > 0
+                and risk_exit_allowed_by_feed
+                and trade.get("strategy")
+                and "rsi_oversold_checklist" in str(trade.get("strategy")).lower()
+            ):
+                try:
+                    chk_exit, chk_reason = await self._rsi_checklist_max_hold_exit(
+                        trade, pnl_percentage, trading_config
+                    )
+                    if chk_exit:
+                        should_exit = True
+                        exit_reason = chk_reason
+                        exit_trigger_price = current_price
+                        logger.warning(
+                            f"[Trade {trade_id}] [ChecklistMaxHold] {chk_reason} "
+                            f"(mark ${current_price:.6f}, PnL {pnl_percentage:.2f}%)"
+                        )
+                except Exception as chk_hold_err:
+                    logger.debug(f"[Trade {trade_id}] [ChecklistMaxHold] check skipped: {chk_hold_err}")
+
+            # VWMA Hull: structural long exit (1h OHLCV) — mirrors strategy ``should_exit``
+            # crossover / VWMAHull-break paths. Previously never ran in production because
+            # orchestrator does not hydrate strategy state or call ``should_exit``.
+            if (
+                not should_exit
+                and position_size > 0
+                and risk_exit_allowed_by_feed
+                and trade.get("strategy")
+                and "vwma_hull" in str(trade.get("strategy")).lower()
+            ):
+                st_hit, st_tag = await self._vwma_hull_structural_exit_signal(
+                    exchange, pair, trade=trade
+                )
+                if st_hit:
+                    should_exit = True
+                    exit_reason = f"vwma_hull_structural_{st_tag or 'signal'}"
+                    exit_trigger_price = current_price
+                    logger.warning(
+                        f"[Trade {trade_id}] [VWMAHullStructural] Structural exit: {exit_reason} "
+                        f"(mark ${current_price:.6f}, PnL {pnl_percentage:.2f}%, feed={feed_quality})"
+                    )
+
+            if (
+                not should_exit
+                and position_size > 0
+                and risk_exit_allowed_by_feed
+                and trade.get("strategy")
+                and "swing_hull_rsi_ema" in str(trade.get("strategy")).lower()
+            ):
+                sh_hit, sh_tag = await self._swing_hull_rsi_ema_structural_exit_signal(
+                    exchange, pair, trade=trade
+                )
+                if sh_hit:
+                    should_exit = True
+                    exit_reason = f"swing_hull_rsi_ema_structural_{sh_tag or 'signal'}"
+                    exit_trigger_price = current_price
+                    logger.warning(
+                        f"[Trade {trade_id}] [SwingHullRsiEmaStructural] Structural exit: {exit_reason} "
+                        f"(mark ${current_price:.6f}, PnL {pnl_percentage:.2f}%, feed={feed_quality})"
                     )
 
             # TRAILING STOP SYSTEM: Check if new system handles this trade or use legacy system
@@ -3459,6 +4445,66 @@ class TradingOrchestrator:
                         f"(feed_quality={feed_quality}) — defer TP until live feed recovers"
                     )
 
+            # MACD continuation fast-fail: if the trade has not proved itself
+            # quickly, close before the normal stagnant-loser/stop-loss path.
+            if (
+                not should_exit
+                and is_macd_continuation_trade
+                and risk_exit_allowed_by_feed
+                and entry_price > 0
+                and highest_price > 0
+            ):
+                try:
+                    cont_risk_cfg = trading_config.get("macd_continuation_risk", {}) or {}
+                    fail_age_minutes = float(
+                        cont_risk_cfg.get("early_fail_after_minutes", 30.0) or 30.0
+                    )
+                    fail_peak_pct = float(
+                        cont_risk_cfg.get("early_fail_required_peak_pct", 0.20) or 0.20
+                    )
+                    fail_pnl_pct = float(
+                        cont_risk_cfg.get("early_fail_pnl_below_pct", 0.0) or 0.0
+                    )
+                    peak_pct = ((highest_price - entry_price) / entry_price) * 100.0
+                    entry_time_raw = trade.get("entry_time")
+                    age_minutes = 0.0
+                    if entry_time_raw:
+                        if isinstance(entry_time_raw, str):
+                            entry_dt = datetime.fromisoformat(
+                                entry_time_raw.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                        else:
+                            entry_dt = entry_time_raw
+                        age_minutes = (datetime.utcnow() - entry_dt).total_seconds() / 60.0
+                    if (
+                        age_minutes >= fail_age_minutes
+                        and peak_pct < fail_peak_pct
+                        and pnl_percentage <= fail_pnl_pct
+                    ):
+                        should_exit = True
+                        exit_trigger_price = current_price
+                        exit_reason = (
+                            f"macd_continuation_fast_fail@{pnl_percentage:.2f}%"
+                            f"_peak{peak_pct:.2f}%_age{age_minutes:.0f}m"
+                        )
+                        logger.warning(
+                            "[Trade %s] [MACDContinuationRisk] 🚩 FAST-FAIL EXIT: "
+                            "age %.0fm >= %.0fm, peak %.2f%% < %.2f%%, pnl %.2f%% <= %.2f%%",
+                            trade_id,
+                            age_minutes,
+                            fail_age_minutes,
+                            peak_pct,
+                            fail_peak_pct,
+                            pnl_percentage,
+                            fail_pnl_pct,
+                        )
+                except Exception as cont_fast_fail_err:
+                    logger.debug(
+                        "[Trade %s] [MACDContinuationRisk] fast-fail skipped: %s",
+                        trade_id,
+                        cont_fast_fail_err,
+                    )
+
             # PnL-FIX v10 (2026-04-20) — STAGNANT LOSER DIVERGENCE EXIT.
             # Observed from 7-day trade review: a non-trivial class of
             # losers (AAVE/USD -5.10%, ARC/USD -1.57%, API3/USD -3.43%)
@@ -3484,6 +4530,11 @@ class TradingOrchestrator:
                     )
                     min_age_minutes = float(stagnant_cfg.get("min_age_minutes", 30.0) or 30.0)
                     base_peak_cap_pct = float(stagnant_cfg.get("peak_cap_pct", 0.3) or 0.3)
+                    pp_cfg = trading_config.get("profit_protection", {}) or {}
+                    pp_act_dec = float(pp_cfg.get("activation_threshold", 0.006) or 0.006)
+                    if pp_act_dec > 0:
+                        activation_peak_cap = (pp_act_dec * 100.0) * 0.92
+                        base_peak_cap_pct = min(base_peak_cap_pct, activation_peak_cap)
                     base_loss_trigger_pct = float(stagnant_cfg.get("loss_trigger_pct", -0.8) or -0.8)
                     # Volatility-aware regime tuning:
                     # high-vol (hostile) => faster and deeper guard
@@ -3512,15 +4563,31 @@ class TradingOrchestrator:
                         else:
                             entry_dt = entry_time_raw
                         age_minutes = (datetime.utcnow() - entry_dt).total_seconds() / 60.0
-                    if (
+                    fast_fail_peak = float(
+                        stagnant_cfg.get("fast_fail_peak_pct", 0.15) or 0.15
+                    )
+                    fast_fail_age = float(
+                        stagnant_cfg.get("fast_fail_min_age_minutes", 15.0) or 15.0
+                    )
+                    fast_fail_loss = float(
+                        stagnant_cfg.get("fast_fail_loss_pct", -0.55) or -0.55
+                    )
+                    fast_fail = (
+                        age_minutes >= fast_fail_age
+                        and peak_pct <= fast_fail_peak
+                        and pnl_percentage <= fast_fail_loss
+                    )
+                    stagnant_standard = (
                         age_minutes >= dynamic_age_minutes
                         and peak_pct <= dynamic_peak_cap_pct
                         and pnl_percentage <= dynamic_loss_trigger_pct
-                    ):
+                    )
+                    if fast_fail or stagnant_standard:
                         should_exit = True
                         exit_trigger_price = current_price
+                        tag = "fast_fail" if fast_fail else "divergence"
                         exit_reason = (
-                            f"stagnant_loser_divergence@{pnl_percentage:.2f}%"
+                            f"stagnant_loser_{tag}@{pnl_percentage:.2f}%"
                             f"_peak{peak_pct:.2f}%_age{age_minutes:.0f}m"
                         )
                         logger.warning(
@@ -3715,7 +4782,10 @@ class TradingOrchestrator:
                     for t in rows:
                         if str(t.get("status", "")).upper() not in ("CLOSED", "FAILED"):
                             continue
-                        if not is_macd_momentum_strategy(t.get("strategy")):
+                        if (
+                            not blacklist_all_strategies
+                            and not is_macd_momentum_strategy(t.get("strategy"))
+                        ):
                             continue
                         pair = str(t.get("pair") or "")
                         if not pair:
@@ -4116,9 +5186,9 @@ class TradingOrchestrator:
         try:
             now = datetime.utcnow()
 
-            # Global cross-exchange cooldown for the normalized pair.
-            pair_global_key = self._normalized_pair_key(pair)
-            recent_negative_until = self._recent_negative_realized_blacklist_until.get(pair_global_key)
+            # Global cross-exchange cooldown + blacklist keyed by base asset (ALGO/*).
+            cluster_key = self._entry_cluster_key(pair)
+            recent_negative_until = self._recent_negative_realized_blacklist_until.get(cluster_key)
             if recent_negative_until and recent_negative_until > now:
                 remaining = (recent_negative_until - now).total_seconds() / 60.0
                 logger.warning(
@@ -4130,20 +5200,21 @@ class TradingOrchestrator:
                 )
                 return False
             if recent_negative_until and recent_negative_until <= now:
-                self._recent_negative_realized_blacklist_until.pop(pair_global_key, None)
-            global_cooldown_until = self._global_pair_cooldown_until.get(pair_global_key)
+                self._recent_negative_realized_blacklist_until.pop(cluster_key, None)
+            global_cooldown_until = self._global_pair_cooldown_until.get(cluster_key)
             if global_cooldown_until and global_cooldown_until > now:
                 remaining = (global_cooldown_until - now).total_seconds() / 60.0
                 logger.info(
-                    "🧊 [GLOBAL PAIR COOLDOWN] %s blocked on %s for %.1f more min (until %s)",
+                    "🧊 [GLOBAL BASE COOLDOWN] %s (%s) blocked on %s for %.1f more min (until %s)",
                     pair,
+                    cluster_key or "?",
                     exchange_name,
                     remaining,
                     global_cooldown_until.isoformat(),
                 )
                 return False
             if global_cooldown_until and global_cooldown_until <= now:
-                self._global_pair_cooldown_until.pop(pair_global_key, None)
+                self._global_pair_cooldown_until.pop(cluster_key, None)
 
             key = loss_cooldown_key(exchange_name, pair)
             cooldown_until = self._pair_cooldown_until.get(key)
@@ -4186,9 +5257,9 @@ class TradingOrchestrator:
             window_hours = float(
                 await self._get_config_value("trading.block_pair_after_negative_realized_hours", 12) or 12
             )
-            min_realized_pct = float(
-                await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.5)
-                or 0.5
+            min_realized_pct = self._float_config(
+                await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.0),
+                0.0,
             )
             scan_limit = int(
                 await self._get_config_value("trading.pair_rotation.scan_recent_closed_limit", 2000) or 2000
@@ -4211,7 +5282,7 @@ class TradingOrchestrator:
                         continue
                     rows.extend((trades_resp.json() or {}).get("trades", []) or [])
 
-            new_map: Dict[str, datetime] = {}
+            latest_by_cluster: Dict[str, Tuple[datetime, float, str]] = {}
             for t in rows:
                 st = str(t.get("status") or "").upper()
                 if st not in ("CLOSED", "FAILED"):
@@ -4232,8 +5303,6 @@ class TradingOrchestrator:
                 if notional <= 0.0:
                     continue
                 realized_pnl_pct = (rpnl / notional) * 100.0
-                if realized_pnl_pct >= min_realized_pct:
-                    continue
                 exit_time_raw = t.get("exit_time") or t.get("updated_at")
                 if not exit_time_raw:
                     continue
@@ -4245,12 +5314,17 @@ class TradingOrchestrator:
                     continue
                 if exit_time < cutoff:
                     continue
-                until = exit_time + timedelta(hours=window_hours)
-                if until <= now:
+                key = self._entry_cluster_key(pair_name)
+                prev = latest_by_cluster.get(key)
+                if prev is None or exit_time > prev[0]:
+                    latest_by_cluster[key] = (exit_time, realized_pnl_pct, pair_name)
+
+            new_map: Dict[str, datetime] = {}
+            for key, (exit_time, realized_pnl_pct, pair_name) in latest_by_cluster.items():
+                if realized_pnl_pct >= min_realized_pct:
                     continue
-                key = self._normalized_pair_key(pair_name)
-                prev = new_map.get(key)
-                if prev is None or until > prev:
+                until = exit_time + timedelta(hours=window_hours)
+                if until > now:
                     new_map[key] = until
             self._recent_negative_realized_blacklist_until = new_map
         except Exception as e:
@@ -4270,13 +5344,13 @@ class TradingOrchestrator:
             window_hours = float(
                 await self._get_config_value("trading.block_pair_after_negative_realized_hours", 12) or 12
             )
-            min_realized_pct = float(
-                await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.5)
-                or 0.5
+            min_realized_pct = self._float_config(
+                await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.0),
+                0.0,
             )
             if realized_pnl_pct is not None and float(realized_pnl_pct) >= min_realized_pct:
                 return
-            key = self._normalized_pair_key(pair)
+            key = self._entry_cluster_key(pair)
             until = datetime.utcnow() + timedelta(hours=window_hours)
             prev = self._recent_negative_realized_blacklist_until.get(key)
             if prev is None or until > prev:
@@ -4303,7 +5377,7 @@ class TradingOrchestrator:
             mins = minutes if minutes is not None else self._pair_cooldown_minutes
             key = loss_cooldown_key(exchange_name, pair)
             self._pair_cooldown_until[key] = datetime.utcnow() + timedelta(minutes=mins)
-            global_key = self._normalized_pair_key(pair)
+            global_key = self._entry_cluster_key(pair)
             global_mins = max(0, int(self._global_pair_cooldown_minutes))
             if global_key and global_mins > 0:
                 self._global_pair_cooldown_until[global_key] = datetime.utcnow() + timedelta(
@@ -4316,7 +5390,7 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"[PAIR COOLDOWN] Error marking cooldown for {pair}: {e}")
 
-    async def _check_correlation_cap(self, exchange_name: str, pair: str) -> bool:
+    async def _check_correlation_cap(self, exchange_name: str, pair: str, force_refresh: bool = False) -> bool:
         """
         PnL-FIX v3: Reject new entries when the "crypto beta" basket is already
         full. Since ~all pairs we trade are crypto longs with correlation >0.8,
@@ -4330,7 +5404,20 @@ class TradingOrchestrator:
         try:
             # Fetch current open trades from database-service (already used elsewhere).
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(f"{database_service_url}/api/v1/trades/open")
+                req_headers = None
+                req_params = None
+                if force_refresh:
+                    ts_nonce = int(datetime.utcnow().timestamp() * 1000)
+                    req_headers = {
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                    }
+                    req_params = {"_ts": ts_nonce}
+                response = await client.get(
+                    f"{database_service_url}/api/v1/trades/open",
+                    headers=req_headers,
+                    params=req_params,
+                )
                 response.raise_for_status()
                 open_trades = response.json().get('trades', [])
 
@@ -4357,12 +5444,21 @@ class TradingOrchestrator:
             logger.error(f"[CORRELATION CAP] Error checking cap for {pair}: {e}")
             return True  # fail-open
 
+    async def _refresh_entry_guard_sources(self) -> None:
+        """Refresh in-memory guard maps so retries use the latest state."""
+        try:
+            await self._refresh_hard_loss_cooldown_map()
+            await self._refresh_recent_negative_realized_blacklist_map()
+        except Exception as e:
+            logger.warning("[EntryGuardRefresh] Guard source refresh failed: %s", e)
+
     async def _check_no_negative_unrealized_on_same_pair(
         self, exchange_name: str, pair: str
     ) -> bool:
         """
-        Block a new entry when any OPEN position on the **same normalized pair on any
-        exchange** has unrealized_pnl% at/below configured threshold (default 0.5%).
+        Block a new entry when any OPEN position on the **same base asset (cluster)
+        on any exchange** has unrealized_pnl% at/below configured threshold (e.g. ALGO/USD
+        vs ALGO/USDC both count as ALGO).
         """
         try:
             enabled = await self._get_config_value(
@@ -4378,10 +5474,24 @@ class TradingOrchestrator:
             )
             active_trades = await self._get_active_trades_for_entry_guards()
             for t in active_trades:
-                if not self._dashboard_pair_key_match(t.get("pair"), pair):
+                if not self._entry_cluster_key_match(t.get("pair"), pair):
                     continue
                 status = str(t.get("status") or "").upper()
                 if status == "PENDING":
+                    # Defensive refresh before blocking: avoid rejecting entries
+                    # from stale OPEN/PENDING snapshots.
+                    refreshed = await self._refresh_entry_guard_trade_state(
+                        pair=pair, trade_id=str(t.get("trade_id") or "")
+                    )
+                    if refreshed is None:
+                        logger.info(
+                            "[OPEN UPNL GATE] Ignoring stale pending blocker for %s %s "
+                            "(trade %s no longer active after refresh)",
+                            exchange_name,
+                            pair,
+                            t.get("trade_id"),
+                        )
+                        continue
                     logger.warning(
                         "🚫 [OPEN UPNL GATE] Blocking new entry on %s %s — existing pending trade %s on %s",
                         exchange_name,
@@ -4404,6 +5514,44 @@ class TradingOrchestrator:
                 # Require existing same-pair legs to be above threshold before allowing new entry.
                 # If pct cannot be computed, keep conservative legacy behavior for negative uPnL.
                 if (upnl_pct is not None and upnl_pct <= min_upnl_pct) or (upnl_pct is None and u < 0):
+                    # Revalidate against a forced fresh snapshot so stale DB/API
+                    # rows from recently-closed trades do not block new entries.
+                    refreshed = await self._refresh_entry_guard_trade_state(
+                        pair=pair,
+                        trade_id=str(t.get("trade_id") or ""),
+                    )
+                    if refreshed is None:
+                        logger.info(
+                            "[OPEN UPNL GATE] Ignoring stale blocker for %s %s "
+                            "(trade %s no longer active after refresh)",
+                            exchange_name,
+                            pair,
+                            t.get("trade_id"),
+                        )
+                        continue
+                    t = refreshed
+                    try:
+                        u = float(t.get("unrealized_pnl") or 0.0)
+                    except (TypeError, ValueError):
+                        u = 0.0
+                    notional = infer_trade_notional_usd(
+                        entry_price=float(t.get("entry_price") or 0.0),
+                        position_size=float(t.get("position_size") or 0.0),
+                        total_investment=float(t.get("total_investment") or 0.0),
+                        entry_notional=float(t.get("entry_notional") or 0.0),
+                    )
+                    upnl_pct = (u / notional) * 100.0 if notional > 0.0 else None
+                    if not ((upnl_pct is not None and upnl_pct <= min_upnl_pct) or (upnl_pct is None and u < 0)):
+                        logger.info(
+                            "[OPEN UPNL GATE] Fresh trade state no longer blocks %s %s "
+                            "(trade %s uPnL %.2f%% > %.2f%% threshold)",
+                            exchange_name,
+                            pair,
+                            t.get("trade_id"),
+                            0.0 if upnl_pct is None else upnl_pct,
+                            min_upnl_pct,
+                        )
+                        continue
                     oex = str(t.get("exchange", "") or "").strip().lower()
                     logger.warning(
                         "🚫 [OPEN UPNL GATE] Blocking new entry on %s %s — open trade %s on %s has "
@@ -4427,7 +5575,26 @@ class TradingOrchestrator:
             )
             return True  # fail-open; other risk gates still apply
 
-    async def _get_active_trades_for_entry_guards(self) -> List[Dict[str, Any]]:
+    async def _refresh_entry_guard_trade_state(self, pair: str, trade_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Force-refresh active trade view for one pair/trade to avoid stale blockers.
+        Returns latest active row if still OPEN/PENDING, otherwise None.
+        """
+        if not pair or not trade_id:
+            return None
+        fresh_rows = await self._get_active_trades_for_entry_guards(force_refresh=True)
+        for row in fresh_rows:
+            if str(row.get("trade_id") or "") != trade_id:
+                continue
+            if not self._entry_cluster_key_match(row.get("pair"), pair):
+                continue
+            status = str(row.get("status") or "").upper()
+            if status in ("OPEN", "PENDING"):
+                return row
+            return None
+        return None
+
+    async def _get_active_trades_for_entry_guards(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         """
         Fetch trade states that should block re-entry.
 
@@ -4438,13 +5605,34 @@ class TradingOrchestrator:
         active_rows: List[Dict[str, Any]] = []
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                open_resp = await client.get(f"{database_service_url}/api/v1/trades/open")
+                req_headers = {}
+                open_params = None
+                pending_params: Dict[str, Any] = {
+                    "status": "PENDING",
+                    "limit": 500,
+                    "sort_by": "entry_time",
+                    "sort_order": "desc",
+                }
+                if force_refresh:
+                    ts_nonce = int(datetime.utcnow().timestamp() * 1000)
+                    req_headers = {
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                    }
+                    open_params = {"_ts": ts_nonce}
+                    pending_params["_ts"] = ts_nonce
+                open_resp = await client.get(
+                    f"{database_service_url}/api/v1/trades/open",
+                    headers=req_headers or None,
+                    params=open_params,
+                )
                 open_resp.raise_for_status()
                 active_rows.extend(open_resp.json().get("trades", []) or [])
 
                 pending_resp = await client.get(
                     f"{database_service_url}/api/v1/trades",
-                    params={"status": "PENDING", "limit": 500, "sort_by": "entry_time", "sort_order": "desc"},
+                    headers=req_headers or None,
+                    params=pending_params,
                 )
                 pending_resp.raise_for_status()
                 active_rows.extend((pending_resp.json() or {}).get("trades", []) or [])
@@ -4470,6 +5658,25 @@ class TradingOrchestrator:
         return a.replace("/", "").upper() == b.replace("/", "").upper()
 
     @staticmethod
+    def _entry_cluster_key(pair: Optional[str]) -> str:
+        """
+        Base-asset key for cross-venue / cross-quote entry coordination.
+        ALGO/USD (cryptocom) and ALGO/USDC (binance) -> ALGO.
+        """
+        s = str(pair or "").strip()
+        if not s:
+            return ""
+        if "/" in s:
+            return s.split("/", 1)[0].strip().upper()
+        return s.replace("/", "").strip().upper()
+
+    @classmethod
+    def _entry_cluster_key_match(cls, trade_pair: Optional[str], candidate_pair: str) -> bool:
+        a = cls._entry_cluster_key(trade_pair)
+        b = cls._entry_cluster_key(candidate_pair)
+        return bool(a and b and a == b)
+
+    @staticmethod
     def _normalized_pair_key(pair: str) -> str:
         """Stable normalized pair key for cross-exchange entry reservations."""
         return str(pair or "").replace("/", "").strip().upper()
@@ -4479,7 +5686,7 @@ class TradingOrchestrator:
         Reserve a normalized pair while evaluating/placing a new entry.
         Prevents same-cycle concurrent entries on the same pair across exchanges.
         """
-        key = self._normalized_pair_key(pair)
+        key = self._entry_cluster_key(pair)
         if not key:
             return False
         async with self._pair_entry_reservation_lock:
@@ -4495,7 +5702,7 @@ class TradingOrchestrator:
             return True
 
     async def _release_pair_entry_reservation(self, pair: str) -> None:
-        key = self._normalized_pair_key(pair)
+        key = self._entry_cluster_key(pair)
         if not key:
             return
         async with self._pair_entry_reservation_lock:
@@ -4508,12 +5715,17 @@ class TradingOrchestrator:
         ex_lo = str(exchange_name or "").strip().lower()
         p = str(pair or "").strip()
         now = datetime.utcnow()
-        pair_key = self._normalized_pair_key(p)
-        recent_until = self._recent_negative_realized_blacklist_until.get(pair_key)
+        cluster_key = self._entry_cluster_key(p)
+        global_cd = self._global_pair_cooldown_until.get(cluster_key)
+        if global_cd and global_cd > now:
+            return "global_pair_cooldown"
+        if global_cd and global_cd <= now:
+            self._global_pair_cooldown_until.pop(cluster_key, None)
+        recent_until = self._recent_negative_realized_blacklist_until.get(cluster_key)
         if recent_until and recent_until > now:
             return "recent_negative_realized_blacklist"
         if recent_until and recent_until <= now:
-            self._recent_negative_realized_blacklist_until.pop(pair_key, None)
+            self._recent_negative_realized_blacklist_until.pop(cluster_key, None)
         for store, label in (
             (self._pair_execution_downgrade_until, "execution_downgrade"),
             (self._pair_cooldown_until, "pair_cooldown"),
@@ -4585,13 +5797,13 @@ class TradingOrchestrator:
             if mem:
                 blocks[ps] = mem
                 if mem == "recent_negative_realized_blacklist":
-                    pair_key = self._normalized_pair_key(ps)
-                    until = self._recent_negative_realized_blacklist_until.get(pair_key)
-                    min_realized_pct = float(
+                    ckey = self._entry_cluster_key(ps)
+                    until = self._recent_negative_realized_blacklist_until.get(ckey)
+                    min_realized_pct = self._float_config(
                         await self._get_config_value(
-                            "trading.block_pair_after_realized_pnl_below_pct", 0.5
-                        )
-                        or 0.5
+                            "trading.block_pair_after_realized_pnl_below_pct", 0.0
+                        ),
+                        0.0,
                     )
                     block_details[ps] = {
                         "type": mem,
@@ -4600,6 +5812,18 @@ class TradingOrchestrator:
                         "message": (
                             f"recent close realized PnL% below {min_realized_pct:.2f}%"
                             + (f"; blocked until {until.isoformat()}" if until else "")
+                        ),
+                    }
+                elif mem == "global_pair_cooldown":
+                    ckey = self._entry_cluster_key(ps)
+                    until = self._global_pair_cooldown_until.get(ckey)
+                    block_details[ps] = {
+                        "type": mem,
+                        "cluster": ckey,
+                        "until": until.isoformat() if until else None,
+                        "message": (
+                            f"base-asset cooldown active for {ckey}"
+                            + (f" until {until.isoformat()}" if until else "")
                         ),
                     }
 
@@ -4672,12 +5896,11 @@ class TradingOrchestrator:
             same_pair_opens = [
                 t
                 for t in open_trades
-                if str(t.get("exchange", "")).lower() == ex_lo
-                and self._dashboard_pair_key_match(t.get("pair"), ps)
+                if self._entry_cluster_key_match(t.get("pair"), ps)
             ]
             if upnl_gate_active:
                 for t in open_trades:
-                    if not self._dashboard_pair_key_match(t.get("pair"), ps):
+                    if not self._entry_cluster_key_match(t.get("pair"), ps):
                         continue
                     try:
                         u_open = float(t.get("unrealized_pnl") or 0.0)
@@ -4702,7 +5925,7 @@ class TradingOrchestrator:
                             "upnl_usd": u_open,
                             "upnl_pct": upnl_pct,
                             "message": (
-                                f"open same-pair leg must be > {upnl_gate_min_pct:.2f}% uPnL "
+                                f"open same-base leg must be > {upnl_gate_min_pct:.2f}% uPnL "
                                 f"(current={0.0 if upnl_pct is None else upnl_pct:.2f}%)"
                             ),
                         }
@@ -4723,7 +5946,7 @@ class TradingOrchestrator:
                 block_details[ps] = {
                     "type": "force_single_open_per_pair",
                     "open_count": len(same_pair_opens),
-                    "message": f"{len(same_pair_opens)} active trade(s) on pair",
+                    "message": f"{len(same_pair_opens)} active trade(s) on same base asset",
                 }
                 continue
             neg_cnt = 0
@@ -4738,7 +5961,7 @@ class TradingOrchestrator:
             for t in hist_trades:
                 if str(t.get("exchange", "")).lower() != ex_lo:
                     continue
-                if not self._dashboard_pair_key_match(t.get("pair"), ps):
+                if not self._entry_cluster_key_match(t.get("pair"), ps):
                     continue
                 st = str(t.get("status") or "").upper()
                 if st not in ("CLOSED", "FAILED"):
@@ -4791,23 +6014,68 @@ class TradingOrchestrator:
                 return
             logger.info(f"🔍 [ENTRY CHECK] Starting entry evaluation for {pair} on {exchange_name}")
 
-            # CONDITION CHECK 0a: Per-pair cooldown (PnL-FIX v3)
+            if await self._is_stablecoin_pair(pair):
+                logger.warning(
+                    "[EntryGate] Block stablecoin pair %s on %s (base is stable/fiat-pegged)",
+                    pair,
+                    exchange_name,
+                )
+                return
+
+            # CONDITION CHECK 0a: Blacklist / recent-loss rotation (pair selection + weak closes)
+            bl_blocked, bl_reason = await self._is_pair_blacklisted_for_entry(exchange_name, pair)
+            if bl_blocked:
+                logger.warning(
+                    "[EntryGate] Block %s %s: blacklisted (%s)",
+                    exchange_name,
+                    pair,
+                    bl_reason,
+                )
+                return
+
+            # CONDITION CHECK 0b: Per-pair cooldown (PnL-FIX v3)
             if not await self._check_pair_cooldown(exchange_name, pair):
-                return
+                logger.info(
+                    "[EntryGate] First-block on pair cooldown for %s %s; refreshing and rechecking once",
+                    exchange_name,
+                    pair,
+                )
+                await self._refresh_entry_guard_sources()
+                if not await self._check_pair_cooldown(exchange_name, pair):
+                    return
 
-            # CONDITION CHECK 0b: Correlation basket cap (PnL-FIX v3)
+            # CONDITION CHECK 0c: Correlation basket cap (PnL-FIX v3)
             if not await self._check_correlation_cap(exchange_name, pair):
-                return
+                logger.info(
+                    "[EntryGate] First-block on correlation cap for %s %s; refreshing and rechecking once",
+                    exchange_name,
+                    pair,
+                )
+                if not await self._check_correlation_cap(exchange_name, pair, force_refresh=True):
+                    return
 
-            # CONDITION CHECK 0c: No entry if this normalized pair is underwater on any exchange
+            # CONDITION CHECK 0d: No entry if this normalized pair is underwater on any exchange
             if not await self._check_no_negative_unrealized_on_same_pair(exchange_name, pair):
-                return
+                logger.info(
+                    "[EntryGate] First-block on open-uPnL guard for %s %s; rechecking once",
+                    exchange_name,
+                    pair,
+                )
+                if not await self._check_no_negative_unrealized_on_same_pair(exchange_name, pair):
+                    return
 
             # CONDITION CHECK 1: Risk Management
             logger.info(f"🔍 [CONDITION 1] Checking risk management for {pair} on {exchange_name}")
             if not await self._check_pair_risk_management(exchange_name, pair):
-                logger.warning(f"❌ [CONDITION 1] Risk Management Block: Skipping {pair} on {exchange_name} - risk management check failed")
-                return
+                logger.info(
+                    "[EntryGate] First-block on risk management for %s %s; refreshing and rechecking once",
+                    exchange_name,
+                    pair,
+                )
+                await self._refresh_entry_guard_sources()
+                if not await self._check_pair_risk_management(exchange_name, pair):
+                    logger.warning(f"❌ [CONDITION 1] Risk Management Block: Skipping {pair} on {exchange_name} - risk management check failed")
+                    return
             else:
                 logger.info(f"✅ [CONDITION 1] Risk management check passed for {pair} on {exchange_name}")
             
@@ -4876,8 +6144,8 @@ class TradingOrchestrator:
             consensus = signals_data.get('consensus', {})
             logger.info(f"📊 [CONSENSUS] {pair} on {exchange_name}: Signal={consensus.get('signal', 'unknown').upper()}, Confidence={consensus.get('confidence', 0):.2f}, Agreement={consensus.get('agreement', 0):.1f}%")
             
-            # Consensus-driven entry (critical): do NOT bypass consensus by
-            # executing any individual strategy BUY in isolation.
+            # Two-lane entry model: legacy/shared strategies use consensus;
+            # standalone strategies execute through their own gates.
             strategies = signals_data.get('strategies', {}) or {}
             logger.info(f"📋 [STRATEGIES] Received {len(strategies)} strategy votes for {pair} on {exchange_name}")
             for strategy_name, signal_data in strategies.items():
@@ -4919,7 +6187,6 @@ class TradingOrchestrator:
                 pass
             c_primary_override = bool(consensus.get("primary_override", False))
             c_sell_veto_max = float(consensus.get("sell_veto_max", 0) or 0)
-            rsi_checklist_override = bool(consensus.get("rsi_checklist_buy_override", False))
             rsi_oversold_override = bool(consensus.get("rsi_15m_oversold_buy_override", False))
             macd_override_cfg = await self._get_config_value("trading.macd_buy_override", {})
             if not isinstance(macd_override_cfg, dict):
@@ -4951,7 +6218,20 @@ class TradingOrchestrator:
             fallback_min_conf = float(fallback_cfg.get("min_buy_strategy_confidence", 0.72) or 0.72)
             fallback_min_strength = float(fallback_cfg.get("min_buy_strategy_strength", 0.10) or 0.10)
             fallback_max_sell_signals = int(fallback_cfg.get("max_sell_signals", 0) or 0)
-            consensus_excluded_strategies = {"macd_momentum"}
+            # Keep this aligned with strategy-service consensus weighting:
+            # these strategies are independent entry lanes and should not vote
+            # in the legacy consensus basket.
+            consensus_excluded_strategies = {
+                "macd_momentum",
+                "rsi_oversold_checklist",
+                "macd_ema_vwap_scalper",
+                "supertrend",
+                "swing_hull_rsi_ema",
+                "pullback_long_scalping",
+                "breakout_retest_long",
+                "vwap_bounce_scalping",
+                "small_size_momentum_scalp",
+            }
             consensus_strategies = {
                 name: data
                 for name, data in strategies.items()
@@ -4975,29 +6255,54 @@ class TradingOrchestrator:
                     sell_votes.append((s_conf, s_strength, strategy_name))
 
             macd_signal_data = strategies.get("macd_momentum", {}) or {}
-            macd_validation = (macd_signal_data.get("validation", {}) or {})
-            macd_rule_triggered = bool(
-                macd_validation.get("trigger")
-                or macd_validation.get("macd_green_rsi_buy_ok")
-                or macd_signal_data.get("macd_green_rsi_buy_ok")
+            stable_regime_lc = str(stable_regime or "").strip().lower()
+            macd_is_buy_override = await self._macd_override_qualifies(
+                macd_signal_data, macd_override_cfg, stable_regime_lc
             )
-            macd_is_buy_override = (
-                macd_override_enabled
-                and (
-                    str(macd_signal_data.get("signal", "hold")).lower() == "buy"
-                    or macd_rule_triggered
+            macd_raw_buy_signal = str(macd_signal_data.get("signal", "hold")).lower() == "buy"
+            if macd_raw_buy_signal and not macd_is_buy_override:
+                logger.info(
+                    "[EntryGate] %s %s: MACD BUY signal ignored for standalone execution "
+                    "(regime=%s conf=%.2f str=%.2f — override thresholds not met)",
+                    exchange_name,
+                    pair,
+                    stable_regime_lc or "unknown",
+                    float(macd_signal_data.get("confidence", 0) or 0),
+                    float(macd_signal_data.get("strength", 0) or 0),
                 )
-            )
             rsi_override_strategy_data = strategies.get("rsi_oversold_override", {}) or {}
             rsi_is_buy_override = (
                 rsi_oversold_override
                 and str(rsi_override_strategy_data.get("signal", "hold")).lower() == "buy"
             )
             rsi_checklist_strategy_data = strategies.get("rsi_oversold_checklist", {}) or {}
+            # Independent of weighted consensus — same execution model as macd_momentum.
             rsi_checklist_is_buy_override = (
-                rsi_checklist_override
-                and str(rsi_checklist_strategy_data.get("signal", "hold")).lower() == "buy"
+                str(rsi_checklist_strategy_data.get("signal", "hold")).lower() == "buy"
             )
+            scalper_strategy_data = strategies.get("macd_ema_vwap_scalper", {}) or {}
+            scalper_is_buy_override = (
+                str(scalper_strategy_data.get("signal", "hold")).lower() == "buy"
+            )
+            supertrend_strategy_data = strategies.get("supertrend", {}) or {}
+            supertrend_is_buy_override = (
+                str(supertrend_strategy_data.get("signal", "hold")).lower() == "buy"
+            )
+            swing_hull_strategy_data = strategies.get("swing_hull_rsi_ema", {}) or {}
+            swing_hull_is_buy_override = (
+                str(swing_hull_strategy_data.get("signal", "hold")).lower() == "buy"
+            )
+            intraday_standalone_names = (
+                "pullback_long_scalping",
+                "breakout_retest_long",
+                "vwap_bounce_scalping",
+                "small_size_momentum_scalp",
+            )
+            intraday_buy_overrides = {
+                name: (strategies.get(name, {}) or {})
+                for name in intraday_standalone_names
+                if str((strategies.get(name, {}) or {}).get("signal", "hold")).lower() == "buy"
+            }
             if macd_is_buy_override:
                 logger.warning(
                     "[MACDOverride] %s %s: forcing BUY execution from macd_momentum "
@@ -5025,12 +6330,61 @@ class TradingOrchestrator:
                 )
             if rsi_checklist_is_buy_override:
                 logger.warning(
-                    "[RSIChecklistOverride] %s %s: forcing BUY execution from rsi_oversold_checklist "
-                    "(confidence=%.2f, strength=%.2f, consensus=%s %.2f/%.1f%%)",
+                    "[RSIChecklistStandalone] %s %s: BUY from rsi_oversold_checklist (independent of consensus; "
+                    "conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
                     exchange_name,
                     pair,
                     float(rsi_checklist_strategy_data.get("confidence", 0) or 0),
                     float(rsi_checklist_strategy_data.get("strength", 0) or 0),
+                    c_signal,
+                    c_conf,
+                    c_agreement,
+                )
+            if scalper_is_buy_override:
+                logger.warning(
+                    "[MACDVWAPScalperStandalone] %s %s: BUY from macd_ema_vwap_scalper (independent of consensus; "
+                    "conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
+                    exchange_name,
+                    pair,
+                    float(scalper_strategy_data.get("confidence", 0) or 0),
+                    float(scalper_strategy_data.get("strength", 0) or 0),
+                    c_signal,
+                    c_conf,
+                    c_agreement,
+                )
+            if supertrend_is_buy_override:
+                logger.warning(
+                    "[SuperTrendStandalone] %s %s: BUY from supertrend (independent of consensus; "
+                    "conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
+                    exchange_name,
+                    pair,
+                    float(supertrend_strategy_data.get("confidence", 0) or 0),
+                    float(supertrend_strategy_data.get("strength", 0) or 0),
+                    c_signal,
+                    c_conf,
+                    c_agreement,
+                )
+            if swing_hull_is_buy_override:
+                logger.warning(
+                    "[SwingHullRsiEmaStandalone] %s %s: BUY from swing_hull_rsi_ema (independent of consensus; "
+                    "conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
+                    exchange_name,
+                    pair,
+                    float(swing_hull_strategy_data.get("confidence", 0) or 0),
+                    float(swing_hull_strategy_data.get("strength", 0) or 0),
+                    c_signal,
+                    c_conf,
+                    c_agreement,
+                )
+            for intraday_name, intraday_data in intraday_buy_overrides.items():
+                logger.warning(
+                    "[IntradayStandalone] %s %s: BUY from %s (independent of consensus; "
+                    "conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
+                    exchange_name,
+                    pair,
+                    intraday_name,
+                    float(intraday_data.get("confidence", 0) or 0),
+                    float(intraday_data.get("strength", 0) or 0),
                     c_signal,
                     c_conf,
                     c_agreement,
@@ -5055,24 +6409,24 @@ class TradingOrchestrator:
                         c_signal, c_conf, len(sell_votes)
                     )
 
-            if c_signal != 'buy' and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
+            if c_signal != 'buy' and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus is {c_signal.upper()} for {pair} on {exchange_name}; "
                     f"entry blocked (confidence={c_conf:.2f}, agreement={c_agreement:.1f}%)"
                 )
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", f"consensus_{c_signal}")
                 return
-            # Critical safety: unless explicitly enabled, do not allow generic forced BUY
-            # overrides to bypass HOLD/SELL consensus.
-            # Exception: macd_momentum override is an explicit hard-entry policy requested
-            # for all pairs when the MACD+RSI rule is satisfied.
+            # Critical safety: optional block for rsi_oversold_override only.
+            # macd_momentum, rsi_oversold_checklist, macd_ema_vwap_scalper, supertrend, and swing_hull_rsi_ema are standalone entry policies
+            # (not consensus-gated); rsi_oversold_override remains consensus-coupled here.
             if (
                 c_signal != "buy"
-                and (rsi_is_buy_override or rsi_checklist_is_buy_override)
+                and rsi_is_buy_override
                 and not allow_forced_overrides
             ):
                 logger.warning(
-                    "[EntryGate] Reject %s %s: forced override blocked while consensus=%s (non-MACD override)",
+                    "[EntryGate] Reject %s %s: rsi_oversold_override blocked while consensus=%s "
+                    "(enable trading.allow_forced_buy_overrides to allow)",
                     exchange_name,
                     pair,
                     c_signal,
@@ -5081,21 +6435,21 @@ class TradingOrchestrator:
                     exchange_name, stable_regime, "rejected", "forced_override_blocked"
                 )
                 return
-            if c_conf <= min_confidence and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
+            if c_conf <= min_confidence and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
                     f"confidence {c_conf:.2f} <= min {min_confidence:.2f}"
                 )
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "consensus_confidence")
                 return
-            if c_agreement < min_agreement and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
+            if c_agreement < min_agreement and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
                     f"agreement {c_agreement:.1f}% < min {min_agreement:.1f}%"
                 )
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "consensus_agreement")
                 return
-            if c_sell_veto_max >= sell_veto_threshold and not c_primary_override and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
+            if c_sell_veto_max >= sell_veto_threshold and not c_primary_override and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
                     f"sell-veto {c_sell_veto_max:.2f} >= {sell_veto_threshold:.2f}"
@@ -5114,7 +6468,7 @@ class TradingOrchestrator:
                             strategy_name,
                         )
                     )
-            if not buy_candidates and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
+            if not buy_candidates and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
                 logger.info(f"📄 [SUMMARY] Consensus BUY but no concrete BUY candidate found for {pair} on {exchange_name}")
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "no_buy_candidates")
                 return
@@ -5139,37 +6493,151 @@ class TradingOrchestrator:
                 best_conf = float(rsi_checklist_strategy_data.get("confidence", 0) or 0)
                 best_strength = float(rsi_checklist_strategy_data.get("strength", 0) or 0)
                 best_strategy = "rsi_oversold_checklist"
+            if scalper_is_buy_override:
+                best_conf = float(scalper_strategy_data.get("confidence", 0) or 0)
+                best_strength = float(scalper_strategy_data.get("strength", 0) or 0)
+                best_strategy = "macd_ema_vwap_scalper"
+            if supertrend_is_buy_override:
+                best_conf = float(supertrend_strategy_data.get("confidence", 0) or 0)
+                best_strength = float(supertrend_strategy_data.get("strength", 0) or 0)
+                best_strategy = "supertrend"
+            if swing_hull_is_buy_override:
+                best_conf = float(swing_hull_strategy_data.get("confidence", 0) or 0)
+                best_strength = float(swing_hull_strategy_data.get("strength", 0) or 0)
+                best_strategy = "swing_hull_rsi_ema"
+            if intraday_buy_overrides:
+                intraday_ranked = sorted(
+                    (
+                        (
+                            float(data.get("confidence", 0) or 0),
+                            float(data.get("strength", 0) or 0),
+                            name,
+                        )
+                        for name, data in intraday_buy_overrides.items()
+                    ),
+                    reverse=True,
+                )
+                best_conf, best_strength, best_strategy = intraday_ranked[0]
 
-            if not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override:
-                logger.info(f"🔍 [CONDITION 5] Checking momentum filter for {pair} on {exchange_name}")
-                allow_entry, filter_reason = await self.momentum_filter.should_allow_entry(exchange_name, pair)
-                if not allow_entry:
-                    logger.warning(f"❌ [CONDITION 5] Momentum filter BLOCKED entry for {pair} on {exchange_name}: {filter_reason}")
-                    self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "momentum_filter")
+            is_standalone_entry = (
+                macd_is_buy_override
+                or rsi_is_buy_override
+                or rsi_checklist_is_buy_override
+                or scalper_is_buy_override
+                or supertrend_is_buy_override
+                or swing_hull_is_buy_override
+                or bool(intraday_buy_overrides)
+            )
+            if is_standalone_entry:
+                if not await self._standalone_entry_gate_allowed(
+                    best_strategy, stable_regime, exchange_name
+                ):
+                    logger.info(
+                        "[EntryGate] Reject %s %s: standalone gate failed "
+                        "(strategy=%s stable_regime=%s)",
+                        exchange_name,
+                        pair,
+                        best_strategy,
+                        stable_regime,
+                    )
+                    self._record_regime_entry_decision(
+                        exchange_name, stable_regime, "rejected", "standalone_regime_blocked"
+                    )
                     return
-            else:
-                if macd_is_buy_override:
+                expectancy_ok, expectancy_reason = await self._strategy_expectancy_allows_entry(
+                    best_strategy
+                )
+                if not expectancy_ok:
                     logger.warning(
-                        "[MACDOverride] %s %s: bypassing momentum filter due to forced macd_momentum BUY override",
+                        "[StrategyExpectancyGuard] Reject %s %s: strategy=%s %s",
+                        exchange_name,
+                        pair,
+                        best_strategy,
+                        expectancy_reason,
+                    )
+                    self._record_regime_entry_decision(
+                        exchange_name,
+                        stable_regime,
+                        "rejected",
+                        "strategy_expectancy_guard",
+                    )
+                    return
+            elif not await self._long_entry_regime_allowed(stable_regime):
+                logger.info(
+                    "[EntryGate] Reject %s %s: stable_regime=%s not in long_entry_allowed_regimes (consensus path)",
+                    exchange_name,
+                    pair,
+                    stable_regime,
+                )
+                self._record_regime_entry_decision(
+                    exchange_name, stable_regime, "rejected", "long_regime_blocked"
+                )
+                return
+
+            momentum_bypass = {"macd_momentum", "rsi_oversold_override"}
+            if rsi_is_buy_override:
+                momentum_bypass.add("rsi_oversold_override")
+            momentum_apply_raw = await self._get_config_value(
+                "trading.standalone_apply_momentum_filter",
+                ["macd_ema_vwap_scalper", "supertrend", "swing_hull_rsi_ema"],
+            )
+            momentum_apply = {
+                str(x).strip()
+                for x in (momentum_apply_raw or [])
+                if str(x).strip()
+            }
+            needs_momentum = (
+                not is_standalone_entry
+                or best_strategy in momentum_apply
+            )
+            if needs_momentum and best_strategy not in momentum_bypass:
+                logger.info(
+                    f"🔍 [CONDITION 5] Checking momentum filter for {pair} on {exchange_name} "
+                    f"(strategy={best_strategy})"
+                )
+                allow_entry, filter_reason = await self.momentum_filter.should_allow_entry(
+                    exchange_name, pair
+                )
+                if not allow_entry:
+                    logger.warning(
+                        f"❌ [CONDITION 5] Momentum filter BLOCKED entry for {pair} on "
+                        f"{exchange_name}: {filter_reason}"
+                    )
+                    self._record_regime_entry_decision(
+                        exchange_name, stable_regime, "rejected", "momentum_filter"
+                    )
+                    return
+            elif is_standalone_entry and best_strategy in momentum_bypass:
+                logger.warning(
+                    "[EntryGate] %s %s: bypassing momentum filter for %s standalone entry",
+                    exchange_name,
+                    pair,
+                    best_strategy,
+                )
+
+            if macd_is_buy_override:
+                if not await self._macd_continuation_confirmation_ready(
+                    exchange_name, pair, macd_signal_data
+                ):
+                    logger.info(
+                        "[EntryGate] %s %s: MACD continuation waiting for price confirmation",
                         exchange_name,
                         pair,
                     )
-                if rsi_is_buy_override:
-                    logger.warning(
-                        "[RSIOverride] %s %s: bypassing momentum filter due to forced RSI oversold BUY override",
+                    self._record_regime_entry_decision(
                         exchange_name,
-                        pair,
+                        stable_regime,
+                        "rejected",
+                        "macd_continuation_confirmation_pending",
                     )
-                if rsi_checklist_is_buy_override:
-                    logger.warning(
-                        "[RSIChecklistOverride] %s %s: bypassing momentum filter due to checklist BUY override",
-                        exchange_name,
-                        pair,
-                    )
+                    return
 
             logger.info(
-                f"🚀 [TRADE EXECUTION] Consensus BUY approved for {pair} on {exchange_name} "
+                f"🚀 [TRADE EXECUTION] Entry approved for {pair} on {exchange_name} "
                 f"(consensus={c_conf:.2f}/{c_agreement:.1f}%, strategy={best_strategy}, conf={best_conf:.2f})"
+            )
+            gate_summary = self._format_strategy_gate_summary(
+                best_strategy, strategies.get(best_strategy, {})
             )
             await self._execute_trade_entry(exchange_name, pair, {
                 'strategy': best_strategy,
@@ -5183,16 +6651,29 @@ class TradingOrchestrator:
                 'regime_score': float((signals_data.get('consensus') or {}).get('regime_score') or signals_data.get('regime_score') or 0.0),
                 'policy_version': policy_version,
                 'policy_mode': policy_mode,
+                'strategy_gate_summary': gate_summary,
                 'entry_gate_reason': (
-                    'rsi_oversold_checklist_buy_override'
-                    if rsi_checklist_is_buy_override
+                    'swing_hull_rsi_ema_buy_override'
+                    if swing_hull_is_buy_override
                     else (
-                        'rsi_oversold_buy_override'
-                        if rsi_is_buy_override
+                        'supertrend_buy_override'
+                        if supertrend_is_buy_override
                         else (
-                            'macd_buy_override'
-                            if macd_is_buy_override
-                            else ('consensus_fallback_buy' if fallback_triggered else 'consensus_buy_pass')
+                            'macd_ema_vwap_scalper_buy_override'
+                            if scalper_is_buy_override
+                            else (
+                                'rsi_oversold_checklist_buy_override'
+                                if rsi_checklist_is_buy_override
+                                else (
+                                    'rsi_oversold_buy_override'
+                                    if rsi_is_buy_override
+                                    else (
+                                        'macd_buy_override'
+                                        if macd_is_buy_override
+                                        else ('consensus_fallback_buy' if fallback_triggered else 'consensus_buy_pass')
+                                    )
+                                )
+                            )
                         )
                     )
                 ),
@@ -5257,16 +6738,37 @@ class TradingOrchestrator:
 
             two_hours_ago = datetime.utcnow() - timedelta(hours=2)
 
-            pair_open_trades = [
-                t
-                for t in open_trades
-                if str(t.get("exchange", "")).lower() == ex_lo
-                and self._dashboard_pair_key_match(t.get("pair"), pair)
-            ]
+            def _cluster_open_from(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                ck = self._entry_cluster_key(pair)
+                if not ck:
+                    return []
+                return [
+                    t
+                    for t in rows
+                    if self._entry_cluster_key(t.get("pair")) == ck
+                ]
+
+            pair_open_trades = _cluster_open_from(open_trades)
 
             pending_same_pair = [
                 t for t in pair_open_trades if str(t.get("status") or "").upper() == "PENDING"
             ]
+            if pending_same_pair:
+                fresh_open_trades = await self._get_active_trades_for_entry_guards(force_refresh=True)
+                fresh_pair_open = _cluster_open_from(fresh_open_trades)
+                fresh_pending_same_pair = [
+                    t for t in fresh_pair_open if str(t.get("status") or "").upper() == "PENDING"
+                ]
+                if not fresh_pending_same_pair:
+                    logger.info(
+                        "[RISK MANAGEMENT] Ignoring stale pending block for %s on %s after refresh",
+                        pair,
+                        exchange_name,
+                    )
+                    pair_open_trades = fresh_pair_open
+                else:
+                    pair_open_trades = fresh_pair_open
+                    pending_same_pair = fresh_pending_same_pair
             if pending_same_pair:
                 logger.warning(
                     "🚫 [LAYER 0] Pending entry block: %s on %s has %s pending trade(s)",
@@ -5277,19 +6779,37 @@ class TradingOrchestrator:
                 return False
 
             if max_open_pp > 0 and len(pair_open_trades) >= max_open_pp:
-                logger.warning(
-                    f"🚫 [LAYER 0] Max open trades per pair: {pair} on {exchange_name} "
-                    f"({len(pair_open_trades)} >= {max_open_pp})"
-                )
-                return False
+                fresh_open_trades = await self._get_active_trades_for_entry_guards(force_refresh=True)
+                pair_open_trades = _cluster_open_from(fresh_open_trades)
+                if max_open_pp > 0 and len(pair_open_trades) < max_open_pp:
+                    logger.info(
+                        "[RISK MANAGEMENT] Ignoring stale max-open block for %s on %s after refresh",
+                        pair,
+                        exchange_name,
+                    )
+                else:
+                    logger.warning(
+                        f"🚫 [LAYER 0] Max open trades per pair: {pair} on {exchange_name} "
+                        f"({len(pair_open_trades)} >= {max_open_pp})"
+                    )
+                    return False
             if force_single_open_per_pair and len(pair_open_trades) >= 1:
-                logger.warning(
-                    "🚫 [LAYER 0] Forced single-open-per-pair block: %s on %s already has %s active trade(s)",
-                    pair,
-                    exchange_name,
-                    len(pair_open_trades),
-                )
-                return False
+                fresh_open_trades = await self._get_active_trades_for_entry_guards(force_refresh=True)
+                pair_open_trades = _cluster_open_from(fresh_open_trades)
+                if force_single_open_per_pair and len(pair_open_trades) < 1:
+                    logger.info(
+                        "[RISK MANAGEMENT] Ignoring stale single-open block for %s on %s after refresh",
+                        pair,
+                        exchange_name,
+                    )
+                else:
+                    logger.warning(
+                        "🚫 [LAYER 0] Forced single-open-per-pair block: %s on %s already has %s active trade(s)",
+                        pair,
+                        exchange_name,
+                        len(pair_open_trades),
+                    )
+                    return False
 
             neg_cnt = 0
             for t in pair_open_trades:
@@ -5300,13 +6820,42 @@ class TradingOrchestrator:
                 if u < 0:
                     neg_cnt += 1
 
+            if neg_cnt >= layer1_min:
+                fresh_open_trades = await self._get_active_trades_for_entry_guards(force_refresh=True)
+                pair_open_trades = _cluster_open_from(fresh_open_trades)
+                neg_cnt = 0
+                for t in pair_open_trades:
+                    try:
+                        u = float(t.get("unrealized_pnl") or 0.0)
+                    except (TypeError, ValueError):
+                        u = 0.0
+                    if u < 0:
+                        neg_cnt += 1
+                if neg_cnt < layer1_min:
+                    logger.info(
+                        "[RISK MANAGEMENT] Ignoring stale underwater block for %s on %s after refresh",
+                        pair,
+                        exchange_name,
+                    )
+                else:
+                    logger.warning(
+                        f"🚫 [LAYER 1] Open underwater block: {pair} on {exchange_name} "
+                        f"({neg_cnt} negative unrealized >= {layer1_min})"
+                    )
+                    return False
+
+            # keep references for downstream portfolio/exchange rollups
+            all_open_trades = open_trades
+            if 'fresh_open_trades' in locals():
+                all_open_trades = fresh_open_trades
+
             closed_loss_2h = 0
             recent_closed_losses_2h: List[Dict[str, Any]] = []
 
             for t in hist_trades:
                 if str(t.get("exchange", "")).lower() != ex_lo:
                     continue
-                if not self._dashboard_pair_key_match(t.get("pair"), pair):
+                if not self._entry_cluster_key_match(t.get("pair"), pair):
                     continue
                 st = str(t.get("status") or "").upper()
                 if st not in ("CLOSED", "FAILED"):
@@ -5341,12 +6890,6 @@ class TradingOrchestrator:
                 )
                 return False
 
-            if neg_cnt >= layer1_min:
-                logger.warning(
-                    f"🚫 [LAYER 1] Open underwater block: {pair} on {exchange_name} "
-                    f"({neg_cnt} negative unrealized >= {layer1_min})"
-                )
-                return False
 
             if recent_closed_losses_2h:
                 largest_loss = min(float(t.get("realized_pnl", 0)) for t in recent_closed_losses_2h)
@@ -5354,7 +6897,6 @@ class TradingOrchestrator:
                     logger.warning(f"🚫 [LAYER 2b] Large loss (2h): {pair} on {exchange_name} (${largest_loss:.2f})")
                     return False
 
-            all_open_trades = open_trades
             portfolio_unrealized_pnl = sum(
                 float(trade.get("unrealized_pnl", 0))
                 for trade in all_open_trades
@@ -5398,6 +6940,75 @@ class TradingOrchestrator:
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
         """Execute trade entry with Redis queue-based processing (HYBRID MODE)"""
         try:
+            standalone_strategies = {
+                "macd_momentum",
+                "rsi_oversold_override",
+                "rsi_oversold_checklist",
+                "macd_ema_vwap_scalper",
+                "supertrend",
+                "swing_hull_rsi_ema",
+                "pullback_long_scalping",
+                "breakout_retest_long",
+                "vwap_bounce_scalping",
+                "small_size_momentum_scalp",
+            }
+            strategy_name = str(signal.get("strategy") or "")
+            stable_regime = str(signal.get("stable_regime") or "unknown")
+            if strategy_name in standalone_strategies:
+                if not await self._standalone_entry_gate_allowed(
+                    strategy_name, stable_regime, exchange_name
+                ):
+                    logger.warning(
+                        "[EntryGate] Final block %s %s: standalone gate failed "
+                        "(strategy=%s stable_regime=%s)",
+                        exchange_name,
+                        pair,
+                        strategy_name,
+                        stable_regime,
+                    )
+                    return
+                expectancy_ok, expectancy_reason = await self._strategy_expectancy_allows_entry(
+                    strategy_name
+                )
+                if not expectancy_ok:
+                    logger.warning(
+                        "[StrategyExpectancyGuard] Final block %s %s: strategy=%s %s",
+                        exchange_name,
+                        pair,
+                        strategy_name,
+                        expectancy_reason,
+                    )
+                    return
+                if not await self._passes_standalone_pair_guards(
+                    strategy_name, exchange_name, pair
+                ):
+                    logger.warning(
+                        "[EntryGate] Final block %s %s: standalone pair guard failed "
+                        "(strategy=%s stable_regime=%s)",
+                        exchange_name,
+                        pair,
+                        strategy_name,
+                        stable_regime,
+                    )
+                    return
+
+            if await self._is_stablecoin_pair(pair):
+                logger.warning(
+                    "[EntryGate] Final block %s %s: stablecoin pair not tradable",
+                    exchange_name,
+                    pair,
+                )
+                return
+
+            if strategy_name and not await self._check_strategy_max_open_trades(strategy_name):
+                logger.warning(
+                    "[EntryGate] Final block %s %s: strategy max open trades (strategy=%s)",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                )
+                return
+
             # PnL-FIX v3: Immediately mark pair cooldown so the next cycle can't re-enter
             # the same pair even before the order ack comes back (the issue that caused
             # 30 correlated longs on crypto pairs).
@@ -7139,6 +8750,199 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning("OHLCV price fallback failed %s/%s: %s", exchange_name, pair, e)
             return 0.0
+
+    async def _fetch_ohlcv_dataframe_for_structural(
+        self, exchange_name: str, pair: str, timeframe: str = "1h", limit: int = 120
+    ) -> Optional[pd.DataFrame]:
+        """OHLCV DataFrame from exchange-service (public); used for vwma_hull structural exits."""
+        try:
+            encoded = quote(pair, safe="")
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                r = await client.get(
+                    f"{exchange_service_url}/api/v1/market/ohlcv/{exchange_name}/{encoded}",
+                    params={"timeframe": timeframe, "limit": int(limit)},
+                )
+            if r.status_code != 200:
+                logger.warning(
+                    "structural OHLCV HTTP %s for %s/%s tf=%s: %s",
+                    r.status_code,
+                    exchange_name,
+                    pair,
+                    timeframe,
+                    (r.text or "")[:160],
+                )
+                return None
+            payload = r.json() or {}
+            d = payload.get("data") or {}
+            ts_list = d.get("timestamp") or []
+            if not ts_list:
+                return None
+            o = d.get("open") or []
+            h = d.get("high") or []
+            lo = d.get("low") or []
+            c = d.get("close") or []
+            v = d.get("volume") or []
+            n = min(len(ts_list), len(o), len(h), len(lo), len(c), len(v))
+            if n < 30:
+                return None
+            ts_list = ts_list[-n:]
+            df = pd.DataFrame(
+                {
+                    "open": [float(x) for x in o[-n:]],
+                    "high": [float(x) for x in h[-n:]],
+                    "low": [float(x) for x in lo[-n:]],
+                    "close": [float(x) for x in c[-n:]],
+                    "volume": [float(x) for x in v[-n:]],
+                }
+            )
+            last_ms = int(ts_list[-1])
+            last_bar_dt = datetime.utcfromtimestamp(last_ms / 1000.0)
+            if (datetime.utcnow() - last_bar_dt).total_seconds() > 4 * 3600:
+                logger.warning(
+                    "structural OHLCV stale for %s/%s tf=%s (last bar age) — skip structural exit",
+                    exchange_name,
+                    pair,
+                    timeframe,
+                )
+                return None
+            return df
+        except Exception as e:
+            logger.warning("structural OHLCV fetch failed %s/%s: %s", exchange_name, pair, e)
+            return None
+
+    def _trade_age_minutes(self, trade: Dict[str, Any]) -> float:
+        """Minutes since trade entry_time (UTC). Returns 0 if entry_time missing."""
+        entry_time_raw = trade.get("entry_time")
+        if not entry_time_raw:
+            return 0.0
+        try:
+            if isinstance(entry_time_raw, str):
+                entry_dt = datetime.fromisoformat(
+                    entry_time_raw.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            else:
+                entry_dt = entry_time_raw
+            return max(0.0, (datetime.utcnow() - entry_dt).total_seconds() / 60.0)
+        except Exception:
+            return 0.0
+
+    async def _rsi_checklist_max_hold_exit(
+        self,
+        trade: Dict[str, Any],
+        pnl_percentage: float,
+        trading_config: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """Force exit checklist trades open longer than strategies.rsi_oversold_checklist max_hold_hours."""
+        root = getattr(self, "_config", None) or {}
+        strat_root = root.get("strategies") or {}
+        chk_block = strat_root.get("rsi_oversold_checklist") or {}
+        params = chk_block.get("parameters") or {}
+        if not bool(chk_block.get("enabled", True)):
+            return False, ""
+        max_hold_hours = float(params.get("max_hold_hours", 0) or 0)
+        if max_hold_hours <= 0:
+            return False, ""
+        age_minutes = self._trade_age_minutes(trade)
+        if age_minutes < max_hold_hours * 60.0:
+            return False, ""
+        return True, (
+            f"rsi_checklist_max_hold@{pnl_percentage:.2f}%_age{age_minutes:.0f}m"
+            f"_limit{max_hold_hours:.0f}h"
+        )
+
+    async def _vwma_hull_structural_exit_signal(
+        self,
+        exchange_name: str,
+        pair: str,
+        trade: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """True when VWMA/Hull structural long-exit matches strategy-service 1h ``update()`` data."""
+        try:
+            root = getattr(self, "_config", None) or {}
+            strat_root = root.get("strategies") or {}
+            vh_block = strat_root.get("vwma_hull") or {}
+            params = vh_block.get("parameters") or {}
+            if not bool(vh_block.get("enabled", True)):
+                return False, None
+            if params.get("orchestrator_structural_exit_enabled", True) is False:
+                return False, None
+            min_hold_minutes = float(params.get("structural_exit_min_hold_minutes", 0) or 0)
+            if trade is not None and min_hold_minutes > 0:
+                age_minutes = self._trade_age_minutes(trade)
+                if age_minutes < min_hold_minutes:
+                    logger.debug(
+                        "[VWMAHullStructural] %s/%s: skip structural exit "
+                        "(age %.1fm < min_hold %.1fm)",
+                        exchange_name,
+                        pair,
+                        age_minutes,
+                        min_hold_minutes,
+                    )
+                    return False, None
+            tf = str(params.get("structural_exit_timeframe") or "1h")
+        except Exception:
+            params = {}
+            tf = "1h"
+
+        try:
+            from strategy.vwma_hull_strategy import VWMAHullStrategy
+        except ImportError as e:
+            logger.warning("VWMAHullStrategy import failed for structural exit: %s", e)
+            return False, None
+
+        stub = VWMAHullStrategy({"parameters": params}, None, None)
+        df = await self._fetch_ohlcv_dataframe_for_structural(exchange_name, pair, timeframe=tf, limit=160)
+        if df is None or df.empty:
+            return False, None
+        return stub.structural_long_exit_from_ohlcv(df)
+
+    async def _swing_hull_rsi_ema_structural_exit_signal(
+        self,
+        exchange_name: str,
+        pair: str,
+        trade: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """True when 1h RSI crosses above rsi_exit_level (TV closeLong)."""
+        try:
+            root = getattr(self, "_config", None) or {}
+            strat_root = root.get("strategies") or {}
+            sh_block = strat_root.get("swing_hull_rsi_ema") or {}
+            params = sh_block.get("parameters") or {}
+            if not bool(sh_block.get("enabled", True)):
+                return False, None
+            if params.get("orchestrator_structural_exit_enabled", True) is False:
+                return False, None
+            min_hold_minutes = float(params.get("structural_exit_min_hold_minutes", 0) or 0)
+            if trade is not None and min_hold_minutes > 0:
+                age_minutes = self._trade_age_minutes(trade)
+                if age_minutes < min_hold_minutes:
+                    logger.debug(
+                        "[SwingHullRsiEmaStructural] %s/%s: skip structural exit "
+                        "(age %.1fm < min_hold %.1fm)",
+                        exchange_name,
+                        pair,
+                        age_minutes,
+                        min_hold_minutes,
+                    )
+                    return False, None
+            tf = str(params.get("structural_exit_timeframe") or "1h")
+        except Exception:
+            params = {}
+            tf = "1h"
+
+        try:
+            from strategy.swing_hull_rsi_ema_strategy import SwingHullRsiEmaStrategy
+        except ImportError as e:
+            logger.warning("SwingHullRsiEmaStrategy import failed for structural exit: %s", e)
+            return False, None
+
+        stub = SwingHullRsiEmaStrategy({"parameters": params}, None, None)
+        df = await self._fetch_ohlcv_dataframe_for_structural(
+            exchange_name, pair, timeframe=tf, limit=160
+        )
+        if df is None or df.empty:
+            return False, None
+        return stub.structural_long_exit_from_ohlcv(df)
 
     async def _fetch_mid_price_from_orderbook(self, exchange_name: str, pair: str) -> float:
         """Mid (bid+ask)/2 from order book when ticker and OHLCV are unavailable."""

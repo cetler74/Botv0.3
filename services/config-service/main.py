@@ -66,6 +66,15 @@ def redact_config(config: dict, testing: bool = False) -> dict:
                 ex["api_secret"] = "***REDACTED***"
     return redacted
 
+def is_sensitive_config_path(path: str) -> bool:
+    """Return True when a dot-path targets a secret value."""
+    parts = [p.strip().lower() for p in path.split('.') if p.strip()]
+    if parts == ["database", "password"] or parts == ["redis", "password"]:
+        return True
+    if len(parts) >= 3 and parts[0] == "exchanges" and parts[-1] in {"api_key", "api_secret", "secret"}:
+        return True
+    return False
+
 # Override sensitive config fields with environment variables
 SENSITIVE_ENV_MAP = {
     "database.password": "DB_PASSWORD",
@@ -462,6 +471,9 @@ async def get_specific_config_path(path: str):
     if value is None:
         raise HTTPException(status_code=404, detail="Configuration path not found")
     
+    if is_sensitive_config_path(path) and not os.getenv("TESTING"):
+        return {"path": path, "value": "***REDACTED***"}
+
     return {"path": path, "value": value}
 
 @app.put("/api/v1/config/update")
@@ -620,4 +632,4 @@ if __name__ == "__main__":
         port=8001,
         reload=True,
         log_level="info"
-    ) 
+    )

@@ -26,8 +26,8 @@ def create_order_book_integration_patch():
                     # Verify these are our order book-based selections by checking if they match our known good pairs
                     known_order_book_pairs = {
                         'binance': ['VET/USDC', 'SHIB/USDC', 'SUI/USDC', 'XRP/USDC', 'XLM/USDC'],
-                        'bybit': ['ARB/USDC', 'DOGE/USDC', 'SHIB/USDC', 'USDE/USDC', 'ADA/USDC'],
-                        'cryptocom': ['USDT/USD', 'ADA/USD', 'XLM/USD', 'DOGE/USD', 'HBAR/USD']
+                        'bybit': ['ARB/USDC', 'DOGE/USDC', 'SHIB/USDC', 'ADA/USDC'],
+                        'cryptocom': ['ADA/USD', 'XLM/USD', 'DOGE/USD', 'HBAR/USD']
                     }
                     
                     expected_pairs = known_order_book_pairs.get(exchange_name.lower(), [])

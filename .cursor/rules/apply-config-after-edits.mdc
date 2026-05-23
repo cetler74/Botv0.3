@@ -1,0 +1,49 @@
+---
+description: Always run scripts/apply_config.sh after editing config/config.yaml so the running Docker stack picks up the new values.
+globs: config/config.yaml,config/**/*.yaml
+alwaysApply: true
+---
+
+# Apply config changes to the running stack
+
+After ANY edit to `config/config.yaml`, run the helper script to propagate
+the change. A plain `docker compose restart` is NOT enough.
+
+## Run this command
+
+```bash
+./scripts/apply_config.sh
+```
+
+## Why
+
+`config/config.yaml` is baked into 4 service images at build time
+(`config-service`, `exchange-service`, `mcp-service`, `web-dashboard-service`).
+Colima on this host cannot bind-mount the host path (mounts list is empty and
+the project path contains a space — `/Volumes/OWC Volume/...`).
+
+So host edits do NOT reach the running containers without a rebuild. The
+helper script does the full cycle:
+
+1. Rebuilds the 4 baked-config images
+2. Recreates those containers
+3. Waits for `config-service` health and POSTs `/api/v1/config/reload`
+4. Restarts `strategy-service` and `orchestrator-service` to flush their
+   in-memory config caches (they cache config from their first HTTP fetch
+   at startup)
+5. Prints the live `macd_momentum` parameters as verification
+
+## What NOT to do
+
+- Do NOT only run `docker compose restart` — the baked images keep serving
+  old values.
+- Do NOT only rebuild `config-service` — `strategy-service` will still hold
+  its cached dict until restarted.
+
+## Verifying
+
+After the script finishes, confirm new values in live logs:
+
+```bash
+docker compose logs --since 30s strategy-service | grep -E 'lookback=|threshold=|applied overrides'
+```

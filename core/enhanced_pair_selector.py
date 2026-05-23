@@ -15,6 +15,7 @@ from .intraday_liquidity_monitor import IntradayLiquidityMonitor, LiquidityMetri
 from .spread_analysis_engine import SpreadAnalysisEngine, SpreadMetrics
 from .volatility_filter import VolatilityFilter, VolatilityMetrics
 from .performance_metrics_tracker import PerformanceMetricsTracker, PairPerformanceMetrics
+from .pair_filters import filter_stablecoin_pairs, load_stablecoin_bases_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,9 @@ class EnhancedPairSelector:
                     candidate_pairs.append(symbol)
             
             await exchange.close()
+            
+            stable_bases = await load_stablecoin_bases_from_config()
+            candidate_pairs = filter_stablecoin_pairs(candidate_pairs, stable_bases)
             
             # Limit to top candidates by volume for efficiency
             # Sort by volume and take top 50 for detailed analysis

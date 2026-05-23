@@ -4,11 +4,84 @@ from datetime import datetime
 import re
 import httpx
 
+from core.pair_filters import filter_stablecoin_pairs, load_stablecoin_bases_from_config
+
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(value, default=0.0):
+    if value is None:
+        return default
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", "")
+        return float(value)
+    except Exception:
+        return default
+
+
+def _nested_get(data, *keys):
+    current = data or {}
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _quote_volume_from_ticker(symbol, ticker, market):
+    """Normalize exchange-specific ticker fields to approximate 24h quote volume."""
+    ticker = ticker or {}
+    info = ticker.get("info") or {}
+    market_info = (market or {}).get("info") or {}
+
+    quote_volume_keys = (
+        "quoteVolume",
+        "quote_volume",
+        "volumeQuote",
+        "volume_quote",
+        "turnover24h",
+        "turnover",
+        "quoteVolume24h",
+        "amount24",
+        "vv",  # Crypto.com 24h traded value
+    )
+    for source in (ticker, info, market_info):
+        for key in quote_volume_keys:
+            volume = _safe_float(source.get(key))
+            if volume > 0:
+                return volume
+
+    base_volume_keys = (
+        "baseVolume",
+        "base_volume",
+        "volume",
+        "volume24h",
+        "vol24h",
+        "v",  # Crypto.com 24h base volume
+    )
+    price_keys = ("last", "close", "bid", "ask", "a", "c", "lastPrice")
+    price = 0.0
+    for source in (ticker, info, market_info):
+        for key in price_keys:
+            price = _safe_float(source.get(key))
+            if price > 0:
+                break
+        if price > 0:
+            break
+
+    for source in (ticker, info, market_info):
+        for key in base_volume_keys:
+            base_volume = _safe_float(source.get(key))
+            if base_volume > 0:
+                return base_volume * price if price > 0 else base_volume
+
+    return 0.0
 
 async def select_top_pairs_ccxt(exchange_id, base_currency='USDC', num_pairs=10, market_type='spot'):
     # Load blacklisted pairs from config
     blacklisted_pairs = await _get_blacklisted_pairs()
+    stable_bases = await load_stablecoin_bases_from_config()
     
     try:
         exchange_class = getattr(ccxt_async, exchange_id)
@@ -47,24 +120,72 @@ async def select_top_pairs_ccxt(exchange_id, base_currency='USDC', num_pairs=10,
             if symbol in blacklisted_pairs:
                 logger.warning(f"[PairSelector] ⚠️  BLACKLISTED: {symbol} excluded due to poor performance")
                 continue
+            if stable_bases and symbol.split("/", 1)[0].upper() in stable_bases:
+                logger.debug(f"[PairSelector] Excluded {symbol}: stablecoin base")
+                continue
             pairs.append(symbol)
         
         logger.info(f"[PairSelector] Filtered out {len(blacklisted_pairs)} blacklisted pairs: {blacklisted_pairs}")
         
-        # Sort by 24h volume if available
-        def get_volume(symbol):
-            info = exchange.markets[symbol].get('info', {})
-            # Try several possible volume keys
-            for key in ['quoteVolume', 'turnover24h', 'volume', 'baseVolume']:
-                v = info.get(key)
-                if v is not None:
+        # Sort by live 24h quote volume. `load_markets()` often has no volume
+        # data (notably Crypto.com), so rely on ticker payloads first.
+        tickers = {}
+        try:
+            if getattr(exchange, "has", {}).get("fetchTickers"):
+                try:
+                    tickers = await exchange.fetch_tickers(pairs)
+                except Exception as symbol_bulk_error:
+                    logger.info(
+                        "[CCXT PairSelector] %s does not support symbol-list fetch_tickers (%s); trying all tickers",
+                        exchange_id,
+                        symbol_bulk_error,
+                    )
+                    tickers = await exchange.fetch_tickers()
+            elif getattr(exchange, "has", {}).get("fetchTicker"):
+                for symbol in pairs:
                     try:
-                        return float(v)
-                    except Exception:
-                        continue
-            return 0
-        pairs = sorted(pairs, key=get_volume, reverse=True)
-        await exchange.close()
+                        tickers[symbol] = await exchange.fetch_ticker(symbol)
+                    except Exception as ticker_error:
+                        logger.debug(
+                            "[CCXT PairSelector] ticker fetch failed for %s %s: %s",
+                            exchange_id,
+                            symbol,
+                            ticker_error,
+                        )
+        except Exception as ticker_error:
+            logger.warning(
+                "[CCXT PairSelector] bulk ticker fetch failed for %s; falling back to market metadata: %s",
+                exchange_id,
+                ticker_error,
+            )
+            if getattr(exchange, "has", {}).get("fetchTicker"):
+                tickers = {}
+                for symbol in pairs:
+                    try:
+                        tickers[symbol] = await exchange.fetch_ticker(symbol)
+                    except Exception as symbol_error:
+                        logger.debug(
+                            "[CCXT PairSelector] ticker fetch failed for %s %s: %s",
+                            exchange_id,
+                            symbol,
+                            symbol_error,
+                        )
+
+        volumes = {
+            symbol: _quote_volume_from_ticker(
+                symbol,
+                tickers.get(symbol),
+                exchange.markets.get(symbol, {}),
+            )
+            for symbol in pairs
+        }
+        pairs = sorted(pairs, key=lambda symbol: volumes.get(symbol, 0.0), reverse=True)
+        logger.info(
+            "[CCXT PairSelector] Top volume candidates for %s %s: %s",
+            exchange_id,
+            base_currency,
+            [(symbol, round(volumes.get(symbol, 0.0), 2)) for symbol in pairs[:10]],
+        )
         
         # Validate pairs have usable market data (especially important for crypto.com)
         validated_pairs = []
@@ -74,7 +195,7 @@ async def select_top_pairs_ccxt(exchange_id, base_currency='USDC', num_pairs=10,
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 # Test more pairs than needed to account for invalid ones
-                test_pairs = pairs[:num_pairs * 2]  # Test 2x pairs to account for failures
+                test_pairs = pairs[:num_pairs * 4]  # Test extra pairs to account for validation failures
                 for symbol in test_pairs:
                     try:
                         # Convert symbol format for URL (remove slash)
@@ -114,7 +235,10 @@ async def select_top_pairs_ccxt(exchange_id, base_currency='USDC', num_pairs=10,
         else:
             # For other exchanges, use pairs as-is (no validation needed)
             sanitized_pairs = pairs[:num_pairs]
+
+        await exchange.close()
         
+        sanitized_pairs = filter_stablecoin_pairs(sanitized_pairs, stable_bases)
         logger.info(f"[CCXT PairSelector] Top {num_pairs} pairs for {exchange_id} {base_currency}: {sanitized_pairs}")
         return {
             "selected_pairs": sanitized_pairs,
@@ -169,6 +293,7 @@ async def select_top_pairs_ccxt_enhanced(exchange_id, base_currency='USDC', num_
     # Load blacklisted pairs
     blacklisted_pairs = await _get_blacklisted_pairs()
     all_excluded = set(blacklisted_pairs + exclude_pairs)
+    stable_bases = await load_stablecoin_bases_from_config()
     
     exchange_class = getattr(ccxt_async, exchange_id)
     exchange = exchange_class({'enableRateLimit': True})
@@ -205,6 +330,9 @@ async def select_top_pairs_ccxt_enhanced(exchange_id, base_currency='USDC', num_
         if symbol in all_excluded:
             logger.debug(f"[EnhancedPairSelector] Excluded {symbol}: blacklisted/excluded")
             continue
+        if stable_bases and symbol.split("/", 1)[0].upper() in stable_bases:
+            logger.debug(f"[EnhancedPairSelector] Excluded {symbol}: stablecoin base")
+            continue
             
         # Enhanced volume filtering
         volume = get_volume_enhanced(symbol, exchange, min_volume_requirement)
@@ -216,6 +344,7 @@ async def select_top_pairs_ccxt_enhanced(exchange_id, base_currency='USDC', num_
     # Sort by volume and select top pairs
     pairs = sorted(pairs, key=lambda x: x[1], reverse=True)
     selected_pairs = [pair[0] for pair in pairs[:num_pairs]]
+    selected_pairs = filter_stablecoin_pairs(selected_pairs, stable_bases)
     
     await exchange.close()
     

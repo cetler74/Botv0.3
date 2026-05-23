@@ -204,6 +204,8 @@ class StrategyPerformance(BaseModel):
     max_drawdown: float
     period: str
 
+DEFAULT_ANALYSIS_TIMEFRAMES = ['1h', '4h', '15m', '5m', '1m']
+
 class AnalysisRequest(BaseModel):
     # PnL-FIX v4: Default timeframes updated to the union of all strategies'
     # declared target_timeframes in config.yaml:
@@ -217,7 +219,7 @@ class AnalysisRequest(BaseModel):
     # wasn't declared by any strategy — dropping it removes one wasted call.
     # Order matters: ``timeframes[0]`` is the "primary" used for market-regime
     # detection, so keep 1h first (4h regimes would react too slowly).
-    timeframes: List[str] = ['1h', '4h', '15m']
+    timeframes: List[str] = DEFAULT_ANALYSIS_TIMEFRAMES
     strategies: Optional[List[str]] = None
     include_indicators: bool = True
 
@@ -241,7 +243,11 @@ SNAPSHOT_ENTRY_CONFIDENCE = 0.3
 strategy_manager = None
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
 exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
-database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database_service:8002")
+# Compose DNS uses the service name `database-service` (hyphen). A legacy default used
+# `database_service` (underscore), which does not resolve → errno -3 / "Temporary failure in name resolution".
+database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+if "database_service" in database_service_url and "database-service" not in database_service_url:
+    database_service_url = database_service_url.replace("database_service", "database-service")
 
 class ExchangeAdapter:
     """Adapter to provide exchange functionality to strategies via HTTP calls"""
@@ -373,6 +379,8 @@ def _record_pair_strategy_snapshot(
             "analysis_status": analysis_status,
             "summary": detail or "No analysis data",
             "market_regime": None,
+            "stable_regime": analysis_status,
+            "detected_regime": None,
             "consensus": {},
             "strategies": [],
         }
@@ -409,6 +417,22 @@ def _record_pair_strategy_snapshot(
                 f"BUY at or above entry-confidence bar ({conf:.2f} ≥ {SNAPSHOT_ENTRY_CONFIDENCE}); "
                 "counts toward long bias."
             )
+            if name in {
+                "pullback_long_scalping",
+                "breakout_retest_long",
+                "vwap_bounce_scalping",
+                "small_size_momentum_scalp",
+            }:
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    reason = (
+                        f"BUY — {indicators.get('setup', name)} standalone: "
+                        f"rr={float(indicators.get('reward_risk', 0) or 0):.2f}, "
+                        f"entry={float(indicators.get('entry_price', 0) or 0):.8f}, "
+                        f"stop={float(indicators.get('stop_hint', 0) or 0):.8f}, "
+                        f"target={float(indicators.get('target_hint', 0) or 0):.8f}. "
+                        f"{indicators.get('entry_reason', '')}"
+                    )
         elif sig == "sell" and conf >= SNAPSHOT_ENTRY_CONFIDENCE:
             outcome = "sell_signal"
             reason = (
@@ -473,6 +497,57 @@ def _record_pair_strategy_snapshot(
                                 else ""
                             )
                         )
+            if name == "macd_ema_vwap_scalper":
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    failed = []
+                    if indicators.get("fully_above_ema200") is False:
+                        failed.append("body_not_fully_above_ema200")
+                    if indicators.get("pulled_to_vwap") is False:
+                        failed.append("vwap_pull_or_hold")
+                    if indicators.get("macd_bullish_cross") is False:
+                        failed.append("macd_bull_cross")
+                    if indicators.get("trend_above_ema200_ok") is False:
+                        failed.append("1h_not_above_ema200")
+                    if failed:
+                        reason = "HOLD — MACD+EMA200+VWAP scalper: " + ", ".join(failed)
+            if name == "supertrend":
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    if indicators.get("bullish_flip") is False:
+                        tf = indicators.get("exec_timeframe") or "1h"
+                        reason = (
+                            f"HOLD — SuperTrend: no {tf} bullish flip on last closed bar "
+                            f"(trend_prev={indicators.get('trend_prev')}, trend={indicators.get('trend')})"
+                        )
+                    elif indicators.get("trend_1h_ok") is False:
+                        tf = indicators.get("trend_timeframe") or "1h"
+                        reason = (
+                            f"HOLD — SuperTrend: flip but {tf} trend not bullish "
+                            f"(trend_1h={indicators.get('trend_1h')})"
+                        )
+            if name == "swing_hull_rsi_ema":
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    failed = []
+                    if indicators.get("hull_bullish") is False:
+                        failed.append("hull_not_bullish")
+                    if indicators.get("ema_cross_down") is False:
+                        failed.append("no_ema_cross_down")
+                    if failed:
+                        reason = "HOLD — Swing Hull/RSI/EMA: " + ", ".join(failed)
+            if name in {
+                "pullback_long_scalping",
+                "breakout_retest_long",
+                "vwap_bounce_scalping",
+                "small_size_momentum_scalp",
+            }:
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    reason = (
+                        f"HOLD — {indicators.get('setup', name)}: "
+                        f"{indicators.get('skip_reason', 'conditions_not_met')}"
+                    )
         elif sig == "buy":
             outcome = "weak_buy"
             reason = (
@@ -516,6 +591,23 @@ def _record_pair_strategy_snapshot(
                     if name == "macd_momentum"
                     else None
                 ),
+                "setup": ((sr.get("state") or {}).get("indicators") or {}).get("setup"),
+                "risk": (
+                    {
+                        "entry_price": ((sr.get("state") or {}).get("indicators") or {}).get("entry_price"),
+                        "stop_hint": ((sr.get("state") or {}).get("indicators") or {}).get("stop_hint"),
+                        "target_hint": ((sr.get("state") or {}).get("indicators") or {}).get("target_hint"),
+                        "reward_risk": ((sr.get("state") or {}).get("indicators") or {}).get("reward_risk"),
+                        "stop_pct": ((sr.get("state") or {}).get("indicators") or {}).get("stop_pct"),
+                    }
+                    if name in {
+                        "pullback_long_scalping",
+                        "breakout_retest_long",
+                        "vwap_bounce_scalping",
+                        "small_size_momentum_scalp",
+                    }
+                    else None
+                ),
             }
         )
 
@@ -546,6 +638,8 @@ def _record_pair_strategy_snapshot(
         "analysis_status": "success",
         "summary": " ".join(parts),
         "market_regime": results.get("market_regime"),
+        "stable_regime": results.get("stable_regime"),
+        "detected_regime": results.get("detected_regime"),
         "applicable_strategies": list(results.get("applicable_strategies") or []),
         "consensus": {
             "signal": cs,
@@ -727,6 +821,34 @@ class StrategyManager:
             'engulfing_multi_tf': {
                 'module': 'engulfing_multi_tf',
                 'class': 'EngulfingMultiTimeframeStrategy'
+            },
+            'macd_ema_vwap_scalper': {
+                'module': 'macd_ema_vwap_scalper_strategy',
+                'class': 'MACDEMAVWAPScalperStrategy'
+            },
+            'supertrend': {
+                'module': 'supertrend_strategy',
+                'class': 'SuperTrendStrategy'
+            },
+            'swing_hull_rsi_ema': {
+                'module': 'swing_hull_rsi_ema_strategy',
+                'class': 'SwingHullRsiEmaStrategy'
+            },
+            'pullback_long_scalping': {
+                'module': 'intraday_long_standalone_strategies',
+                'class': 'PullbackLongScalpingStrategy'
+            },
+            'breakout_retest_long': {
+                'module': 'intraday_long_standalone_strategies',
+                'class': 'BreakoutRetestLongStrategy'
+            },
+            'vwap_bounce_scalping': {
+                'module': 'intraday_long_standalone_strategies',
+                'class': 'VWAPBounceScalpingStrategy'
+            },
+            'small_size_momentum_scalp': {
+                'module': 'intraday_long_standalone_strategies',
+                'class': 'SmallSizeMomentumScalpStrategy'
             }
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
@@ -848,6 +970,36 @@ class StrategyManager:
                     and "rsi_oversold_checklist" not in applicable_strategies
                 ):
                     applicable_strategies.append("rsi_oversold_checklist")
+                if (
+                    "macd_ema_vwap_scalper" in strategies
+                    and strategies["macd_ema_vwap_scalper"].get("enabled", False)
+                    and "macd_ema_vwap_scalper" not in applicable_strategies
+                ):
+                    applicable_strategies.append("macd_ema_vwap_scalper")
+                if (
+                    "supertrend" in strategies
+                    and strategies["supertrend"].get("enabled", False)
+                    and "supertrend" not in applicable_strategies
+                ):
+                    applicable_strategies.append("supertrend")
+                if (
+                    "swing_hull_rsi_ema" in strategies
+                    and strategies["swing_hull_rsi_ema"].get("enabled", False)
+                    and "swing_hull_rsi_ema" not in applicable_strategies
+                ):
+                    applicable_strategies.append("swing_hull_rsi_ema")
+                for standalone_name in (
+                    "pullback_long_scalping",
+                    "breakout_retest_long",
+                    "vwap_bounce_scalping",
+                    "small_size_momentum_scalp",
+                ):
+                    if (
+                        standalone_name in strategies
+                        and strategies[standalone_name].get("enabled", False)
+                        and standalone_name not in applicable_strategies
+                    ):
+                        applicable_strategies.append(standalone_name)
                 
                 # Log regime detection
                 logger.info(
@@ -1129,11 +1281,11 @@ class StrategyManager:
                 strength = float(result.get('strength', 0) or 0)
                 selected_for_regime = result.get('selected_for_regime', 'unknown')
 
-                # Independent/non-consensus strategies do not contribute to
-                # weighted consensus voting.
-                # - RSI overrides are handled by explicit RSI override logic.
-                # - MACD momentum runs for telemetry/standalone visibility but
-                #   must not influence consensus voting.
+                # Independent / non-consensus strategies (weight 0; no vote):
+                # - rsi_oversold_checklist + macd_momentum + macd_ema_vwap_scalper + supertrend + swing_hull_rsi_ema
+                #   + intraday playbook strategies: orchestrator standalone entries.
+                # - rsi_oversold_override: optional consensus-coupled forced entry
+                #   (trading.allow_forced_buy_overrides).
                 if strategy_name == "rsi_oversold_override":
                     valid_signals.append({
                         'strategy': strategy_name,
@@ -1167,6 +1319,55 @@ class StrategyManager:
                         'is_primary': False,
                     })
                     continue
+                if strategy_name == "macd_ema_vwap_scalper":
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
+                if strategy_name == "supertrend":
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
+                if strategy_name == "swing_hull_rsi_ema":
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
+                if strategy_name in {
+                    "pullback_long_scalping",
+                    "breakout_retest_long",
+                    "vwap_bounce_scalping",
+                    "small_size_momentum_scalp",
+                }:
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
 
                 # Determine strategy weight + primary flag based on regime
                 strategy_weight = regime_weights['secondary']
@@ -1177,11 +1378,6 @@ class StrategyManager:
                     strategy_weight = regime_weights['primary']
                     is_primary = True
                 elif strategy_name == 'vwma_hull' and selected_for_regime in ('breakout',):
-                    strategy_weight = regime_weights['primary']
-                    is_primary = True
-                elif strategy_name == 'macd_momentum' and selected_for_regime in (
-                    'trending_up', 'breakout', 'high_volatility'
-                ):
                     strategy_weight = regime_weights['primary']
                     is_primary = True
                 elif strategy_name == 'multi_timeframe_confluence' and selected_for_regime in (
@@ -1276,19 +1472,12 @@ class StrategyManager:
                 consensus_signal = 'hold'
                 primary_overrode = False
 
-            # ---------- Step 4: RSI 15m oversold override --------------------------------
-            # Operator note: overrides run after SELL veto — see operator/README.md
+            # ---------- Step 4: RSI flags (telemetry only; no consensus hijack) ----------
+            # macd_momentum / rsi_oversold_checklist are standalone in the orchestrator.
+            # rsi_oversold_override remains orchestrator-gated via allow_forced_buy_overrides.
             rsi_oversold_override = bool(ctx.get("rsi_15m_oversold_buy_override", False))
             rsi_checklist_override = bool(ctx.get("rsi_checklist_buy_override", False))
             rsi_15m_value = float(ctx.get("rsi_15m_value", 50.0) or 50.0)
-            if rsi_oversold_override:
-                consensus_signal = 'buy'
-                logger.info(
-                    f"🟢 [RSI OVERRIDE] Forcing BUY consensus: 15m RSI={rsi_15m_value:.2f} < 30.00"
-                )
-            if rsi_checklist_override:
-                consensus_signal = 'buy'
-                logger.info("🟢 [RSI CHECKLIST OVERRIDE] Forcing BUY consensus from checklist strategy")
 
             # ---------- Confidence / agreement / sanitize -------------------------------
             total_strategies = len(valid_signals)
@@ -1313,14 +1502,6 @@ class StrategyManager:
             if primary_overrode and primary_buy_signal is not None:
                 avg_confidence = max(avg_confidence, primary_buy_signal['confidence'])
                 avg_strength = max(avg_strength, primary_buy_signal['strength'])
-
-            # Independent RSI override sets a high-confidence BUY floor.
-            if rsi_oversold_override:
-                avg_confidence = max(avg_confidence, 0.95)
-                avg_strength = max(avg_strength, 0.90)
-            if rsi_checklist_override:
-                avg_confidence = max(avg_confidence, 0.97)
-                avg_strength = max(avg_strength, 0.92)
 
             try:
                 if np.isnan(avg_confidence) or np.isinf(avg_confidence):
@@ -1736,39 +1917,89 @@ async def initialize_strategies():
         logger.error(f"Failed to initialize strategy service: {e}")
         raise
 
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """Docker/Colima occasionally returns EAI_AGAIN (-3) for internal service DNS."""
+    msg = str(exc).lower()
+    if "temporary failure in name resolution" in msg:
+        return True
+    if "name or service not known" in msg:
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in (-3, 11):
+        return True
+    if isinstance(exc, (httpx.ConnectError, httpx.ReadError, httpx.WriteError)):
+        return True
+    return False
+
+
+async def _fetch_pairs_for_exchange(client: httpx.AsyncClient, exchange: str) -> List[str]:
+    """GET /api/v1/pairs/{exchange} with retries for transient resolver failures."""
+    url = f"{database_service_url}/api/v1/pairs/{exchange}"
+    max_attempts = 5
+    last_err: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            response = await client.get(url)
+            if response.status_code == 200:
+                if attempt > 0:
+                    logger.info(
+                        "📊 Pairs fetch for %s succeeded on attempt %s/%s",
+                        exchange,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                pairs_data = response.json()
+                return list(pairs_data.get("pairs") or [])
+            logger.warning(
+                "⚠️ Failed to get pairs for %s: HTTP %s",
+                exchange,
+                response.status_code,
+            )
+            return []
+        except Exception as e:
+            last_err = e
+            transient = _is_transient_network_error(e)
+            if not transient or attempt == max_attempts - 1:
+                logger.warning("⚠️ Error getting pairs for %s: %s", exchange, e)
+                return []
+            wait_s = min(8.0, 1.0 * (2**attempt))
+            logger.warning(
+                "⚠️ Transient network error getting pairs for %s (attempt %s/%s): %s — retry in %.1fs",
+                exchange,
+                attempt + 1,
+                max_attempts,
+                e,
+                wait_s,
+            )
+            await asyncio.sleep(wait_s)
+    if last_err:
+        logger.warning("⚠️ Error getting pairs for %s: %s", exchange, last_err)
+    return []
+
+
 async def continuous_strategy_analysis():
     """Continuous strategy analysis loop"""
     logger.info("🔄 Starting continuous strategy analysis loop")
-    
+    logger.info("🔗 DATABASE_SERVICE_URL=%s", database_service_url)
+
     # Define exchanges to analyze
     exchanges = ['binance', 'bybit', 'cryptocom']
-    
+
     while True:
         try:
             all_trading_pairs = []
-            
+
             # Get trading pairs from database for each exchange
             async with httpx.AsyncClient(timeout=60.0) as client:
                 for exchange in exchanges:
-                    try:
-                        response = await client.get(f"{database_service_url}/api/v1/pairs/{exchange}")
-                        if response.status_code == 200:
-                            pairs_data = response.json()
-                            pairs = pairs_data.get('pairs', [])
-                            
-                            # Convert to the expected format
-                            for pair in pairs:
-                                all_trading_pairs.append({
-                                    'exchange': exchange,
-                                    'pair': pair
-                                })
-                            
-                            logger.info(f"📊 Retrieved {len(pairs)} pairs for {exchange}")
-                        else:
-                            logger.warning(f"⚠️ Failed to get pairs for {exchange}: {response.status_code}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Error getting pairs for {exchange}: {e}")
-                        continue
+                    pairs = await _fetch_pairs_for_exchange(client, exchange)
+                    for pair in pairs:
+                        all_trading_pairs.append({
+                            'exchange': exchange,
+                            'pair': pair
+                        })
+                    if pairs:
+                        logger.info(f"📊 Retrieved {len(pairs)} pairs for {exchange}")
             
             if not all_trading_pairs:
                 logger.warning("⚠️ No trading pairs configured for analysis")
@@ -1785,6 +2016,8 @@ async def continuous_strategy_analysis():
                     # Create analysis request.
                     # PnL-FIX v4: include 4h so vwma_hull's macro HARD VETO and
                     # heikin_ashi's 4h hierarchy level actually receive data.
+                    # Intraday standalone scalpers also require 5m/1m for setup
+                    # confirmation and execution timing.
                     # PnL-FIX v6: do NOT pass an explicit `strategies` whitelist
                     # here. Previously this hard-coded ['vwma_hull','heikin_ashi']
                     # silently flipped `enabled=False` on every other strategy
@@ -1797,7 +2030,7 @@ async def continuous_strategy_analysis():
                     # applicable strategies per pair; let it decide.
                     analysis_request = AnalysisRequest(
                         strategies=None,
-                        timeframes=['1h', '4h', '15m'],
+                        timeframes=DEFAULT_ANALYSIS_TIMEFRAMES,
                         include_indicators=True
                     )
                     
@@ -2015,7 +2248,11 @@ async def get_signals(exchange: str, pair: str):
         return signal_cache[cache_key]
     
     # If not in cache, perform analysis with formatted pair
-    analysis_results = await strategy_manager.analyze_pair(exchange, formatted_pair)
+    analysis_results = await strategy_manager.analyze_pair(
+        exchange,
+        formatted_pair,
+        DEFAULT_ANALYSIS_TIMEFRAMES,
+    )
     
     if not analysis_results:
         raise HTTPException(status_code=404, detail="No signals available")
@@ -2043,7 +2280,11 @@ async def get_consensus_signals(exchange: str, pair: str):
             raise HTTPException(status_code=404, detail=f"Unsupported pair format: {pair}")
     
     # Get full analysis with formatted pair
-    analysis_results = await strategy_manager.analyze_pair(exchange, formatted_pair)
+    analysis_results = await strategy_manager.analyze_pair(
+        exchange,
+        formatted_pair,
+        DEFAULT_ANALYSIS_TIMEFRAMES,
+    )
     
     if not analysis_results or 'consensus' not in analysis_results:
         raise HTTPException(status_code=404, detail="No consensus available")

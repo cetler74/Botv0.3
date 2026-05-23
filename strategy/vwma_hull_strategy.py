@@ -107,6 +107,33 @@ class VWMAHullStrategy(BaseStrategy):
         self.rsi_short_ceiling = float(parameters.get('rsi_short_ceiling', 50.0))   # symmetric for shorts
         self.rsi_period_long = int(parameters.get('rsi_period_long', 14))           # spec defaults to 14
         self.rsi_boost = float(parameters.get('rsi_boost', 0.05))
+
+        # PnL-FIX v8 — entry quality (YAML `min_confidence_score` was never read here).
+        self.min_confidence_score = float(parameters.get('min_confidence_score', 0.55))
+        self.require_close_above_vwma_hull_for_long = bool(
+            parameters.get('require_close_above_vwma_hull_for_long', self.enable_canonical_vwma_hull)
+        )
+        self.require_rsi_above_floor_for_long = bool(parameters.get('require_rsi_above_floor_for_long', True))
+        self.continuation_long_enabled = bool(parameters.get('continuation_long_enabled', False))
+        self.require_hull_slope_up_for_continuation_long = bool(
+            parameters.get('require_hull_slope_up_for_continuation_long', True)
+        )
+        self.blocked_entry_regimes = {
+            str(r).strip().lower()
+            for r in (parameters.get('blocked_entry_regimes') or [])
+            if str(r).strip()
+        }
+        self.structural_exit_confirm_bars = max(
+            1, int(parameters.get('structural_exit_confirm_bars', 1) or 1)
+        )
+        # Snapshot for generate_signal: regime overrides mutate attrs — reset each call to avoid leaks.
+        # (Do not include min_confidence_score: per-pair overrides apply before generate_signal.)
+        self._vwma_entry_defaults = {
+            'require_close_above_vwma_hull_for_long': self.require_close_above_vwma_hull_for_long,
+            'require_rsi_above_floor_for_long': self.require_rsi_above_floor_for_long,
+            'continuation_long_enabled': self.continuation_long_enabled,
+            'require_hull_slope_up_for_continuation_long': self.require_hull_slope_up_for_continuation_long,
+        }
         
         # Debug log the loaded parameters
         self.logger.info(f"VWMA Hull Strategy initialized with volume_method: {self.volume_method}, scalping_enabled: {self.scalping_enabled}")
@@ -738,12 +765,21 @@ class VWMAHullStrategy(BaseStrategy):
           - Added ADX >= 22 as a HARD VETO (was not checked at all in prior version).
           - Added 4h macro-trend alignment check (reject longs when 4h EMA9<EMA21).
           - Keeps existing volume/volatility checks (already hard vetos).
+        PnL-FIX v8:
+          - Enforces ``min_confidence_score`` after soft confirms (YAML was ignored).
+          - Optional hard vetos: close>VWMAHull, RSI>floor for longs.
+          - ``continuation_long_enabled`` gates weak ``vwma_above_hull`` entries (default off).
         """
         try:
             import pandas_ta as ta
             # Use exchange_adapter if provided to override self.exchange
             if exchange_adapter is not None:
                 self.exchange = exchange_adapter
+
+            # Reset entry knobs to YAML defaults (regime overrides only patch a subset; without
+            # this, e.g. continuation_long_enabled could leak from a prior pair's regime).
+            for _k, _v in getattr(self, '_vwma_entry_defaults', {}).items():
+                setattr(self, _k, _v)
 
             # OPTION-A: apply regime-driven parameter overrides before any
             # downstream condition reads self.<attr>. Safe no-op if no
@@ -752,6 +788,15 @@ class VWMAHullStrategy(BaseStrategy):
                 self._apply_regime_overrides(getattr(self.state, 'market_regime', None))
             except Exception as _ra_err:
                 self.logger.debug(f"[VWMAHullStrategy] regime-override apply failed: {_ra_err}")
+
+            regime_lc = str(getattr(self.state, 'market_regime', None) or '').strip().lower()
+            if regime_lc and regime_lc in self.blocked_entry_regimes:
+                self.logger.info(
+                    "[VWMAHullStrategy] %s HOLD — blocked_entry_regime=%s",
+                    pair,
+                    regime_lc,
+                )
+                return 'hold', 0.0, 0.0
 
             # Handle both DataFrame and dict market_data formats
             if isinstance(market_data, dict):
@@ -850,10 +895,25 @@ class VWMAHullStrategy(BaseStrategy):
             trend_strength = abs(current_vwma - current_hull) / current_hull if current_hull > 0 else 0
             price_change = abs(current_price - prev_price) / prev_price if prev_price > 0 else 0
 
+            # RSI once for soft confirms + hard long vetos (PnL-FIX v8).
+            rsi_series = None
+            rsi_now = float('nan')
+            try:
+                rsi_series = ta.rsi(ohlcv['close'], length=self.rsi_period_long)
+                if rsi_series is not None and len(rsi_series) > 0 and not pd.isna(rsi_series.iloc[-1]):
+                    rsi_now = float(rsi_series.iloc[-1])
+            except Exception as _rsi_pre_err:
+                self.logger.debug(f"[VWMAHullStrategy] RSI precompute failed for {pair}: {_rsi_pre_err}")
+
             # Scalping conditions
             signal, confidence, strength, reason = 'hold', 0.0, 0.0, []
             min_price_move = self.min_price_move  # 0.1% price change
             min_volatility = atr_value / current_price > self.min_volatility_threshold  # ATR > 0.2% of price
+
+            cont_slope_ok = (
+                not self.require_hull_slope_up_for_continuation_long
+                or current_hull > prev_hull
+            )
 
             if crossover == 'bullish' and min_volatility and price_change > min_price_move:
                 signal = 'buy'
@@ -865,7 +925,13 @@ class VWMAHullStrategy(BaseStrategy):
                 confidence = 0.8 + min(trend_strength * 10, 0.2)
                 strength = min(trend_strength * 10, 1.0)
                 reason.append('bearish_crossover')
-            elif current_vwma > current_hull and trend_strength > self.trend_threshold and min_volatility:
+            elif (
+                self.continuation_long_enabled
+                and cont_slope_ok
+                and current_vwma > current_hull
+                and trend_strength > self.trend_threshold
+                and min_volatility
+            ):
                 signal = 'buy'
                 confidence = 0.7 + min(trend_strength * 8, 0.2)
                 strength = min(trend_strength * 8, 1.0)
@@ -922,28 +988,59 @@ class VWMAHullStrategy(BaseStrategy):
                     strength = min(1.0, strength + self.hma_slope_boost)
                     reason.append('hma_slope_down')
 
-                # 3) RSI(14) > rsi_long_floor (default 50) for longs (spec).
-                rsi_now = float('nan')
-                try:
-                    rsi_series = ta.rsi(ohlcv['close'], length=self.rsi_period_long)
-                    if rsi_series is not None and len(rsi_series) > 0 and not pd.isna(rsi_series.iloc[-1]):
-                        rsi_now = float(rsi_series.iloc[-1])
-                        if signal == 'buy' and rsi_now > self.rsi_long_floor:
-                            confidence = min(1.0, confidence + self.rsi_boost)
-                            strength = min(1.0, strength + self.rsi_boost)
-                            reason.append(f'rsi>{self.rsi_long_floor:.0f}')
-                        elif signal == 'buy' and rsi_now <= self.rsi_long_floor:
-                            confidence = max(0.0, confidence - self.rsi_boost)
-                            strength = max(0.0, strength - self.rsi_boost)
-                            reason.append(f'rsi<={self.rsi_long_floor:.0f}')
-                        elif signal == 'sell' and rsi_now < self.rsi_short_ceiling:
-                            confidence = min(1.0, confidence + self.rsi_boost)
-                            strength = min(1.0, strength + self.rsi_boost)
-                            reason.append(f'rsi<{self.rsi_short_ceiling:.0f}')
-                except Exception as _rsi_err:
-                    self.logger.debug(f"[VWMAHullStrategy] RSI soft-confirm failed for {pair}: {_rsi_err}")
+                # 3) RSI(14) > rsi_long_floor (default 50) for longs (spec) — uses precomputed rsi_series.
+                if rsi_series is not None and len(rsi_series) > 0 and not pd.isna(rsi_series.iloc[-1]):
+                    if signal == 'buy' and rsi_now > self.rsi_long_floor:
+                        confidence = min(1.0, confidence + self.rsi_boost)
+                        strength = min(1.0, strength + self.rsi_boost)
+                        reason.append(f'rsi>{self.rsi_long_floor:.0f}')
+                    elif signal == 'buy' and rsi_now <= self.rsi_long_floor:
+                        confidence = max(0.0, confidence - self.rsi_boost)
+                        strength = max(0.0, strength - self.rsi_boost)
+                        reason.append(f'rsi<={self.rsi_long_floor:.0f}')
+                    elif signal == 'sell' and rsi_now < self.rsi_short_ceiling:
+                        confidence = min(1.0, confidence + self.rsi_boost)
+                        strength = min(1.0, strength + self.rsi_boost)
+                        reason.append(f'rsi<{self.rsi_short_ceiling:.0f}')
             except Exception as _soft_err:
                 self.logger.debug(f"[VWMAHullStrategy] Soft-confirmation layer failed for {pair}: {_soft_err}")
+
+            # Hard long entry vetos + min confidence (regime_overrides may tune thresholds).
+            if signal == 'buy':
+                if self.require_close_above_vwma_hull_for_long and self.enable_canonical_vwma_hull:
+                    vh_chk = self._calculate_vwma_hull(ohlcv, indicators_cache, pair, timeframe)
+                    if vh_chk is not None and len(vh_chk) and not pd.isna(vh_chk.iloc[-1]):
+                        vhn = float(vh_chk.iloc[-1])
+                        if float(current_price) <= vhn:
+                            self.logger.info(
+                                f"[VWMAHullStrategy] {pair} HOLD — entry veto: close<=VWMAHull "
+                                f"({float(current_price):.6f} <= {vhn:.6f})"
+                            )
+                            signal, confidence, strength = 'hold', 0.0, 0.0
+                            reason = ['veto_close_not_above_vwma_hull']
+                if signal == 'buy' and self.require_rsi_above_floor_for_long:
+                    if rsi_now != rsi_now:
+                        self.logger.info(
+                            f"[VWMAHullStrategy] {pair} HOLD — entry veto: RSI unavailable "
+                            f"(require_rsi_above_floor_for_long)"
+                        )
+                        signal, confidence, strength = 'hold', 0.0, 0.0
+                        reason = ['veto_rsi_unavailable']
+                    elif rsi_now <= self.rsi_long_floor:
+                        self.logger.info(
+                            f"[VWMAHullStrategy] {pair} HOLD — entry veto: RSI {rsi_now:.1f} <= "
+                            f"floor {self.rsi_long_floor:.0f}"
+                        )
+                        signal, confidence, strength = 'hold', 0.0, 0.0
+                        reason = [f'veto_rsi_lte_floor_{rsi_now:.1f}']
+
+            if signal in ('buy', 'sell') and confidence < self.min_confidence_score:
+                self.logger.info(
+                    f"[VWMAHullStrategy] {pair} HOLD — min_confidence_score: {confidence:.3f} < "
+                    f"{self.min_confidence_score:.3f} (was {signal})"
+                )
+                signal, confidence, strength = 'hold', 0.0, 0.0
+                reason = [f'veto_min_confidence_was_{signal}']
 
             reason_str = '+'.join(reason) + f'|adx={adx_now:.1f}' if reason else 'no_signal'
             self.logger.info(f"[VWMAHullStrategy] Generated {signal.upper()} signal for {pair or self.state.pair}: "
@@ -1021,6 +1118,99 @@ class VWMAHullStrategy(BaseStrategy):
         except Exception as e:
             self.logger.error(f"Error calculating position size: {str(e)}")
             return 0.0
+
+    def _structural_long_exit_on_slice(self, ohlcv: pd.DataFrame) -> Tuple[bool, Optional[str]]:
+        """Single-bar structural exit on the last row of ``ohlcv`` (closed-bar slice)."""
+        pair = getattr(self.state, "pair", None) or "N/A"
+        if ohlcv is None or ohlcv.empty:
+            return False, None
+        required_cols = {"open", "high", "low", "close", "volume"}
+        if not required_cols.issubset(ohlcv.columns):
+            return False, None
+        min_len = max(self.vwma_period, self.hull_period) + 2
+        if len(ohlcv) < min_len:
+            return False, None
+
+        current_price = float(ohlcv["close"].iloc[-1])
+        vwma_series = self._calculate_vwma(ohlcv)
+        hull_series = self._calculate_hull_ma(vwma_series)
+        if (
+            vwma_series is not None
+            and hull_series is not None
+            and len(vwma_series) >= 2
+            and len(hull_series) >= 2
+            and not pd.isna(vwma_series.iloc[-1])
+            and not pd.isna(hull_series.iloc[-1])
+            and not pd.isna(vwma_series.iloc[-2])
+            and not pd.isna(hull_series.iloc[-2])
+        ):
+            prev_vwma = float(vwma_series.iloc[-2])
+            prev_hull = float(hull_series.iloc[-2])
+            curr_vwma = float(vwma_series.iloc[-1])
+            curr_hull = float(hull_series.iloc[-1])
+            if prev_vwma > prev_hull and curr_vwma < curr_hull:
+                self.logger.info(
+                    "[VWMAHullStrategy] structural_long_exit: VWMA/Hull crossover for %s "
+                    "(%.6f->%.6f vs %.6f->%.6f)",
+                    pair,
+                    prev_vwma,
+                    curr_vwma,
+                    prev_hull,
+                    curr_hull,
+                )
+                return True, "crossover"
+
+        if self.enable_canonical_vwma_hull:
+            vh = self._calculate_vwma_hull(ohlcv)
+            if vh is not None and len(vh) >= 2 and not pd.isna(vh.iloc[-1]) and not pd.isna(vh.iloc[-2]):
+                prev_close = float(ohlcv["close"].iloc[-2])
+                curr_close = float(current_price)
+                prev_vh = float(vh.iloc[-2])
+                curr_vh = float(vh.iloc[-1])
+                if prev_close >= prev_vh and curr_close < curr_vh:
+                    self.logger.info(
+                        "[VWMAHullStrategy] structural_long_exit: close<VWMAHull for %s "
+                        "close %.6f->%.6f vs VH %.6f->%.6f",
+                        pair,
+                        prev_close,
+                        curr_close,
+                        prev_vh,
+                        curr_vh,
+                    )
+                    return True, "vwma_hull_break"
+
+        return False, None
+
+    def structural_long_exit_from_ohlcv(self, ohlcv: pd.DataFrame) -> Tuple[bool, Optional[str]]:
+        """Bearish VWMA/Hull crossunder and/or close<VWMAHull (canonical line) for LONG exits.
+
+        Mirrors the technical branches inside ``should_exit`` (no SL/TP/time-exit) but
+        takes explicit OHLCV so the orchestrator can evaluate structural exits on **1h**
+        candles — the same primary timeframe ``StrategyManager`` passes to ``update()``.
+        When ``structural_exit_confirm_bars`` > 1, the signal must fire on each of the
+        last N closed bars (reduces single-tick / partial-bar noise exits).
+        """
+        pair = getattr(self.state, "pair", None) or "N/A"
+        try:
+            if ohlcv is None or ohlcv.empty:
+                return False, None
+            confirm_bars = max(1, int(getattr(self, "structural_exit_confirm_bars", 1) or 1))
+            min_len = max(self.vwma_period, self.hull_period) + 2 + confirm_bars
+            if len(ohlcv) < min_len:
+                return False, None
+
+            last_tag: Optional[str] = None
+            for i in range(confirm_bars):
+                end_idx = len(ohlcv) - confirm_bars + i
+                slice_df = ohlcv.iloc[: end_idx + 1]
+                hit, tag = self._structural_long_exit_on_slice(slice_df)
+                if not hit:
+                    return False, None
+                last_tag = tag
+            return True, last_tag
+        except Exception as e:
+            self.logger.debug("[VWMAHullStrategy] structural_long_exit_from_ohlcv failed for %s: %s", pair, e)
+            return False, None
 
     async def should_exit(self) -> Tuple[bool, Optional[str]]:
         """Check if current position should be exited based on strategy and fallback conditions."""

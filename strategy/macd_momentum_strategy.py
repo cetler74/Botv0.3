@@ -1,15 +1,18 @@
 """
 MACD Momentum strategy tuned for crypto intraday execution.
 
-Design:
-- MACD line vs signal for bias: execution chart (e.g. 15m) or trend chart (e.g. 1h), per parameters.
-- Histogram, EMA, volume, ADX on the execution timeframe.
-- Applies volume and EMA filters to reduce false breakouts.
-- Emits buy/sell/hold signals only; exits remain orchestrator-managed
-  (profit protection + trailing stop + global risk controls).
+Single long entry path (all gates must pass):
+  1. 15m + 1h OHLCV available with sufficient history.
+  2. Mandatory (15m): two consecutive green rising MACD histogram bars.
+  3. Mandatory (15m): at least one of the last N closed RSI values < rsi_max_for_buy.
+  4. 1h MACD line > 1h signal (long_macd_bias_timeframe: trend).
+  5. 15m close > EMA(ema_filter_period).
+  6. 15m volume >= dynamic volume_multiplier × rolling mean (when enabled).
+
+Exits remain orchestrator-managed (trailing stop / profit protection / global risk).
 """
 
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import logging
 
 import pandas as pd
@@ -55,32 +58,72 @@ class MACDMomentumStrategy(BaseStrategy):
         self.volume_multiplier = float(params.get("volume_multiplier", 1.2))
         self.histogram_min_delta = float(params.get("histogram_min_delta", 0.0))
         self.min_confidence_score = float(params.get("min_confidence_score", 0.55))
-        self.adx_threshold = float(params.get("adx_threshold", 18.0))
-        self.adx_period = int(params.get("adx_period", 14))
         self.min_hist_rising_bars = int(params.get("min_hist_rising_bars", 2))
         self.min_hist_falling_bars = int(params.get("min_hist_falling_bars", 2))
         self.require_hist_positive_for_long = bool(params.get("require_hist_positive_for_long", True))
         self.require_hist_negative_for_short = bool(params.get("require_hist_negative_for_short", True))
         self.use_volume_confirmation = bool(params.get("use_volume_confirmation", True))
-        self.adx_boost_threshold = float(params.get("adx_boost_threshold", self.adx_threshold))
-        self.adx_confidence_boost = float(params.get("adx_confidence_boost", 0.06))
-        # When True, block buy/sell unless ADX(execution TF) >= adx_threshold (YAML
-        # adx_threshold finally acts as a hard gate, not only a boost reference).
-        self.enforce_adx_threshold = bool(params.get("enforce_adx_threshold", False))
         self.skip_sideways_regime = bool(params.get("skip_sideways_regime", True))
+        ar = params.get("allowed_regimes")
+        if ar is None:
+            ar = []
+        self.allowed_regimes = {str(x).strip().lower() for x in ar if str(x).strip()}
+        br = params.get("blocked_regimes")
+        if br is None:
+            br = []
+        self.blocked_regimes = {str(x).strip().lower() for x in br if str(x).strip()}
+        ae = params.get("allowed_exchanges")
+        if ae is None:
+            ae = []
+        self.allowed_exchanges = {str(x).strip().lower() for x in ae if str(x).strip()}
         self.dynamic_volume_enabled = bool(params.get("dynamic_volume_enabled", True))
         self.dynamic_volume_floor = float(params.get("dynamic_volume_floor", 1.05))
         self.dynamic_volume_ceiling = float(params.get("dynamic_volume_ceiling", 1.15))
         self.enable_divergence_detection = bool(params.get("enable_divergence_detection", True))
         self.divergence_lookback = int(params.get("divergence_lookback", 12))
         self.divergence_confidence_boost = float(params.get("divergence_confidence_boost", 0.05))
-        self.use_rsi_buy_filter = bool(params.get("use_rsi_buy_filter", True))
         self.rsi_period = int(params.get("rsi_period", 14))
-        self.rsi_buy_max = float(params.get("rsi_buy_max", 50.0))
-        self.macd_green_rsi_lookback = int(params.get("macd_green_rsi_lookback", 5))
-        self.macd_green_rsi_buy_threshold = float(params.get("macd_green_rsi_buy_threshold", 35.0))
-        self.macd_green_rsi_force_buy_override = bool(params.get("macd_green_rsi_force_buy_override", True))
-        # "trend" = higher-TF MACD vs signal (1h when present); "execution" = same chart as triggers (15m).
+        # Mandatory long gates (15m): 2 green rising histogram bars.
+        self.require_two_green_hist_bars = bool(params.get("require_two_green_hist_bars", True))
+        # ANY-of-last-N: at least one closed 15m RSI in this window must be < rsi_max_for_buy.
+        self.rsi_last_n_below = int(params.get("rsi_last_n_below", 6))
+        self.rsi_max_for_buy = float(
+            params.get("rsi_max_for_buy", params.get("macd_green_rsi_buy_threshold", 30.0))
+        )
+        # Dashboard / analytics aliases (same gate as rsi_last_n_below / rsi_max_for_buy).
+        self.macd_green_rsi_lookback = int(
+            params.get("macd_green_rsi_lookback", self.rsi_last_n_below)
+        )
+        self.macd_green_rsi_buy_threshold = float(
+            params.get("macd_green_rsi_buy_threshold", self.rsi_max_for_buy)
+        )
+        self.buy_strength_floor = float(params.get("buy_strength_floor", 0.30))
+        self.continuation_long_enabled = bool(params.get("continuation_long_enabled", False))
+        continuation_regimes = params.get("continuation_allowed_regimes", ["trending_up", "breakout"])
+        self.continuation_allowed_regimes = {
+            str(x).strip().lower() for x in continuation_regimes if str(x).strip()
+        }
+        self.continuation_min_rsi = float(params.get("continuation_min_rsi", 45.0))
+        self.continuation_max_rsi = float(params.get("continuation_max_rsi", 68.0))
+        self.continuation_min_trend_rsi = float(params.get("continuation_min_trend_rsi", 45.0))
+        self.continuation_require_exec_macd_bias = bool(
+            params.get("continuation_require_exec_macd_bias", True)
+        )
+        self.continuation_confidence = float(params.get("continuation_confidence", self.min_confidence_score))
+        self.continuation_strength_floor = float(params.get("continuation_strength_floor", self.buy_strength_floor))
+        self.continuation_volume_multiplier = float(
+            params.get("continuation_volume_multiplier", self.volume_multiplier)
+        )
+        self.continuation_requires_volume_ok = bool(
+            params.get("continuation_requires_volume_ok", False)
+        )
+        self.continuation_confirmation_pct = float(
+            params.get("continuation_confirmation_pct", 0.0025)
+        )
+        self.continuation_confirm_lookback = int(
+            params.get("continuation_confirm_lookback", 2)
+        )
+        # Long bias: "trend" => 1h MACD > 1h signal (canonical single-path design).
         self.long_macd_bias_timeframe = str(params.get("long_macd_bias_timeframe", "trend")).lower()
         self.short_macd_bias_timeframe = str(params.get("short_macd_bias_timeframe", "trend")).lower()
 
@@ -151,6 +194,20 @@ class MACDMomentumStrategy(BaseStrategy):
         bearish = (price_new.max() > price_old.max()) and (hist_new.max() < hist_old.max())
         return bool(bullish), bool(bearish)
 
+    def _regime_allowed(self, current_regime: str) -> bool:
+        regime = str(current_regime or "unknown").strip().lower()
+        if self.allowed_regimes:
+            return regime in self.allowed_regimes
+        if self.skip_sideways_regime and regime == "sideways":
+            return False
+        return regime not in self.blocked_regimes
+
+    def _exchange_allowed(self) -> bool:
+        if not self.allowed_exchanges:
+            return True
+        ex = str(self.exchange_name or "").strip().lower()
+        return ex in self.allowed_exchanges
+
     async def generate_signal(
         self,
         market_data,
@@ -162,10 +219,18 @@ class MACDMomentumStrategy(BaseStrategy):
         try:
             self._apply_regime_overrides(getattr(self.state, "market_regime", None))
             current_regime = str(getattr(self.state, "market_regime", "unknown") or "unknown").lower()
-            if self.skip_sideways_regime and current_regime in ("sideways",):
+            if not self._exchange_allowed():
                 self.logger.info(
-                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 reason=sideways_regime_skip",
-                    pair or self.state.pair
+                    "[MACDMomentumStrategy] %s HOLD: exchange=%s not in allowed_exchanges",
+                    pair or self.state.pair,
+                    self.exchange_name,
+                )
+                return "hold", 0.0, 0.0
+            if not self._regime_allowed(current_regime):
+                self.logger.info(
+                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 reason=regime_blocked (%s)",
+                    pair or self.state.pair,
+                    current_regime,
                 )
                 return "hold", 0.0, 0.0
 
@@ -236,17 +301,14 @@ class MACDMomentumStrategy(BaseStrategy):
             price_now = float(exec_df["close"].iloc[-1])
             price_above_ema = price_now > ema_now
             price_below_ema = price_now < ema_now
+            previous_close = float(exec_df["close"].iloc[-2])
 
             avg_volume = float(exec_df["volume"].rolling(window=self.volume_window).mean().iloc[-1])
             current_volume = float(exec_df["volume"].iloc[-1])
             required_volume_multiplier = self._resolve_volume_multiplier(exec_df, current_regime)
+            volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 0.0
             volume_ok = avg_volume > 0 and current_volume >= (avg_volume * required_volume_multiplier)
 
-            adx_df = ta.adx(exec_df["high"], exec_df["low"], exec_df["close"], length=self.adx_period)
-            adx_col = next((c for c in adx_df.columns if str(c).startswith("ADX")) if adx_df is not None else (), None)
-            adx_now = float(adx_df[adx_col].iloc[-1]) if adx_col and not pd.isna(adx_df[adx_col].iloc[-1]) else 0.0
-            adx_boost_active = adx_now >= self.adx_boost_threshold
-            adx_entry_ok = (not self.enforce_adx_threshold) or (adx_now >= self.adx_threshold)
             exec_rsi_series = ta.rsi(exec_df["close"], length=self.rsi_period)
             trend_rsi_series = ta.rsi(trend_df["close"], length=self.rsi_period)
             exec_rsi_now = (
@@ -259,28 +321,17 @@ class MACDMomentumStrategy(BaseStrategy):
                 if trend_rsi_series is not None and len(trend_rsi_series) > 0 and not pd.isna(trend_rsi_series.iloc[-1])
                 else 50.0
             )
-            rsi_buy_ok = (
-                (exec_rsi_now < self.rsi_buy_max) and (trend_rsi_now < self.rsi_buy_max)
-                if self.use_rsi_buy_filter
-                else True
-            )
-            macd_green_rsi_buy_ok = False
             macd_rsi_window_values = []
             macd_rsi_window_timestamps = []
-            macd_green_consecutive_ok = (hist_now > 0.0 and hist_prev > 0.0 and hist_now > hist_prev)
-            lookback = max(1, self.macd_green_rsi_lookback)
-            # Rule order is explicit by design:
-            # 1) current MACD histogram must be green (> 0),
-            # 2) require 2 consecutive green bars with increasing histogram,
-            # 3) then evaluate RSI<threshold over the recent closed RSI window.
-            if (
-                macd_green_consecutive_ok
-                and exec_rsi_series is not None
-                and len(exec_rsi_series) >= lookback
-                and len(exec_hist) >= lookback
-            ):
-                # Last N fully closed RSI values ending at latest closed candle.
-                recent_rsi = exec_rsi_series.iloc[-lookback:]
+            green_consecutive_increasing = (
+                hist_now > 0.0 and hist_prev > 0.0 and hist_now > hist_prev
+            )
+            hist_rising_two_bars_gate = hist_now > hist_prev > hist_prev2
+            rsi_lookback = max(1, self.rsi_last_n_below)
+            rsi_any_of_last_n_below = False
+            rsi_gate_fail_detail = "insufficient_rsi_history"
+            if exec_rsi_series is not None and len(exec_rsi_series) >= rsi_lookback:
+                recent_rsi = exec_rsi_series.iloc[-rsi_lookback:]
                 macd_rsi_window_values = [
                     round(float(v), 2)
                     for v in recent_rsi.tolist()
@@ -290,104 +341,170 @@ class MACDMomentumStrategy(BaseStrategy):
                     ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
                     for ts in recent_rsi.index.tolist()
                 ]
-                macd_green_rsi_buy_ok = bool(
-                    not recent_rsi.empty
-                    and (recent_rsi < self.macd_green_rsi_buy_threshold).any()
-                )
+                if len(macd_rsi_window_values) < rsi_lookback:
+                    rsi_gate_fail_detail = "rsi_window_has_nan"
+                elif (recent_rsi < self.rsi_max_for_buy).any():
+                    rsi_any_of_last_n_below = True
+                else:
+                    rsi_gate_fail_detail = (
+                        f"rsi_none_of_last{rsi_lookback}_lt_{int(self.rsi_max_for_buy)}"
+                    )
             self.logger.info(
-                "[MACDMomentumStrategy] %s macd_rsi_rule hist_now=%.6f hist_prev=%.6f "
-                "green_consecutive_increasing=%s hist_ts=%s lookback=%s threshold=%.2f "
-                "rsi_window_ts=%s rsi_window=%s trigger=%s",
+                "[MACDMomentumStrategy] %s buy_gates hist_now=%.6f hist_prev=%.6f "
+                "green_consecutive_increasing=%s require_two_green=%s "
+                "rsi_last_n=%s rsi_max=%.2f rsi_any_below=%s rsi_fail=%s "
+                "rsi_window_ts=%s rsi_window=%s",
                 pair or self.state.pair,
                 hist_now,
                 hist_prev,
-                macd_green_consecutive_ok,
-                exec_df.index[-1].isoformat() if hasattr(exec_df.index[-1], "isoformat") else str(exec_df.index[-1]),
-                lookback,
-                self.macd_green_rsi_buy_threshold,
+                green_consecutive_increasing,
+                self.require_two_green_hist_bars,
+                rsi_lookback,
+                self.rsi_max_for_buy,
+                rsi_any_of_last_n_below,
+                rsi_gate_fail_detail,
                 macd_rsi_window_timestamps,
                 macd_rsi_window_values,
-                macd_green_rsi_buy_ok,
             )
 
             signal = "hold"
             confidence = 0.0
             strength = 0.0
-            reasons = []
+            reasons: List[str] = []
+            gate_fail_reasons: List[str] = []
 
-            long_hist_ok = (
-                (hist_rising_two_bars and (not self.require_hist_positive_for_long or hist_now > 0.0))
-                or hist_flipped_positive
-                or (bullish_cross and hist_expanding_up)
+            # Mandatory 15m gates: two rising histogram bars (allows negative-but-recovering hist).
+            if self.require_two_green_hist_bars:
+                buy_hist_gate_ok = hist_rising_two_bars_gate
+                if self.require_hist_positive_for_long:
+                    buy_hist_gate_ok = buy_hist_gate_ok and hist_now > 0.0 and hist_prev > 0.0
+            else:
+                buy_hist_gate_ok = (
+                    hist_rising_two_bars
+                    and (not self.require_hist_positive_for_long or hist_now > 0.0)
+                )
+            buy_rsi_gate_ok = rsi_any_of_last_n_below
+            long_volume_ok = (not self.use_volume_confirmation) or volume_ok
+            continuation_regime_ok = (
+                current_regime in self.continuation_allowed_regimes
+                if self.continuation_allowed_regimes
+                else True
             )
-            macd_green_oversold_setup = exec_bias_bullish and macd_green_rsi_buy_ok
-            long_setup_ok = long_hist_ok or macd_green_oversold_setup
+            continuation_exec_bias_ok = (not self.continuation_require_exec_macd_bias) or exec_bias_bullish
+            continuation_rsi_ok = (
+                self.continuation_min_rsi <= exec_rsi_now <= self.continuation_max_rsi
+                and trend_rsi_now >= self.continuation_min_trend_rsi
+            )
+            continuation_hist_ok = hist_rising_two_bars_gate or (
+                hist_now > hist_prev and hist_expanding_up
+            )
+            continuation_volume_ok = (
+                (not self.use_volume_confirmation)
+                or (avg_volume > 0 and volume_ratio >= self.continuation_volume_multiplier)
+            )
+            continuation_full_volume_ok = (not self.use_volume_confirmation) or volume_ok
+            continuation_confirm_ok = True
+            if self.continuation_confirmation_pct > 0:
+                lookback = max(1, min(self.continuation_confirm_lookback, len(exec_df) - 1))
+                prior_close_high = float(exec_df["close"].iloc[-(lookback + 1):-1].max())
+                confirm_base = max(previous_close, prior_close_high)
+                continuation_confirm_ok = (
+                    confirm_base > 0
+                    and price_now >= confirm_base * (1.0 + self.continuation_confirmation_pct)
+                )
+            continuation_long_ok = (
+                self.continuation_long_enabled
+                and continuation_regime_ok
+                and continuation_hist_ok
+                and long_macd_bias_ok
+                and continuation_exec_bias_ok
+                and price_above_ema
+                and continuation_volume_ok
+                and (continuation_full_volume_ok or not self.continuation_requires_volume_ok)
+                and continuation_rsi_ok
+                and continuation_confirm_ok
+            )
+
             short_hist_ok = (
                 (hist_falling_two_bars and (not self.require_hist_negative_for_short or hist_now < 0.0))
                 or hist_flipped_negative
                 or (bearish_cross and hist_expanding_down)
             )
-
-            long_volume_ok = (not self.use_volume_confirmation) or volume_ok
             short_volume_ok = (not self.use_volume_confirmation) or volume_ok
 
-            if self.macd_green_rsi_force_buy_override and macd_green_rsi_buy_ok:
-                signal = "buy"
-                confidence = max(self.min_confidence_score, 0.85)
-                strength = max(min(1.0, abs(hist_now) * 8), 0.7)
-                reasons = ["macd_green_rsi_force_buy_override", "macd_green_rsi<35"]
-                if exec_bias_bullish:
-                    reasons.append("exec_tf_bull_bias")
-                if adx_boost_active:
-                    confidence = min(1.0, confidence + self.adx_confidence_boost)
-                    reasons.append("adx_boost")
-            elif (
-                long_macd_bias_ok
+            if not buy_hist_gate_ok:
+                gate_fail_reasons.append("gate_fail:hist_2rising")
+            if not buy_rsi_gate_ok:
+                gate_fail_reasons.append(
+                    f"gate_fail:rsi_none_of_last{rsi_lookback}_lt_{int(self.rsi_max_for_buy)}"
+                    f"({rsi_gate_fail_detail})"
+                )
+            if not long_macd_bias_ok:
+                gate_fail_reasons.append(
+                    "gate_fail:1h_macd_lte_signal"
+                    if self.long_macd_bias_timeframe == "trend"
+                    else "gate_fail:exec_macd_lte_signal"
+                )
+            if not price_above_ema:
+                gate_fail_reasons.append("gate_fail:price_below_ema")
+            if not long_volume_ok:
+                gate_fail_reasons.append("gate_fail:volume")
+
+            long_entry_ok = (
+                buy_hist_gate_ok
+                and buy_rsi_gate_ok
+                and long_macd_bias_ok
                 and price_above_ema
-                and long_setup_ok
                 and long_volume_ok
-                and (rsi_buy_ok or macd_green_rsi_buy_ok)
-                and adx_entry_ok
-            ):
+            )
+
+            if long_entry_ok:
                 signal = "buy"
                 confidence = self.min_confidence_score
-                strength = min(1.0, abs(hist_now) * 8)
-                reasons = (
-                    ["trend_1h_bull_bias", "price>ema", "hist_long_setup"]
-                    if self.long_macd_bias_timeframe == "trend"
-                    else ["exec_tf_bull_bias", "price>ema", "hist_long_setup"]
+                strength = max(
+                    self.buy_strength_floor,
+                    min(1.0, abs(hist_now) * 8),
                 )
-                if volume_ok:
-                    reasons.append("vol_ok")
-                if self.use_rsi_buy_filter:
-                    reasons.append("rsi_buy_ok")
-                if macd_green_rsi_buy_ok:
-                    reasons.append("macd_green_rsi<35")
-                if macd_green_oversold_setup:
-                    reasons.append("macd_green_oversold_setup")
-                if adx_boost_active:
-                    confidence = min(1.0, confidence + self.adx_confidence_boost)
-                    reasons.append("adx_boost")
-                if bullish_divergence:
+                reasons = [
+                    "gate:hist_2rising",
+                    f"gate:rsi_any_of_last{rsi_lookback}_lt_{int(self.rsi_max_for_buy)}",
+                    (
+                        "1h_macd_gt_signal"
+                        if self.long_macd_bias_timeframe == "trend"
+                        else "15m_macd_gt_signal"
+                    ),
+                    "price>ema",
+                    "vol_ok",
+                ]
+                if self.enable_divergence_detection and bullish_divergence:
                     confidence = min(1.0, confidence + self.divergence_confidence_boost)
                     reasons.append("bull_divergence")
-            elif (
-                long_macd_bias_ok
-                and price_above_ema
-                and long_setup_ok
-                and long_volume_ok
-                and (rsi_buy_ok or macd_green_rsi_buy_ok)
-                and not adx_entry_ok
-                and self.enforce_adx_threshold
-            ):
-                self.logger.info(
-                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 "
-                    "reason=adx_below_threshold adx=%.2f need>=%.2f",
-                    pair or self.state.pair,
-                    adx_now,
-                    self.adx_threshold,
+            elif continuation_long_ok:
+                signal = "buy"
+                confidence = max(self.min_confidence_score, self.continuation_confidence)
+                strength = max(
+                    self.continuation_strength_floor,
+                    min(1.0, max(abs(hist_now) * 8, (exec_rsi_now - self.continuation_min_rsi) / 50.0)),
                 )
-            elif short_macd_bias_ok and price_below_ema and short_hist_ok and short_volume_ok and adx_entry_ok:
+                reasons = [
+                    "continuation_long",
+                    "hist_rising",
+                    (
+                        "1h_macd_gt_signal"
+                        if self.long_macd_bias_timeframe == "trend"
+                        else "15m_macd_gt_signal"
+                    ),
+                    "price>ema",
+                    "vol_ok",
+                    f"rsi_{self.continuation_min_rsi:.0f}_{self.continuation_max_rsi:.0f}",
+                ]
+            elif gate_fail_reasons:
+                self.logger.info(
+                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 reason=%s",
+                    pair or self.state.pair,
+                    "+".join(gate_fail_reasons),
+                )
+            elif short_macd_bias_ok and price_below_ema and short_hist_ok and short_volume_ok:
                 signal = "sell"
                 confidence = max(0.5, self.min_confidence_score - 0.05)
                 strength = min(1.0, abs(hist_now) * 8)
@@ -398,27 +515,9 @@ class MACDMomentumStrategy(BaseStrategy):
                 )
                 if volume_ok:
                     reasons.append("vol_ok")
-                if adx_boost_active:
-                    confidence = min(1.0, confidence + self.adx_confidence_boost)
-                    reasons.append("adx_boost")
-                if bearish_divergence:
+                if self.enable_divergence_detection and bearish_divergence:
                     confidence = min(1.0, confidence + self.divergence_confidence_boost)
                     reasons.append("bear_divergence")
-            elif (
-                short_macd_bias_ok
-                and price_below_ema
-                and short_hist_ok
-                and short_volume_ok
-                and not adx_entry_ok
-                and self.enforce_adx_threshold
-            ):
-                self.logger.info(
-                    "[MACDMomentumStrategy] %s HOLD conf=0.00 strength=0.00 "
-                    "reason=adx_below_threshold adx=%.2f need>=%.2f",
-                    pair or self.state.pair,
-                    adx_now,
-                    self.adx_threshold,
-                )
 
             self.state.indicators.update(
                 {
@@ -427,28 +526,45 @@ class MACDMomentumStrategy(BaseStrategy):
                     "exec_macd_hist": hist_now,
                     "trend_macd": trend_macd_now,
                     "trend_macd_signal": trend_sig_now,
-                    "adx": adx_now,
-                    "adx_entry_ok": adx_entry_ok,
-                    "enforce_adx_threshold": self.enforce_adx_threshold,
-                    "volume_ratio": (current_volume / avg_volume) if avg_volume > 0 else 0.0,
+                    "volume_ratio": volume_ratio,
                     "required_volume_multiplier": required_volume_multiplier,
+                    "continuation_volume_multiplier": self.continuation_volume_multiplier,
+                    "continuation_requires_volume_ok": self.continuation_requires_volume_ok,
+                    "continuation_confirmation_pct": self.continuation_confirmation_pct,
+                    "continuation_confirm_ok": continuation_confirm_ok,
                     "ema_exec": ema_now,
+                    "price_now": price_now,
+                    "price_above_ema": price_above_ema,
                     "hist_rising_two_bars": hist_rising_two_bars,
                     "hist_falling_two_bars": hist_falling_two_bars,
-                    "long_setup_ok": long_setup_ok,
                     "hist_flipped_positive": hist_flipped_positive,
                     "hist_flipped_negative": hist_flipped_negative,
                     "bullish_divergence": bullish_divergence,
                     "bearish_divergence": bearish_divergence,
                     "exec_rsi": exec_rsi_now,
                     "trend_rsi": trend_rsi_now,
-                    "rsi_buy_ok": rsi_buy_ok,
-                    "macd_green_oversold_setup": macd_green_oversold_setup,
-                    "macd_green_rsi_buy_ok": macd_green_rsi_buy_ok,
-                    "macd_green_rsi_force_buy_override": self.macd_green_rsi_force_buy_override,
-                    "macd_green_rsi_lookback": lookback,
-                    "macd_green_rsi_threshold": self.macd_green_rsi_buy_threshold,
-                    "macd_green_consecutive_increasing": macd_green_consecutive_ok,
+                    "buy_hist_gate_ok": buy_hist_gate_ok,
+                    "buy_rsi_gate_ok": buy_rsi_gate_ok,
+                    "macd_green_rsi_buy_ok": buy_rsi_gate_ok,
+                    "long_entry_ok": long_entry_ok,
+                    "continuation_long_enabled": self.continuation_long_enabled,
+                    "continuation_long_ok": continuation_long_ok,
+                    "continuation_regime_ok": continuation_regime_ok,
+                    "continuation_hist_ok": continuation_hist_ok,
+                    "continuation_rsi_ok": continuation_rsi_ok,
+                    "continuation_exec_bias_ok": continuation_exec_bias_ok,
+                    "continuation_volume_ok": continuation_volume_ok,
+                    "continuation_full_volume_ok": continuation_full_volume_ok,
+                    "continuation_min_rsi": self.continuation_min_rsi,
+                    "continuation_max_rsi": self.continuation_max_rsi,
+                    "long_volume_ok": long_volume_ok,
+                    "require_two_green_hist_bars": self.require_two_green_hist_bars,
+                    "rsi_last_n_below": rsi_lookback,
+                    "rsi_max_for_buy": self.rsi_max_for_buy,
+                    "rsi_any_of_last_n_below": rsi_any_of_last_n_below,
+                    "macd_green_rsi_lookback": rsi_lookback,
+                    "macd_green_rsi_threshold": self.rsi_max_for_buy,
+                    "macd_green_consecutive_increasing": green_consecutive_increasing,
                     "macd_hist_prev": hist_prev,
                     "macd_hist_ts": (
                         exec_df.index[-1].isoformat()
@@ -461,11 +577,14 @@ class MACDMomentumStrategy(BaseStrategy):
                     "exec_bias_bearish": exec_bias_bearish,
                     "long_macd_bias_ok": long_macd_bias_ok,
                     "short_macd_bias_ok": short_macd_bias_ok,
+                    "long_macd_bias_timeframe": self.long_macd_bias_timeframe,
                 }
             )
             self.state.last_signal = signal
 
-            reason_str = "+".join(reasons) if reasons else "no_signal"
+            reason_str = "+".join(reasons) if reasons else (
+                "+".join(gate_fail_reasons) if gate_fail_reasons else "no_signal"
+            )
             self.logger.info(
                 f"[MACDMomentumStrategy] {pair or self.state.pair} {signal.upper()} "
                 f"conf={confidence:.2f} strength={strength:.2f} reason={reason_str}"

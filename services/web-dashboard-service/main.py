@@ -5,7 +5,7 @@ User interface and real-time monitoring
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 import json
 import httpx
@@ -19,6 +19,8 @@ import uvicorn
 import os
 import yaml
 import shutil
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Configure logging
@@ -63,9 +65,387 @@ exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-servic
 strategy_service_url = os.getenv("STRATEGY_SERVICE_URL", "http://strategy-service:8004")
 orchestrator_service_url = os.getenv("ORCHESTRATOR_SERVICE_URL", "http://orchestrator-service:8005")
 order_sync_service_url = os.getenv("ORDER_SYNC_SERVICE_URL", "http://order-sync-service:8008")
+dashboard_ui_version = os.getenv("DASHBOARD_UI_VERSION", "legacy").strip().lower()
+
+coinstats_api_url = os.getenv("COINSTATS_API_URL", "https://openapiv1.coinstats.app").rstrip("/")
+coinstats_api_key = os.getenv("COINSTATS_API_KEY", "").strip()
+coinstats_enabled = os.getenv("COINSTATS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+coinstats_monthly_credit_limit = int(os.getenv("COINSTATS_MONTHLY_CREDIT_LIMIT", "20000") or "20000")
+coinstats_rate_limit_per_second = float(os.getenv("COINSTATS_RATE_LIMIT_PER_SECOND", "2") or "2")
+coinstats_hard_budget_percent = float(os.getenv("COINSTATS_HARD_BUDGET_PERCENT", "95") or "95")
+news_enabled = os.getenv("NEWS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+_external_cache: Dict[str, Tuple[float, Any]] = {}
+_coinstats_rate_lock = asyncio.Lock()
+_coinstats_last_request_at = 0.0
+
+COINSTATS_TOKEN_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "CRO": "crypto-com-chain",
+    "SOL": "solana",
+    "ADA": "cardano",
+    "XRP": "ripple",
+    "DOT": "polkadot",
+    "LINK": "chainlink",
+    "AVAX": "avalanche-2",
+    "MATIC": "polygon",
+    "POL": "polygon-ecosystem-token",
+    "LTC": "litecoin",
+    "DOGE": "dogecoin",
+    "ATOM": "cosmos",
+    "NEAR": "near-protocol",
+    "UNI": "uniswap",
+    "AAVE": "aave",
+    "ALGO": "algorand",
+    "BNB": "binance-coin",
+}
+
+NEWS_RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+]
 
 # WebSocket connections
 active_connections: List[WebSocket] = []
+
+
+def _cache_get(key: str) -> Any:
+    item = _external_cache.get(key)
+    if not item:
+        return None
+    expires_at, value = item
+    if expires_at < time.time():
+        _external_cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any, ttl_seconds: int) -> Any:
+    _external_cache[key] = (time.time() + ttl_seconds, value)
+    return value
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pair_base(pair: str) -> str:
+    if not pair:
+        return ""
+    return str(pair).split("/", 1)[0].replace("-", "").strip().upper()
+
+
+def _fmt_symbol_for_exchange(pair: str) -> str:
+    return str(pair or "").replace("/", "")
+
+
+def _iso_now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+async def _coinstats_wait_for_slot() -> None:
+    global _coinstats_last_request_at
+    if coinstats_rate_limit_per_second <= 0:
+        return
+    async with _coinstats_rate_lock:
+        min_interval = 1.0 / coinstats_rate_limit_per_second
+        elapsed = time.monotonic() - _coinstats_last_request_at
+        if elapsed < min_interval:
+            await asyncio.sleep(min_interval - elapsed)
+        _coinstats_last_request_at = time.monotonic()
+
+
+async def _coinstats_usage(client: httpx.AsyncClient) -> Dict[str, Any]:
+    cached = _cache_get("coinstats:usage")
+    if cached is not None:
+        return cached
+    if not (coinstats_enabled and coinstats_api_key):
+        return {
+            "enabled": coinstats_enabled,
+            "configured": bool(coinstats_api_key),
+            "usedCredits": 0,
+            "totalCredits": coinstats_monthly_credit_limit,
+            "remainingCredits": coinstats_monthly_credit_limit,
+            "budgetStatus": "disabled" if not coinstats_enabled else "missing_key",
+        }
+    try:
+        await _coinstats_wait_for_slot()
+        response = await client.get(
+            f"{coinstats_api_url}/usage/credits",
+            headers={"X-API-KEY": coinstats_api_key},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        data = response.json() or {}
+    except Exception as exc:
+        logger.warning("CoinStats usage check failed: %s", exc)
+        data = {}
+
+    total = _safe_float(data.get("totalCredits"), coinstats_monthly_credit_limit)
+    used = _safe_float(data.get("usedCredits"), 0)
+    remaining = _safe_float(data.get("remainingCredits"), max(total - used, 0))
+    configured_total = float(coinstats_monthly_credit_limit)
+    usage_ratio = used / configured_total if configured_total > 0 else 1.0
+    if usage_ratio >= (coinstats_hard_budget_percent / 100.0):
+        budget_status = "paused"
+    elif usage_ratio >= 0.80:
+        budget_status = "watch"
+    else:
+        budget_status = "ok"
+    usage = {
+        "enabled": coinstats_enabled,
+        "configured": bool(coinstats_api_key),
+        "usedCredits": used,
+        "totalCredits": total,
+        "configuredMonthlyLimit": configured_total,
+        "remainingCredits": remaining,
+        "subscription": data.get("subscription"),
+        "budgetStatus": budget_status,
+        "rateLimitPerSecond": coinstats_rate_limit_per_second,
+        "hardBudgetPercent": coinstats_hard_budget_percent,
+        "checkedAt": _iso_now(),
+    }
+    return _cache_set("coinstats:usage", usage, 3600)
+
+
+async def _coinstats_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str, Any]] = None, cache_key: Optional[str] = None, ttl_seconds: int = 900) -> Optional[Dict[str, Any]]:
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+    usage = await _coinstats_usage(client)
+    if not (usage.get("enabled") and usage.get("configured")):
+        return None
+    if usage.get("budgetStatus") == "paused":
+        return None
+    try:
+        await _coinstats_wait_for_slot()
+        response = await client.get(
+            f"{coinstats_api_url}{path}",
+            params=params or {},
+            headers={"X-API-KEY": coinstats_api_key},
+            timeout=12.0,
+        )
+        response.raise_for_status()
+        data = response.json() or {}
+        if cache_key:
+            _cache_set(cache_key, data, ttl_seconds)
+        return data
+    except Exception as exc:
+        logger.warning("CoinStats request failed for %s: %s", path, exc)
+        return None
+
+
+async def _fetch_token_metadata(client: httpx.AsyncClient, tokens: List[str]) -> Dict[str, Dict[str, Any]]:
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for token in tokens[:12]:
+        token_id = COINSTATS_TOKEN_IDS.get(token.upper())
+        if not token_id:
+            metadata[token] = {"symbol": token, "source": "internal", "available": False}
+            continue
+        data = await _coinstats_get(
+            client,
+            f"/coins/{token_id}",
+            params={"currency": "USD"},
+            cache_key=f"coinstats:coin:{token_id}",
+            ttl_seconds=6 * 3600,
+        )
+        if data:
+            metadata[token] = {
+                "id": data.get("id", token_id),
+                "symbol": data.get("symbol", token),
+                "name": data.get("name", token),
+                "rank": data.get("rank"),
+                "price": data.get("price"),
+                "priceChange1d": data.get("priceChange1d"),
+                "priceChange1w": data.get("priceChange1w"),
+                "marketCap": data.get("marketCap"),
+                "volume": data.get("volume"),
+                "riskScore": data.get("riskScore"),
+                "volatilityScore": data.get("volatilityScore"),
+                "icon": data.get("icon"),
+                "source": "coinstats",
+                "available": True,
+            }
+        else:
+            metadata[token] = {"symbol": token, "source": "internal", "available": False}
+    return metadata
+
+
+async def _fetch_coinstats_news(client: httpx.AsyncClient, tokens: List[str]) -> List[Dict[str, Any]]:
+    data = await _coinstats_get(
+        client,
+        "/news",
+        params={"limit": 50},
+        cache_key="coinstats:news:latest",
+        ttl_seconds=1800,
+    )
+    if not data:
+        return []
+    raw_items = data.get("result") or data.get("news") or data.get("items") or []
+    return _normalize_news_items(raw_items, tokens, "CoinStats")
+
+
+async def _fetch_rss_news(client: httpx.AsyncClient, tokens: List[str]) -> List[Dict[str, Any]]:
+    cached = _cache_get("rss:token-news:" + ",".join(tokens))
+    if cached is not None:
+        return cached
+    items: List[Dict[str, Any]] = []
+    for feed_url in NEWS_RSS_FEEDS:
+        try:
+            response = await client.get(feed_url, timeout=10.0, follow_redirects=True)
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+            channel_items = root.findall(".//item")
+            for item in channel_items[:30]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                published = (item.findtext("pubDate") or "").strip()
+                source = "CoinDesk" if "coindesk" in feed_url else "Cointelegraph"
+                items.append({
+                    "title": title,
+                    "headline": title,
+                    "url": link,
+                    "source": source,
+                    "publishedAt": published,
+                    "summary": (item.findtext("description") or "").strip(),
+                })
+        except Exception as exc:
+            logger.debug("RSS feed unavailable %s: %s", feed_url, exc)
+    normalized = _normalize_news_items(items, tokens, "RSS")
+    return _cache_set("rss:token-news:" + ",".join(tokens), normalized, 1800)
+
+
+def _normalize_news_items(raw_items: List[Dict[str, Any]], tokens: List[str], provider: str) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    token_set = {t.upper() for t in tokens}
+    token_names = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+        "CRO": "crypto.com",
+        "SOL": "solana",
+        "ADA": "cardano",
+        "XRP": "ripple",
+        "DOT": "polkadot",
+        "LINK": "chainlink",
+        "AVAX": "avalanche",
+        "MATIC": "polygon",
+        "POL": "polygon",
+    }
+    important_words = {"upgrade", "exploit", "hack", "outage", "etf", "sec", "regulation", "listing", "delisting", "mainnet", "partnership", "governance", "staking"}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("headline") or item.get("name") or "").strip()
+        if not title:
+            continue
+        haystack = f"{title} {item.get('description', '')} {item.get('summary', '')}".lower()
+        matched = []
+        for token in token_set:
+            if token.lower() in haystack or token_names.get(token, "") in haystack:
+                matched.append(token)
+        if not matched:
+            continue
+        keyword_hits = [kw for kw in important_words if kw in haystack]
+        relevance = "High relevance" if keyword_hits else "Relevant"
+        if any(kw in keyword_hits for kw in ("exploit", "hack", "outage", "delisting")):
+            sentiment = "risk"
+        elif any(kw in keyword_hits for kw in ("upgrade", "partnership", "etf", "mainnet")):
+            sentiment = "constructive"
+        else:
+            sentiment = "neutral"
+        normalized.append({
+            "headline": title,
+            "source": item.get("source") or item.get("sourceName") or provider,
+            "url": item.get("url") or item.get("link"),
+            "publishedAt": item.get("publishedAt") or item.get("published_at") or item.get("pubDate"),
+            "tokens": matched,
+            "provider": provider,
+            "relevance": relevance,
+            "sentiment": sentiment,
+            "affectsOpenPosition": False,
+            "summary": str(item.get("summary") or item.get("description") or "")[:220],
+        })
+    return normalized[:12]
+
+
+async def _fetch_token_news(client: httpx.AsyncClient, tokens: List[str], open_tokens: Set[str]) -> List[Dict[str, Any]]:
+    if not news_enabled:
+        return []
+    news = await _fetch_coinstats_news(client, tokens)
+    if not news:
+        news = await _fetch_rss_news(client, tokens)
+    for item in news:
+        item["affectsOpenPosition"] = bool(open_tokens.intersection(set(item.get("tokens", []))))
+    return sorted(news, key=lambda x: (not x.get("affectsOpenPosition"), x.get("publishedAt") or ""), reverse=False)[:10]
+
+
+async def _fetch_json(client: httpx.AsyncClient, url: str, default: Any = None, **kwargs) -> Any:
+    try:
+        response = await client.get(url, **kwargs)
+        if response.status_code == 200:
+            return response.json()
+        logger.debug("GET %s returned %s", url, response.status_code)
+    except Exception as exc:
+        logger.debug("GET %s failed: %s", url, exc)
+    return default
+
+
+async def _fetch_ticker_snapshot(client: httpx.AsyncClient, exchange: str, pair: str) -> Dict[str, Any]:
+    url_symbol = _fmt_symbol_for_exchange(pair)
+    data = await _fetch_json(
+        client,
+        f"{exchange_service_url}/api/v1/market/ticker-live/{exchange}/{url_symbol}",
+        default={},
+        timeout=8.0,
+    )
+    if not data:
+        data = await _fetch_json(
+            client,
+            f"{exchange_service_url}/api/v1/market/ticker/{exchange}/{pair}",
+            default={},
+            timeout=8.0,
+        )
+    return data or {}
+
+
+def _extract_trade_list(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("trades", "active_trades", "open_trades", "positions"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def _trade_pair(trade: Dict[str, Any]) -> str:
+    return str(trade.get("pair") or trade.get("symbol") or trade.get("trading_pair") or "").strip()
+
+
+def _trade_exchange(trade: Dict[str, Any]) -> str:
+    return str(trade.get("exchange") or trade.get("exchange_name") or "unknown").strip().lower()
+
+
+def _trade_status(trade: Dict[str, Any]) -> str:
+    return str(trade.get("status") or "").strip().upper()
+
 
 # Global performance analytics instance
 if PERFORMANCE_ANALYTICS_AVAILABLE:
@@ -281,7 +661,19 @@ async def liveness_check():
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Enhanced main dashboard page"""
+    if dashboard_ui_version in {"portfolio", "portfolio-dashboard", "new"}:
+        return templates.TemplateResponse("portfolio_dashboard.html", {"request": request})
     return templates.TemplateResponse("enhanced-dashboard.html", {"request": request})
+
+@app.get("/legacy-dashboard", response_class=HTMLResponse)
+async def legacy_dashboard(request: Request):
+    """Stable legacy dashboard route for quick rollback."""
+    return templates.TemplateResponse("enhanced-dashboard.html", {"request": request})
+
+@app.get("/portfolio-dashboard", response_class=HTMLResponse)
+async def portfolio_dashboard(request: Request):
+    """New portfolio intelligence dashboard."""
+    return templates.TemplateResponse("portfolio_dashboard.html", {"request": request})
 
 @app.get("/dashboard-original", response_class=HTMLResponse)
 async def original_dashboard(request: Request):
@@ -1241,6 +1633,233 @@ async def get_active_trades():
         logger.error(f"Error getting active trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/v1/dashboard/portfolio-intelligence")
+async def get_portfolio_intelligence():
+    """One-call dashboard payload for the portfolio intelligence UI."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        portfolio_task = _fetch_json(client, f"{database_service_url}/api/v1/portfolio/summary", default={})
+        profitability_task = _fetch_json(client, "http://127.0.0.1:8006/api/v1/profitability", default={})
+        bot_status_task = _fetch_json(client, "http://127.0.0.1:8006/api/bot-status", default={})
+        daily_pnl_task = _fetch_json(client, "http://127.0.0.1:8006/api/v1/pnl/daily", default={})
+        active_trades_task = _fetch_json(client, f"{orchestrator_service_url}/api/v1/trading/active-trades", default={})
+        db_open_trades_task = _fetch_json(
+            client,
+            f"{database_service_url}/api/v1/trades",
+            default={},
+            params={"status": "OPEN", "limit": 100},
+        )
+        selected_pair_tasks = {
+            exchange: _fetch_json(client, f"{database_service_url}/api/v1/pairs/{exchange}", default={})
+            for exchange in ("binance", "bybit", "cryptocom")
+        }
+
+        portfolio, profitability, bot_status, daily_pnl, active_trades_payload, db_open_payload = await asyncio.gather(
+            portfolio_task,
+            profitability_task,
+            bot_status_task,
+            daily_pnl_task,
+            active_trades_task,
+            db_open_trades_task,
+        )
+        selected_pairs_payloads = {
+            exchange: await task for exchange, task in selected_pair_tasks.items()
+        }
+
+        active_trades = _extract_trade_list(active_trades_payload)
+        db_open_trades = _extract_trade_list(db_open_payload)
+        if db_open_trades:
+            active_trades = db_open_trades
+        open_trade_keys = {
+            (_trade_exchange(trade), _trade_pair(trade))
+            for trade in active_trades
+            if _trade_pair(trade)
+        }
+
+        tracked_pairs: List[Dict[str, Any]] = []
+        for exchange, payload in selected_pairs_payloads.items():
+            for pair in (payload or {}).get("pairs", []) or []:
+                if not pair:
+                    continue
+                tracked_pairs.append({
+                    "exchange": exchange,
+                    "pair": pair,
+                    "token": _pair_base(pair),
+                    "selectedAt": (payload or {}).get("timestamp"),
+                    "isOpen": (exchange, pair) in open_trade_keys,
+                })
+
+        rows_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for item in tracked_pairs[:30]:
+            rows_by_key[(item["exchange"], item["pair"])] = {
+                "exchange": item["exchange"],
+                "pair": item["pair"],
+                "token": item["token"],
+                "isOpen": item["isOpen"],
+                "positionSize": 0,
+                "realizedPnl": 0,
+                "unrealizedPnl": 0,
+                "strategy": "watchlist",
+                "signal": "watch",
+                "status": "tracked",
+                "lastUpdate": item.get("selectedAt"),
+            }
+
+        for trade in active_trades:
+            pair = _trade_pair(trade)
+            exchange = _trade_exchange(trade)
+            if not pair:
+                continue
+            key = (exchange, pair)
+            rows_by_key[key] = {
+                "exchange": exchange,
+                "pair": pair,
+                "token": _pair_base(pair),
+                "isOpen": True,
+                "positionSize": _safe_float(
+                    trade.get("position_size")
+                    or trade.get("amount")
+                    or trade.get("quantity")
+                    or trade.get("size")
+                ),
+                "entryPrice": _safe_float(trade.get("entry_price") or trade.get("price")),
+                "realizedPnl": _safe_float(trade.get("realized_pnl")),
+                "unrealizedPnl": _safe_float(trade.get("unrealized_pnl")),
+                "strategy": trade.get("strategy") or trade.get("strategy_name") or "unknown",
+                "signal": trade.get("signal") or ("open" if _trade_status(trade) in {"OPEN", "PENDING"} else "hold"),
+                "status": _trade_status(trade) or "OPEN",
+                "lastUpdate": trade.get("updated_at") or trade.get("entry_time") or trade.get("created_at"),
+            }
+
+        position_rows = list(rows_by_key.values())[:18]
+        ticker_tasks = [
+            _fetch_ticker_snapshot(client, row["exchange"], row["pair"])
+            for row in position_rows
+            if row.get("exchange") and row.get("pair")
+        ]
+        ticker_results = await asyncio.gather(*ticker_tasks, return_exceptions=True)
+        for row, ticker in zip(position_rows, ticker_results):
+            if isinstance(ticker, Exception) or not isinstance(ticker, dict):
+                ticker = {}
+            row["price"] = _safe_float(ticker.get("last") or ticker.get("price") or ticker.get("close"))
+            row["bid"] = _safe_float(ticker.get("bid") or ticker.get("best_bid"))
+            row["ask"] = _safe_float(ticker.get("ask") or ticker.get("best_ask"))
+            row["priceChange24h"] = _safe_float(
+                ticker.get("percentage")
+                or ticker.get("change_percentage")
+                or ticker.get("priceChangePercent")
+                or ticker.get("change_24h")
+            )
+
+        tokens = sorted({row["token"] for row in position_rows if row.get("token")})
+        if not tokens:
+            tokens = ["BTC", "ETH", "CRO", "SOL"]
+        open_tokens = {row["token"] for row in position_rows if row.get("isOpen") and row.get("token")}
+        token_metadata_task = _fetch_token_metadata(client, tokens)
+        usage_task = _coinstats_usage(client)
+        news_task = _fetch_token_news(client, tokens, open_tokens)
+        token_metadata, coinstats_usage, token_news = await asyncio.gather(
+            token_metadata_task,
+            usage_task,
+            news_task,
+        )
+
+        token_research = []
+        for token in tokens[:8]:
+            meta = token_metadata.get(token, {})
+            token_rows = [row for row in position_rows if row.get("token") == token]
+            token_unrealized = sum(_safe_float(row.get("unrealizedPnl")) for row in token_rows)
+            token_realized = sum(_safe_float(row.get("realizedPnl")) for row in token_rows)
+            change = _safe_float(meta.get("priceChange1d"))
+            if not meta.get("available"):
+                first_row = token_rows[0] if token_rows else {}
+                change = _safe_float(first_row.get("priceChange24h"))
+                meta["price"] = first_row.get("price")
+            if token in open_tokens:
+                why = "Open position: monitor price action, execution spread, and fresh headlines."
+            elif abs(change) >= 3:
+                why = "Elevated 24h move: useful context for watchlist rotation."
+            else:
+                why = "Tracked token: cached market context for pair selection."
+            token_research.append({
+                "token": token,
+                "name": meta.get("name") or token,
+                "rank": meta.get("rank"),
+                "price": meta.get("price"),
+                "priceChange1d": change,
+                "marketCap": meta.get("marketCap"),
+                "volume": meta.get("volume"),
+                "riskScore": meta.get("riskScore"),
+                "source": meta.get("source", "internal"),
+                "isOpen": token in open_tokens,
+                "realizedPnl": token_realized,
+                "unrealizedPnl": token_unrealized,
+                "signal": "active" if token in open_tokens else "watch",
+                "whyItMatters": why,
+            })
+
+        services = (bot_status or {}).get("services", {}) if isinstance(bot_status, dict) else {}
+        exchange_status = [
+            {"exchange": name, "status": services.get(name, "unknown")}
+            for name in ("config", "database", "exchange", "strategy", "orchestrator")
+        ]
+
+        summary = {
+            "totalPortfolio": _safe_float(
+                (portfolio or {}).get("total_value")
+                or (portfolio or {}).get("total_balance")
+                or (portfolio or {}).get("total_portfolio")
+                or (profitability or {}).get("total_portfolio")
+                or (profitability or {}).get("current_balance"),
+                0,
+            ),
+            "availableBalance": _safe_float(
+                (portfolio or {}).get("available_balance")
+                or (profitability or {}).get("available_balance"),
+                0,
+            ),
+            "investedAmount": _safe_float(
+                (portfolio or {}).get("invested_amount")
+                or (profitability or {}).get("invested_amount")
+                or sum(_safe_float((ex or {}).get("invested_amount")) for ex in ((portfolio or {}).get("exchanges") or {}).values()),
+                0,
+            ),
+            "dailyPnl": _safe_float((portfolio or {}).get("daily_pnl") or (profitability or {}).get("daily_pnl"), 0),
+            "totalPnl": _safe_float(
+                (portfolio or {}).get("total_pnl")
+                or (profitability or {}).get("total_pnl")
+                or (profitability or {}).get("realized_pnl"),
+                0,
+            ),
+            "unrealizedPnl": _safe_float(
+                (portfolio or {}).get("unrealized_pnl")
+                or (portfolio or {}).get("total_unrealized_pnl")
+                or (profitability or {}).get("unrealized_pnl"),
+                0,
+            ),
+            "openTrades": len(open_trade_keys) or _safe_int((portfolio or {}).get("active_trades") or (profitability or {}).get("open_trades")),
+            "totalTrades": _safe_int((portfolio or {}).get("total_trades") or (profitability or {}).get("total_trades")),
+            "winRate": _safe_float((portfolio or {}).get("win_rate") or (profitability or {}).get("win_rate"), 0),
+        }
+
+        return {
+            "timestamp": _iso_now(),
+            "uiVersion": dashboard_ui_version,
+            "portfolio": summary,
+            "positions": position_rows,
+            "trackedPairs": tracked_pairs,
+            "tokenResearch": token_research,
+            "news": token_news,
+            "dailyPnl": (daily_pnl or {}).get("daily_pnl", daily_pnl if isinstance(daily_pnl, list) else []),
+            "exchangeStatus": exchange_status,
+            "tradingStatus": (bot_status or {}).get("trading_status", {}),
+            "externalData": {
+                "coinstats": coinstats_usage,
+                "newsEnabled": news_enabled,
+                "provider": "coinstats" if coinstats_usage.get("enabled") and coinstats_usage.get("configured") else "rss/internal",
+            },
+        }
+
 @app.get("/api/risk/exposure")
 async def get_risk_exposure():
     """Get risk exposure"""
@@ -1686,7 +2305,7 @@ async def run_optimization(auto_apply: bool = False, test_duration: int = 0):
         # Get current configuration for analysis
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                config_response = await client.get("http://localhost:8001/api/v1/config/all")
+                config_response = await client.get(f"{config_service_url}/api/v1/config/all")
                 current_config = config_response.json() if config_response.status_code == 200 else {}
         except:
             current_config = {}
@@ -1811,7 +2430,7 @@ async def simulate_comprehensive_optimization(current_config: Dict[str, Any]) ->
     # Get real-time data from profitability API to show current state
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get("http://localhost:8006/api/v1/profitability", timeout=10.0)
+            response = await client.get("http://127.0.0.1:8006/api/v1/profitability", timeout=10.0)
             if response.status_code == 200:
                 current_data = response.json()
                 current_strategy_stats = current_data.get('strategy_stats', {})
@@ -4244,4 +4863,4 @@ if __name__ == "__main__":
         port=8006,
         reload=True,
         log_level="info"
-    ) 
+    )

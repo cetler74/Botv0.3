@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Portfolio Intelligence</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260521" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260521">
+</head>
+<body>
+    <header class="pi-topbar">
+        <div class="pi-brand">
+            <div class="pi-brand-mark"><i class="fas fa-chart-line"></i></div>
+            <div>
+                <h1>Portfolio Intelligence</h1>
+                <p>Crypto pairs, PnL, signals, and token context</p>
+            </div>
+        </div>
+        <div class="pi-topbar-center">
+            <span class="pi-live"><span></span>Live</span>
+            <span class="pi-pill" id="exchange-pill-binance">Binance</span>
+            <span class="pi-pill" id="exchange-pill-bybit">Bybit</span>
+            <span class="pi-pill" id="exchange-pill-cryptocom">Crypto.com</span>
+            <span class="pi-credit-pill" id="coinstats-credit-pill">External data: loading</span>
+        </div>
+        <div class="pi-actions">
+            <a href="/legacy-dashboard" class="pi-link">Legacy</a>
+            <button class="pi-btn pi-btn-start" data-control="start"><i class="fas fa-play"></i> Start</button>
+            <button class="pi-btn pi-btn-stop" data-control="stop"><i class="fas fa-pause"></i> Stop</button>
+            <button class="pi-btn pi-btn-danger" data-control="emergency"><i class="fas fa-stop-circle"></i> Emergency</button>
+        </div>
+    </header>
+
+    <main class="pi-shell">
+        <section class="pi-hero">
+            <div class="pi-hero-main">
+                <p class="pi-eyebrow">Total Portfolio</p>
+                <div class="pi-portfolio-value" id="total-portfolio">$0.00</div>
+                <div class="pi-portfolio-sub">
+                    <span id="trading-status">Status: loading</span>
+                    <span id="updated-at">Updating...</span>
+                </div>
+            </div>
+            <div class="pi-kpi-grid">
+                <article class="pi-kpi">
+                    <span>Daily PnL</span>
+                    <strong id="daily-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Total PnL</span>
+                    <strong id="total-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Invested</span>
+                    <strong id="invested-amount">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open Trades</span>
+                    <strong id="open-trades">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Win Rate</span>
+                    <strong id="win-rate">0.0%</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Unrealized</span>
+                    <strong id="unrealized-pnl">$0.00</strong>
+                </article>
+            </div>
+        </section>
+
+        <section class="pi-grid">
+            <article class="pi-panel pi-positions">
+                <div class="pi-panel-head">
+                    <div>
+                        <p class="pi-eyebrow">Active Pairs</p>
+                        <h2>Positions & Watchlist</h2>
+                    </div>
+                    <span id="position-count" class="pi-muted">0 pairs</span>
+                </div>
+                <div class="pi-table-wrap">
+                    <table class="pi-table">
+                        <thead>
+                            <tr>
+                                <th>Pair</th>
+                                <th>Exchange</th>
+                                <th>Price</th>
+                                <th>24h</th>
+                                <th>Position</th>
+                                <th>Realized</th>
+                                <th>Unrealized</th>
+                                <th>Strategy</th>
+                                <th>Signal</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-body">
+                            <tr><td colspan="9" class="pi-empty">Loading positions...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </article>
+
+            <aside class="pi-panel pi-news">
+                <div class="pi-panel-head">
+                    <div>
+                        <p class="pi-eyebrow">Token News</p>
+                        <h2>Market Context</h2>
+                    </div>
+                    <span class="pi-muted">Cached</span>
+                </div>
+                <div id="news-list" class="pi-news-list">
+                    <div class="pi-empty">Loading token news...</div>
+                </div>
+            </aside>
+        </section>
+
+        <section class="pi-research-band">
+            <article class="pi-panel pi-token-panel">
+                <div class="pi-panel-head">
+                    <div>
+                        <p class="pi-eyebrow">Research Desk</p>
+                        <h2>Token Intelligence</h2>
+                    </div>
+                    <span class="pi-muted">CoinStats / Internal</span>
+                </div>
+                <div id="token-cards" class="pi-token-grid"></div>
+            </article>
+
+            <article class="pi-panel pi-chart-panel">
+                <div class="pi-panel-head">
+                    <div>
+                        <p class="pi-eyebrow">Performance</p>
+                        <h2>Daily PnL</h2>
+                    </div>
+                    <span class="pi-muted">Last 7 days</span>
+                </div>
+                <div id="daily-pnl-bars" class="pi-bars"></div>
+            </article>
+        </section>
+
+        <section class="pi-system-strip" id="system-strip">
+            <span>System health loading...</span>
+        </section>
+    </main>
+
+    <script src="/static/js/portfolio-dashboard.js?v=20260521"></script>
+</body>
+</html>
