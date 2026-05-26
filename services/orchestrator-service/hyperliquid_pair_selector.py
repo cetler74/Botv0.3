@@ -2,20 +2,26 @@
 Hyperliquid perpetual pair selector.
 
 Selects tradable HL perp coins from live market data (metaAndAssetCtxs), using
-HL-specific liquidity metrics — not the spot exchange pair_selector output.
+HL-specific liquidity metrics aligned with root pair_selector thresholds.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 import httpx
+
+from core.pair_filters import DEFAULT_STABLECOIN_BASES, is_stablecoin_base_asset
 
 logger = logging.getLogger(__name__)
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+DEFAULT_MAX_PAIRS = 20
+DEFAULT_MIN_DAY_NOTIONAL = 2_000_000.0
+DEFAULT_MIN_OPEN_INTEREST = 50_000.0
+DEFAULT_MAX_IMPACT_SPREAD_PCT = 0.5
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -65,66 +71,105 @@ def impact_spread_pct(ctx: Dict[str, Any]) -> float:
     return ((sell_impact - buy_impact) / mid) * 100.0
 
 
+def _stable_bases_from_configs(
+    hl_cfg: Dict[str, Any],
+    global_pair_selector: Dict[str, Any],
+    stable_bases_override: Optional[FrozenSet[str]],
+) -> FrozenSet[str]:
+    if stable_bases_override is not None:
+        return stable_bases_override
+    hl_sel = hl_cfg.get("pair_selector") or {}
+    global_ps = global_pair_selector or {}
+    exclude = hl_sel.get("exclude_stablecoin_bases")
+    if exclude is None:
+        exclude = global_ps.get("exclude_stablecoin_bases", True)
+    if not exclude:
+        return frozenset()
+    assets = hl_sel.get("stablecoin_base_assets") or global_ps.get("stablecoin_base_assets")
+    if not assets:
+        return DEFAULT_STABLECOIN_BASES
+    return frozenset(str(a).strip().upper() for a in assets if str(a).strip())
+
+
 def _merge_selector_config(hl_cfg: Dict[str, Any], global_selector: Dict[str, Any]) -> Dict[str, Any]:
     hl_sel = dict(hl_cfg.get("pair_selector") or {})
-    global_criteria = (global_selector or {}).get("selection_criteria") or {}
+    global_ps = global_selector or {}
+    global_criteria = global_ps.get("selection_criteria") or {}
+
     min_vol = hl_sel.get("min_day_notional_volume")
     if min_vol is None:
-        min_vol = global_criteria.get("min_volume_24h", 1_000_000)
-    min_oi = hl_sel.get("min_open_interest", 50_000)
-    max_impact = hl_sel.get("max_impact_spread_pct", 0.5)
-    max_pairs = hl_sel.get("max_pairs", hl_cfg.get("max_selected_pairs", 12))
+        min_vol = global_criteria.get("min_volume_24h", DEFAULT_MIN_DAY_NOTIONAL)
+
+    max_impact = hl_sel.get("max_impact_spread_pct")
+    if max_impact is None:
+        max_impact = global_criteria.get("max_spread_percentage", DEFAULT_MAX_IMPACT_SPREAD_PCT)
+
+    max_pairs = hl_sel.get("max_pairs", hl_cfg.get("max_selected_pairs", DEFAULT_MAX_PAIRS))
+
+    exclude_stable = hl_sel.get("exclude_stablecoin_bases")
+    if exclude_stable is None:
+        exclude_stable = global_ps.get("exclude_stablecoin_bases", True)
+
     return {
         "enabled": hl_sel.get("enabled", True),
-        "max_pairs": int(max_pairs or 12),
-        "min_day_notional_volume": _safe_float(min_vol, 1_000_000),
-        "min_open_interest": _safe_float(min_oi, 50_000),
-        "max_impact_spread_pct": _safe_float(max_impact, 0.5),
+        "max_pairs": int(max_pairs or DEFAULT_MAX_PAIRS),
+        "min_day_notional_volume": _safe_float(min_vol, DEFAULT_MIN_DAY_NOTIONAL),
+        "min_open_interest": _safe_float(hl_sel.get("min_open_interest"), DEFAULT_MIN_OPEN_INTEREST),
+        "max_impact_spread_pct": _safe_float(max_impact, DEFAULT_MAX_IMPACT_SPREAD_PCT),
         "blacklisted_coins": [str(c).upper() for c in (hl_sel.get("blacklisted_coins") or [])],
-        "candidate_cap": [str(c).upper() for c in (hl_cfg.get("allowed_symbols") or []) if str(c).strip()],
+        "exclude_stablecoin_bases": bool(exclude_stable),
     }
+
+
+def _empty_selection(selector: str, error: Optional[str] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "selected_coins": [],
+        "selected_pairs": [],
+        "candidates": [],
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "selector": selector,
+    }
+    if error:
+        out["error"] = error
+    return out
 
 
 async def select_top_hyperliquid_perps(
     hl_cfg: Dict[str, Any],
     global_pair_selector: Optional[Dict[str, Any]] = None,
     client: Optional[httpx.AsyncClient] = None,
+    stable_bases: Optional[FrozenSet[str]] = None,
+    excluded_coins: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """
     Rank Hyperliquid perpetual markets by dayNtlVlm and apply HL liquidity filters.
 
     Returns selected coin symbols (e.g. BTC, ETH) and per-coin market stats.
     """
-    sel_cfg = _merge_selector_config(hl_cfg, global_pair_selector or {})
+    global_sel = global_pair_selector or {}
+    sel_cfg = _merge_selector_config(hl_cfg, global_sel)
+    stable_set = _stable_bases_from_configs(hl_cfg, global_sel, stable_bases)
+
     if not sel_cfg.get("enabled", True):
-        cap = sel_cfg.get("candidate_cap") or []
-        return {
-            "selected_coins": cap[: sel_cfg["max_pairs"]],
-            "selected_pairs": [f"{c}/USD-PERP" for c in cap[: sel_cfg["max_pairs"]]],
-            "candidates": [],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "selector": "disabled",
-        }
+        return _empty_selection("disabled")
 
     universe, ctxs = await fetch_hyperliquid_meta_and_ctxs(client)
     if not universe or not ctxs:
-        cap = sel_cfg.get("candidate_cap") or []
-        logger.warning("[HLPairSelector] metaAndAssetCtxs empty; using config candidate_cap fallback")
-        return {
-            "selected_coins": cap[: sel_cfg["max_pairs"]],
-            "selected_pairs": [f"{c}/USD-PERP" for c in cap[: sel_cfg["max_pairs"]]],
-            "candidates": [],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "selector": "fallback_config",
-            "error": "empty_hyperliquid_meta",
-        }
+        logger.warning("[HLPairSelector] metaAndAssetCtxs empty; returning no selection")
+        return _empty_selection("fallback_empty", error="empty_hyperliquid_meta")
 
     blacklisted = set(sel_cfg.get("blacklisted_coins") or [])
-    candidate_cap = set(sel_cfg.get("candidate_cap") or [])
+    runtime_excluded = {
+        str(c or "").upper().strip()
+        for c in (excluded_coins or [])
+        if str(c or "").strip()
+    }
+    excluded = blacklisted | runtime_excluded
     min_vol = sel_cfg["min_day_notional_volume"]
     min_oi = sel_cfg["min_open_interest"]
     max_impact = sel_cfg["max_impact_spread_pct"]
     max_pairs = sel_cfg["max_pairs"]
+    exclude_stable = sel_cfg.get("exclude_stablecoin_bases", True)
 
     candidates: List[Dict[str, Any]] = []
     for idx, asset in enumerate(universe):
@@ -133,9 +178,9 @@ async def select_top_hyperliquid_perps(
         if not isinstance(asset, dict):
             continue
         coin = str(asset.get("name") or "").upper().strip()
-        if not coin or coin in blacklisted:
+        if not coin or coin in excluded:
             continue
-        if candidate_cap and coin not in candidate_cap:
+        if exclude_stable and is_stablecoin_base_asset(coin, stable_set):
             continue
         ctx = ctxs[idx] if isinstance(ctxs[idx], dict) else {}
         day_ntl = _safe_float(ctx.get("dayNtlVlm"))
@@ -162,11 +207,13 @@ async def select_top_hyperliquid_perps(
     selected_coins = [row["coin"] for row in selected]
 
     logger.info(
-        "[HLPairSelector] Selected %s HL perps (min_vol=%.0f min_oi=%.0f max_impact=%.2f%%): %s",
+        "[HLPairSelector] Selected %s HL perps (min_vol=%.0f min_oi=%.0f max_impact=%.2f%% exclude_stable=%s runtime_excluded=%s): %s",
         len(selected_coins),
         min_vol,
         min_oi,
         max_impact,
+        exclude_stable,
+        sorted(runtime_excluded),
         selected_coins,
     )
 
@@ -181,5 +228,7 @@ async def select_top_hyperliquid_perps(
             "min_open_interest": min_oi,
             "max_impact_spread_pct": max_impact,
             "max_pairs": max_pairs,
+            "exclude_stablecoin_bases": exclude_stable,
+            "runtime_excluded_coins": sorted(runtime_excluded),
         },
     }

@@ -348,29 +348,29 @@ class Dashboard {
         }
         tbody.innerHTML = trades.map(trade => `
             <tr>
-                <td class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle" title="${trade.trade_id || 'N/A'}">${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exchange || 'N/A'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${this.formatDateTime(trade.entry_time)}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${(trade.unrealized_pnl || 0).toFixed(2)}${this.calculatePnlPercentage(trade)}</td>
-                <td class="px-2 sm:px-4 py-3 text-sm align-middle">
+                <td data-label="Trade ID" class="px-2 sm:px-4 py-3 text-sm font-mono text-gray-900 align-middle" title="${trade.trade_id || 'N/A'}">${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}</td>
+                <td data-label="Pair" class="px-2 sm:px-4 py-3 text-sm font-semibold text-gray-900 align-middle">${trade.pair || 'N/A'}</td>
+                <td data-label="Exchange" class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exchange || 'N/A'}</td>
+                <td data-label="Entry Time" class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${this.formatDateTime(trade.entry_time)}</td>
+                <td data-label="Exit Time" class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
+                <td data-label="Entry Price" class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.entry_price?.toFixed(4) || '0.0000'}</td>
+                <td data-label="Current Price" class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">$${trade.current_price?.toFixed(4) || '0.0000'}</td>
+                <td data-label="Amount (units)" class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle">${trade.position_size?.toFixed(6) || '0.000000'}</td>
+                <td data-label="Notional Value ($)" class="px-2 sm:px-4 py-3 text-sm text-gray-500 text-right align-middle" id="notional-value-${trade.trade_id || 'N/A'}">$${((trade.entry_price || 0) * (trade.position_size || 0)).toFixed(2)}</td>
+                <td data-label="Unrealized PnL" class="px-2 sm:px-4 py-3 text-sm ${this.getPnlClass(trade.unrealized_pnl)} text-right align-middle">$${(trade.unrealized_pnl || 0).toFixed(2)}${this.calculatePnlPercentage(trade)}</td>
+                <td data-label="Status" class="px-2 sm:px-4 py-3 text-sm align-middle">
                     <span class="badge ${trade.status === 'OPEN' ? 'bg-success' : trade.status === 'CLOSED' ? 'bg-secondary' : 'bg-warning'}">${trade.status || 'N/A'}</span>
                 </td>
-                <td class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden" title="${trade.entry_reason || 'N/A'}">${this.truncateText(trade.entry_reason || 'N/A', 30)}</td>
-                <td class="profit-trigger-col align-middle">
+                <td data-label="Entry Reason" class="px-2 sm:px-4 py-3 text-sm text-gray-500 align-middle mobile-hidden" title="${trade.entry_reason || 'N/A'}">${this.truncateText(trade.entry_reason || 'N/A', 30)}</td>
+                <td data-label="Profit Trigger" class="profit-trigger-col align-middle">
                   ${trade.profit_protection || 'inactive'}
                   <div class="text-xs text-gray-500">${trade.profit_protection_trigger ? `Trigger: ${trade.profit_protection_trigger}${this.calculatePnlPercentage(trade)}` : 'None'}</div>
                 </td>
-                <td class="trailing-stop-col align-middle">
+                <td data-label="Trailing Stop" class="trailing-stop-col align-middle">
                   ${trade.trail_stop || 'inactive'}
                   <div class="text-xs text-gray-500">${trade.trail_stop_trigger ? `Trigger: ${trade.trail_stop_trigger}${this.calculatePnlPercentage(trade)}` : 'None'}</div>
                 </td>
-                <td class="highest-price-col text-right align-middle">
+                <td data-label="Highest Price" class="highest-price-col text-right align-middle">
                   ${trade.highest_price !== undefined && trade.highest_price !== null ? trade.highest_price.toFixed(6) : 'None'}
                 </td>
             </tr>
@@ -635,17 +635,18 @@ function updateExchangeBreakdownTable(exchangeData) {
     exchangeData.forEach(exchange => {
         const row = document.createElement('tr');
         row.innerHTML = `
-            <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${exchange.exchange || 'N/A'}</td>
-            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.total_balance || 0).toFixed(2)}</td>
-            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.available_balance || 0).toFixed(2)}</td>
-            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.total_pnl || 0).toFixed(2)}</td>
-            <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${exchange.timestamp ? new Date(exchange.timestamp).toLocaleString() : 'N/A'}</td>
+            <td data-label="Exchange" class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${exchange.exchange || 'N/A'}</td>
+            <td data-label="Total Balance" class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.total_balance || 0).toFixed(2)}</td>
+            <td data-label="Available Balance" class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.available_balance || 0).toFixed(2)}</td>
+            <td data-label="Total PnL" class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">$${(exchange.total_pnl || 0).toFixed(2)}</td>
+            <td data-label="Timestamp" class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${exchange.timestamp ? new Date(exchange.timestamp).toLocaleString() : 'N/A'}</td>
         `;
         tbody.appendChild(row);
     });
 }
 
 // Add this function for trade history rendering (similar to updateRecentTradesUI)
+function updateTradeHistoryUI(trades) {
     const tbody = document.getElementById('trade-history-table-body');
     if (!tbody) return;
     if (!trades || trades.length === 0) {
@@ -681,15 +682,17 @@ function updateExchangeBreakdownTable(exchangeData) {
     `).join('');
 }
 
+async function updateTradeHistory() {
     try {
         const response = await fetch('/api/trades/closed/history?limit=20');
         if (response.ok) {
             const data = await response.json();
+            updateTradeHistoryUI(data.trades || []);
         }
     } catch (error) {
         console.error('Error updating trade history:', error);
     }
-};
+}
 
 function updateExchangeStatus(exchanges) {
     const exchangeStatus = document.getElementById('exchange-status');
@@ -725,4 +728,4 @@ document.addEventListener('DOMContentLoaded', () => {
         });
       });
     });
-}); 
+});

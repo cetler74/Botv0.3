@@ -2017,9 +2017,36 @@ async def modify_order(exchange: str, order_id: str, modification: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 # OHLCV Data Endpoints
+@app.get("/api/v1/market/ohlcv/hyperliquid/{symbol:path}")
+async def get_hyperliquid_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 100):
+    """Hyperliquid perp candles via public candleSnapshot API."""
+    try:
+        from hyperliquid_market import (
+            candles_to_ohlcv_columns,
+            fetch_hyperliquid_candles,
+            normalize_hyperliquid_coin,
+        )
+
+        coin = normalize_hyperliquid_coin(symbol)
+        candles = await fetch_hyperliquid_candles(coin, timeframe, limit)
+        if not candles:
+            return {"data": None, "error": "No data available", "symbol": coin, "timeframe": timeframe}
+        return {
+            "data": candles_to_ohlcv_columns(candles),
+            "symbol": coin,
+            "timeframe": timeframe,
+            "exchange": "hyperliquid",
+        }
+    except Exception as e:
+        logger.warning("Hyperliquid OHLCV failed for %s: %s", symbol, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/market/ohlcv/{exchange}/{symbol:path}")
 async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: int = 100):
     """Get OHLCV (candlestick) data for a symbol - REQUIRED FOR STRATEGY SERVICE"""
+    if str(exchange).lower() == "hyperliquid":
+        return await get_hyperliquid_ohlcv(symbol, timeframe=timeframe, limit=limit)
     if not exchange_manager or exchange not in exchanges:
         raise HTTPException(status_code=404, detail=f"Exchange {exchange} not found")
     

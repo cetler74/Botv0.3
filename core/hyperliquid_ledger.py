@@ -12,11 +12,16 @@ def compute_hyperliquid_balance_amounts(
     margin_used: float,
     daily_realized_pnl: float = 0.0,
 ) -> Dict[str, float]:
+    """Compute paper venue balances from settled PnL only.
+
+    Open unrealized PnL is exposed separately for monitoring, but it must not
+    inflate or reduce the venue balance until a paper position closes.
+    """
     starting = float(starting_balance_usd)
     total_pnl = float(total_realized_pnl)
     unrealized = float(unrealized_pnl)
     margin = float(margin_used)
-    equity = starting + total_pnl + unrealized
+    equity = starting + total_pnl
     available = max(0.0, starting + total_pnl - margin)
     return {
         "balance": equity,

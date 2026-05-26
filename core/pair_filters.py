@@ -59,6 +59,25 @@ def parse_pair_base(pair: str) -> str:
     return pair.split("/", 1)[0].strip().upper()
 
 
+def is_stablecoin_base_asset(
+    symbol: str,
+    stable_bases: Optional[Set[str] | FrozenSet[str]] = None,
+) -> bool:
+    """True when a coin/base symbol (e.g. HL perp name or spot base) is stablecoin/fiat-pegged."""
+    if stable_bases is None:
+        stable_bases = DEFAULT_STABLECOIN_BASES
+    if not stable_bases:
+        return False
+    base = str(symbol or "").strip().upper()
+    if not base:
+        return False
+    if base in stable_bases:
+        return True
+    if "/" in base:
+        return parse_pair_base(base) in stable_bases
+    return False
+
+
 def is_stablecoin_pair(pair: str, stable_bases: Optional[Set[str] | FrozenSet[str]] = None) -> bool:
     """True when the pair's base asset is a stablecoin / fiat-pegged token."""
     if stable_bases is None:

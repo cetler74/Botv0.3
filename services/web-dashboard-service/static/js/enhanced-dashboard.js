@@ -1397,46 +1397,46 @@ cryptocom_status: (websocket_status && websocket_status.connections && websocket
 
         return `
             <tr class="enhanced-table-row">
-                <td class="font-mono text-sm" title="${trade.trade_id || 'N/A'}">
+                <td data-label="Trade ID" class="font-mono text-sm" title="${trade.trade_id || 'N/A'}">
                     ${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}
                     <div class="mobile-time-inline">
                         <div>E: ${this.formatDateTime(trade.entry_time)}</div>
                         <div>X: ${this.formatDateTime(trade.exit_time)}</div>
                     </div>
                 </td>
-                <td class="font-semibold">${trade.pair || 'N/A'}</td>
-                <td class="mobile-hidden">${trade.exchange || 'N/A'}</td>
-                <td class="text-sm">${this.formatDateTime(trade.entry_time)}</td>
-                <td class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
-                <td class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
-                <td class="text-sm">${this.formatDateTime(trade.exit_time)}</td>
-                <td class="text-right font-mono">${this.formatCurrency(trade.exit_price, 4)}</td>
-                <td class="mobile-hidden text-sm" title="${trade.entry_reason || 'N/A'}">
+                <td data-label="Pair" class="font-semibold">${trade.pair || 'N/A'}</td>
+                <td data-label="Exchange" class="mobile-hidden">${trade.exchange || 'N/A'}</td>
+                <td data-label="Entry Time" class="text-sm">${this.formatDateTime(trade.entry_time)}</td>
+                <td data-label="Entry Price" class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
+                <td data-label="Amount (units)" class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
+                <td data-label="Exit Time" class="text-sm">${this.formatDateTime(trade.exit_time)}</td>
+                <td data-label="Exit Price" class="text-right font-mono">${this.formatCurrency(trade.exit_price, 4)}</td>
+                <td data-label="Entry Reason" class="mobile-hidden text-sm" title="${trade.entry_reason || 'N/A'}">
                     ${this.truncateText(trade.entry_reason || 'N/A', 30)}
                 </td>
-                <td class="mobile-hidden text-sm" title="${trade.exit_reason || 'N/A'}">
+                <td data-label="Exit Reason" class="mobile-hidden text-sm" title="${trade.exit_reason || 'N/A'}">
                     ${this.truncateText(trade.exit_reason || 'N/A', 30)}
                 </td>
-                <td class="text-right font-mono ${pnlClass}">
+                <td data-label="Net PnL" class="text-right font-mono ${pnlClass}">
                     ${this.formatCurrency(displayPnl)}
                     ${this.calculatePnlPercentage(trade)}
                 </td>
-                <td class="text-right font-mono ${unrealizedPnlClass}">
+                <td data-label="Unrealized PnL" class="text-right font-mono ${unrealizedPnlClass}">
                     ${trade.status === 'OPEN' ? this.formatCurrency(trade.unrealized_pnl || 0) : '—'}
                 </td>
-                <td class="profit-trigger-col">
+                <td data-label="Profit Trigger" class="profit-trigger-col">
                     <div class="enhanced-badge ${trade.profit_protection === 'active' ? 'badge-success' : 'badge-danger'}">
                         ${trade.profit_protection || 'inactive'}
                     </div>
                     ${trade.profit_protection_trigger ? `<div class="text-xs text-gray-500 mt-1">Trigger: ${trade.profit_protection_trigger}</div>` : ''}
                 </td>
-                <td class="trailing-stop-col">
+                <td data-label="Trailing Stop" class="trailing-stop-col">
                     <div class="enhanced-badge ${trade.trail_stop === 'active' ? 'badge-success' : 'badge-danger'}">
                         ${trade.trail_stop || 'inactive'}
                     </div>
                     ${trade.trail_stop_trigger ? `<div class="text-xs text-gray-500 mt-1">Trigger: ${trade.trail_stop_trigger}</div>` : ''}
                 </td>
-                <td class="highest-price-col text-right font-mono">
+                <td data-label="Highest Price" class="highest-price-col text-right font-mono">
                     ${trade.highest_price !== undefined && trade.highest_price !== null ? 
                       this.formatCurrency(trade.highest_price, 6) : 'None'}
                 </td>
@@ -1817,46 +1817,46 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
 
         return `
             <tr class="enhanced-table-row ${rowClass}">
-                <td class="font-mono text-sm" title="${trade.trade_id || 'N/A'}">
+                <td data-label="Trade ID" class="font-mono text-sm" title="${trade.trade_id || 'N/A'}">
                     ${trade.trade_id ? trade.trade_id.substring(0, 8) + '...' : 'N/A'}
                     <div class="mobile-time-inline">
                         <div>E: ${this.formatDateTime(trade.entry_time)}</div>
                         <div>X: ${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</div>
                     </div>
                 </td>
-                <td class="font-semibold">${trade.pair || 'N/A'}</td>
-                <td class="mobile-hidden">${trade.exchange || 'N/A'}</td>
-                <td class="text-sm">${this.formatDateTime(trade.entry_time)}</td>
-                <td class="text-sm">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
-                <td class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
-                <td class="text-right font-mono">${trade.exit_price ? this.formatCurrency(trade.exit_price, 4) : 'N/A'}</td>
-                <td class="text-right font-mono">${this.formatCurrency(trade.current_price, 4)}</td>
-                <td class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
-                <td class="text-right font-mono" id="notional-value-${trade.trade_id || 'N/A'}">
+                <td data-label="Pair" class="font-semibold">${trade.pair || 'N/A'}</td>
+                <td data-label="Exchange" class="mobile-hidden">${trade.exchange || 'N/A'}</td>
+                <td data-label="Entry Time" class="text-sm">${this.formatDateTime(trade.entry_time)}</td>
+                <td data-label="Exit Time" class="text-sm">${trade.exit_time ? this.formatDateTime(trade.exit_time) : 'N/A'}</td>
+                <td data-label="Entry Price" class="text-right font-mono">${this.formatCurrency(trade.entry_price, 4)}</td>
+                <td data-label="Exit Price" class="text-right font-mono">${trade.exit_price ? this.formatCurrency(trade.exit_price, 4) : 'N/A'}</td>
+                <td data-label="Current Price" class="text-right font-mono">${this.formatCurrency(trade.current_price, 4)}</td>
+                <td data-label="Amount (units)" class="text-right font-mono">${(trade.position_size || 0).toFixed(6)}</td>
+                <td data-label="Notional Value ($)" class="text-right font-mono" id="notional-value-${trade.trade_id || 'N/A'}">
                     ${this.formatCurrency(((trade.entry_price || 0) * (trade.position_size || 0)), 2)}
                 </td>
-                <td class="fee-col mobile-hidden text-right font-mono text-red-600" title="Entry fee: ${trade.entry_fee_amount || 0} ${trade.entry_fee_currency || ''}">
+                <td data-label="Entry Fee" class="fee-col mobile-hidden text-right font-mono text-red-600" title="Entry fee: ${trade.entry_fee_amount || 0} ${trade.entry_fee_currency || ''}">
                     ${trade.entry_fee_amount !== null && trade.entry_fee_amount !== undefined && trade.entry_fee_currency ? (trade.entry_fee_amount.toFixed(4) + ' ' + trade.entry_fee_currency) : 'N/A'}
                 </td>
-                <td class="fee-col mobile-hidden text-right font-mono text-red-600" title="Exit fee: ${trade.exit_fee_amount || 0} ${trade.exit_fee_currency || ''}">
+                <td data-label="Exit Fee" class="fee-col mobile-hidden text-right font-mono text-red-600" title="Exit fee: ${trade.exit_fee_amount || 0} ${trade.exit_fee_currency || ''}">
                     ${trade.exit_fee_amount !== null && trade.exit_fee_amount !== undefined && trade.exit_fee_currency ? (trade.exit_fee_amount.toFixed(4) + ' ' + trade.exit_fee_currency) : 'N/A'}
                 </td>
-                <td class="fee-col text-right font-mono text-red-600" title="Total fees in USD">
+                <td data-label="Total Fees ($)" class="fee-col text-right font-mono text-red-600" title="Total fees in USD">
                     ${trade.total_fees_usd ? this.formatCurrency(trade.total_fees_usd, 2) : this.formatCurrency(trade.fees || 0, 2)}
                 </td>
-                <td class="text-right font-mono ${pnlClass}" title="${String(trade.status || '').toUpperCase() === 'CLOSED' ? 'Realized PnL (net of fees)' : 'Unrealized PnL'}">
+                <td data-label="Net PnL" class="text-right font-mono ${pnlClass}" title="${String(trade.status || '').toUpperCase() === 'CLOSED' ? 'Realized PnL (net of fees)' : 'Unrealized PnL'}">
                     ${this.formatCurrency(displayPnl, 2)}
                     ${this.calculatePnlPercentage(trade)}
                 </td>
-                <td>
+                <td data-label="Status">
                     <div class="enhanced-badge ${statusClass}">
                         ${trade.status || 'N/A'}
                     </div>
                 </td>
-                <td class="mobile-hidden text-sm" title="${trade.entry_reason || 'N/A'}">
+                <td data-label="Entry Reason" class="mobile-hidden text-sm" title="${trade.entry_reason || 'N/A'}">
                     ${this.truncateText(trade.entry_reason || 'N/A', 30)}
                 </td>
-                <td class="profit-trigger-col">
+                <td data-label="Profit Trigger" class="profit-trigger-col">
                     <div class="enhanced-badge ${trade.profit_protection === 'active' ? 'badge-success' : 'badge-danger'}">
                         ${trade.profit_protection || 'inactive'}
                     </div>
@@ -1870,7 +1870,7 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                         </div>
                     ` : ''}
                 </td>
-                <td class="trailing-stop-col">
+                <td data-label="Trailing Stop" class="trailing-stop-col">
                     <div class="enhanced-badge ${trade.trail_stop === 'active' ? 'badge-success' : 'badge-danger'}">
                         ${trade.trail_stop || 'inactive'}
                     </div>
@@ -1887,14 +1887,14 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
                         </div>
                     ` : ''}
                 </td>
-                <td class="highest-price-col text-right font-mono">
+                <td data-label="Highest Price" class="highest-price-col text-right font-mono">
                     ${trade.highest_price !== undefined && trade.highest_price !== null ? 
                       this.formatCurrency(trade.highest_price, 6) : 'None'}
                 </td>
-                <td class="entry-id-col font-mono text-sm" title="${trade.entry_id || 'N/A'}">
+                <td data-label="Entry ID" class="entry-id-col font-mono text-sm" title="${trade.entry_id || 'N/A'}">
                     ${trade.entry_id || 'N/A'}
                 </td>
-                <td class="exit-id-col font-mono text-sm" title="${trade.exit_id || 'N/A'}">
+                <td data-label="Exit ID" class="exit-id-col font-mono text-sm" title="${trade.exit_id || 'N/A'}">
                     ${trade.exit_id || 'N/A'}
                 </td>
             </tr>
@@ -2122,19 +2122,19 @@ const searchTerm = (document.getElementById('trade-search') ? document.getElemen
         tbody.innerHTML = exchangeData.map((exchange, index) => {
             return `
                 <tr class="enhanced-table-row" style="opacity: 0; transform: translateY(10px); transition: all 0.3s ease ${index * 50}ms;">
-                    <td class="font-semibold capitalize">
+                    <td data-label="Exchange" class="font-semibold capitalize">
                         <div class="flex items-center">
                             <div class="w-3 h-3 rounded-full bg-blue-500 mr-2"></div>
                             ${exchange.exchange || 'N/A'}
                         </div>
                     </td>
-                    <td class="text-right font-mono">${this.formatCurrency(exchange.total_balance || 0, 2)}</td>
-                    <td class="text-right font-mono">${this.formatCurrency(exchange.available_balance || 0, 2)}</td>
-                    <td class="text-right font-mono text-blue-600">${this.formatCurrency(exchange.invested_amount || 0, 2)}</td>
-                    <td class="text-right font-mono ${this.getPnlClass(exchange.total_pnl || 0)}">
+                    <td data-label="Total Balance" class="text-right font-mono">${this.formatCurrency(exchange.total_balance || 0, 2)}</td>
+                    <td data-label="Available Balance" class="text-right font-mono">${this.formatCurrency(exchange.available_balance || 0, 2)}</td>
+                    <td data-label="Invested Amount" class="text-right font-mono text-blue-600">${this.formatCurrency(exchange.invested_amount || 0, 2)}</td>
+                    <td data-label="Total PnL" class="text-right font-mono ${this.getPnlClass(exchange.total_pnl || 0)}">
                         ${this.formatCurrency(exchange.total_pnl || 0, 2)}
                     </td>
-                    <td class="mobile-hidden text-center text-sm text-gray-500">
+                    <td data-label="Last Updated" class="mobile-hidden text-center text-sm text-gray-500">
                         ${exchange.timestamp ? this.formatDateTime(exchange.timestamp) : 'N/A'}
                     </td>
                 </tr>

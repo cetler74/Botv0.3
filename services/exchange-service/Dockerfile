@@ -17,6 +17,7 @@ COPY config/config.yaml /app/config/config.yaml
 
 # Application modules (trailing / required when multiple *.py match)
 COPY services/exchange-service/*.py ./
+COPY core/hyperliquid_market.py ./hyperliquid_market.py
 
 # Expose port
 EXPOSE 8003

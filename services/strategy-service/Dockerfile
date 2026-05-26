@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY services/strategy-service/main.py .
+COPY services/strategy-service/hyperliquid_strategy_manager.py .
 COPY core ./core
 COPY strategy ./strategy
 

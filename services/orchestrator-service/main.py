@@ -90,14 +90,21 @@ from pair_loss_policy import (
 )
 from hyperliquid_perps import (
     calculate_perp_pnl,
+    evaluate_paper_perp_exit,
     filter_allowed_coin,
     find_mirror_spot_pair,
+    hyperliquid_coin_entry_block,
+    hyperliquid_standalone_entry_gate,
+    hyperliquid_strategy_side_performance,
+    hyperliquid_strategy_side_entry_block,
+    paper_perp_exit_config_from_yaml,
+    paper_perp_position_size_multiplier,
     perp_side_fee,
     pair_to_hyperliquid_coin,
     pnl_percentage,
     position_sides_from_signal,
     select_mirrored_signal,
-    should_close_paper_perp,
+    sma_reclaim_bull_flag_specialist_gate,
 )
 from hyperliquid_pair_selector import select_top_hyperliquid_perps
 from hyperliquid_balance import fetch_hyperliquid_wallet_balance
@@ -625,6 +632,8 @@ class TradingOrchestrator:
         self.hyperliquid_pair_selections: List[str] = []
         self.hyperliquid_pair_pairs: List[str] = []
         self._hyperliquid_pair_selection_updated_at: Optional[datetime] = None
+        self._hyperliquid_pair_selector_signature: Optional[str] = None
+        self._hyperliquid_blocked_signal_diagnostic_at: Dict[str, datetime] = {}
         self.balances = {}
         self.start_time = None
         self.exiting_trades = set()  # Track trades currently being exited to prevent duplicates
@@ -754,17 +763,27 @@ class TradingOrchestrator:
             strategy_snapshot = {}
             for name, data in strategies.items():
                 data = data or {}
+                state = data.get("state") or {}
+                indicators = data.get("indicators") or state.get("indicators") or {}
                 strategy_snapshot[name] = {
                     "signal": data.get("signal"),
                     "confidence": data.get("confidence"),
                     "strength": data.get("strength"),
                     "market_regime": data.get("market_regime"),
                     "selected_for_regime": data.get("selected_for_regime"),
+                    "reason": data.get("reason"),
+                    "skip_reason": data.get("skip_reason") or indicators.get("skip_reason"),
+                    "invalidation_reason": (
+                        data.get("invalidation_reason")
+                        or indicators.get("invalidation_reason")
+                    ),
+                    "entry_reason": data.get("entry_reason") or state.get("entry_reason"),
                 }
             stable_regime = str(
                 (resolved_policy or {}).get("stable_regime")
                 or consensus.get("stable_regime")
                 or signals_data.get("stable_regime")
+                or signals_data.get("market_regime")
                 or "unknown"
             )
             payload = {
@@ -1499,6 +1518,7 @@ class TradingOrchestrator:
                 "breakout_retest_long",
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
+                "sma_reclaim_bull_flag",
             )
             for strat_name in standalone_buy_strategies:
                 strat_raw = strategies.get(strat_name, {}) or {}
@@ -4978,30 +4998,316 @@ class TradingOrchestrator:
         await self._update_hyperliquid_paper_positions(mids, cfg)
         if deadline is not None and time.monotonic() >= deadline:
             return
-        await self._mirror_strategy_signals_to_hyperliquid(mids, cfg, deadline=deadline)
+        await self._run_hyperliquid_strategy_entries(mids, cfg, deadline=deadline)
+
+    async def _hyperliquid_runtime_blocked_coins(self, cfg: Dict[str, Any]) -> List[str]:
+        """Coins blocked by current paper-position or recent realized-loss gates."""
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
+                open_trades = (
+                    (open_resp.json() or {}).get("trades", [])
+                    if open_resp.status_code == 200
+                    else []
+                )
+                closed_resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={"status": "CLOSED", "limit": 200},
+                )
+                closed_trades = (
+                    (closed_resp.json() or {}).get("trades", [])
+                    if closed_resp.status_code == 200
+                    else []
+                )
+
+            coins = {
+                pair_to_hyperliquid_coin(
+                    t.get("coin") or t.get("pair") or t.get("source_pair") or ""
+                )
+                for t in list(open_trades or []) + list(closed_trades or [])
+            }
+            blocked: List[str] = []
+            for coin in sorted(c for c in coins if c):
+                block = hyperliquid_coin_entry_block(
+                    coin,
+                    open_trades,
+                    closed_trades,
+                    realized_block_hours=float(
+                        cfg.get("block_after_negative_realized_hours", 12) or 12
+                    ),
+                )
+                if block.get("entryBlocked"):
+                    blocked.append(coin)
+            return blocked
+        except Exception as e:
+            logger.warning("[HyperliquidPaper] Could not compute runtime blocked HL coins: %s", e)
+            return []
+
+    async def _record_hyperliquid_blocked_signal_diagnostics(
+        self,
+        cfg: Dict[str, Any],
+        blocked_coins: List[str],
+    ) -> None:
+        """Persist signal snapshots for blocked HL coins without allowing entries."""
+        if not blocked_coins:
+            return
+        try:
+            interval_minutes = float(
+                cfg.get("blocked_signal_diagnostic_interval_minutes", 15) or 15
+            )
+        except (TypeError, ValueError):
+            interval_minutes = 15.0
+        interval_seconds = max(60.0, interval_minutes * 60.0)
+        now = datetime.utcnow()
+        due_coins: List[str] = []
+        for coin in sorted({str(c or "").upper() for c in blocked_coins if c}):
+            last_at = self._hyperliquid_blocked_signal_diagnostic_at.get(coin)
+            if not last_at or (now - last_at).total_seconds() >= interval_seconds:
+                due_coins.append(coin)
+        if not due_coins:
+            return
+
+        signal_source = str(cfg.get("signal_source", "mirror_spot") or "mirror_spot").lower()
+        consensus_cfg = cfg.get("strategy_consensus") or {}
+        min_long_conf = float(
+            consensus_cfg.get("min_confidence_long", cfg.get("min_confidence_long", 0.55))
+            or 0.55
+        )
+        min_short_conf = float(
+            consensus_cfg.get("min_confidence_short", cfg.get("min_confidence_short", 0.55))
+            or 0.55
+        )
+        min_agreement = float(consensus_cfg.get("min_agreement", 0.0) or 0.0)
+        mirror_exchanges = [str(x) for x in cfg.get("mirror_source_exchanges", []) or []]
+        if not mirror_exchanges:
+            mirror_exchanges = list(self.pair_selections.keys())
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
+                open_trades = (
+                    (open_resp.json() or {}).get("trades", [])
+                    if open_resp.status_code == 200
+                    else []
+                )
+                closed_resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={"status": "CLOSED", "limit": 200},
+                )
+                closed_trades = (
+                    (closed_resp.json() or {}).get("trades", [])
+                    if closed_resp.status_code == 200
+                    else []
+                )
+                open_keys = {
+                    (
+                        str(t.get("coin") or "").upper(),
+                        str(t.get("position_side") or "").lower(),
+                    )
+                    for t in (open_trades or [])
+                }
+
+                for coin in due_coins:
+                    block = hyperliquid_coin_entry_block(
+                        coin,
+                        open_trades,
+                        closed_trades,
+                        realized_block_hours=float(
+                            cfg.get("block_after_negative_realized_hours", 12) or 12
+                        ),
+                    )
+                    if not block.get("entryBlocked"):
+                        self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
+                        continue
+
+                    exchange_name = "hyperliquid"
+                    pair = f"{coin}/USD-PERP"
+                    try:
+                        if signal_source == "hyperliquid_strategies":
+                            signals_url = f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin}"
+                        else:
+                            spot_ex, spot_pair = find_mirror_spot_pair(
+                                coin, mirror_exchanges, self.pair_selections
+                            )
+                            if not spot_ex or not spot_pair:
+                                logger.debug(
+                                    "[HyperliquidPaper] Blocked diagnostic has no mirror spot pair for %s",
+                                    coin,
+                                )
+                                self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
+                                continue
+                            exchange_name = spot_ex
+                            pair = spot_pair
+                            signals_url = (
+                                f"{strategy_service_url}/api/v1/signals/"
+                                f"{spot_ex}/{spot_pair.replace('/', '')}"
+                            )
+                        signals_resp = await client.get(signals_url, timeout=90.0)
+                        if signals_resp.status_code != 200:
+                            logger.debug(
+                                "[HyperliquidPaper] Blocked diagnostic signal fetch failed %s: %s",
+                                coin,
+                                signals_resp.status_code,
+                            )
+                            self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
+                            continue
+                        signals_data = signals_resp.json() or {}
+                    except Exception as exc:
+                        logger.debug(
+                            "[HyperliquidPaper] Blocked diagnostic signal fetch failed %s: %s",
+                            coin,
+                            exc,
+                        )
+                        self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
+                        continue
+
+                    mirrored = select_mirrored_signal(signals_data)
+                    side = position_sides_from_signal((mirrored or {}).get("signal"))
+                    signal_gate_reason = "no_actionable_signal"
+                    signal_gate_pass = False
+                    strategy_side_block: Dict[str, Any] = {
+                        "entryBlocked": False,
+                        "entryBlockReason": None,
+                        "entryBlockMessage": "",
+                    }
+                    if side in {"long", "short"} and mirrored:
+                        conf = float(mirrored.get("confidence") or 0.0)
+                        required_conf = min_long_conf if side == "long" else min_short_conf
+                        if conf < required_conf:
+                            signal_gate_reason = f"confidence_{conf:.2f}_lt_{required_conf:.2f}"
+                        else:
+                            specialist_gate = sma_reclaim_bull_flag_specialist_gate(
+                                mirrored,
+                                cfg,
+                            )
+                            if specialist_gate.get("isSpecialist") and not specialist_gate.get("allowed"):
+                                signal_gate_reason = (
+                                    f"specialist_gate:{specialist_gate.get('reason')}"
+                                )
+                            else:
+                                agreement = float(mirrored.get("consensus_agreement") or 0.0)
+                                bypass_consensus = bool(
+                                    specialist_gate.get("bypassConsensus")
+                                )
+                                if min_agreement > 0 and agreement < min_agreement and not bypass_consensus:
+                                    signal_gate_reason = (
+                                        f"agreement_{agreement:.1f}_lt_{min_agreement:.1f}"
+                                    )
+                                else:
+                                    signal_gate_pass = True
+                                    signal_gate_reason = "signal_gates_passed"
+                                    strategy_side_block = hyperliquid_strategy_side_entry_block(
+                                        mirrored.get("strategy") or "unknown",
+                                        side,
+                                        closed_trades,
+                                        realized_block_hours=float(
+                                            cfg.get("block_after_negative_realized_hours", 12) or 12
+                                        ),
+                                    )
+
+                    would_open_without_coin_block = (
+                        bool(signal_gate_pass)
+                        and not bool(strategy_side_block.get("entryBlocked"))
+                        and side in {"long", "short"}
+                        and (coin, side) not in open_keys
+                    )
+                    details = {
+                        "coin_block": block,
+                        "signal_gate_pass": signal_gate_pass,
+                        "signal_gate_reason": signal_gate_reason,
+                        "strategy_side_block": strategy_side_block,
+                        "would_open_without_coin_block": would_open_without_coin_block,
+                        "selected_signal": {
+                            "side": side,
+                            "strategy": (mirrored or {}).get("strategy"),
+                            "confidence": (mirrored or {}).get("confidence"),
+                            "strength": (mirrored or {}).get("strength"),
+                            "consensus_confidence": (mirrored or {}).get("consensus_confidence"),
+                            "consensus_agreement": (mirrored or {}).get("consensus_agreement"),
+                        },
+                        "diagnostic_only": True,
+                    }
+                    await self._record_entry_gate_event(
+                        "hyperliquid",
+                        f"{coin}/USD-PERP",
+                        "hyperliquid_runtime_blocked_signal_snapshot",
+                        signals_data,
+                        None,
+                        details,
+                    )
+                    self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
+                    logger.info(
+                        "[HyperliquidPaper] Blocked diagnostic %s: side=%s strategy=%s would_open_without_coin_block=%s reason=%s",
+                        coin,
+                        side or "none",
+                        (mirrored or {}).get("strategy") or "none",
+                        would_open_without_coin_block,
+                        signal_gate_reason,
+                    )
+        except Exception as e:
+            logger.warning("[HyperliquidPaper] Blocked signal diagnostics skipped: %s", e)
 
     async def _refresh_hyperliquid_pair_selections(self, cfg: Dict[str, Any]) -> None:
         """Run HL-native pair selector and persist to database (exchange=hyperliquid)."""
         global_selector = ((self._config or {}).get("pair_selector") or {}) if hasattr(self, "_config") else {}
         sel_interval = int((cfg.get("pair_selector") or {}).get("update_interval_minutes", 15) or 15)
         now = datetime.utcnow()
-        if self._hyperliquid_pair_selection_updated_at and self.hyperliquid_pair_selections:
+        runtime_blocked_coins = await self._hyperliquid_runtime_blocked_coins(cfg)
+        await self._record_hyperliquid_blocked_signal_diagnostics(cfg, runtime_blocked_coins)
+        selector_signature = json.dumps(
+            {
+                "pair_selector": cfg.get("pair_selector") or {},
+                "allowed_symbols": cfg.get("allowed_symbols") or [],
+                "runtime_blocked_coins": runtime_blocked_coins,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        signature_changed = selector_signature != self._hyperliquid_pair_selector_signature
+        if (
+            not signature_changed
+            and self._hyperliquid_pair_selection_updated_at
+            and self.hyperliquid_pair_selections
+        ):
             elapsed = (now - self._hyperliquid_pair_selection_updated_at).total_seconds()
             if elapsed < sel_interval * 60:
                 return
 
         try:
+            stable_bases = await load_stablecoin_bases_from_config(config_service_url)
             async with httpx.AsyncClient(timeout=20.0) as client:
-                result = await select_top_hyperliquid_perps(cfg, global_selector, client=client)
+                result = await select_top_hyperliquid_perps(
+                    cfg,
+                    global_selector,
+                    client=client,
+                    stable_bases=stable_bases,
+                    excluded_coins=runtime_blocked_coins,
+                )
             coins = list(result.get("selected_coins") or [])
             pairs = list(result.get("selected_pairs") or [f"{c}/USD-PERP" for c in coins])
             if not coins:
+                self.hyperliquid_pair_selections = []
+                self.hyperliquid_pair_pairs = []
+                self._hyperliquid_pair_selection_updated_at = now
+                self._hyperliquid_pair_selector_signature = selector_signature
                 logger.warning("[HyperliquidPaper] HL pair selector returned no coins")
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    resp = await client.post(
+                        f"{database_service_url}/api/v1/pairs/hyperliquid",
+                        json=[],
+                    )
+                    if resp.status_code not in (200, 201):
+                        logger.warning(
+                            "[HyperliquidPaper] Failed to persist empty HL pair selection: %s %s",
+                            resp.status_code,
+                            _http_response_log_snippet(resp),
+                        )
                 return
 
             self.hyperliquid_pair_selections = coins
             self.hyperliquid_pair_pairs = pairs
             self._hyperliquid_pair_selection_updated_at = now
+            self._hyperliquid_pair_selector_signature = selector_signature
 
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post(
@@ -5016,11 +5322,27 @@ class TradingOrchestrator:
                     )
                 else:
                     logger.info(
-                        "[HyperliquidPaper] HL pair selector stored %s coins: %s",
+                        "[HyperliquidPaper] HL pair selector stored %s coins: %s (runtime_blocked=%s)",
                         len(coins),
                         coins,
+                        runtime_blocked_coins,
                     )
         except Exception as e:
+            self.hyperliquid_pair_selections = []
+            self.hyperliquid_pair_pairs = []
+            self._hyperliquid_pair_selection_updated_at = now
+            self._hyperliquid_pair_selector_signature = selector_signature
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    await client.post(
+                        f"{database_service_url}/api/v1/pairs/hyperliquid",
+                        json=[],
+                    )
+            except Exception as persist_exc:
+                logger.debug(
+                    "[HyperliquidPaper] Failed to persist empty HL pair selection after selector error: %s",
+                    persist_exc,
+                )
             logger.warning("[HyperliquidPaper] HL pair selector failed: %s", e)
 
     async def _refresh_hyperliquid_balance(self, cfg: Dict[str, Any]) -> None:
@@ -5090,23 +5412,29 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning("[HyperliquidPaper] HL balance refresh failed: %s", e)
 
-    async def _fetch_hyperliquid_available_balance(self) -> float:
+    async def _fetch_hyperliquid_available_balance(self) -> Optional[float]:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{database_service_url}/api/v1/balances/hyperliquid")
                 if resp.status_code != 200:
-                    return 0.0
+                    logger.warning(
+                        "[HyperliquidPaper] balance lookup failed: %s %s",
+                        resp.status_code,
+                        _http_response_log_snippet(resp),
+                    )
+                    return None
                 data = resp.json() or {}
                 return float(data.get("available_balance") or 0.0)
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            logger.warning("[HyperliquidPaper] balance lookup failed: %s", exc)
+            return None
 
     async def _update_hyperliquid_paper_positions(self, mids: Dict[str, float], cfg: Dict[str, Any]) -> None:
         try:
-            stop_loss_pct = float(cfg.get("stop_loss_pct", 1.5) or 1.5)
-            take_profit_pct = float(cfg.get("take_profit_pct", 2.5) or 2.5)
-            max_holding_minutes = int(cfg.get("max_holding_minutes", 240) or 240)
             fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
+            trading_cfg = (self._config or {}).get("trading", {}) or {}
+            exit_cfg = paper_perp_exit_config_from_yaml(cfg, trading_cfg)
+            use_strategy_exits = bool(cfg.get("use_strategy_exits", False))
             async with httpx.AsyncClient(timeout=20.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
                 if open_resp.status_code != 200:
@@ -5120,20 +5448,41 @@ class TradingOrchestrator:
                         continue
                     entry_price = float(trade.get("entry_price") or 0.0)
                     size = float(trade.get("position_size") or 0.0)
-                    notional = float(trade.get("notional_size") or 0.0) or (entry_price * size)
                     side = str(trade.get("position_side") or "long").lower()
                     fees = float(trade.get("fees") or 0.0) + float(trade.get("funding") or 0.0)
                     unrealized = calculate_perp_pnl(side, entry_price, current_price, size, fees)
-                    exit_reason = should_close_paper_perp(
-                        trade,
-                        current_price,
-                        stop_loss_pct=stop_loss_pct,
-                        take_profit_pct=take_profit_pct,
-                        max_holding_minutes=max_holding_minutes,
-                    )
+                    exit_reason = None
+                    if use_strategy_exits and trade.get("source_strategy"):
+                        try:
+                            advice_resp = await client.post(
+                                f"{strategy_service_url}/api/v1/hyperliquid/{coin}/exit-advice",
+                                json={
+                                    "source_strategy": trade.get("source_strategy"),
+                                    "position_side": side,
+                                    "entry_price": entry_price,
+                                    "current_price": current_price,
+                                },
+                                timeout=45.0,
+                            )
+                            if advice_resp.status_code == 200:
+                                advice = advice_resp.json() or {}
+                                if advice.get("should_exit"):
+                                    exit_reason = str(
+                                        advice.get("reason") or "strategy_exit"
+                                    )
+                        except Exception as exc:
+                            logger.debug(
+                                "[HyperliquidPaper] strategy exit advice skipped %s: %s",
+                                coin,
+                                exc,
+                            )
+                    exit_eval = evaluate_paper_perp_exit(trade, current_price, exit_cfg)
+                    if not exit_reason:
+                        exit_reason = exit_eval.exit_reason
                     payload: Dict[str, Any] = {
                         "current_price": current_price,
                         "unrealized_pnl": unrealized,
+                        "metadata": exit_eval.metadata,
                     }
                     if exit_reason:
                         exit_notional = current_price * size
@@ -5159,19 +5508,28 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning("[HyperliquidPaper] Position update skipped: %s", e)
 
-    async def _mirror_strategy_signals_to_hyperliquid(
+    async def _run_hyperliquid_strategy_entries(
         self,
         mids: Dict[str, float],
         cfg: Dict[str, Any],
         deadline: Optional[float] = None,
     ) -> None:
         try:
+            signal_source = str(cfg.get("signal_source", "mirror_spot") or "mirror_spot").lower()
             leverage = float(cfg.get("default_leverage", 2.0) or 2.0)
             max_margin = float(cfg.get("max_margin_per_trade", 25.0) or 25.0)
             max_notional = float(cfg.get("max_notional_per_trade", 50.0) or 50.0)
             max_open = int(cfg.get("max_open_positions", 5) or 5)
-            min_long_conf = float(cfg.get("min_confidence_long", 0.55) or 0.55)
-            min_short_conf = float(cfg.get("min_confidence_short", 0.55) or 0.55)
+            consensus_cfg = cfg.get("strategy_consensus") or {}
+            min_long_conf = float(
+                consensus_cfg.get("min_confidence_long", cfg.get("min_confidence_long", 0.55))
+                or 0.55
+            )
+            min_short_conf = float(
+                consensus_cfg.get("min_confidence_short", cfg.get("min_confidence_short", 0.55))
+                or 0.55
+            )
+            min_agreement = float(consensus_cfg.get("min_agreement", 0.0) or 0.0)
             fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
             mirror_exchanges = [str(x) for x in cfg.get("mirror_source_exchanges", []) or []]
             if not mirror_exchanges:
@@ -5179,13 +5537,9 @@ class TradingOrchestrator:
 
             hl_coins = list(self.hyperliquid_pair_selections or [])
             if not hl_coins:
-                allowed_fallback = cfg.get("allowed_symbols") or []
-                hl_coins = [str(c).upper() for c in allowed_fallback if str(c).strip()]
                 logger.warning(
-                    "[HyperliquidPaper] No HL selector output; falling back to allowed_symbols (%s)",
-                    len(hl_coins),
+                    "[HyperliquidPaper] No HL selector output; skipping entry cycle"
                 )
-            if not hl_coins:
                 return
             if max_margin <= 0 or max_notional <= 0 or leverage <= 0:
                 logger.warning("[HyperliquidPaper] Invalid sizing config; skipping")
@@ -5196,6 +5550,15 @@ class TradingOrchestrator:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
                 open_trades = (open_resp.json() or {}).get("trades", []) if open_resp.status_code == 200 else []
+                closed_resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={"status": "CLOSED", "limit": 200},
+                )
+                closed_trades = (
+                    (closed_resp.json() or {}).get("trades", [])
+                    if closed_resp.status_code == 200
+                    else []
+                )
                 open_keys = {
                     (str(t.get("coin") or "").upper(), str(t.get("position_side") or "").lower())
                     for t in (open_trades or [])
@@ -5215,26 +5578,56 @@ class TradingOrchestrator:
                     if not price:
                         continue
 
-                    exchange_name, pair = find_mirror_spot_pair(
-                        coin, mirror_exchanges, self.pair_selections
+                    exchange_name = "hyperliquid"
+                    pair = f"{coin}/USD-PERP"
+                    signals_data: Dict[str, Any] = {}
+                    block = hyperliquid_coin_entry_block(
+                        coin,
+                        open_trades,
+                        closed_trades,
+                        realized_block_hours=float(
+                            cfg.get("block_after_negative_realized_hours", 12) or 12
+                        ),
                     )
-                    if not exchange_name or not pair:
-                        logger.debug(
-                            "[HyperliquidPaper] No mirror spot pair for HL coin %s on %s",
+                    if block.get("entryBlocked"):
+                        logger.warning(
+                            "[HyperliquidPaper] Blocked PAPER entry %s: %s (%s)",
                             coin,
-                            mirror_exchanges,
+                            block.get("entryBlockReason"),
+                            block.get("entryBlockMessage"),
                         )
                         continue
-
-                    strategy_pair = pair.replace("/", "")
                     try:
-                        signals_url = f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}"
-                        signals_resp = await client.get(signals_url, timeout=60.0)
+                        if signal_source == "hyperliquid_strategies":
+                            signals_url = (
+                                f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin}"
+                            )
+                        else:
+                            spot_ex, spot_pair = find_mirror_spot_pair(
+                                coin, mirror_exchanges, self.pair_selections
+                            )
+                            if not spot_ex or not spot_pair:
+                                logger.debug(
+                                    "[HyperliquidPaper] No mirror spot pair for HL coin %s",
+                                    coin,
+                                )
+                                continue
+                            exchange_name = spot_ex
+                            pair = spot_pair
+                            strategy_pair = pair.replace("/", "")
+                            signals_url = (
+                                f"{strategy_service_url}/api/v1/signals/{spot_ex}/{strategy_pair}"
+                            )
+                        signals_resp = await client.get(signals_url, timeout=90.0)
                         if signals_resp.status_code != 200:
                             continue
                         signals_data = signals_resp.json()
                     except Exception as e:
-                        logger.debug("[HyperliquidPaper] Signal fetch failed for %s %s: %s", exchange_name, pair, e)
+                        logger.debug(
+                            "[HyperliquidPaper] Signal fetch failed for %s: %s",
+                            coin,
+                            e,
+                        )
                         continue
 
                     mirrored = select_mirrored_signal(signals_data)
@@ -5245,14 +5638,157 @@ class TradingOrchestrator:
                         continue
                     conf = float(mirrored.get("confidence") or 0.0)
                     if side == "long" and conf < min_long_conf:
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER long %s: strategy=%s conf=%.2f < %.2f consensus_conf=%.2f agreement=%.1f%%",
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            conf,
+                            min_long_conf,
+                            float(mirrored.get("consensus_confidence") or 0.0),
+                            float(mirrored.get("consensus_agreement") or 0.0),
+                        )
                         continue
                     if side == "short" and conf < min_short_conf:
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER short %s: strategy=%s conf=%.2f < %.2f consensus_conf=%.2f agreement=%.1f%%",
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            conf,
+                            min_short_conf,
+                            float(mirrored.get("consensus_confidence") or 0.0),
+                            float(mirrored.get("consensus_agreement") or 0.0),
+                        )
+                        continue
+                    perf_logging = (cfg.get("strategy_performance_logging") or {})
+                    perf_enabled = perf_logging.get("enabled", True)
+                    if perf_enabled is not False and str(perf_enabled).lower() not in {"0", "false", "no", "off"}:
+                        performance = hyperliquid_strategy_side_performance(
+                            mirrored.get("strategy") or "unknown",
+                            side,
+                            closed_trades,
+                            lookback_trades=perf_logging.get("lookback_trades", 12),
+                        )
+                        logger.info(
+                            "[HyperliquidPaper] Strategy performance %s %s: closed=%d wins=%d losses=%d win_rate=%s realized_pnl=%.2f consecutive_losses=%d profit_factor=%s latest_pnl=%s latest_exit=%s",
+                            performance["strategy"],
+                            performance["side"],
+                            performance["closedCount"],
+                            performance["wins"],
+                            performance["losses"],
+                            (
+                                "n/a"
+                                if performance["winRate"] is None
+                                else f"{performance['winRate'] * 100:.1f}%"
+                            ),
+                            performance["realizedPnl"],
+                            performance["consecutiveLosses"],
+                            (
+                                "n/a"
+                                if performance["profitFactor"] is None
+                                else f"{performance['profitFactor']:.2f}"
+                            ),
+                            (
+                                "n/a"
+                                if performance["latestPnl"] is None
+                                else f"{performance['latestPnl']:.2f}"
+                            ),
+                            performance["latestExitTime"] or "n/a",
+                        )
+                    consensus_agreement = float(mirrored.get("consensus_agreement") or 0.0)
+                    consensus_confidence = float(mirrored.get("consensus_confidence") or 0.0)
+                    specialist_gate = sma_reclaim_bull_flag_specialist_gate(mirrored, cfg)
+                    standalone_gate = (
+                        {"isStandalone": False, "allowed": False, "bypassConsensus": False, "sizeMultiplier": None}
+                        if specialist_gate.get("isSpecialist")
+                        else hyperliquid_standalone_entry_gate(mirrored, cfg)
+                    )
+                    if specialist_gate.get("isSpecialist") and not specialist_gate.get("allowed"):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER specialist %s %s: strategy=%s reason=%s conf=%.2f strength=%.2f",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            specialist_gate.get("reason"),
+                            conf,
+                            float(mirrored.get("strength") or 0.0),
+                        )
+                        continue
+                    if standalone_gate.get("isStandalone") and not standalone_gate.get("allowed"):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER standalone %s %s: strategy=%s family=%s reason=%s conf=%.2f strength=%.2f",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            standalone_gate.get("family") or "standalone",
+                            standalone_gate.get("reason"),
+                            conf,
+                            float(mirrored.get("strength") or 0.0),
+                        )
+                        continue
+                    bypass_consensus = bool(
+                        specialist_gate.get("bypassConsensus")
+                        or standalone_gate.get("bypassConsensus")
+                    )
+                    if min_agreement > 0 and consensus_agreement < min_agreement and not bypass_consensus:
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: strategy=%s agreement=%.1f%% < %.1f%% consensus_conf=%.2f conf=%.2f",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            consensus_agreement,
+                            min_agreement,
+                            consensus_confidence,
+                            conf,
+                        )
+                        continue
+                    if bypass_consensus:
+                        logger.info(
+                            "[HyperliquidPaper] PAPER %s %s bypassed global consensus: strategy=%s gate=%s agreement=%.1f%% conf=%.2f reason=%s",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            "specialist" if specialist_gate.get("bypassConsensus") else "standalone",
+                            consensus_agreement,
+                            conf,
+                            specialist_gate.get("reason") if specialist_gate.get("bypassConsensus") else standalone_gate.get("reason"),
+                        )
+                    strategy_side_block = hyperliquid_strategy_side_entry_block(
+                        mirrored.get("strategy") or "unknown",
+                        side,
+                        closed_trades,
+                        realized_block_hours=float(
+                            cfg.get("block_after_negative_realized_hours", 12) or 12
+                        ),
+                    )
+                    if strategy_side_block.get("entryBlocked"):
+                        logger.warning(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: strategy=%s (%s)",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            strategy_side_block.get("entryBlockMessage"),
+                        )
                         continue
                     if (coin, side) in open_keys:
                         continue
 
-                    margin_used = min(max_margin, max_notional / leverage)
-                    if available_balance > 0 and margin_used > available_balance:
+                    size_multiplier = (
+                        float(specialist_gate.get("sizeMultiplier"))
+                        if specialist_gate.get("sizeMultiplier") is not None
+                        else float(standalone_gate.get("sizeMultiplier"))
+                        if standalone_gate.get("sizeMultiplier") is not None
+                        else paper_perp_position_size_multiplier(mirrored, cfg)
+                    )
+                    scaled_max_margin = max_margin * size_multiplier
+                    scaled_max_notional = max_notional * size_multiplier
+                    margin_used = min(scaled_max_margin, scaled_max_notional / leverage)
+                    if available_balance is None:
+                        logger.warning(
+                            "[HyperliquidPaper] Blocking %s entry because HL available balance is unavailable",
+                            coin,
+                        )
+                        continue
+                    if margin_used > available_balance:
                         logger.debug(
                             "[HyperliquidPaper] Insufficient HL available (%.2f) for margin %.2f on %s",
                             available_balance,
@@ -5260,7 +5796,7 @@ class TradingOrchestrator:
                             coin,
                         )
                         continue
-                    notional = min(max_notional, margin_used * leverage)
+                    notional = min(scaled_max_notional, margin_used * leverage)
                     size = notional / price
                     if size <= 0:
                         continue
@@ -5290,16 +5826,19 @@ class TradingOrchestrator:
                         "funding": 0.0,
                         "confidence": conf,
                         "strength": float(mirrored.get("strength") or 0.0),
-                        "consensus_confidence": float(mirrored.get("consensus_confidence") or 0.0),
-                        "consensus_agreement": float(mirrored.get("consensus_agreement") or 0.0),
+                        "consensus_confidence": consensus_confidence,
+                        "consensus_agreement": consensus_agreement,
                         "mode": "paper",
                         "metadata": {
                             "paper_only": True,
                             "no_live_orders": True,
                             "cycle": self.cycle_count,
                             "hl_selector": True,
+                            "signal_source": signal_source,
+                            "position_size_multiplier": size_multiplier,
                             "stable_regime": (signals_data or {}).get("stable_regime"),
                             "market_regime": (signals_data or {}).get("market_regime"),
+                            "hl_recommended": (signals_data or {}).get("recommended"),
                         },
                     }
                     create_resp = await client.post(
@@ -5309,10 +5848,9 @@ class TradingOrchestrator:
                     if create_resp.status_code in (200, 201):
                         open_keys.add((coin, side))
                         opened += 1
-                        if available_balance > 0:
-                            available_balance = max(0.0, available_balance - margin_used)
+                        available_balance = max(0.0, available_balance - margin_used)
                         logger.warning(
-                            "[HyperliquidPaper] Opened PAPER %s %s from %s %s strategy=%s conf=%.2f notional=%.2f lev=%.1fx",
+                            "[HyperliquidPaper] Opened PAPER %s %s from %s %s strategy=%s conf=%.2f notional=%.2f lev=%.1fx size_mult=%.2f",
                             side,
                             coin,
                             exchange_name,
@@ -5321,6 +5859,7 @@ class TradingOrchestrator:
                             conf,
                             notional,
                             leverage,
+                            size_multiplier,
                         )
                     else:
                         logger.warning(
@@ -12818,14 +13357,8 @@ async def startup_event():
     asyncio.create_task(orchestrator.start_trading())
     asyncio.create_task(hybrid_order_tracker.start_background_tasks())
 
-    telegram_auto_enabled = os.getenv("TELEGRAM_AUTO_REPORT_ENABLED", "false").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-    if telegram_auto_enabled:
-        telegram_hourly_report_task = asyncio.create_task(_telegram_hourly_report_loop())
-        logger.info("✅ Telegram auto report scheduler enabled")
-    else:
-        logger.info("ℹ️ Telegram auto report scheduler disabled")
+    telegram_hourly_report_task = None
+    logger.info("ℹ️ Telegram auto report scheduler disabled; dashboard is the reporting surface")
     
     logger.info("✅ Orchestrator startup complete - trading loop starting in background")
 

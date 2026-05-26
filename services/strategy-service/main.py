@@ -204,7 +204,7 @@ class StrategyPerformance(BaseModel):
     max_drawdown: float
     period: str
 
-DEFAULT_ANALYSIS_TIMEFRAMES = ['1h', '4h', '15m', '5m', '1m']
+DEFAULT_ANALYSIS_TIMEFRAMES = ['1h', '4h', '15m', '5m', '1m', '1d', '1w']
 
 class AnalysisRequest(BaseModel):
     # PnL-FIX v4: Default timeframes updated to the union of all strategies'
@@ -241,6 +241,8 @@ strategy_cumulative_runs: Dict[str, int] = {}
 # Align with orchestrator default entry bar (see trading.min_confidence_threshold in config)
 SNAPSHOT_ENTRY_CONFIDENCE = 0.3
 strategy_manager = None
+hyperliquid_strategy_manager = None
+hl_signal_cache: Dict[str, Any] = {}
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
 exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
 # Compose DNS uses the service name `database-service` (hyphen). A legacy default used
@@ -422,6 +424,7 @@ def _record_pair_strategy_snapshot(
                 "breakout_retest_long",
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
+                "sma_reclaim_bull_flag",
             }:
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 if isinstance(indicators, dict):
@@ -541,6 +544,7 @@ def _record_pair_strategy_snapshot(
                 "breakout_retest_long",
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
+                "sma_reclaim_bull_flag",
             }:
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 if isinstance(indicators, dict):
@@ -605,6 +609,7 @@ def _record_pair_strategy_snapshot(
                         "breakout_retest_long",
                         "vwap_bounce_scalping",
                         "small_size_momentum_scalp",
+                        "sma_reclaim_bull_flag",
                     }
                     else None
                 ),
@@ -849,7 +854,11 @@ class StrategyManager:
             'small_size_momentum_scalp': {
                 'module': 'intraday_long_standalone_strategies',
                 'class': 'SmallSizeMomentumScalpStrategy'
-            }
+            },
+            'sma_reclaim_bull_flag': {
+                'module': 'sma_reclaim_bull_flag_strategy',
+                'class': 'SmaReclaimBullFlagStrategy',
+            },
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
@@ -993,6 +1002,7 @@ class StrategyManager:
                     "breakout_retest_long",
                     "vwap_bounce_scalping",
                     "small_size_momentum_scalp",
+                    "sma_reclaim_bull_flag",
                 ):
                     if (
                         standalone_name in strategies
@@ -1905,6 +1915,31 @@ async def get_config_from_service() -> Dict[str, Any]:
             }
         }
 
+async def get_hyperliquid_config_from_service() -> Dict[str, Any]:
+    """Load Hyperliquid perp strategy config (separate from spot)."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{config_service_url}/api/v1/config/strategies-hyperliquid"
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error("Failed to get HL strategies config: %s", e)
+        return {}
+
+
+async def get_hyperliquid_consensus_config() -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"{config_service_url}/api/v1/config/hyperliquid-perps")
+            if response.status_code == 200:
+                return (response.json() or {}).get("strategy_consensus") or {}
+    except Exception:
+        pass
+    return {}
+
+
 async def initialize_strategies():
     """Initialize strategy manager"""
     global strategy_manager
@@ -1916,6 +1951,28 @@ async def initialize_strategies():
     except Exception as e:
         logger.error(f"Failed to initialize strategy service: {e}")
         raise
+
+
+async def initialize_hyperliquid_strategies():
+    """Initialize Hyperliquid perp strategy manager (isolated from spot)."""
+    global hyperliquid_strategy_manager
+    try:
+        from hyperliquid_strategy_manager import HyperliquidStrategyManager
+
+        hl_config = await get_hyperliquid_config_from_service()
+        consensus_cfg = await get_hyperliquid_consensus_config()
+        hyperliquid_strategy_manager = HyperliquidStrategyManager(
+            hl_config,
+            exchange_service_url,
+            consensus_cfg=consensus_cfg,
+        )
+        logger.info(
+            "[HLStrategy] Hyperliquid strategy manager ready (%s strategies)",
+            len(hyperliquid_strategy_manager.strategies),
+        )
+    except Exception as e:
+        logger.error("Failed to initialize Hyperliquid strategies: %s", e)
+        hyperliquid_strategy_manager = None
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -2222,6 +2279,79 @@ async def analyze_pair(exchange: str, pair: str, request: AnalysisRequest):
         logger.error(f"Error analyzing {pair} on {exchange}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/v1/signals/hyperliquid/{coin}")
+async def get_hyperliquid_signals(coin: str):
+    """Analyze Hyperliquid perp coin with HL-native strategy forks."""
+    if not hyperliquid_strategy_manager:
+        raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
+    symbol = str(coin or "").upper().replace("/", "")
+    cache_key = f"hl_{symbol}_{int(datetime.utcnow().timestamp() / 300)}"
+    if cache_key in hl_signal_cache:
+        return hl_signal_cache[cache_key]
+    results = await hyperliquid_strategy_manager.analyze_coin(symbol)
+    if not results:
+        raise HTTPException(status_code=404, detail=f"No HL signals for {symbol}")
+    hl_signal_cache[cache_key] = results
+    return results
+
+
+@app.post("/api/v1/analysis/hyperliquid/{coin}")
+async def analyze_hyperliquid_coin(coin: str, request: AnalysisRequest):
+    if not hyperliquid_strategy_manager:
+        raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
+    symbol = str(coin or "").upper().replace("/", "")
+    results = await hyperliquid_strategy_manager.analyze_coin(
+        symbol,
+        request.timeframes or ["1h", "4h", "15m", "5m"],
+        strategy_allowlist=request.strategies,
+    )
+    if not results:
+        raise HTTPException(status_code=404, detail="Analysis failed")
+    return results
+
+
+class HyperliquidExitAdviceRequest(BaseModel):
+    source_strategy: str
+    position_side: str
+    entry_price: float
+    current_price: float
+
+
+@app.post("/api/v1/hyperliquid/{coin}/exit-advice")
+async def hyperliquid_exit_advice(coin: str, body: HyperliquidExitAdviceRequest):
+    if not hyperliquid_strategy_manager:
+        raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
+    symbol = str(coin or "").upper().replace("/", "")
+    market_data = await hyperliquid_strategy_manager._get_market_data(
+        symbol, ["1h", "15m"]
+    )
+    advice = await hyperliquid_strategy_manager.exit_advice_for_trade(
+        {
+            "coin": symbol,
+            "source_strategy": body.source_strategy,
+            "position_side": body.position_side,
+            "entry_price": body.entry_price,
+        },
+        market_data,
+        body.current_price,
+    )
+    return advice
+
+
+@app.get("/api/v1/signals/hyperliquid/{coin}/{strategy_name}")
+async def get_hyperliquid_strategy_signal(coin: str, strategy_name: str):
+    if not hyperliquid_strategy_manager:
+        raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
+    symbol = str(coin or "").upper().replace("/", "")
+    results = await hyperliquid_strategy_manager.analyze_coin(
+        symbol, strategy_allowlist=[strategy_name]
+    )
+    strat = (results.get("strategies") or {}).get(strategy_name)
+    if not strat:
+        raise HTTPException(status_code=404, detail=f"Strategy {strategy_name} not found")
+    return {"coin": symbol, "strategy": strategy_name, **strat}
+
+
 @app.get("/api/v1/signals/{exchange}/{pair}")
 async def get_signals(exchange: str, pair: str):
     """Get cached signals for a pair"""
@@ -2492,6 +2622,7 @@ async def startup_event():
     """Initialize strategies on startup"""
     logger.info("Starting Strategy Service...")
     await initialize_strategies()
+    await initialize_hyperliquid_strategies()
     
     # Start continuous strategy analysis in background
     asyncio.create_task(continuous_strategy_analysis())

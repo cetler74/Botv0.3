@@ -7,8 +7,44 @@ signals into isolated paper positions so spot trading remains untouched.
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, Iterable, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+from strategy.hyperliquid.consensus import normalize_perp_entry_signal
+
+
+HYPERLIQUID_STRATEGY_FAMILIES = {
+    "heikin_ashi": "trend_momentum",
+    "vwma_hull": "trend_momentum",
+    "macd_momentum": "trend_momentum",
+    "multi_timeframe_confluence": "trend_momentum",
+    "swing_hull_rsi_ema": "trend_momentum",
+    "pullback_long_scalping": "pullback_scalp",
+    "vwap_bounce_scalping": "pullback_scalp",
+    "macd_ema_vwap_scalper": "pullback_scalp",
+    "small_size_momentum_scalp": "pullback_scalp",
+    "sma_reclaim_bull_flag": "reversal_reclaim",
+    "rsi_oversold_checklist": "reversal_reclaim",
+    "rsi_oversold_override": "reversal_reclaim",
+    "breakout_retest_long": "pattern_breakout",
+    "engulfing_multi_tf": "pattern_breakout",
+}
+
+
+DEFAULT_STANDALONE_STRATEGY_GATES = {
+    "heikin_ashi": {"min_confidence": 0.75, "min_strength": 0.50, "size_multiplier": None},
+    "vwma_hull": {"min_confidence": 0.70, "min_strength": 0.20, "size_multiplier": None},
+    "macd_momentum": {"min_confidence": 0.65, "min_strength": 0.50, "size_multiplier": None},
+    "multi_timeframe_confluence": {"min_confidence": 0.65, "min_strength": 0.50, "size_multiplier": None},
+    "swing_hull_rsi_ema": {"min_confidence": 0.62, "min_strength": 0.60, "size_multiplier": None},
+    "pullback_long_scalping": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "vwap_bounce_scalping": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "macd_ema_vwap_scalper": {"min_confidence": 0.65, "min_strength": 0.55, "size_multiplier": None},
+    "small_size_momentum_scalp": {"min_confidence": 0.70, "min_strength": 0.55, "size_multiplier": None},
+    "breakout_retest_long": {"min_confidence": 0.70, "min_strength": 0.70, "size_multiplier": None},
+    "engulfing_multi_tf": {"min_confidence": 0.72, "min_strength": 0.70, "size_multiplier": None},
+}
 
 
 def pair_to_hyperliquid_coin(pair: str) -> str:
@@ -23,10 +59,10 @@ def pair_to_hyperliquid_coin(pair: str) -> str:
 
 
 def position_sides_from_signal(signal: str) -> Optional[str]:
-    sig = str(signal or "").lower().strip()
-    if sig == "buy":
+    sig = normalize_perp_entry_signal(signal)
+    if sig == "long":
         return "long"
-    if sig == "sell":
+    if sig == "short":
         return "short"
     return None
 
@@ -66,10 +102,11 @@ def pnl_percentage(position_side: str, entry_price: float, current_price: float)
 
 def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Pick the best actionable buy/sell signal from a strategy-service payload.
+    Pick the best actionable long/short entry intent from a strategy-service payload.
 
-    Consensus buy/sell gets priority. If consensus is hold, use the strongest
-    individual buy/sell strategy so sell signals can be paper-tested as shorts.
+    Consensus long/short gets priority for direction. The executable confidence
+    uses the strongest matching strategy because consensus confidence can be
+    diluted when most other strategies are correctly holding.
     """
     if not isinstance(signals_data, dict):
         return None
@@ -83,7 +120,7 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
         for name, data in strategies.items():
             if not isinstance(data, dict):
                 continue
-            if str(data.get("signal", "")).lower() != side:
+            if normalize_perp_entry_signal(data.get("signal", "")) != side:
                 continue
             candidates.append(
                 (
@@ -104,21 +141,34 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
             "details": data,
         }
 
+    def strongest_opposite_for(side: str) -> Dict[str, Any]:
+        opposite = "short" if side == "long" else "long"
+        return best_strategy_for(opposite)
+
     consensus = signals_data.get("consensus") or {}
-    c_signal = str(consensus.get("signal", "")).lower()
-    if c_signal in {"buy", "sell"}:
+    c_signal = normalize_perp_entry_signal(consensus.get("signal", ""))
+    if c_signal in {"long", "short"}:
         best = best_strategy_for(c_signal)
-        return {
+        consensus_confidence = float(consensus.get("confidence", 0) or 0)
+        best_confidence = float(best.get("confidence", 0) or 0)
+        selected = {
             "strategy": best.get("strategy") or "consensus",
             "signal": c_signal,
-            "confidence": float(consensus.get("confidence", 0) or best.get("confidence", 0) or 0),
+            "confidence": max(consensus_confidence, best_confidence),
             "strength": float(best.get("strength", 0) or consensus.get("strength", 0) or 0),
-            "consensus_confidence": float(consensus.get("confidence", 0) or 0),
+            "consensus_confidence": consensus_confidence,
             "consensus_agreement": float(consensus.get("agreement", 0) or 0),
+            "details": best.get("details") or {},
         }
+        opposite = strongest_opposite_for(c_signal)
+        if opposite:
+            selected["opposite_strategy"] = opposite.get("strategy")
+            selected["opposite_confidence"] = float(opposite.get("confidence", 0) or 0)
+            selected["opposite_strength"] = float(opposite.get("strength", 0) or 0)
+        return selected
 
     candidates = []
-    for side in ("buy", "sell"):
+    for side in ("long", "short"):
         best = best_strategy_for(side)
         if best:
             candidates.append(best)
@@ -131,7 +181,796 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
     )[0]
     best["consensus_confidence"] = float(consensus.get("confidence", 0) or 0)
     best["consensus_agreement"] = float(consensus.get("agreement", 0) or 0)
+    opposite = strongest_opposite_for(str(best.get("signal") or ""))
+    if opposite:
+        best["opposite_strategy"] = opposite.get("strategy")
+        best["opposite_confidence"] = float(opposite.get("confidence", 0) or 0)
+        best["opposite_strength"] = float(opposite.get("strength", 0) or 0)
     return best
+
+
+@dataclass(frozen=True)
+class PaperPerpExitConfig:
+    """Exit rules for HL paper perps — mirrors spot trading.trailing_stop / profit_protection."""
+
+    use_spot_exit_rules: bool = True
+    fixed_stop_loss_enabled: bool = True
+    stop_loss_pct: float = 1.5
+    take_profit_pct: float = 0.0
+    max_holding_minutes: int = 240
+    overall_take_profit_pct: float = 4.5
+
+    trailing_enabled: bool = True
+    trailing_activation_decimal: float = 0.0035
+    trailing_step_decimal: float = 0.0025
+    tightened_step_decimal: float = 0.0020
+    dynamic_tightening_enabled: bool = True
+    tighten_profit_threshold_decimal: float = 0.0035
+    breakeven_floor_decimal: float = 0.0035
+    min_trigger_distance_decimal: float = 0.0035
+
+    profit_protection_enabled: bool = True
+    profit_protection_activation_decimal: float = 0.0035
+    fee_rate_per_side: float = 0.001
+    profit_protection_fee_buffer: float = 0.0015
+    effective_profit_floor_decimal: float = 0.0035
+
+
+@dataclass
+class PaperPerpExitResult:
+    exit_reason: Optional[str]
+    metadata: Dict[str, Any]
+
+
+def paper_perp_exit_config_from_yaml(
+    hl_cfg: Dict[str, Any],
+    trading_cfg: Dict[str, Any],
+) -> PaperPerpExitConfig:
+    """Build exit config from hyperliquid_perps + global trading sections."""
+    hl_cfg = hl_cfg or {}
+    trading_cfg = trading_cfg or {}
+    trailing = trading_cfg.get("trailing_stop") or {}
+    pp = trading_cfg.get("profit_protection") or {}
+
+    overall_dec = float(trading_cfg.get("overall_profit_take_exit_pct", 0.045) or 0.0)
+    overall_pct = overall_dec * 100.0 if overall_dec > 0 else 0.0
+
+    stop_loss_pct = float(hl_cfg.get("stop_loss_pct", 1.5) or 1.5)
+    spot_sl = trading_cfg.get("stop_loss_percentage")
+    if spot_sl is not None:
+        try:
+            stop_loss_pct = abs(float(spot_sl) * 100.0)
+        except (TypeError, ValueError):
+            pass
+
+    take_profit_pct = float(hl_cfg.get("take_profit_pct", 0) or 0)
+    use_spot = bool(hl_cfg.get("use_spot_exit_rules", True))
+
+    def _dec(key: str, default: float) -> float:
+        try:
+            return float(trailing.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    step = _dec("step_percentage", 0.0025)
+    tightened = _dec("tightened_step_percentage", step)
+    if tightened <= 0:
+        tightened = step
+
+    try:
+        pp_activation = float(pp.get("activation_threshold", 0.0035) or 0.0035)
+    except (TypeError, ValueError):
+        pp_activation = 0.0035
+
+    try:
+        fee_rate_per_side = float(hl_cfg.get("fee_rate_per_side", 0.001) or 0.001)
+    except (TypeError, ValueError):
+        fee_rate_per_side = 0.001
+    try:
+        fee_buffer = float(hl_cfg.get("profit_protection_fee_buffer", 0.0015) or 0.0015)
+    except (TypeError, ValueError):
+        fee_buffer = 0.0015
+    fee_floor = max(0.0, (fee_rate_per_side * 2.0) + fee_buffer)
+    breakeven_floor = max(_dec("breakeven_floor_percentage", 0.0035), fee_floor)
+    min_trigger_distance = max(_dec("min_trigger_distance_percentage", 0.0035), fee_floor)
+    trailing_activation = max(_dec("activation_threshold", 0.0035), fee_floor)
+    pp_activation = max(pp_activation, fee_floor)
+
+    return PaperPerpExitConfig(
+        use_spot_exit_rules=use_spot,
+        fixed_stop_loss_enabled=bool(hl_cfg.get("fixed_stop_loss_enabled", True)),
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct if not use_spot else 0.0,
+        max_holding_minutes=int(hl_cfg.get("max_holding_minutes", 240) or 240),
+        overall_take_profit_pct=overall_pct,
+        trailing_enabled=bool(trailing.get("enabled", True)),
+        trailing_activation_decimal=trailing_activation,
+        trailing_step_decimal=step,
+        tightened_step_decimal=tightened,
+        dynamic_tightening_enabled=bool(trailing.get("dynamic_tightening_enabled", True)),
+        tighten_profit_threshold_decimal=_dec("tighten_profit_threshold", 0.0035),
+        breakeven_floor_decimal=breakeven_floor,
+        min_trigger_distance_decimal=min_trigger_distance,
+        profit_protection_enabled=bool(pp.get("enabled", True)),
+        profit_protection_activation_decimal=pp_activation,
+        fee_rate_per_side=fee_rate_per_side,
+        profit_protection_fee_buffer=fee_buffer,
+        effective_profit_floor_decimal=fee_floor,
+    )
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _strategy_family(strategy: str) -> str:
+    return HYPERLIQUID_STRATEGY_FAMILIES.get(str(strategy or "").strip().lower(), "standalone")
+
+
+def hyperliquid_standalone_entry_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    General standalone gate for HL-native strategy playbooks.
+
+    These strategies are heterogeneous; HOLD from unrelated playbooks means
+    "not my setup" rather than a veto. This gate lets configured complete
+    playbooks bypass global all-strategy agreement while retaining their own
+    quality thresholds and a strong opposite-signal safety check.
+    """
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    defaults = DEFAULT_STANDALONE_STRATEGY_GATES.get(strategy)
+    if defaults is None:
+        return {
+            "isStandalone": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "strategy_not_standalone",
+            "family": _strategy_family(strategy),
+            "sizeMultiplier": None,
+        }
+
+    root = (hl_cfg or {}).get("standalone_strategy_gates") or {}
+    global_cfg = root.get("global") or {}
+    strategy_cfg = root.get(strategy) or {}
+    enabled = strategy_cfg.get("enabled", global_cfg.get("enabled", True))
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isStandalone": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "standalone_gate_disabled",
+            "family": _strategy_family(strategy),
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(
+        strategy_cfg.get("min_confidence", global_cfg.get("min_confidence", defaults["min_confidence"])),
+        defaults["min_confidence"],
+    )
+    min_strength = _safe_float(
+        strategy_cfg.get("min_strength", global_cfg.get("min_strength", defaults["min_strength"])),
+        defaults["min_strength"],
+    )
+    size_mult_raw = strategy_cfg.get("size_multiplier", defaults.get("size_multiplier"))
+    size_mult = None if size_mult_raw is None else max(0.0, min(1.0, _safe_float(size_mult_raw, 1.0)))
+
+    opposite_cfg = global_cfg.get("strong_opposition_block") or {}
+    block_opposite = opposite_cfg.get("enabled", True)
+    opposite_conf_threshold = _safe_float(opposite_cfg.get("min_confidence", 0.85), 0.85)
+    opposite_strength_threshold = _safe_float(opposite_cfg.get("min_strength", 0.65), 0.65)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    opposite_conf = _safe_float((signal or {}).get("opposite_confidence"), 0.0)
+    opposite_strength = _safe_float((signal or {}).get("opposite_strength"), 0.0)
+
+    failures = []
+    if side not in {"long", "short"}:
+        failures.append("not_directional")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if (
+        block_opposite is not False
+        and opposite_conf >= opposite_conf_threshold
+        and opposite_strength >= opposite_strength_threshold
+    ):
+        failures.append(
+            f"opposite_{opposite_conf:.2f}_{opposite_strength:.2f}_gte_"
+            f"{opposite_conf_threshold:.2f}_{opposite_strength_threshold:.2f}"
+        )
+
+    return {
+        "isStandalone": True,
+        "allowed": not failures,
+        "bypassConsensus": not failures,
+        "reason": ",".join(failures) if failures else "standalone_gate_pass",
+        "family": _strategy_family(strategy),
+        "sizeMultiplier": size_mult,
+    }
+
+
+def sma_reclaim_bull_flag_specialist_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated long-only gate for SMA reclaim bull flag entries."""
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    if strategy != "sma_reclaim_bull_flag":
+        return {
+            "isSpecialist": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "not_sma_reclaim_bull_flag",
+            "sizeMultiplier": None,
+        }
+
+    gates = (((hl_cfg or {}).get("specialist_strategy_gates") or {}).get(strategy) or {})
+    enabled = gates.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isSpecialist": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "specialist_gate_disabled",
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(gates.get("min_confidence", 0.85), 0.85)
+    min_strength = _safe_float(gates.get("min_strength", 0.70), 0.70)
+    min_rr = _safe_float(gates.get("min_reward_risk", 1.8), 1.8)
+    max_stop_pct = _safe_float(gates.get("max_stop_pct", 0.03), 0.03)
+    size_mult = _safe_float(gates.get("size_multiplier", 0.35), 0.35)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    details = (signal or {}).get("details") or {}
+    state = details.get("state") or {}
+    indicators = details.get("indicators") or state.get("indicators") or {}
+    rr = _safe_float(indicators.get("reward_risk"), 0.0)
+    stop_pct = _safe_float(indicators.get("stop_pct"), 999.0)
+    invalidation = str(indicators.get("invalidation_reason") or "").strip().lower()
+    setup = str(indicators.get("setup") or "").strip().lower()
+
+    failures = []
+    if side != "long":
+        failures.append("not_long")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if rr < min_rr:
+        failures.append(f"rr_{rr:.2f}_lt_{min_rr:.2f}")
+    if stop_pct > max_stop_pct:
+        failures.append(f"stop_pct_{stop_pct:.4f}_gt_{max_stop_pct:.4f}")
+    if invalidation not in {"", "none"}:
+        failures.append(f"invalidation_{invalidation}")
+    if setup and setup != "sma_reclaim_bull_flag":
+        failures.append(f"setup_{setup}")
+
+    return {
+        "isSpecialist": True,
+        "allowed": not failures,
+        "bypassConsensus": bool(gates.get("bypass_consensus", True)) and not failures,
+        "reason": ",".join(failures) if failures else "specialist_gate_pass",
+        "sizeMultiplier": max(0.0, min(1.0, size_mult)),
+    }
+
+
+def paper_perp_position_size_multiplier(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Return weak/normal/strong paper sizing multiplier from signal metadata."""
+    sizing = ((hl_cfg or {}).get("position_sizing") or {})
+    enabled = sizing.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return 1.0
+
+    weak_mult = _safe_float(sizing.get("weak_multiplier", 0.35), 0.35)
+    normal_mult = _safe_float(sizing.get("normal_multiplier", 0.70), 0.70)
+    strong_mult = _safe_float(sizing.get("strong_multiplier", 1.00), 1.00)
+    normal_conf = _safe_float(sizing.get("normal_confidence", 0.62), 0.62)
+    strong_conf = _safe_float(sizing.get("strong_confidence", 0.72), 0.72)
+    normal_strength = _safe_float(sizing.get("normal_strength", 0.60), 0.60)
+    strong_strength = _safe_float(sizing.get("strong_strength", 0.68), 0.68)
+    normal_agreement = _safe_float(sizing.get("normal_agreement", 60.0), 60.0)
+    strong_agreement = _safe_float(sizing.get("strong_agreement", 65.0), 65.0)
+    normal_consensus_conf = _safe_float(
+        sizing.get("normal_consensus_confidence", normal_conf),
+        normal_conf,
+    )
+    strong_consensus_conf = _safe_float(
+        sizing.get("strong_consensus_confidence", normal_conf),
+        normal_conf,
+    )
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    consensus_conf = _safe_float((signal or {}).get("consensus_confidence"), 0.0)
+    agreement = _safe_float((signal or {}).get("consensus_agreement"), 0.0)
+
+    strong = (
+        conf >= strong_conf
+        and strength >= strong_strength
+        and (agreement >= strong_agreement or consensus_conf >= strong_consensus_conf)
+    )
+    normal = (
+        (conf >= normal_conf or strength >= normal_strength)
+        and (agreement >= normal_agreement or consensus_conf >= normal_consensus_conf)
+    )
+    selected = strong_mult if strong else normal_mult if normal else weak_mult
+    return max(0.0, min(1.0, selected))
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except Exception:
+        return None
+
+
+def hyperliquid_strategy_side_performance(
+    strategy: str,
+    side: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    lookback_trades: int = 12,
+) -> Dict[str, Any]:
+    """Summarize recent closed paper performance for one strategy direction."""
+    normalized_strategy = str(strategy or "").strip().lower()
+    normalized_side = str(side or "").strip().lower()
+    try:
+        lookback = max(1, int(float(lookback_trades or 12)))
+    except (TypeError, ValueError):
+        lookback = 12
+    if not normalized_strategy or normalized_side not in {"long", "short"}:
+        return {
+            "strategy": normalized_strategy,
+            "side": normalized_side,
+            "closedCount": 0,
+            "wins": 0,
+            "losses": 0,
+            "consecutiveLosses": 0,
+            "realizedPnl": 0.0,
+            "grossProfit": 0.0,
+            "grossLoss": 0.0,
+            "profitFactor": None,
+            "winRate": None,
+            "latestExitTime": None,
+            "latestPnl": None,
+            "lookbackTrades": lookback,
+        }
+
+    rows = []
+    for trade in closed_trades or []:
+        trade_strategy = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        raw_side = trade.get("position_side") or trade.get("source_signal") or ""
+        trade_side = str(raw_side or "").strip().lower()
+        if trade_side not in {"long", "short"}:
+            trade_side = normalize_perp_entry_signal(raw_side) or trade_side
+        if trade_strategy != normalized_strategy or trade_side != normalized_side:
+            continue
+        try:
+            rpnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        rows.append({"pnl": rpnl, "exit_time": exit_time})
+
+    rows.sort(key=lambda row: row["exit_time"] or datetime.min, reverse=True)
+    recent = rows[:lookback]
+
+    wins = sum(1 for row in recent if row["pnl"] > 0)
+    losses = sum(1 for row in recent if row["pnl"] < 0)
+    realized = sum(row["pnl"] for row in recent)
+    gross_profit = sum(row["pnl"] for row in recent if row["pnl"] > 0)
+    gross_loss = abs(sum(row["pnl"] for row in recent if row["pnl"] < 0))
+    consecutive_losses = 0
+    for row in recent:
+        if row["pnl"] < 0:
+            consecutive_losses += 1
+            continue
+        break
+
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = None
+
+    latest = recent[0] if recent else None
+    latest_time = latest.get("exit_time") if latest else None
+    return {
+        "strategy": normalized_strategy,
+        "side": normalized_side,
+        "closedCount": len(recent),
+        "wins": wins,
+        "losses": losses,
+        "consecutiveLosses": consecutive_losses,
+        "realizedPnl": round(realized, 6),
+        "grossProfit": round(gross_profit, 6),
+        "grossLoss": round(gross_loss, 6),
+        "profitFactor": None if profit_factor is None else round(profit_factor, 6),
+        "winRate": None if not recent else round(wins / len(recent), 6),
+        "latestExitTime": latest_time.isoformat() + "+00:00" if latest_time else None,
+        "latestPnl": None if latest is None else round(float(latest["pnl"]), 6),
+        "lookbackTrades": lookback,
+    }
+
+
+def hyperliquid_coin_entry_block(
+    coin: str,
+    open_trades: Iterable[Dict[str, Any]],
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    realized_block_hours: float = 12.0,
+) -> Dict[str, Any]:
+    """Return dashboard/entry block metadata for the coin, or entryBlocked=False."""
+    normalized = pair_to_hyperliquid_coin(coin)
+    now_dt = now or datetime.utcnow()
+    block_hours = max(0.0, float(realized_block_hours or 0.0))
+
+    for trade in open_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        if trade_coin != normalized:
+            continue
+        try:
+            upnl = float(trade.get("unrealized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            upnl = 0.0
+        if upnl < 0:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "open_unrealized_negative",
+                "entryBlockUntil": None,
+                "entryBlockMessage": f"open paper position is underwater (${upnl:.2f})",
+            }
+
+    latest_loss_time: Optional[datetime] = None
+    latest_loss_pnl = 0.0
+    for trade in closed_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        if trade_coin != normalized:
+            continue
+        try:
+            rpnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if rpnl >= 0:
+            continue
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_time is None:
+            continue
+        if latest_loss_time is None or exit_time > latest_loss_time:
+            latest_loss_time = exit_time
+            latest_loss_pnl = rpnl
+
+    if latest_loss_time and block_hours > 0:
+        until_dt = latest_loss_time + timedelta(hours=block_hours)
+        if until_dt > now_dt:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "recent_negative_realized_12h",
+                "entryBlockUntil": until_dt.isoformat() + "+00:00",
+                "entryBlockMessage": (
+                    f"realized loss ${latest_loss_pnl:.2f}; cooldown until {until_dt.isoformat()} UTC"
+                ),
+            }
+
+    return {
+        "entryBlocked": False,
+        "entryBlockReason": None,
+        "entryBlockUntil": None,
+        "entryBlockMessage": "",
+    }
+
+
+def hyperliquid_strategy_side_entry_block(
+    strategy: str,
+    side: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    realized_block_hours: float = 12.0,
+) -> Dict[str, Any]:
+    """Block a strategy direction after its latest realized paper loss."""
+    normalized_strategy = str(strategy or "").strip().lower()
+    normalized_side = str(side or "").strip().lower()
+    if not normalized_strategy or normalized_side not in {"long", "short"}:
+        return {
+            "entryBlocked": False,
+            "entryBlockReason": None,
+            "entryBlockUntil": None,
+            "entryBlockMessage": "",
+        }
+
+    now_dt = now or datetime.utcnow()
+    block_hours = max(0.0, float(realized_block_hours or 0.0))
+    latest_loss_time: Optional[datetime] = None
+    latest_loss_pnl = 0.0
+    latest_loss_coin = ""
+
+    for trade in closed_trades or []:
+        trade_strategy = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        trade_side = str(
+            trade.get("position_side") or trade.get("source_signal") or ""
+        ).strip().lower()
+        if trade_strategy != normalized_strategy or trade_side != normalized_side:
+            continue
+        try:
+            rpnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if rpnl >= 0:
+            continue
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_time is None:
+            continue
+        if latest_loss_time is None or exit_time > latest_loss_time:
+            latest_loss_time = exit_time
+            latest_loss_pnl = rpnl
+            latest_loss_coin = pair_to_hyperliquid_coin(
+                trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+            )
+
+    if latest_loss_time and block_hours > 0:
+        until_dt = latest_loss_time + timedelta(hours=block_hours)
+        if until_dt > now_dt:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "recent_strategy_side_negative_realized_12h",
+                "entryBlockUntil": until_dt.isoformat() + "+00:00",
+                "entryBlockMessage": (
+                    f"{normalized_strategy} {normalized_side} realized loss "
+                    f"${latest_loss_pnl:.2f} on {latest_loss_coin or 'perps'}; "
+                    f"cooldown until {until_dt.isoformat()} UTC"
+                ),
+            }
+
+    return {
+        "entryBlocked": False,
+        "entryBlockReason": None,
+        "entryBlockUntil": None,
+        "entryBlockMessage": "",
+    }
+
+
+def _peak_pct(side: str, entry_price: float, extreme_price: float) -> float:
+    if entry_price <= 0 or extreme_price <= 0:
+        return 0.0
+    if side == "short":
+        return ((entry_price - extreme_price) / entry_price) * 100.0
+    return ((extreme_price - entry_price) / entry_price) * 100.0
+
+
+def _update_extreme_price(
+    side: str, entry_price: float, current_price: float, metadata: Dict[str, Any]
+) -> float:
+    if side == "short":
+        key = "lowest_price"
+        extreme = float(metadata.get(key) or entry_price)
+        if current_price < extreme:
+            extreme = current_price
+    else:
+        key = "highest_price"
+        extreme = float(metadata.get(key) or entry_price)
+        if current_price > extreme:
+            extreme = current_price
+    metadata[key] = extreme
+    return extreme
+
+
+def _active_trail_step_decimal(cfg: PaperPerpExitConfig, peak_pct: float) -> float:
+    if (
+        cfg.dynamic_tightening_enabled
+        and peak_pct >= cfg.tighten_profit_threshold_decimal * 100.0
+    ):
+        return cfg.tightened_step_decimal
+    return cfg.trailing_step_decimal
+
+
+def _trail_trigger_price(
+    side: str,
+    entry_price: float,
+    extreme_price: float,
+    step_decimal: float,
+    cfg: PaperPerpExitConfig,
+) -> float:
+    """Mirror orchestrator new-trailing-stop trigger price (in-memory, no exchange order)."""
+    if side == "short":
+        calculated = extreme_price * (1.0 + step_decimal)
+        floor_cap = entry_price * (1.0 - cfg.breakeven_floor_decimal)
+        trigger = min(calculated, floor_cap)
+        min_trigger = entry_price * (1.0 - cfg.min_trigger_distance_decimal)
+        if trigger > min_trigger:
+            trigger = min_trigger
+        return trigger
+
+    calculated = extreme_price * (1.0 - step_decimal)
+    floor_price = entry_price * (1.0 + cfg.breakeven_floor_decimal)
+    trigger = max(calculated, floor_price)
+    min_trigger = entry_price * (1.0 + cfg.min_trigger_distance_decimal)
+    if trigger < min_trigger:
+        trigger = min_trigger
+    return trigger
+
+
+def _is_better_trigger(side: str, new_trigger: float, old_trigger: float) -> bool:
+    if old_trigger <= 0:
+        return True
+    if side == "short":
+        return new_trigger < old_trigger
+    return new_trigger > old_trigger
+
+
+def _max_holding_exit(
+    trade: Dict[str, Any],
+    max_holding_minutes: int,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    if max_holding_minutes <= 0:
+        return None
+    raw_entry = trade.get("entry_time")
+    try:
+        entry_time = (
+            raw_entry
+            if isinstance(raw_entry, datetime)
+            else datetime.fromisoformat(str(raw_entry).replace("Z", "+00:00")).replace(tzinfo=None)
+        )
+        now_dt = now or datetime.utcnow()
+        if now_dt.tzinfo:
+            now_dt = now_dt.replace(tzinfo=None)
+        if (now_dt - entry_time).total_seconds() >= max_holding_minutes * 60:
+            return "paper_max_holding_time"
+    except Exception:
+        return None
+    return None
+
+
+def evaluate_paper_perp_exit(
+    trade: Dict[str, Any],
+    current_price: float,
+    cfg: PaperPerpExitConfig,
+    now: Optional[datetime] = None,
+) -> PaperPerpExitResult:
+    """
+    Paper perp exit evaluation using the same trailing / profit-protection model as spot.
+
+    State is persisted in trade metadata (highest_price, trail_stop_trigger, etc.).
+    """
+    metadata = dict(trade.get("metadata") or {})
+    if current_price <= 0:
+        return PaperPerpExitResult(None, metadata)
+
+    entry_price = float(trade.get("entry_price") or 0.0)
+    side = str(trade.get("position_side") or "long").lower()
+    if entry_price <= 0:
+        return PaperPerpExitResult(None, metadata)
+
+    extreme = _update_extreme_price(side, entry_price, current_price, metadata)
+    pct = pnl_percentage(side, entry_price, current_price)
+    peak_pct = _peak_pct(side, entry_price, extreme)
+
+    if cfg.fixed_stop_loss_enabled and cfg.stop_loss_pct > 0 and pct <= -abs(cfg.stop_loss_pct):
+        return PaperPerpExitResult("paper_stop_loss", metadata)
+
+    holding_exit = _max_holding_exit(trade, cfg.max_holding_minutes, now=now)
+    if holding_exit:
+        return PaperPerpExitResult(holding_exit, metadata)
+
+    if not cfg.use_spot_exit_rules:
+        if cfg.take_profit_pct > 0 and pct >= cfg.take_profit_pct:
+            return PaperPerpExitResult("paper_take_profit", metadata)
+        return PaperPerpExitResult(None, metadata)
+
+    if cfg.overall_take_profit_pct > 0 and pct >= cfg.overall_take_profit_pct:
+        return PaperPerpExitResult(
+            f"paper_overall_take_profit_{cfg.overall_take_profit_pct:.2f}%@{pct:.2f}%",
+            metadata,
+        )
+
+    trail_active = str(metadata.get("trail_stop") or "").lower() == "active"
+    pp_status = metadata.get("profit_protection")
+    trailing_activation_pct = cfg.trailing_activation_decimal * 100.0
+    pp_activation_pct = cfg.profit_protection_activation_decimal * 100.0
+    profit_guarantee_pct = cfg.breakeven_floor_decimal * 100.0
+
+    if (
+        cfg.profit_protection_enabled
+        and peak_pct >= pp_activation_pct
+        and not pp_status
+        and not trail_active
+    ):
+        if side == "short":
+            trigger_px = entry_price * (1.0 - cfg.breakeven_floor_decimal)
+        else:
+            trigger_px = entry_price * (1.0 + cfg.breakeven_floor_decimal)
+        metadata["trail_stop_trigger"] = trigger_px
+        metadata["profit_protection"] = "profit_guaranteed"
+        metadata["profit_protection_trigger"] = pct
+
+    if (
+        cfg.profit_protection_enabled
+        and metadata.get("profit_protection") == "profit_guaranteed"
+        and not trail_active
+    ):
+        pp_trigger = float(metadata.get("trail_stop_trigger") or 0.0)
+        if pp_trigger > 0:
+            if side == "long" and current_price > entry_price and current_price <= pp_trigger:
+                return PaperPerpExitResult(
+                    f"paper_profit_protection_breach@{pct:.2f}%",
+                    metadata,
+                )
+            if side == "short" and current_price < entry_price and current_price >= pp_trigger:
+                return PaperPerpExitResult(
+                    f"paper_profit_protection_breach@{pct:.2f}%",
+                    metadata,
+                )
+
+    if cfg.trailing_enabled:
+        step_decimal = _active_trail_step_decimal(cfg, peak_pct)
+        min_peak_pct_for_trail = (cfg.breakeven_floor_decimal + step_decimal) * 100.0
+
+        if trail_active:
+            new_trigger = _trail_trigger_price(side, entry_price, extreme, step_decimal, cfg)
+            old_trigger = float(metadata.get("trail_stop_trigger") or 0.0)
+            if _is_better_trigger(side, new_trigger, old_trigger):
+                metadata["trail_stop_trigger"] = new_trigger
+            trigger_px = float(metadata.get("trail_stop_trigger") or 0.0)
+            if trigger_px > 0:
+                if side == "long" and current_price <= trigger_px:
+                    return PaperPerpExitResult(
+                        f"paper_trailing_stop_trigger_${trigger_px:.4f}@{pct:.2f}%",
+                        metadata,
+                    )
+                if side == "short" and current_price >= trigger_px:
+                    return PaperPerpExitResult(
+                        f"paper_trailing_stop_trigger_${trigger_px:.4f}@{pct:.2f}%",
+                        metadata,
+                    )
+        elif pct >= trailing_activation_pct and extreme > 0:
+            if peak_pct >= min_peak_pct_for_trail:
+                if side == "long" and extreme <= entry_price:
+                    pass
+                elif side == "short" and extreme >= entry_price:
+                    pass
+                else:
+                    trigger_px = _trail_trigger_price(
+                        side, entry_price, extreme, step_decimal, cfg
+                    )
+                    metadata["trail_stop"] = "active"
+                    metadata["trail_stop_trigger"] = trigger_px
+                    metadata["profit_protection"] = "trailing"
+                    trail_active = True
+
+    if cfg.take_profit_pct > 0 and pct >= cfg.take_profit_pct and not trail_active:
+        return PaperPerpExitResult("paper_take_profit", metadata)
+
+    return PaperPerpExitResult(None, metadata)
 
 
 def should_close_paper_perp(
@@ -143,33 +982,17 @@ def should_close_paper_perp(
     max_holding_minutes: int,
     now: Optional[datetime] = None,
 ) -> Optional[str]:
-    """Return an exit reason when a paper position should close."""
-    if current_price <= 0:
-        return None
-    entry_price = float(trade.get("entry_price") or 0.0)
-    side = str(trade.get("position_side") or "long").lower()
-    pct = pnl_percentage(side, entry_price, current_price)
-    if take_profit_pct > 0 and pct >= take_profit_pct:
-        return "paper_take_profit"
-    if stop_loss_pct > 0 and pct <= -abs(stop_loss_pct):
-        return "paper_stop_loss"
-
-    if max_holding_minutes > 0:
-        raw_entry = trade.get("entry_time")
-        try:
-            entry_time = (
-                raw_entry
-                if isinstance(raw_entry, datetime)
-                else datetime.fromisoformat(str(raw_entry).replace("Z", "+00:00")).replace(tzinfo=None)
-            )
-            now_dt = now or datetime.utcnow()
-            if now_dt.tzinfo:
-                now_dt = now_dt.replace(tzinfo=None)
-            if (now_dt - entry_time).total_seconds() >= max_holding_minutes * 60:
-                return "paper_max_holding_time"
-        except Exception:
-            return None
-    return None
+    """Return an exit reason when a paper position should close (fixed TP/SL fallback)."""
+    cfg = PaperPerpExitConfig(
+        use_spot_exit_rules=False,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_holding_minutes=max_holding_minutes,
+        trailing_enabled=False,
+        profit_protection_enabled=False,
+    )
+    result = evaluate_paper_perp_exit(trade, current_price, cfg, now=now)
+    return result.exit_reason
 
 
 def filter_allowed_coin(coin: str, allowed_symbols: Iterable[str]) -> bool:
@@ -191,4 +1014,3 @@ def find_mirror_spot_pair(
             if pair_to_hyperliquid_coin(str(pair)) == target:
                 return str(exchange_name), str(pair)
     return None, None
-

@@ -363,6 +363,7 @@
             .mobile-hidden { display: none !important; }
             .mobile-full-width { width: 100% !important; }
             .mobile-stack { flex-direction: column !important; }
+            .mobile-record-table .mobile-hidden { display: grid !important; }
             .mobile-time-inline {
                 display: block;
                 font-size: 0.7rem;
@@ -1257,8 +1258,8 @@
                     <h3 class="text-xl font-bold text-gray-900">Per-Exchange Balances</h3>
                 </div>
 
-                <div class="table-container table-scroll custom-scrollbar">
-                    <table class="enhanced-table w-full">
+                <div class="table-container table-scroll custom-scrollbar mobile-record-list">
+                    <table class="enhanced-table w-full mobile-record-table">
                         <thead>
                             <tr>
                                 <th>Exchange</th>
@@ -1350,8 +1351,8 @@
                 </div>
 
                 <!-- Recent Trades Table -->
-                <div class="table-container table-scroll custom-scrollbar">
-                    <table class="enhanced-table w-full">
+                <div class="table-container table-scroll custom-scrollbar mobile-record-list">
+                    <table class="enhanced-table w-full mobile-record-table">
                         <thead>
                             <tr>
                                 <th>Trade ID</th>

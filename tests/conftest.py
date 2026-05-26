@@ -3,12 +3,16 @@ Pytest configuration and shared fixtures for trading bot microservices tests
 """
 
 import importlib.util
+import os
 import warnings
+
+# pandas_ta imports numba in some environments. Disable JIT before any strategy
+# test imports pandas_ta so collection is deterministic on local macOS/Python.
+os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 
 import pytest
 import asyncio
 import httpx
-import os
 import tempfile
 import json
 from typing import Dict, Any, Generator

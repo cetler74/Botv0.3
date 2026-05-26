@@ -406,6 +406,14 @@ async def get_strategies_config():
     
     return config_data.get('strategies', {})
 
+
+@app.get("/api/v1/config/strategies-hyperliquid")
+async def get_strategies_hyperliquid_config():
+    """Get Hyperliquid perp strategies configuration (isolated from spot)."""
+    if not config_data:
+        raise HTTPException(status_code=503, detail="Configuration not loaded")
+    return config_data.get("strategies_hyperliquid", {})
+
 @app.get("/api/v1/config/realtime")
 async def get_realtime_config():
     """Get real-time pricing and WebSocket configuration"""
@@ -557,10 +565,28 @@ async def get_hyperliquid_perps_settings():
     return {
         "enabled": bool(hl.get("enabled", False)),
         "mode": str(hl.get("mode", "paper")),
+        "signal_source": str(hl.get("signal_source", "mirror_spot")),
+        "strategy_consensus": hl.get("strategy_consensus") or {},
+        "use_strategy_exits": bool(hl.get("use_strategy_exits", False)),
         "starting_balance_usd": float(hl.get("starting_balance_usd", 5000.0)),
         "wallet_address": str(hl.get("wallet_address") or "").strip(),
         "fee_rate_per_side": float(hl.get("fee_rate_per_side", 0.001)),
         "allow_live_orders": bool(hl.get("allow_live_orders", False)),
+        "default_leverage": float(hl.get("default_leverage", 2.0)),
+        "max_margin_per_trade": float(hl.get("max_margin_per_trade", 100.0)),
+        "max_notional_per_trade": float(hl.get("max_notional_per_trade", 200.0)),
+        "max_open_positions": int(hl.get("max_open_positions", 5)),
+        "fixed_stop_loss_enabled": bool(hl.get("fixed_stop_loss_enabled", True)),
+        "stop_loss_pct": float(hl.get("stop_loss_pct", 1.5)),
+        "take_profit_pct": float(hl.get("take_profit_pct", 0.0)),
+        "use_spot_exit_rules": bool(hl.get("use_spot_exit_rules", True)),
+        "max_holding_minutes": int(hl.get("max_holding_minutes", 240)),
+        "profit_protection_fee_buffer": float(hl.get("profit_protection_fee_buffer", 0.0015)),
+        "block_after_negative_realized_hours": float(
+            hl.get("block_after_negative_realized_hours", 12)
+        ),
+        "strategy_performance_logging": hl.get("strategy_performance_logging") or {},
+        "position_sizing": hl.get("position_sizing") or {},
     }
 
 @app.get("/api/v1/config/pair_specific/{pair}/{strategy_name}")

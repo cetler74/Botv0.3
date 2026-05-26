@@ -1781,23 +1781,77 @@ def _build_hyperliquid_watchlist(
     hl_cfg: Dict[str, Any],
     mids: Dict[str, float],
     open_trades: List[Dict[str, Any]],
+    closed_trades: Optional[List[Dict[str, Any]]] = None,
     hl_selected_pairs: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     selected_from_db = [
         _pair_to_hyperliquid_coin(p) for p in (hl_selected_pairs or []) if str(p).strip()
     ]
-    allowed_cap = [str(x).upper().strip() for x in (hl_cfg.get("allowed_symbols") or []) if str(x).strip()]
-    if selected_from_db:
-        coins = selected_from_db
-    elif allowed_cap:
-        coins = allowed_cap
-    else:
-        coins = []
+    coins = list(dict.fromkeys(selected_from_db))
     open_by_coin: Dict[str, List[Dict[str, Any]]] = {}
     for trade in open_trades or []:
         coin = str(trade.get("coin") or "").upper()
         if coin:
             open_by_coin.setdefault(coin, []).append(trade)
+    closed_by_coin: Dict[str, List[Dict[str, Any]]] = {}
+    for trade in closed_trades or []:
+        coin = _pair_to_hyperliquid_coin(
+            str(trade.get("coin") or trade.get("pair") or trade.get("source_pair") or "")
+        )
+        if coin:
+            closed_by_coin.setdefault(coin, []).append(trade)
+
+    def _parse_dt(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None) if value.tzinfo else value
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except Exception:
+            return None
+
+    block_hours = _safe_float(hl_cfg.get("block_after_negative_realized_hours"), 12.0)
+    now = datetime.utcnow()
+
+    def _entry_block_for(coin: str, coin_opens: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for trade in coin_opens:
+            upnl = _safe_float(trade.get("unrealized_pnl"))
+            if upnl < 0:
+                return {
+                    "entryBlocked": True,
+                    "entryBlockReason": "open_unrealized_negative",
+                    "entryBlockUntil": None,
+                    "entryBlockMessage": f"open paper position is underwater (${upnl:.2f})",
+                }
+        latest_loss_time = None
+        latest_loss_pnl = 0.0
+        for trade in closed_by_coin.get(coin, []):
+            rpnl = _safe_float(trade.get("realized_pnl"))
+            if rpnl >= 0:
+                continue
+            exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+            if exit_time is None:
+                continue
+            if latest_loss_time is None or exit_time > latest_loss_time:
+                latest_loss_time = exit_time
+                latest_loss_pnl = rpnl
+        if latest_loss_time and block_hours > 0:
+            until = latest_loss_time + timedelta(hours=block_hours)
+            if until > now:
+                return {
+                    "entryBlocked": True,
+                    "entryBlockReason": "recent_negative_realized_12h",
+                    "entryBlockUntil": until.isoformat() + "+00:00",
+                    "entryBlockMessage": f"realized loss ${latest_loss_pnl:.2f}; cooldown until {until.isoformat()} UTC",
+                }
+        return {
+            "entryBlocked": False,
+            "entryBlockReason": None,
+            "entryBlockUntil": None,
+            "entryBlockMessage": "",
+        }
 
     watchlist: List[Dict[str, Any]] = []
     for coin in coins:
@@ -1812,6 +1866,14 @@ def _build_hyperliquid_watchlist(
             status = "no_price"
 
         first_open = coin_opens[0] if coin_opens else {}
+        entry_block = _entry_block_for(coin, coin_opens)
+        if not mid:
+            entry_block = {
+                "entryBlocked": True,
+                "entryBlockReason": "no_price",
+                "entryBlockUntil": None,
+                "entryBlockMessage": "no Hyperliquid mid price available",
+            }
         watchlist.append({
             "coin": coin,
             "pair": f"{coin}/USD-PERP",
@@ -1821,6 +1883,7 @@ def _build_hyperliquid_watchlist(
             "openSide": first_open.get("position_side"),
             "openTradeId": first_open.get("trade_id"),
             "unrealizedPnl": sum(_safe_float(t.get("unrealized_pnl")) for t in coin_opens),
+            **entry_block,
         })
 
     status_order = {
@@ -1870,6 +1933,17 @@ def _perp_portfolio_summary(
         "unrealizedPnl": _safe_float(paper_summary.get("unrealized_pnl")),
         "winRate": _safe_float(paper_summary.get("win_rate")),
     }
+
+
+def _nested_config(config_payload: Any, *keys: str) -> Dict[str, Any]:
+    node: Any = config_payload
+    if isinstance(node, dict) and "config" in node and not node.get(keys[0] if keys else ""):
+        node = node.get("config") or node
+    for key in keys:
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key) or {}
+    return node if isinstance(node, dict) else {}
 
 
 @app.get("/api/v1/dashboard/portfolio-intelligence")
@@ -1932,8 +2006,17 @@ async def get_portfolio_intelligence():
         by_side = (perps_summary or {}).get("by_side", []) if isinstance(perps_summary, dict) else []
         hl_balance = (perps_summary or {}).get("balance", {}) if isinstance(perps_summary, dict) else {}
 
-        watchlist = _build_hyperliquid_watchlist(hl_cfg, mids, open_trades, hl_selected_pairs)
+        watchlist = _build_hyperliquid_watchlist(
+            hl_cfg,
+            mids,
+            open_trades,
+            closed_trades,
+            hl_selected_pairs,
+        )
         portfolio = _perp_portfolio_summary(paper_summary, by_side, hl_balance)
+        trading_cfg = _nested_config(config_payload, "trading")
+        trailing_cfg = trading_cfg.get("trailing_stop") or {}
+        profit_protection_cfg = trading_cfg.get("profit_protection") or {}
 
         entry_rules = {
             "minConfidenceLong": _safe_float(hl_cfg.get("min_confidence_long")),
@@ -1945,7 +2028,44 @@ async def get_portfolio_intelligence():
             "stopLossPct": _safe_float(hl_cfg.get("stop_loss_pct")),
             "takeProfitPct": _safe_float(hl_cfg.get("take_profit_pct")),
             "maxHoldingMinutes": _safe_int(hl_cfg.get("max_holding_minutes")),
+            "fixedStopLossEnabled": bool(hl_cfg.get("fixed_stop_loss_enabled", True)),
+            "profitProtectionActivationPct": _safe_float(
+                profit_protection_cfg.get("activation_threshold"), 0.0035
+            ),
+            "trailingActivationPct": _safe_float(
+                trailing_cfg.get("activation_threshold"), 0.0035
+            ),
+            "trailingStepPct": _safe_float(trailing_cfg.get("step_percentage"), 0.0025),
+            "tightenedTrailingStepPct": _safe_float(
+                trailing_cfg.get("tightened_step_percentage"), 0.0020
+            ),
+            "trailingTightenProfitPct": _safe_float(
+                trailing_cfg.get("tighten_profit_threshold"), 0.0035
+            ),
+            "breakevenFloorPct": _safe_float(
+                trailing_cfg.get("breakeven_floor_percentage"), 0.0035
+            ),
+            "minTriggerDistancePct": _safe_float(
+                trailing_cfg.get("min_trigger_distance_percentage"), 0.0035
+            ),
+            "feeRatePerSide": _safe_float(hl_cfg.get("fee_rate_per_side"), 0.001),
+            "profitProtectionFeeBuffer": _safe_float(
+                hl_cfg.get("profit_protection_fee_buffer"), 0.0015
+            ),
         }
+        effective_floor = max(
+            _safe_float(entry_rules.get("breakevenFloorPct"), 0.0035),
+            (_safe_float(entry_rules.get("feeRatePerSide"), 0.001) * 2.0)
+            + _safe_float(entry_rules.get("profitProtectionFeeBuffer"), 0.0015),
+        )
+        entry_rules["effectiveProfitFloorPct"] = effective_floor
+        for floor_key in (
+            "profitProtectionActivationPct",
+            "trailingActivationPct",
+            "breakevenFloorPct",
+            "minTriggerDistancePct",
+        ):
+            entry_rules[floor_key] = max(_safe_float(entry_rules.get(floor_key), 0.0), effective_floor)
 
         service_health = dict(service_health_results)
         exchange_status = [
@@ -1961,7 +2081,9 @@ async def get_portfolio_intelligence():
                 "config": {
                     "enabled": bool(hl_cfg.get("enabled", False)),
                     "mode": str(hl_cfg.get("mode", "paper")),
-                    "allowedSymbols": [str(x).upper() for x in (hl_cfg.get("allowed_symbols") or [])],
+                    "selectedSymbols": [
+                        _pair_to_hyperliquid_coin(p) for p in (hl_selected_pairs or []) if str(p).strip()
+                    ],
                     "mirrorSourceExchanges": list(hl_cfg.get("mirror_source_exchanges") or []),
                     "maxOpenPositions": _safe_int(hl_cfg.get("max_open_positions")),
                     "entryRules": entry_rules,

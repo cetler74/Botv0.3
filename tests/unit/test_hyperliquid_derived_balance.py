@@ -17,15 +17,17 @@ def test_empty_book_equals_starting():
     assert v["margin_used"] == 0.0
 
 
-def test_open_position_locks_margin_not_unrealized_in_available():
+def test_open_position_locks_margin_but_unrealized_does_not_change_balance():
     v = compute_hyperliquid_balance_amounts(
         starting_balance_usd=5000.0,
         total_realized_pnl=0.0,
         unrealized_pnl=3.0,
         margin_used=25.0,
     )
-    assert v["equity"] == 5003.0
+    assert v["equity"] == 5000.0
+    assert v["balance"] == 5000.0
     assert v["available_balance"] == 4975.0
+    assert v["unrealized_pnl"] == 3.0
 
 
 def test_closed_trade_releases_margin_and_adds_realized():
