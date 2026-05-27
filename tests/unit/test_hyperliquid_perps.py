@@ -21,6 +21,7 @@ from hyperliquid_perps import (  # noqa: E402
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    is_block_window,
     is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
@@ -931,6 +932,66 @@ def test_is_caution_window_wrapping():
 
     is_caution3, _ = is_caution_window(3, cfg)
     assert is_caution3 is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (2026-05-27): Retuned caution windows + optional block windows
+# ---------------------------------------------------------------------------
+
+
+def _phase4_session_cfg(**overrides):
+    base = {
+        "session_sizing": {
+            "enabled": True,
+            "caution_multiplier": 0.5,
+            "caution_windows": [
+                {"start_utc": 2, "end_utc": 5},
+                {"start_utc": 13, "end_utc": 15},
+                {"start_utc": 19, "end_utc": 22},
+            ],
+            "block_windows_enabled": True,
+            "block_windows": [
+                {"start_utc": 13, "end_utc": 14},
+                {"start_utc": 21, "end_utc": 22},
+            ],
+        }
+    }
+    base["session_sizing"].update(overrides)
+    return base
+
+
+def test_phase4_caution_windows_cover_worst_hours():
+    cfg = _phase4_session_cfg()
+    for hour in (2, 3, 4, 13, 14, 19, 20, 21):
+        caution, mult = is_caution_window(hour, cfg)
+        assert caution is True
+        assert mult == pytest.approx(0.5)
+
+
+def test_phase4_caution_windows_exclude_best_hours():
+    cfg = _phase4_session_cfg()
+    for hour in (0, 8, 16, 23):
+        caution, mult = is_caution_window(hour, cfg)
+        assert caution is False
+        assert mult == pytest.approx(1.0)
+
+
+def test_phase4_block_windows_hard_skip_when_enabled():
+    cfg = _phase4_session_cfg()
+    assert is_block_window(13, cfg) is True
+    assert is_block_window(21, cfg) is True
+    assert is_block_window(20, cfg) is False
+
+
+def test_phase4_block_windows_off_by_flag():
+    cfg = _phase4_session_cfg(block_windows_enabled=False)
+    assert is_block_window(13, cfg) is False
+    assert is_block_window(21, cfg) is False
+
+
+def test_phase4_block_windows_off_when_session_sizing_disabled():
+    cfg = _phase4_session_cfg(enabled=False)
+    assert is_block_window(13, cfg) is False
 
 
 # ---------------------------------------------------------------------------

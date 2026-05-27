@@ -1363,6 +1363,24 @@ def hyperliquid_reentry_cooldown_check(
 # ---------------------------------------------------------------------------
 
 
+def _hour_in_windows(utc_hour: int, windows: List[Dict[str, Any]]) -> bool:
+    for window in windows or []:
+        try:
+            start = int(window.get("start_utc", -1))
+            end = int(window.get("end_utc", -1))
+        except (TypeError, ValueError):
+            continue
+        if start < 0 or end < 0:
+            continue
+        if start <= end:
+            if start <= utc_hour < end:
+                return True
+        else:
+            if utc_hour >= start or utc_hour < end:
+                return True
+    return False
+
+
 def is_caution_window(
     utc_hour: int,
     hl_cfg: Optional[Dict[str, Any]] = None,
@@ -1380,16 +1398,28 @@ def is_caution_window(
     caution_mult = _safe_float(session_cfg.get("caution_multiplier", 0.5), 0.5)
     windows: List[Dict[str, Any]] = session_cfg.get("caution_windows") or []
 
-    for window in windows:
-        start = int(window.get("start_utc", -1))
-        end = int(window.get("end_utc", -1))
-        if start < 0 or end < 0:
-            continue
-        if start <= end:
-            if start <= utc_hour < end:
-                return True, caution_mult
-        else:
-            if utc_hour >= start or utc_hour < end:
-                return True, caution_mult
+    if _hour_in_windows(utc_hour, windows):
+        return True, caution_mult
 
     return False, 1.0
+
+
+def is_block_window(
+    utc_hour: int,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Phase 4 (2026-05-27): hard-skip windows for hours that lifetime PnL shows
+    as systematically losing (e.g. 13 UTC US chop, 21 UTC US-close vacuum).
+
+    Block windows are gated by ``session_sizing.block_windows_enabled`` AND
+    ``session_sizing.enabled``. Returns True iff utc_hour falls inside any
+    configured window. Default off to allow gradual rollout.
+    """
+    session_cfg = ((hl_cfg or {}).get("session_sizing") or {})
+    if not session_cfg.get("enabled", False):
+        return False
+    if not session_cfg.get("block_windows_enabled", False):
+        return False
+    windows: List[Dict[str, Any]] = session_cfg.get("block_windows") or []
+    return _hour_in_windows(utc_hour, windows)

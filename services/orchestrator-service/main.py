@@ -99,6 +99,7 @@ from hyperliquid_perps import (
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    is_block_window,
     is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
@@ -5819,6 +5820,13 @@ class TradingOrchestrator:
                     if regime_size_mult is not None:
                         size_multiplier *= float(regime_size_mult)
                     utc_hour = datetime.utcnow().hour
+                    if is_block_window(utc_hour, cfg):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: "
+                            "session_block_window (UTC %d:00)",
+                            side, coin, utc_hour,
+                        )
+                        continue
                     caution, caution_mult = is_caution_window(utc_hour, cfg)
                     if caution:
                         size_multiplier *= caution_mult

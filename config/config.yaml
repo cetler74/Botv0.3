@@ -1983,13 +1983,30 @@ trading:
     min_confidence_short: 0.62
     # 2026-05-26: re-entry cooldown after ANY exit on same coin+side (not just losses).
     perp_reentry_cooldown_minutes: 30
-    # 2026-05-26: session-aware position sizing — reduce size during choppy windows.
+    # Phase 4 (2026-05-27): session-aware sizing/blocking driven by lifetime
+    # paper PnL distribution per UTC hour:
+    #   worst: 13 (-$24.33), 21 (-$21.80), 19 (-$15.94), 2 (-$14.88), 4 (-$13.89)
+    #   best:  20 (+$13.03), 23 (+$4.20), 16 (+$3.66), 8 (+$3.11), 0 (+$2.05)
+    # Replaces the original 10–12 UTC window from the 2026-05-26 spec, which
+    # did not match the observed hour-of-day loss pattern.
     session_sizing:
       enabled: true
       caution_multiplier: 0.5
       caution_windows:
-        - start_utc: 10
-          end_utc: 12
+        - start_utc: 2
+          end_utc: 5      # thin Asia chop
+        - start_utc: 13
+          end_utc: 15     # US session entry chop
+        - start_utc: 19
+          end_utc: 22     # US close / Asia open vacuum
+      # block_windows hard-skip the very worst single hours; off by default to
+      # allow gradual rollout once caution sizing has been validated.
+      block_windows_enabled: false
+      block_windows:
+        - start_utc: 13
+          end_utc: 14
+        - start_utc: 21
+          end_utc: 22
     # Fixed downside stop is enabled so losing positions do not wait for max-hold exits.
     fixed_stop_loss_enabled: true
     stop_loss_pct: 1.5
