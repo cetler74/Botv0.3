@@ -1691,7 +1691,7 @@ strategies_hyperliquid:
     enabled: true
     parameters:
       allow_long: true
-      allow_short: true
+      allow_short: false  # 2026-05-27: shorts -$0.50 at 25% WR (8 trades); longs -$51.77 still need higher confidence gate (see standalone_strategy_gates).
       breakout_lookback_bars: 30
       retest_tolerance_pct: 0.003
       min_volume_multiplier: 1.2
@@ -1727,7 +1727,7 @@ strategies_hyperliquid:
       stop_loss_pct: 1.5
       take_profit_pct: 2.5
   engulfing_multi_tf:
-    enabled: true
+    enabled: false  # 2026-05-27: disabled — 0% WR on 4 closed paper trades (-$6.44). Same evidence pattern as heikin_ashi. See profit-plan spec.
     parameters:
       allow_long: true
       allow_short: true
@@ -1790,7 +1790,7 @@ strategies_hyperliquid:
     enabled: true
     parameters:
       allow_long: true
-      allow_short: true
+      allow_short: false  # 2026-05-27: shorts -$5.43 at 25% WR (4 trades); longs -$1.51 near breakeven, keep long side enabled.
       buy_confidence: 0.7
       vwap_hold_tolerance_pct: 0.0025
       stop_loss_pct: 1.2
@@ -2054,8 +2054,10 @@ trading:
         min_strength: 0.60
       pullback_long_scalping:
         enabled: true
-        min_confidence: 0.70
-        min_strength: 0.65
+        # 2026-05-27: 78% WR but avg win +$0.42 vs avg loss -$3.28 (PF 0.46).
+        # Raise thresholds to cut trades where edge < avg loser.
+        min_confidence: 0.78
+        min_strength: 0.70
       vwap_bounce_scalping:
         enabled: true
         min_confidence: 0.70
@@ -2070,10 +2072,13 @@ trading:
         min_strength: 0.55
       breakout_retest_long:
         enabled: true
-        min_confidence: 0.70
+        # 2026-05-27: top loser strategy (-$52.27 lifetime, 43.8% WR, PF 0.26).
+        # Raise long confidence floor to cut top-chasing entries in trending_up.
+        min_confidence: 0.80
+        min_confidence_long: 0.80
         min_strength: 0.70
       engulfing_multi_tf:
-        enabled: true
+        enabled: false  # 2026-05-27: gate disabled to match strategy disable above
         min_confidence: 0.72
         min_strength: 0.70
     # Fixed TP disabled when use_spot_exit_rules is true — winners exit via

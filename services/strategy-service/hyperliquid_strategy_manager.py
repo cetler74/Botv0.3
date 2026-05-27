@@ -33,6 +33,12 @@ DEPRECATED_STRATEGIES = {
         "(-$29.24 lifetime perp), 0/4 today (-$4.91). "
         "Disable in config or review design spec before re-enabling."
     ),
+    "engulfing_multi_tf": (
+        "engulfing_multi_tf is deprecated (2026-05-27): 0% WR on 4 closed "
+        "paper trades (-$6.44 lifetime perp). Same evidence pattern as "
+        "heikin_ashi. Disable in config or review profit-plan spec before "
+        "re-enabling."
+    ),
 }
 
 
