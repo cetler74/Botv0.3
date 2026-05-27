@@ -21,6 +21,7 @@ from hyperliquid_perps import (  # noqa: E402
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    hyperliquid_trend_chase_gate,
     is_block_window,
     is_caution_window,
     paper_perp_exit_config_from_yaml,
@@ -1243,3 +1244,92 @@ def test_config_yaml_carries_phase3_overrides():
     assert cfg.stop_loss_atr_enabled is True
     assert cfg.stop_loss_atr_mult == pytest.approx(1.8)
     assert cfg.per_coin_stop_overrides == {"WLD": 1.2, "ONDO": 1.2}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (2026-05-27): Trend-chase guard
+# ---------------------------------------------------------------------------
+
+
+def _chase_signal(side, *, rsi=None, pullback=None, strategy="vwma_hull"):
+    indicators = {}
+    if rsi is not None:
+        indicators["rsi_14"] = rsi
+    if pullback is not None:
+        indicators["pullback_depth_pct"] = pullback
+    return {
+        "strategy": strategy,
+        "signal": side,
+        "details": {"indicators": indicators},
+    }
+
+
+def test_trend_chase_inactive_for_counter_trend():
+    sig = _chase_signal("short", rsi=80)
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is False
+    assert result["passthrough"] is True
+
+
+def test_trend_chase_inactive_outside_trend_regime():
+    sig = _chase_signal("long", rsi=80)
+    result = hyperliquid_trend_chase_gate(sig, "sideways")
+    assert result["blocked"] is False
+    assert result["passthrough"] is True
+
+
+def test_trend_chase_passthrough_when_indicators_missing():
+    sig = _chase_signal("long")
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is False
+    assert result["passthrough"] is True
+    assert result["reason"] == "trend_chase_no_indicators"
+
+
+def test_trend_chase_blocks_long_with_overbought_rsi_no_pullback():
+    sig = _chase_signal("long", rsi=72)
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is True
+    assert "trend_chase_blocked_long_in_trending_up" in result["reason"]
+
+
+def test_trend_chase_blocks_short_with_oversold_rsi_no_pullback():
+    sig = _chase_signal("short", rsi=28)
+    result = hyperliquid_trend_chase_gate(sig, "trending_down")
+    assert result["blocked"] is True
+    assert "trend_chase_blocked_short_in_trending_down" in result["reason"]
+
+
+def test_trend_chase_allows_long_with_pullback_context():
+    sig = _chase_signal("long", rsi=72, pullback=0.9)
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is False
+    assert result["reason"] == "trend_chase_pass"
+
+
+def test_trend_chase_allows_long_with_decimal_pullback():
+    sig = _chase_signal("long", rsi=72, pullback=0.012)
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is False
+
+
+def test_trend_chase_allows_long_with_neutral_rsi():
+    sig = _chase_signal("long", rsi=55)
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is False
+
+
+def test_trend_chase_allows_short_with_neutral_rsi():
+    sig = _chase_signal("short", rsi=45)
+    result = hyperliquid_trend_chase_gate(sig, "trending_down")
+    assert result["blocked"] is False
+
+
+def test_trend_chase_reads_state_indicators_fallback():
+    sig = {
+        "strategy": "supertrend",
+        "signal": "long",
+        "details": {"state": {"indicators": {"rsi_14": 72}}},
+    }
+    result = hyperliquid_trend_chase_gate(sig, "trending_up")
+    assert result["blocked"] is True

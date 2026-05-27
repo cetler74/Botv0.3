@@ -99,6 +99,7 @@ from hyperliquid_perps import (
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    hyperliquid_trend_chase_gate,
     is_block_window,
     is_caution_window,
     paper_perp_exit_config_from_yaml,
@@ -5678,6 +5679,16 @@ class TradingOrchestrator:
                             side, coin,
                             regime_gate.get("reason"),
                             market_regime, conf,
+                        )
+                        continue
+
+                    chase_gate = hyperliquid_trend_chase_gate(
+                        mirrored, market_regime,
+                    )
+                    if chase_gate.get("blocked"):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s",
+                            side, coin, chase_gate.get("reason"),
                         )
                         continue
 

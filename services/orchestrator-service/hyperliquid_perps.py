@@ -1305,6 +1305,134 @@ def hyperliquid_regime_direction_gate(
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 (2026-05-27): Trend-chase guard
+#
+# Lifetime PnL by regime × side from the 166-trade sample showed:
+#   trending_up   × long  = -$51.59 (44 trades, 63.6% WR) — top-chasing
+#   trending_down × short = -$21.53 (20 trades, 45% WR)   — same pattern
+#
+# The Change 3 counter-trend gate addresses the opposite case (shorts in
+# trending_up and longs in trending_down). This new gate keeps *with-trend*
+# entries but requires either a pullback context or a non-extended RSI so we
+# don't chase tops/bottoms. Strategies that do not expose pullback / RSI
+# indicators are passthrough (no behavior change).
+# ---------------------------------------------------------------------------
+
+
+_TREND_CHASE_REGIMES: Dict[str, str] = {
+    "trending_up": "long",
+    "trending_down": "short",
+}
+
+
+def _extract_indicators(signal: Dict[str, Any]) -> Dict[str, Any]:
+    details = (signal or {}).get("details") or {}
+    if not isinstance(details, dict):
+        return {}
+    indicators = details.get("indicators")
+    if isinstance(indicators, dict):
+        return indicators
+    state = details.get("state")
+    if isinstance(state, dict):
+        nested = state.get("indicators")
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def hyperliquid_trend_chase_gate(
+    signal: Dict[str, Any],
+    regime: str,
+    *,
+    min_pullback_pct: float = 0.6,
+    long_rsi_max: float = 60.0,
+    short_rsi_min: float = 40.0,
+) -> Dict[str, Any]:
+    """
+    Block with-trend entries that are chasing an extended move.
+
+    Activates only when:
+      - regime is trending_up and signal side is long, OR
+      - regime is trending_down and signal side is short.
+
+    Within an active branch we allow the entry when either:
+      - the signal indicators expose a meaningful pullback context
+        (`pullback_depth_pct >= min_pullback_pct` -- whether stored as a
+        decimal 0.006 or percent 0.6), OR
+      - the latest RSI(14) is not in the chase zone (<= 60 for longs,
+        >= 40 for shorts).
+
+    When neither indicator is available the gate is permissive (no block).
+    This keeps strategies that do not yet emit RSI/pullback fields
+    unaffected while letting the strategies that do (pullback_long_scalping,
+    vwma_hull, swing_hull_rsi_ema, supertrend) benefit immediately.
+    """
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    regime_key = str(regime or "").lower()
+    expected_side = _TREND_CHASE_REGIMES.get(regime_key)
+
+    if expected_side is None or side != expected_side:
+        return {
+            "blocked": False,
+            "reason": "trend_chase_inactive",
+            "passthrough": True,
+        }
+
+    indicators = _extract_indicators(signal)
+    pullback_raw = indicators.get("pullback_depth_pct")
+    rsi_raw = indicators.get("rsi_14")
+    if rsi_raw is None:
+        rsi_raw = indicators.get("rsi")
+
+    pullback_pct = None
+    if pullback_raw is not None:
+        try:
+            pullback_pct = float(pullback_raw)
+        except (TypeError, ValueError):
+            pullback_pct = None
+        else:
+            if 0 < pullback_pct < 1:
+                pullback_pct *= 100.0
+
+    rsi_value = None
+    if rsi_raw is not None:
+        try:
+            rsi_value = float(rsi_raw)
+        except (TypeError, ValueError):
+            rsi_value = None
+
+    if pullback_pct is None and rsi_value is None:
+        return {
+            "blocked": False,
+            "reason": "trend_chase_no_indicators",
+            "passthrough": True,
+        }
+
+    pullback_ok = pullback_pct is not None and pullback_pct >= min_pullback_pct
+    if side == "long":
+        rsi_ok = rsi_value is not None and rsi_value <= long_rsi_max
+    else:
+        rsi_ok = rsi_value is not None and rsi_value >= short_rsi_min
+
+    if pullback_ok or rsi_ok:
+        return {
+            "blocked": False,
+            "reason": "trend_chase_pass",
+            "passthrough": False,
+        }
+
+    return {
+        "blocked": True,
+        "reason": (
+            f"trend_chase_blocked_{side}_in_{regime_key}_"
+            f"rsi_{rsi_value if rsi_value is not None else 'na'}_"
+            f"pullback_{pullback_pct if pullback_pct is not None else 'na'}"
+        ),
+        "passthrough": False,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Change 5b: Per-coin re-entry cooldown (any exit, not just losses)
 # ---------------------------------------------------------------------------
 
