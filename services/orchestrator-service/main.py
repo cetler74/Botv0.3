@@ -102,6 +102,7 @@ from hyperliquid_perps import (
     is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
+    perp_entry_atr_metadata as _perp_entry_atr_metadata,
     perp_side_fee,
     pair_to_hyperliquid_coin,
     pnl_percentage,
@@ -5886,6 +5887,7 @@ class TradingOrchestrator:
                             "stable_regime": (signals_data or {}).get("stable_regime"),
                             "market_regime": (signals_data or {}).get("market_regime"),
                             "hl_recommended": (signals_data or {}).get("recommended"),
+                            **_perp_entry_atr_metadata(mirrored, price),
                         },
                     }
                     create_resp = await client.post(

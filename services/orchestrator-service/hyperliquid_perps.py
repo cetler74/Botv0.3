@@ -8,9 +8,9 @@ signals into isolated paper positions so spot trading remains untouched.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from strategy.hyperliquid.consensus import normalize_perp_entry_signal
 
@@ -201,6 +201,8 @@ class PaperPerpExitConfig:
     stop_loss_pct: float = 1.5
     take_profit_pct: float = 0.0
     max_holding_minutes: int = 240
+    # Phase 3 (2026-05-27): hard cap once a salvage trail is engaged. 0 disables salvage.
+    max_holding_minutes_hard: int = 360
     overall_take_profit_pct: float = 4.5
 
     trailing_enabled: bool = True
@@ -217,6 +219,18 @@ class PaperPerpExitConfig:
     fee_rate_per_side: float = 0.001
     profit_protection_fee_buffer: float = 0.0015
     effective_profit_floor_decimal: float = 0.0035
+
+    # Phase 3 (2026-05-27): ATR-based stop loss override.
+    # When enabled and trade metadata carries `entry_atr_pct`, the effective
+    # stop loss = clamp(atr_pct * stop_loss_atr_mult, min_pct, max_pct).
+    # Falls back to fixed stop_loss_pct when ATR is unavailable.
+    stop_loss_atr_enabled: bool = False
+    stop_loss_atr_mult: float = 1.8
+    stop_loss_atr_min_pct: float = 0.9
+    stop_loss_atr_max_pct: float = 3.0
+    # Phase 3 (2026-05-27): per-coin stop loss override map (coin → stop pct).
+    # Highest priority — used regardless of ATR availability.
+    per_coin_stop_overrides: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -279,12 +293,42 @@ def paper_perp_exit_config_from_yaml(
     trailing_activation = max(_dec("activation_threshold", 0.0075), fee_floor)
     pp_activation = max(pp_activation, fee_floor)
 
+    atr_cfg = hl_cfg.get("stop_loss_atr") or {}
+    atr_enabled = bool(atr_cfg.get("enabled", False))
+    try:
+        atr_mult = float(atr_cfg.get("mult", 1.8) or 1.8)
+    except (TypeError, ValueError):
+        atr_mult = 1.8
+    try:
+        atr_min_pct = float(atr_cfg.get("min_pct", 0.9) or 0.9)
+    except (TypeError, ValueError):
+        atr_min_pct = 0.9
+    try:
+        atr_max_pct = float(atr_cfg.get("max_pct", 3.0) or 3.0)
+    except (TypeError, ValueError):
+        atr_max_pct = 3.0
+
+    raw_overrides = hl_cfg.get("per_coin_stop_overrides") or {}
+    overrides: Dict[str, float] = {}
+    if isinstance(raw_overrides, dict):
+        for coin, pct in raw_overrides.items():
+            try:
+                overrides[str(coin).strip().upper()] = float(pct)
+            except (TypeError, ValueError):
+                continue
+
+    try:
+        max_hold_hard = int(hl_cfg.get("max_holding_minutes_hard", 360) or 0)
+    except (TypeError, ValueError):
+        max_hold_hard = 360
+
     return PaperPerpExitConfig(
         use_spot_exit_rules=use_spot,
         fixed_stop_loss_enabled=bool(hl_cfg.get("fixed_stop_loss_enabled", True)),
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct if not use_spot else 0.0,
         max_holding_minutes=int(hl_cfg.get("max_holding_minutes", 240) or 240),
+        max_holding_minutes_hard=max_hold_hard,
         overall_take_profit_pct=overall_pct,
         trailing_enabled=bool(trailing.get("enabled", True)),
         trailing_activation_decimal=trailing_activation,
@@ -299,6 +343,11 @@ def paper_perp_exit_config_from_yaml(
         fee_rate_per_side=fee_rate_per_side,
         profit_protection_fee_buffer=fee_buffer,
         effective_profit_floor_decimal=fee_floor,
+        stop_loss_atr_enabled=atr_enabled,
+        stop_loss_atr_mult=atr_mult,
+        stop_loss_atr_min_pct=atr_min_pct,
+        stop_loss_atr_max_pct=atr_max_pct,
+        per_coin_stop_overrides=overrides,
     )
 
 
@@ -839,8 +888,21 @@ def _max_holding_exit(
     max_holding_minutes: int,
     now: Optional[datetime] = None,
 ) -> Optional[str]:
+    """Legacy helper retained for unit-test compatibility. Returns plain reason."""
     if max_holding_minutes <= 0:
         return None
+    elapsed = _elapsed_minutes_since_entry(trade, now=now)
+    if elapsed is None:
+        return None
+    if elapsed >= max_holding_minutes:
+        return "paper_max_holding_time"
+    return None
+
+
+def _elapsed_minutes_since_entry(
+    trade: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> Optional[float]:
     raw_entry = trade.get("entry_time")
     try:
         entry_time = (
@@ -848,14 +910,166 @@ def _max_holding_exit(
             if isinstance(raw_entry, datetime)
             else datetime.fromisoformat(str(raw_entry).replace("Z", "+00:00")).replace(tzinfo=None)
         )
+        if isinstance(entry_time, datetime) and entry_time.tzinfo is not None:
+            entry_time = entry_time.replace(tzinfo=None)
         now_dt = now or datetime.utcnow()
         if now_dt.tzinfo:
             now_dt = now_dt.replace(tzinfo=None)
-        if (now_dt - entry_time).total_seconds() >= max_holding_minutes * 60:
-            return "paper_max_holding_time"
+        return (now_dt - entry_time).total_seconds() / 60.0
     except Exception:
         return None
+
+
+def _atr_pct_from_trade(trade: Dict[str, Any]) -> Optional[float]:
+    """Read entry-time ATR (as percent of entry price) from trade metadata if available."""
+    metadata = trade.get("metadata") or {}
+    for key in ("entry_atr_pct", "atr_pct", "stop_loss_atr_pct"):
+        raw = metadata.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
     return None
+
+
+def perp_entry_atr_metadata(
+    mirrored_signal: Dict[str, Any],
+    entry_price: float,
+) -> Dict[str, Any]:
+    """
+    Extract ATR-as-percent-of-entry-price from a mirrored signal payload.
+
+    Looks under details.indicators / details.state.indicators / details
+    for any of: atr_pct, atr_percent, atr_percentage, atr (absolute price).
+    Absolute ATR values are converted to percent using entry_price.
+    Returns {"entry_atr_pct": float} on success or {} otherwise — callers
+    can splat into the new trade's metadata.
+    """
+    if not isinstance(mirrored_signal, dict):
+        return {}
+    details = mirrored_signal.get("details") or {}
+    if not isinstance(details, dict):
+        return {}
+
+    candidates: List[Mapping[str, Any]] = []
+    indicators = details.get("indicators")
+    if isinstance(indicators, dict):
+        candidates.append(indicators)
+    state = details.get("state")
+    if isinstance(state, dict):
+        nested = state.get("indicators")
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    candidates.append(details)
+
+    pct_keys = ("atr_pct", "atr_percent", "atr_percentage")
+    abs_keys = ("atr", "atr_value", "ATR")
+
+    for source in candidates:
+        for key in pct_keys:
+            raw = source.get(key)
+            try:
+                value = float(raw) if raw is not None else 0.0
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                if value < 1.0:
+                    value *= 100.0
+                return {"entry_atr_pct": value}
+
+    if entry_price and entry_price > 0:
+        for source in candidates:
+            for key in abs_keys:
+                raw = source.get(key)
+                try:
+                    value = float(raw) if raw is not None else 0.0
+                except (TypeError, ValueError):
+                    value = 0.0
+                if value > 0:
+                    pct = (value / entry_price) * 100.0
+                    if pct > 0:
+                        return {"entry_atr_pct": pct}
+    return {}
+
+
+def _effective_stop_pct(
+    trade: Dict[str, Any],
+    cfg: PaperPerpExitConfig,
+) -> float:
+    """Resolve the effective stop loss percentage for this trade.
+
+    Priority: per-coin override > ATR-derived > fixed cfg.stop_loss_pct.
+    """
+    coin = str(trade.get("coin") or "").strip().upper()
+    if coin and coin in cfg.per_coin_stop_overrides:
+        return float(cfg.per_coin_stop_overrides[coin])
+
+    if cfg.stop_loss_atr_enabled:
+        atr_pct = _atr_pct_from_trade(trade)
+        if atr_pct is not None and atr_pct > 0:
+            derived = atr_pct * cfg.stop_loss_atr_mult
+            lo = max(0.0, cfg.stop_loss_atr_min_pct)
+            hi = max(lo, cfg.stop_loss_atr_max_pct)
+            return float(max(lo, min(hi, derived)))
+
+    return float(cfg.stop_loss_pct)
+
+
+def _max_holding_decision(
+    trade: Dict[str, Any],
+    pct: float,
+    cfg: PaperPerpExitConfig,
+    metadata: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> Tuple[Optional[str], bool]:
+    """Decide on max-holding-time exits with breakeven + salvage trail.
+
+    Returns (exit_reason_or_none, metadata_changed).
+    Behavior:
+      - If position has been open >= max_holding_minutes:
+          * pct >= -fee_floor → exit "paper_max_holding_time_flat".
+          * Else → engage salvage mode (metadata flag) and stay open.
+      - In salvage mode:
+          * pct >= 0 → exit "paper_max_holding_time_be" (price recovered).
+          * elapsed >= max_holding_minutes_hard → "paper_max_holding_time_hard".
+      - Stop loss and trailing logic continue to apply outside this helper.
+    """
+    if cfg.max_holding_minutes <= 0:
+        return None, False
+
+    elapsed = _elapsed_minutes_since_entry(trade, now=now)
+    if elapsed is None:
+        return None, False
+
+    fee_floor_pct = cfg.effective_profit_floor_decimal * 100.0
+    in_salvage = bool(metadata.get("salvage_mode"))
+    changed = False
+
+    if in_salvage:
+        if pct >= 0:
+            return "paper_max_holding_time_be", False
+        if (
+            cfg.max_holding_minutes_hard > 0
+            and elapsed >= cfg.max_holding_minutes_hard
+        ):
+            return "paper_max_holding_time_hard", False
+        return None, False
+
+    if elapsed >= cfg.max_holding_minutes:
+        if pct >= -fee_floor_pct:
+            return "paper_max_holding_time_flat", False
+        if cfg.max_holding_minutes_hard > cfg.max_holding_minutes:
+            metadata["salvage_mode"] = True
+            metadata["salvage_engaged_at_pct"] = pct
+            changed = True
+            return None, changed
+        return "paper_max_holding_time", False
+
+    return None, changed
 
 
 def evaluate_paper_perp_exit(
@@ -882,10 +1096,15 @@ def evaluate_paper_perp_exit(
     pct = pnl_percentage(side, entry_price, current_price)
     peak_pct = _peak_pct(side, entry_price, extreme)
 
-    if cfg.fixed_stop_loss_enabled and cfg.stop_loss_pct > 0 and pct <= -abs(cfg.stop_loss_pct):
+    effective_stop_pct = _effective_stop_pct(trade, cfg)
+    if (
+        cfg.fixed_stop_loss_enabled
+        and effective_stop_pct > 0
+        and pct <= -abs(effective_stop_pct)
+    ):
         return PaperPerpExitResult("paper_stop_loss", metadata)
 
-    holding_exit = _max_holding_exit(trade, cfg.max_holding_minutes, now=now)
+    holding_exit, _ = _max_holding_decision(trade, pct, cfg, metadata, now=now)
     if holding_exit:
         return PaperPerpExitResult(holding_exit, metadata)
 

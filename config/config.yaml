@@ -1995,6 +1995,29 @@ trading:
     stop_loss_pct: 1.5
     profit_protection_fee_buffer: 0.0015
     block_after_negative_realized_hours: 12
+    # Phase 3 (2026-05-27): exit reworks driven by 35×$3.60 paper_stop_loss
+    # losses and 19×$4.18 paper_max_holding_time dumps in the 166-trade sample.
+    # max_holding_minutes_hard extends the holding window for a salvage trail
+    # only when the position is still underwater at the soft cap; otherwise
+    # the position closes at paper_max_holding_time_flat near breakeven.
+    max_holding_minutes_hard: 360
+    # ATR-based stop loss. When entry_atr_pct is stamped on trade metadata at
+    # entry (orchestrator copies it from signal indicators), the effective
+    # stop = clamp(atr_pct * mult, min_pct, max_pct). Otherwise falls back
+    # to stop_loss_pct above.
+    stop_loss_atr:
+      enabled: true
+      mult: 1.8
+      min_pct: 0.9
+      max_pct: 3.0
+    # Tighter stops for coins where the lifetime paper sample shows blow-out
+    # losers (WLD -$25.48, NEAR -$16.35, ONDO -$14.21, HYPE -$10.22, LIT -$10.18).
+    per_coin_stop_overrides:
+      WLD: 1.2
+      NEAR: 1.2
+      ONDO: 1.2
+      HYPE: 1.2
+      LIT: 1.2
     strategy_performance_logging:
       enabled: true
       # Recent closed paper trades per strategy + side used only for observability.

@@ -24,6 +24,7 @@ from hyperliquid_perps import (  # noqa: E402
     is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
+    perp_entry_atr_metadata,
     perp_side_fee,
     pair_to_hyperliquid_coin,
     pnl_percentage,
@@ -930,3 +931,254 @@ def test_is_caution_window_wrapping():
 
     is_caution3, _ = is_caution_window(3, cfg)
     assert is_caution3 is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (2026-05-27): Exit logic rework
+#   - Breakeven max-hold exit + salvage trail
+#   - ATR-based stop loss with fixed-pct fallback
+#   - Per-coin stop overrides
+# ---------------------------------------------------------------------------
+
+
+def _phase3_exit_cfg(**overrides) -> PaperPerpExitConfig:
+    defaults = dict(
+        use_spot_exit_rules=True,
+        fixed_stop_loss_enabled=True,
+        stop_loss_pct=1.5,
+        max_holding_minutes=10,
+        max_holding_minutes_hard=30,
+        profit_protection_enabled=False,
+        trailing_enabled=False,
+        effective_profit_floor_decimal=0.0035,
+    )
+    defaults.update(overrides)
+    return PaperPerpExitConfig(**defaults)
+
+
+def test_max_hold_flat_exit_near_breakeven():
+    """Above the fee floor at the soft cap → flat exit at breakeven."""
+    cfg = _phase3_exit_cfg()
+    entry = datetime.utcnow() - timedelta(minutes=12)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 100.05, cfg)
+    assert result.exit_reason == "paper_max_holding_time_flat"
+
+
+def test_max_hold_engages_salvage_when_underwater():
+    """Below the fee floor at the soft cap → salvage mode flag set, no exit."""
+    cfg = _phase3_exit_cfg()
+    entry = datetime.utcnow() - timedelta(minutes=12)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.0, cfg)
+    assert result.exit_reason is None
+    assert result.metadata.get("salvage_mode") is True
+
+
+def test_salvage_exits_on_breakeven_recovery():
+    cfg = _phase3_exit_cfg()
+    entry = datetime.utcnow() - timedelta(minutes=15)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {"salvage_mode": True},
+    }
+    result = evaluate_paper_perp_exit(trade, 100.10, cfg)
+    assert result.exit_reason == "paper_max_holding_time_be"
+
+
+def test_salvage_short_exits_on_breakeven_recovery():
+    cfg = _phase3_exit_cfg()
+    entry = datetime.utcnow() - timedelta(minutes=15)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "short",
+        "entry_time": entry.isoformat(),
+        "metadata": {"salvage_mode": True},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.90, cfg)
+    assert result.exit_reason == "paper_max_holding_time_be"
+
+
+def test_salvage_hard_cap_exits():
+    cfg = _phase3_exit_cfg()
+    entry = datetime.utcnow() - timedelta(minutes=40)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {"salvage_mode": True},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.20, cfg)
+    assert result.exit_reason == "paper_max_holding_time_hard"
+
+
+def test_salvage_stays_open_when_still_underwater_before_hard_cap():
+    cfg = _phase3_exit_cfg()
+    entry = datetime.utcnow() - timedelta(minutes=20)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {"salvage_mode": True},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.40, cfg)
+    assert result.exit_reason is None
+    assert result.metadata.get("salvage_mode") is True
+
+
+def test_per_coin_stop_override_fires_before_fixed_stop():
+    cfg = _phase3_exit_cfg(
+        stop_loss_pct=1.5,
+        per_coin_stop_overrides={"WLD": 1.0},
+    )
+    entry = datetime.utcnow() - timedelta(minutes=1)
+    trade = {
+        "coin": "WLD",
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 98.95, cfg)
+    assert result.exit_reason == "paper_stop_loss"
+
+
+def test_per_coin_stop_override_does_not_fire_for_other_coins():
+    cfg = _phase3_exit_cfg(
+        stop_loss_pct=1.5,
+        per_coin_stop_overrides={"WLD": 1.0},
+    )
+    entry = datetime.utcnow() - timedelta(minutes=1)
+    trade = {
+        "coin": "BTC",
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 98.95, cfg)
+    assert result.exit_reason is None
+
+
+def test_atr_stop_used_when_metadata_present():
+    cfg = _phase3_exit_cfg(
+        stop_loss_atr_enabled=True,
+        stop_loss_atr_mult=1.8,
+        stop_loss_atr_min_pct=0.9,
+        stop_loss_atr_max_pct=3.0,
+    )
+    entry = datetime.utcnow() - timedelta(minutes=1)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {"entry_atr_pct": 1.0},
+    }
+    result = evaluate_paper_perp_exit(trade, 98.10, cfg)
+    assert result.exit_reason == "paper_stop_loss"
+
+
+def test_atr_stop_falls_back_when_metadata_missing():
+    cfg = _phase3_exit_cfg(
+        stop_loss_pct=1.5,
+        stop_loss_atr_enabled=True,
+    )
+    entry = datetime.utcnow() - timedelta(minutes=1)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.00, cfg)
+    assert result.exit_reason is None
+    result_below = evaluate_paper_perp_exit(trade, 98.40, cfg)
+    assert result_below.exit_reason == "paper_stop_loss"
+
+
+def test_atr_stop_clamped_to_min_pct():
+    cfg = _phase3_exit_cfg(
+        stop_loss_atr_enabled=True,
+        stop_loss_atr_mult=1.8,
+        stop_loss_atr_min_pct=1.0,
+        stop_loss_atr_max_pct=3.0,
+    )
+    entry = datetime.utcnow() - timedelta(minutes=1)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": entry.isoformat(),
+        "metadata": {"entry_atr_pct": 0.1},
+    }
+    result_safe = evaluate_paper_perp_exit(trade, 99.50, cfg)
+    assert result_safe.exit_reason is None
+    result_stop = evaluate_paper_perp_exit(trade, 98.95, cfg)
+    assert result_stop.exit_reason == "paper_stop_loss"
+
+
+def test_perp_entry_atr_metadata_extracts_indicator_pct():
+    md = perp_entry_atr_metadata(
+        {"details": {"indicators": {"atr_pct": 1.4}}},
+        entry_price=100.0,
+    )
+    assert md.get("entry_atr_pct") == pytest.approx(1.4)
+
+
+def test_perp_entry_atr_metadata_converts_absolute_value():
+    md = perp_entry_atr_metadata(
+        {"details": {"indicators": {"atr": 1.5}}},
+        entry_price=100.0,
+    )
+    assert md.get("entry_atr_pct") == pytest.approx(1.5)
+
+
+def test_perp_entry_atr_metadata_normalizes_decimal_pct():
+    md = perp_entry_atr_metadata(
+        {"details": {"indicators": {"atr_pct": 0.012}}},
+        entry_price=100.0,
+    )
+    assert md.get("entry_atr_pct") == pytest.approx(1.2)
+
+
+def test_perp_entry_atr_metadata_returns_empty_when_missing():
+    assert perp_entry_atr_metadata({"details": {}}, entry_price=100.0) == {}
+    assert perp_entry_atr_metadata({}, entry_price=100.0) == {}
+    assert perp_entry_atr_metadata(None, entry_price=100.0) == {}
+
+
+def test_config_yaml_carries_phase3_overrides():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "max_holding_minutes": 240,
+            "max_holding_minutes_hard": 360,
+            "stop_loss_atr": {
+                "enabled": True,
+                "mult": 1.8,
+                "min_pct": 0.9,
+                "max_pct": 3.0,
+            },
+            "per_coin_stop_overrides": {"WLD": 1.2, "ondo": 1.2},
+        },
+        {
+            "stop_loss_percentage": 0.015,
+            "trailing_stop": {"enabled": True, "activation_threshold": 0.0075},
+            "profit_protection": {"enabled": True, "activation_threshold": 0.005},
+        },
+    )
+    assert cfg.max_holding_minutes_hard == 360
+    assert cfg.stop_loss_atr_enabled is True
+    assert cfg.stop_loss_atr_mult == pytest.approx(1.8)
+    assert cfg.per_coin_stop_overrides == {"WLD": 1.2, "ONDO": 1.2}
