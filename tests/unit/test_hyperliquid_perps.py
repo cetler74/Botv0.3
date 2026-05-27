@@ -20,6 +20,7 @@ from hyperliquid_perps import (  # noqa: E402
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
     hyperliquid_standalone_entry_gate,
+    hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
     hyperliquid_trend_chase_gate,
@@ -1442,3 +1443,105 @@ def test_min_edge_gate_threshold_follows_fee_rate():
     )
     assert result["blocked"] is True
     assert result["thresholdPct"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 (2026-05-27): PnL-weighted strategy sizing tier
+# ---------------------------------------------------------------------------
+
+
+def _closed_trade(strategy, pnl, hours_ago):
+    return {
+        "source_strategy": strategy,
+        "realized_pnl": pnl,
+        "exit_time": (
+            datetime.utcnow() - timedelta(hours=hours_ago)
+        ).isoformat(),
+    }
+
+
+def test_pnl_tier_strong_when_rolling_pnl_above_threshold():
+    trades = [
+        _closed_trade("swing_hull_rsi_ema", 4.0, 5),
+        _closed_trade("swing_hull_rsi_ema", 3.0, 10),
+        _closed_trade("swing_hull_rsi_ema", -1.0, 20),
+    ]
+    result = hyperliquid_strategy_pnl_multiplier(
+        "swing_hull_rsi_ema", trades,
+        lookback_hours=168, strong_pnl_threshold=5.0, min_sample=3,
+    )
+    assert result["tier"] == "strong"
+    assert result["multiplier"] == pytest.approx(1.0)
+    assert result["lookback_trades"] == 3
+    assert result["lookback_pnl"] == pytest.approx(6.0)
+
+
+def test_pnl_tier_normal_when_above_breakeven_but_below_strong():
+    trades = [
+        _closed_trade("small_size_momentum_scalp", 1.0, 5),
+        _closed_trade("small_size_momentum_scalp", 0.5, 10),
+        _closed_trade("small_size_momentum_scalp", -0.2, 20),
+    ]
+    result = hyperliquid_strategy_pnl_multiplier(
+        "small_size_momentum_scalp", trades, min_sample=3,
+    )
+    assert result["tier"] == "normal"
+    assert result["multiplier"] == pytest.approx(0.7)
+
+
+def test_pnl_tier_probation_when_underwater():
+    trades = [
+        _closed_trade("breakout_retest_long", -2.0, 5),
+        _closed_trade("breakout_retest_long", -1.5, 10),
+        _closed_trade("breakout_retest_long", 0.5, 20),
+    ]
+    result = hyperliquid_strategy_pnl_multiplier(
+        "breakout_retest_long", trades, min_sample=3,
+    )
+    assert result["tier"] == "probation"
+    assert result["multiplier"] == pytest.approx(0.4)
+    assert result["lookback_pnl"] < 0
+
+
+def test_pnl_tier_normal_when_under_min_sample():
+    trades = [_closed_trade("supertrend", 0.7, 5)]
+    result = hyperliquid_strategy_pnl_multiplier(
+        "supertrend", trades, min_sample=3,
+    )
+    assert result["tier"] == "normal_unsampled"
+    assert result["multiplier"] == pytest.approx(0.7)
+
+
+def test_pnl_tier_ignores_old_trades_outside_lookback():
+    trades = [
+        _closed_trade("vwma_hull", -10.0, 200),
+        _closed_trade("vwma_hull", 6.0, 5),
+        _closed_trade("vwma_hull", 4.0, 10),
+        _closed_trade("vwma_hull", 1.0, 20),
+    ]
+    result = hyperliquid_strategy_pnl_multiplier(
+        "vwma_hull", trades, lookback_hours=168, min_sample=3,
+    )
+    assert result["tier"] == "strong"
+    assert result["lookback_trades"] == 3
+    assert result["lookback_pnl"] == pytest.approx(11.0)
+
+
+def test_pnl_tier_filters_by_strategy_name():
+    trades = [
+        _closed_trade("swing_hull_rsi_ema", 5.0, 5),
+        _closed_trade("vwma_hull", -10.0, 5),
+    ]
+    result = hyperliquid_strategy_pnl_multiplier(
+        "vwma_hull", trades, min_sample=1,
+    )
+    assert result["tier"] == "probation"
+    assert result["lookback_pnl"] == pytest.approx(-10.0)
+
+
+def test_pnl_tier_empty_strategy_name():
+    result = hyperliquid_strategy_pnl_multiplier(
+        "", [], min_sample=1,
+    )
+    assert result["tier"] == "normal"
+    assert result["reason"] == "strategy_unknown"

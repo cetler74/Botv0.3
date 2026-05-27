@@ -2044,6 +2044,27 @@ trading:
       enabled: true
       min_edge_pct: 0.40
       edge_multiplier: 2.0
+    # Phase 7 (2026-05-27): PnL-weighted strategy sizing tier. Multiplies the
+    # per-trade size by 0.4 / 0.7 / 1.0 based on rolling realized PnL on
+    # closed paper trades for that strategy. Independent of standalone gate
+    # size_multipliers — they compound.
+    #
+    # Paper-to-live promotion whitelist (preliminary, refresh from
+    # scripts/report_hl_paper_pnl.py before flipping any strategy to live):
+    #   - swing_hull_rsi_ema       (lifetime +$6.47, 66.7% WR, PF 2.38)
+    #   - small_size_momentum_scalp (lifetime +$1.92, 66.7% WR, PF 1.44)
+    #   - vwma_hull longs           (lifetime +$2.16, 71% WR; shorts
+    #                                pending vwma_hull short min_confidence
+    #                                0.85 validation)
+    strategy_pnl_sizing:
+      enabled: true
+      lookback_hours: 168       # last 7 days
+      min_sample: 3
+      strong_pnl_threshold: 5.0
+      normal_pnl_threshold: 0.0
+      strong_multiplier: 1.0
+      normal_multiplier: 0.7
+      probation_multiplier: 0.4
     strategy_performance_logging:
       enabled: true
       # Recent closed paper trades per strategy + side used only for observability.

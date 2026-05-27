@@ -1305,6 +1305,124 @@ def hyperliquid_regime_direction_gate(
 
 
 # ---------------------------------------------------------------------------
+# Phase 7 (2026-05-27): PnL-weighted strategy sizing tier
+#
+# Multiplier applied to the per-trade position size based on the strategy's
+# rolling realized PnL across closed paper trades within a lookback window.
+# Strategies that lose money are put on probation (smaller size), strategies
+# that earn money are full size. This is independent of the standalone gate
+# size multipliers — the final size multiplier is min(gate, pnl_tier).
+# ---------------------------------------------------------------------------
+
+
+def _parse_paper_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        return None
+
+
+def hyperliquid_strategy_pnl_multiplier(
+    strategy: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    lookback_hours: float = 168.0,
+    strong_pnl_threshold: float = 5.0,
+    normal_pnl_threshold: float = 0.0,
+    strong_multiplier: float = 1.0,
+    normal_multiplier: float = 0.7,
+    probation_multiplier: float = 0.4,
+    min_sample: int = 3,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Return a size multiplier tier based on rolling realized PnL.
+
+    Tiers (default):
+      lookback PnL >= +$5  → 1.00x  (strong)
+      lookback PnL >= 0    → 0.70x  (normal)
+      lookback PnL <  0    → 0.40x  (probation)
+
+    Strategies with fewer than ``min_sample`` trades in the lookback window
+    are treated as normal (no penalty, no boost). Returns a structured dict
+    so callers can log the rationale.
+    """
+    normalized = str(strategy or "").strip().lower()
+    if not normalized:
+        return {
+            "multiplier": normal_multiplier,
+            "tier": "normal",
+            "reason": "strategy_unknown",
+            "lookback_pnl": 0.0,
+            "lookback_trades": 0,
+        }
+
+    now_dt = now or datetime.utcnow()
+    if now_dt.tzinfo:
+        now_dt = now_dt.replace(tzinfo=None)
+    cutoff = now_dt - timedelta(hours=max(0.0, float(lookback_hours)))
+
+    total_pnl = 0.0
+    sample = 0
+    for trade in closed_trades or []:
+        if not isinstance(trade, dict):
+            continue
+        strat = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        if strat != normalized:
+            continue
+        exit_dt = _parse_paper_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_dt is None:
+            continue
+        if exit_dt < cutoff:
+            continue
+        try:
+            total_pnl += float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        sample += 1
+
+    if sample < max(0, int(min_sample)):
+        return {
+            "multiplier": normal_multiplier,
+            "tier": "normal_unsampled",
+            "reason": f"sample_{sample}_lt_min_{min_sample}",
+            "lookback_pnl": total_pnl,
+            "lookback_trades": sample,
+        }
+
+    if total_pnl >= strong_pnl_threshold:
+        return {
+            "multiplier": strong_multiplier,
+            "tier": "strong",
+            "reason": f"pnl_{total_pnl:.2f}_gte_{strong_pnl_threshold}",
+            "lookback_pnl": total_pnl,
+            "lookback_trades": sample,
+        }
+    if total_pnl >= normal_pnl_threshold:
+        return {
+            "multiplier": normal_multiplier,
+            "tier": "normal",
+            "reason": f"pnl_{total_pnl:.2f}_gte_{normal_pnl_threshold}",
+            "lookback_pnl": total_pnl,
+            "lookback_trades": sample,
+        }
+    return {
+        "multiplier": probation_multiplier,
+        "tier": "probation",
+        "reason": f"pnl_{total_pnl:.2f}_lt_{normal_pnl_threshold}",
+        "lookback_pnl": total_pnl,
+        "lookback_trades": sample,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase 6 (2026-05-27): Fee-aware minimum-edge gate
 #
 # Round-trip taker fees on Hyperliquid at the paper-engine's default rate

@@ -98,6 +98,7 @@ from hyperliquid_perps import (
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
     hyperliquid_standalone_entry_gate,
+    hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
     hyperliquid_trend_chase_gate,
@@ -5839,6 +5840,44 @@ class TradingOrchestrator:
                     regime_size_mult = regime_gate.get("sizeMultiplier")
                     if regime_size_mult is not None:
                         size_multiplier *= float(regime_size_mult)
+                    pnl_tier_cfg = (cfg.get("strategy_pnl_sizing") or {})
+                    if pnl_tier_cfg.get("enabled", True) is not False:
+                        pnl_tier = hyperliquid_strategy_pnl_multiplier(
+                            str(mirrored.get("strategy") or ""),
+                            closed_trades,
+                            lookback_hours=float(
+                                pnl_tier_cfg.get("lookback_hours", 168.0) or 168.0
+                            ),
+                            strong_pnl_threshold=float(
+                                pnl_tier_cfg.get("strong_pnl_threshold", 5.0)
+                            ),
+                            normal_pnl_threshold=float(
+                                pnl_tier_cfg.get("normal_pnl_threshold", 0.0)
+                            ),
+                            strong_multiplier=float(
+                                pnl_tier_cfg.get("strong_multiplier", 1.0) or 1.0
+                            ),
+                            normal_multiplier=float(
+                                pnl_tier_cfg.get("normal_multiplier", 0.7) or 0.7
+                            ),
+                            probation_multiplier=float(
+                                pnl_tier_cfg.get("probation_multiplier", 0.4) or 0.4
+                            ),
+                            min_sample=int(
+                                pnl_tier_cfg.get("min_sample", 3) or 3
+                            ),
+                        )
+                        size_multiplier *= float(pnl_tier.get("multiplier", 1.0))
+                        logger.info(
+                            "[HyperliquidPaper] %s pnl-tier=%s mult=%.2f lookback=%d "
+                            "trades pnl=%.2f reason=%s",
+                            mirrored.get("strategy"),
+                            pnl_tier.get("tier"),
+                            pnl_tier.get("multiplier"),
+                            pnl_tier.get("lookback_trades"),
+                            pnl_tier.get("lookback_pnl"),
+                            pnl_tier.get("reason"),
+                        )
                     utc_hour = datetime.utcnow().hour
                     if is_block_window(utc_hour, cfg):
                         logger.info(
