@@ -94,6 +94,7 @@ from hyperliquid_perps import (
     filter_allowed_coin,
     find_mirror_spot_pair,
     hyperliquid_coin_entry_block,
+    hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
     hyperliquid_standalone_entry_gate,
@@ -5689,6 +5690,14 @@ class TradingOrchestrator:
                         logger.info(
                             "[HyperliquidPaper] Blocked PAPER %s %s: %s",
                             side, coin, chase_gate.get("reason"),
+                        )
+                        continue
+
+                    edge_gate = hyperliquid_min_edge_gate(mirrored, cfg)
+                    if edge_gate.get("blocked"):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s",
+                            side, coin, edge_gate.get("reason"),
                         )
                         continue
 

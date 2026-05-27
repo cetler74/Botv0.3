@@ -16,6 +16,7 @@ from hyperliquid_perps import (  # noqa: E402
     calculate_perp_pnl,
     evaluate_paper_perp_exit,
     hyperliquid_coin_entry_block,
+    hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
     hyperliquid_standalone_entry_gate,
@@ -1333,3 +1334,111 @@ def test_trend_chase_reads_state_indicators_fallback():
     }
     result = hyperliquid_trend_chase_gate(sig, "trending_up")
     assert result["blocked"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (2026-05-27): Fee-aware minimum-edge gate
+# ---------------------------------------------------------------------------
+
+
+def _edge_cfg(**overrides):
+    cfg = {
+        "fee_rate_per_side": 0.001,
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.40,
+            "edge_multiplier": 2.0,
+        },
+    }
+    cfg["min_edge_gate"].update(overrides)
+    return cfg
+
+
+def test_min_edge_gate_disabled_flag():
+    cfg = _edge_cfg(enabled=False)
+    result = hyperliquid_min_edge_gate({"expected_move_pct": 0.1}, cfg)
+    assert result["blocked"] is False
+    assert result["reason"] == "min_edge_disabled"
+
+
+def test_min_edge_gate_passes_when_no_data():
+    cfg = _edge_cfg()
+    result = hyperliquid_min_edge_gate({"signal": "long"}, cfg)
+    assert result["blocked"] is False
+    assert result["reason"] == "min_edge_no_data"
+
+
+def test_min_edge_gate_uses_direct_expected_move():
+    cfg = _edge_cfg()
+    result = hyperliquid_min_edge_gate(
+        {"signal": "long", "expected_move_pct": 0.55}, cfg,
+    )
+    assert result["blocked"] is False
+    assert result["expectedMovePct"] == pytest.approx(0.55)
+
+
+def test_min_edge_gate_blocks_below_threshold():
+    cfg = _edge_cfg()
+    result = hyperliquid_min_edge_gate(
+        {"signal": "long", "expected_move_pct": 0.25}, cfg,
+    )
+    assert result["blocked"] is True
+    assert "min_edge_blocked" in result["reason"]
+
+
+def test_min_edge_gate_reads_indicator_field():
+    cfg = _edge_cfg()
+    result = hyperliquid_min_edge_gate(
+        {
+            "signal": "long",
+            "details": {"indicators": {"expected_move_pct": 0.65}},
+        },
+        cfg,
+    )
+    assert result["blocked"] is False
+    assert result["expectedMovePct"] == pytest.approx(0.65)
+
+
+def test_min_edge_gate_normalizes_decimal_pct():
+    """Values < 0.1 are interpreted as decimal form (0.002 -> 0.2%)."""
+    cfg = _edge_cfg()
+    result = hyperliquid_min_edge_gate(
+        {"signal": "long", "expected_move_pct": 0.002}, cfg,
+    )
+    assert result["expectedMovePct"] == pytest.approx(0.2)
+    assert result["blocked"] is True
+    assert result["expectedMovePct"] < result["thresholdPct"]
+
+    permissive = hyperliquid_min_edge_gate(
+        {"signal": "long", "expected_move_pct": 0.006}, cfg,
+    )
+    assert permissive["expectedMovePct"] == pytest.approx(0.6)
+    assert permissive["blocked"] is False
+
+
+def test_min_edge_gate_derives_from_tp_sl_and_confidence():
+    cfg = _edge_cfg()
+    signal = {
+        "signal": "long",
+        "confidence": 0.7,
+        "details": {
+            "indicators": {
+                "take_profit_pct": 2.0,
+                "stop_loss_pct": 1.5,
+            }
+        },
+    }
+    result = hyperliquid_min_edge_gate(signal, cfg)
+    assert result["blocked"] is False
+    expected = 2.0 - 1.5 * (1.0 - 0.7)
+    assert result["expectedMovePct"] == pytest.approx(expected)
+
+
+def test_min_edge_gate_threshold_follows_fee_rate():
+    cfg = _edge_cfg()
+    cfg["fee_rate_per_side"] = 0.0025
+    result = hyperliquid_min_edge_gate(
+        {"signal": "long", "expected_move_pct": 0.90}, cfg,
+    )
+    assert result["blocked"] is True
+    assert result["thresholdPct"] == pytest.approx(1.0)

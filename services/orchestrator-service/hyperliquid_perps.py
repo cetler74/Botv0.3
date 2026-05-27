@@ -1305,6 +1305,148 @@ def hyperliquid_regime_direction_gate(
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 (2026-05-27): Fee-aware minimum-edge gate
+#
+# Round-trip taker fees on Hyperliquid at the paper-engine's default rate
+# (0.001 per side -> 0.002 round trip = 0.2%) mean any entry whose expected
+# move is less than ~2x fees is structurally negative EV. Observed avg fees
+# on the 166-trade sample were $0.43/trade (~0.21% on $200 notional).
+#
+# This gate computes an expected_move_pct from the signal payload (or a
+# conservative proxy from confidence + stop/target) and rejects entries
+# where expected move < max(min_edge_pct, fee_round_trip * edge_multiplier).
+# ---------------------------------------------------------------------------
+
+
+def _expected_move_pct_from_signal(signal: Dict[str, Any]) -> Optional[float]:
+    """
+    Read expected_move_pct from a signal, falling back to TP/SL geometry.
+
+    Priority:
+      1. signal.expected_move_pct
+      2. signal.details.indicators.expected_move_pct
+      3. (take_profit_pct - stop_loss_pct * (1 - confidence)) derived
+         from indicators or strategy parameters.
+
+    Decimal forms (0.012) are normalized to percent (1.2).
+    Returns None when nothing usable is available.
+    """
+    if not isinstance(signal, dict):
+        return None
+
+    def _normalize(raw: Any) -> Optional[float]:
+        """Accept percent OR explicit decimal (<0.1) form. Values in [0.1, 50]
+        are treated as already in percent so "0.55" stays as 0.55%."""
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        if value < 0.1:
+            value *= 100.0
+        return value
+
+    direct = _normalize(signal.get("expected_move_pct"))
+    if direct is not None:
+        return direct
+
+    indicators = _extract_indicators(signal)
+    indicator = _normalize(indicators.get("expected_move_pct"))
+    if indicator is not None:
+        return indicator
+
+    details = signal.get("details") or {}
+    candidates: List[Mapping[str, Any]] = []
+    if isinstance(details, dict):
+        for key in ("indicators", "parameters"):
+            data = details.get(key)
+            if isinstance(data, dict):
+                candidates.append(data)
+        candidates.append(details)
+    if not candidates:
+        return None
+
+    def _first_float(*keys: str) -> Optional[float]:
+        for source in candidates:
+            for key in keys:
+                if key in source:
+                    parsed = _normalize(source.get(key))
+                    if parsed is not None:
+                        return parsed
+        return None
+
+    take_profit_pct = _first_float("take_profit_pct", "tp_pct", "target_pct")
+    stop_loss_pct = _first_float("stop_loss_pct", "sl_pct", "stop_pct")
+    if take_profit_pct is None or stop_loss_pct is None:
+        return None
+
+    try:
+        confidence = float(signal.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    expected = take_profit_pct - stop_loss_pct * (1.0 - confidence)
+    if expected <= 0:
+        return None
+    return expected
+
+
+def hyperliquid_min_edge_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Reject entries whose expected move (percent) is too small relative to
+    the round-trip fee load. Soft when expected_move_pct can't be derived.
+    """
+    edge_cfg = ((hl_cfg or {}).get("min_edge_gate") or {})
+    enabled = edge_cfg.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "blocked": False,
+            "reason": "min_edge_disabled",
+            "expectedMovePct": None,
+        }
+
+    min_edge_pct = _safe_float(edge_cfg.get("min_edge_pct", 0.40), 0.40)
+    edge_multiplier = _safe_float(edge_cfg.get("edge_multiplier", 2.0), 2.0)
+    fee_rate_per_side = _safe_float(
+        (hl_cfg or {}).get("fee_rate_per_side", 0.001), 0.001
+    )
+    fee_round_trip_pct = fee_rate_per_side * 2.0 * 100.0
+    threshold_pct = max(min_edge_pct, fee_round_trip_pct * edge_multiplier)
+
+    expected = _expected_move_pct_from_signal(signal)
+    if expected is None:
+        return {
+            "blocked": False,
+            "reason": "min_edge_no_data",
+            "expectedMovePct": None,
+            "thresholdPct": threshold_pct,
+        }
+
+    if expected < threshold_pct:
+        return {
+            "blocked": True,
+            "reason": (
+                f"min_edge_blocked_{expected:.2f}pct_lt_{threshold_pct:.2f}pct"
+            ),
+            "expectedMovePct": expected,
+            "thresholdPct": threshold_pct,
+        }
+
+    return {
+        "blocked": False,
+        "reason": "min_edge_pass",
+        "expectedMovePct": expected,
+        "thresholdPct": threshold_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 (2026-05-27): Trend-chase guard
 #
 # Lifetime PnL by regime × side from the 166-trade sample showed:

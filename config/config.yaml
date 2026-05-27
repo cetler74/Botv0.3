@@ -2035,6 +2035,15 @@ trading:
       ONDO: 1.2
       HYPE: 1.2
       LIT: 1.2
+    # Phase 6 (2026-05-27): reject entries whose expected move is too small
+    # to cover round-trip fees. Threshold = max(min_edge_pct, fee_round_trip
+    # * edge_multiplier). With fee_rate_per_side=0.001 and multiplier=2.0,
+    # the effective floor is 0.40% expected move. Strategies that do not
+    # publish expected_move_pct are passthrough (soft gate).
+    min_edge_gate:
+      enabled: true
+      min_edge_pct: 0.40
+      edge_multiplier: 2.0
     strategy_performance_logging:
       enabled: true
       # Recent closed paper trades per strategy + side used only for observability.
