@@ -94,9 +94,12 @@ from hyperliquid_perps import (
     filter_allowed_coin,
     find_mirror_spot_pair,
     hyperliquid_coin_entry_block,
+    hyperliquid_reentry_cooldown_check,
+    hyperliquid_regime_direction_gate,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
     perp_side_fee,
@@ -5659,6 +5662,38 @@ class TradingOrchestrator:
                             float(mirrored.get("consensus_agreement") or 0.0),
                         )
                         continue
+
+                    market_regime = str(
+                        (signals_data.get("market_regime") or "")
+                    ).lower()
+                    regime_gate = hyperliquid_regime_direction_gate(
+                        side, market_regime, conf,
+                        float(mirrored.get("strength") or 0.0),
+                    )
+                    if regime_gate.get("blocked"):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s (regime=%s conf=%.2f)",
+                            side, coin,
+                            regime_gate.get("reason"),
+                            market_regime, conf,
+                        )
+                        continue
+
+                    cooldown_minutes = int(
+                        cfg.get("perp_reentry_cooldown_minutes", 30) or 30
+                    )
+                    cooldown_check = hyperliquid_reentry_cooldown_check(
+                        coin, side, closed_trades,
+                        cooldown_minutes=cooldown_minutes,
+                    )
+                    if cooldown_check.get("blocked"):
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s",
+                            side, coin,
+                            cooldown_check.get("reason"),
+                        )
+                        continue
+
                     perf_logging = (cfg.get("strategy_performance_logging") or {})
                     perf_enabled = perf_logging.get("enabled", True)
                     if perf_enabled is not False and str(perf_enabled).lower() not in {"0", "false", "no", "off"}:
@@ -5779,6 +5814,18 @@ class TradingOrchestrator:
                         if standalone_gate.get("sizeMultiplier") is not None
                         else paper_perp_position_size_multiplier(mirrored, cfg)
                     )
+                    regime_size_mult = regime_gate.get("sizeMultiplier")
+                    if regime_size_mult is not None:
+                        size_multiplier *= float(regime_size_mult)
+                    utc_hour = datetime.utcnow().hour
+                    caution, caution_mult = is_caution_window(utc_hour, cfg)
+                    if caution:
+                        size_multiplier *= caution_mult
+                        logger.info(
+                            "[HyperliquidPaper] Session caution window active (UTC %d:00): "
+                            "sizing *= %.2f for %s %s",
+                            utc_hour, caution_mult, side, coin,
+                        )
                     scaled_max_margin = max_margin * size_multiplier
                     scaled_max_notional = max_notional * size_multiplier
                     margin_used = min(scaled_max_margin, scaled_max_notional / leverage)

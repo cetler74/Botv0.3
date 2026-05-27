@@ -7,11 +7,14 @@ signals into isolated paper positions so spot trading remains untouched.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from strategy.hyperliquid.consensus import normalize_perp_entry_signal
+
+logger = logging.getLogger(__name__)
 
 
 HYPERLIQUID_STRATEGY_FAMILIES = {
@@ -201,16 +204,16 @@ class PaperPerpExitConfig:
     overall_take_profit_pct: float = 4.5
 
     trailing_enabled: bool = True
-    trailing_activation_decimal: float = 0.0035
-    trailing_step_decimal: float = 0.0025
-    tightened_step_decimal: float = 0.0020
+    trailing_activation_decimal: float = 0.0075
+    trailing_step_decimal: float = 0.0050
+    tightened_step_decimal: float = 0.0030
     dynamic_tightening_enabled: bool = True
-    tighten_profit_threshold_decimal: float = 0.0035
-    breakeven_floor_decimal: float = 0.0035
-    min_trigger_distance_decimal: float = 0.0035
+    tighten_profit_threshold_decimal: float = 0.0150
+    breakeven_floor_decimal: float = 0.0050
+    min_trigger_distance_decimal: float = 0.0050
 
     profit_protection_enabled: bool = True
-    profit_protection_activation_decimal: float = 0.0035
+    profit_protection_activation_decimal: float = 0.0050
     fee_rate_per_side: float = 0.001
     profit_protection_fee_buffer: float = 0.0015
     effective_profit_floor_decimal: float = 0.0035
@@ -252,15 +255,15 @@ def paper_perp_exit_config_from_yaml(
         except (TypeError, ValueError):
             return default
 
-    step = _dec("step_percentage", 0.0025)
+    step = _dec("step_percentage", 0.0050)
     tightened = _dec("tightened_step_percentage", step)
     if tightened <= 0:
         tightened = step
 
     try:
-        pp_activation = float(pp.get("activation_threshold", 0.0035) or 0.0035)
+        pp_activation = float(pp.get("activation_threshold", 0.0050) or 0.0050)
     except (TypeError, ValueError):
-        pp_activation = 0.0035
+        pp_activation = 0.0050
 
     try:
         fee_rate_per_side = float(hl_cfg.get("fee_rate_per_side", 0.001) or 0.001)
@@ -271,9 +274,9 @@ def paper_perp_exit_config_from_yaml(
     except (TypeError, ValueError):
         fee_buffer = 0.0015
     fee_floor = max(0.0, (fee_rate_per_side * 2.0) + fee_buffer)
-    breakeven_floor = max(_dec("breakeven_floor_percentage", 0.0035), fee_floor)
-    min_trigger_distance = max(_dec("min_trigger_distance_percentage", 0.0035), fee_floor)
-    trailing_activation = max(_dec("activation_threshold", 0.0035), fee_floor)
+    breakeven_floor = max(_dec("breakeven_floor_percentage", 0.0050), fee_floor)
+    min_trigger_distance = max(_dec("min_trigger_distance_percentage", 0.0050), fee_floor)
+    trailing_activation = max(_dec("activation_threshold", 0.0075), fee_floor)
     pp_activation = max(pp_activation, fee_floor)
 
     return PaperPerpExitConfig(
@@ -288,7 +291,7 @@ def paper_perp_exit_config_from_yaml(
         trailing_step_decimal=step,
         tightened_step_decimal=tightened,
         dynamic_tightening_enabled=bool(trailing.get("dynamic_tightening_enabled", True)),
-        tighten_profit_threshold_decimal=_dec("tighten_profit_threshold", 0.0035),
+        tighten_profit_threshold_decimal=_dec("tighten_profit_threshold", 0.0150),
         breakeven_floor_decimal=breakeven_floor,
         min_trigger_distance_decimal=min_trigger_distance,
         profit_protection_enabled=bool(pp.get("enabled", True)),
@@ -349,10 +352,14 @@ def hyperliquid_standalone_entry_gate(
             "sizeMultiplier": None,
         }
 
-    min_conf = _safe_float(
-        strategy_cfg.get("min_confidence", global_cfg.get("min_confidence", defaults["min_confidence"])),
-        defaults["min_confidence"],
-    )
+    side_conf_key = f"min_confidence_{side}" if side in {"long", "short"} else None
+    if side_conf_key and side_conf_key in strategy_cfg:
+        min_conf = _safe_float(strategy_cfg[side_conf_key], defaults["min_confidence"])
+    else:
+        min_conf = _safe_float(
+            strategy_cfg.get("min_confidence", global_cfg.get("min_confidence", defaults["min_confidence"])),
+            defaults["min_confidence"],
+        )
     min_strength = _safe_float(
         strategy_cfg.get("min_strength", global_cfg.get("min_strength", defaults["min_strength"])),
         defaults["min_strength"],
@@ -1014,3 +1021,156 @@ def find_mirror_spot_pair(
             if pair_to_hyperliquid_coin(str(pair)) == target:
                 return str(exchange_name), str(pair)
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Change 3: Counter-trend regime direction gate
+# ---------------------------------------------------------------------------
+
+_COUNTER_TREND_BLOCKS: Dict[str, str] = {
+    "trending_up": "short",
+    "trending_down": "long",
+}
+
+_COUNTER_TREND_OVERRIDE_MIN_CONFIDENCE = 0.90
+_COUNTER_TREND_OVERRIDE_MIN_STRENGTH = 0.80
+_COUNTER_TREND_OVERRIDE_SIZE_MULTIPLIER = 0.5
+
+
+def hyperliquid_regime_direction_gate(
+    signal_side: str,
+    regime: str,
+    confidence: float,
+    strength: float,
+) -> Dict[str, Any]:
+    """
+    Block entries that go against the dominant trend direction.
+
+    Short entries are blocked in trending_up regimes and long entries in
+    trending_down regimes unless the signal has exceptionally high conviction
+    (confidence >= 0.90 AND strength >= 0.80), in which case entry is allowed
+    at half size.
+    """
+    side = str(signal_side or "").lower()
+    regime_key = str(regime or "").lower()
+    blocked_side = _COUNTER_TREND_BLOCKS.get(regime_key)
+
+    if blocked_side is None or side != blocked_side:
+        return {
+            "blocked": False,
+            "reason": "regime_direction_ok",
+            "sizeMultiplier": None,
+        }
+
+    if (
+        confidence >= _COUNTER_TREND_OVERRIDE_MIN_CONFIDENCE
+        and strength >= _COUNTER_TREND_OVERRIDE_MIN_STRENGTH
+    ):
+        logger.info(
+            "[HL regime gate] counter-trend override: %s %s in %s "
+            "(conf=%.2f str=%.2f) — allowed at %.0f%% size",
+            side, "entry", regime_key, confidence, strength,
+            _COUNTER_TREND_OVERRIDE_SIZE_MULTIPLIER * 100,
+        )
+        return {
+            "blocked": False,
+            "reason": "counter_trend_override_high_conviction",
+            "sizeMultiplier": _COUNTER_TREND_OVERRIDE_SIZE_MULTIPLIER,
+        }
+
+    return {
+        "blocked": True,
+        "reason": f"counter_trend_blocked_{side}_in_{regime_key}",
+        "sizeMultiplier": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Change 5b: Per-coin re-entry cooldown (any exit, not just losses)
+# ---------------------------------------------------------------------------
+
+
+def hyperliquid_reentry_cooldown_check(
+    coin: str,
+    side: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    cooldown_minutes: int = 30,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Block re-entry on the same coin+side within ``cooldown_minutes`` of any
+    prior exit.  This is distinct from the 12h post-loss block — it applies
+    after profitable exits too, preventing rapid re-entry churn.
+    """
+    normalized_coin = pair_to_hyperliquid_coin(coin)
+    normalized_side = str(side or "").lower()
+    if cooldown_minutes <= 0 or not normalized_coin or normalized_side not in {"long", "short"}:
+        return {"blocked": False, "reason": "cooldown_disabled"}
+
+    now_dt = now or datetime.utcnow()
+    cutoff = now_dt - timedelta(minutes=cooldown_minutes)
+
+    for trade in closed_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        if trade_coin != normalized_coin:
+            continue
+        trade_side = str(
+            trade.get("position_side") or trade.get("source_signal") or ""
+        ).lower()
+        if trade_side != normalized_side:
+            continue
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_time is None:
+            continue
+        if exit_time >= cutoff:
+            until = exit_time + timedelta(minutes=cooldown_minutes)
+            return {
+                "blocked": True,
+                "reason": (
+                    f"reentry_cooldown_{normalized_coin}_{normalized_side}_"
+                    f"until_{until.strftime('%H:%M')}"
+                ),
+                "until": until.isoformat() + "+00:00",
+            }
+
+    return {"blocked": False, "reason": "no_recent_exit"}
+
+
+# ---------------------------------------------------------------------------
+# Change 6: Session-aware position sizing
+# ---------------------------------------------------------------------------
+
+
+def is_caution_window(
+    utc_hour: int,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, float]:
+    """
+    Check if the current UTC hour falls in a configured caution window.
+
+    Returns ``(is_caution, multiplier)``.  When not in a caution window the
+    multiplier is 1.0.
+    """
+    session_cfg = ((hl_cfg or {}).get("session_sizing") or {})
+    if not session_cfg.get("enabled", False):
+        return False, 1.0
+
+    caution_mult = _safe_float(session_cfg.get("caution_multiplier", 0.5), 0.5)
+    windows: List[Dict[str, Any]] = session_cfg.get("caution_windows") or []
+
+    for window in windows:
+        start = int(window.get("start_utc", -1))
+        end = int(window.get("end_utc", -1))
+        if start < 0 or end < 0:
+            continue
+        if start <= end:
+            if start <= utc_hour < end:
+                return True, caution_mult
+        else:
+            if utc_hour >= start or utc_hour < end:
+                return True, caution_mult
+
+    return False, 1.0

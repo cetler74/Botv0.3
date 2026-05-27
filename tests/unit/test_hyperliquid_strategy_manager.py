@@ -140,3 +140,27 @@ async def test_hyperliquid_strategy_manager_normalizes_short_signal(monkeypatch)
 
     assert result["strategies"]["fake_perp"]["signal"] == "short"
     assert result["consensus"]["signal"] == "short"
+
+
+def test_deprecated_strategy_logs_warning(monkeypatch, caplog):
+    import hyperliquid_strategy_manager as manager_module
+
+    monkeypatch.setitem(
+        manager_module.HYPERLIQUID_STRATEGY_MAPPING,
+        "heikin_ashi",
+        ("fake_hl_strategy_module", "FakePerpStrategy"),
+    )
+    monkeypatch.setattr(
+        manager_module.importlib,
+        "import_module",
+        lambda module_path: types.SimpleNamespace(FakePerpStrategy=FakePerpStrategy),
+    )
+
+    with caplog.at_level("WARNING"):
+        manager = manager_module.HyperliquidStrategyManager(
+            {"heikin_ashi": {"enabled": True, "parameters": {}}},
+            "http://exchange-service:8003",
+        )
+
+    assert any("heikin_ashi is deprecated" in msg for msg in caplog.messages)
+    assert "heikin_ashi" in manager.strategies

@@ -16,9 +16,12 @@ from hyperliquid_perps import (  # noqa: E402
     calculate_perp_pnl,
     evaluate_paper_perp_exit,
     hyperliquid_coin_entry_block,
+    hyperliquid_reentry_cooldown_check,
+    hyperliquid_regime_direction_gate,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
     perp_side_fee,
@@ -675,3 +678,255 @@ def test_spot_trailing_short_exits_on_bounce():
     )
     assert exited.exit_reason
     assert "trailing_stop" in exited.exit_reason
+
+
+# ---------------------------------------------------------------------------
+# Change 2: Wider trailing stop defaults
+# ---------------------------------------------------------------------------
+
+
+def test_default_exit_config_uses_widened_trailing_params():
+    cfg = PaperPerpExitConfig()
+    assert cfg.trailing_activation_decimal == pytest.approx(0.0075)
+    assert cfg.trailing_step_decimal == pytest.approx(0.0050)
+    assert cfg.tightened_step_decimal == pytest.approx(0.0030)
+    assert cfg.tighten_profit_threshold_decimal == pytest.approx(0.0150)
+    assert cfg.breakeven_floor_decimal == pytest.approx(0.0050)
+    assert cfg.min_trigger_distance_decimal == pytest.approx(0.0050)
+    assert cfg.profit_protection_activation_decimal == pytest.approx(0.0050)
+
+
+def test_widened_trailing_does_not_arm_at_half_percent():
+    """With activation at 0.75%, a +0.50% move should NOT activate the trail."""
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": (datetime.utcnow() - timedelta(minutes=5)).isoformat(),
+        "metadata": {},
+    }
+    cfg = PaperPerpExitConfig()
+    result = evaluate_paper_perp_exit(trade, 100.50, cfg)
+    assert result.exit_reason is None
+    assert result.metadata.get("trail_stop") != "active"
+
+
+def test_widened_trailing_arms_at_one_percent():
+    """With activation at 0.75%, a +1.0% move should activate the trail."""
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": (datetime.utcnow() - timedelta(minutes=5)).isoformat(),
+        "metadata": {},
+    }
+    cfg = PaperPerpExitConfig()
+    result = evaluate_paper_perp_exit(trade, 101.0, cfg)
+    assert result.exit_reason is None
+    assert result.metadata.get("trail_stop") == "active"
+
+
+# ---------------------------------------------------------------------------
+# Change 3: Counter-trend regime direction gate
+# ---------------------------------------------------------------------------
+
+
+def test_regime_direction_gate_blocks_short_in_trending_up():
+    gate = hyperliquid_regime_direction_gate("short", "trending_up", 0.75, 0.60)
+    assert gate["blocked"] is True
+    assert "counter_trend_blocked" in gate["reason"]
+
+
+def test_regime_direction_gate_blocks_long_in_trending_down():
+    gate = hyperliquid_regime_direction_gate("long", "trending_down", 0.75, 0.60)
+    assert gate["blocked"] is True
+    assert "counter_trend_blocked" in gate["reason"]
+
+
+def test_regime_direction_gate_allows_long_in_trending_up():
+    gate = hyperliquid_regime_direction_gate("long", "trending_up", 0.75, 0.60)
+    assert gate["blocked"] is False
+
+
+def test_regime_direction_gate_allows_any_in_sideways():
+    for side in ("long", "short"):
+        gate = hyperliquid_regime_direction_gate(side, "sideways", 0.50, 0.50)
+        assert gate["blocked"] is False
+
+
+def test_regime_direction_gate_high_conviction_override():
+    gate = hyperliquid_regime_direction_gate("short", "trending_up", 0.92, 0.85)
+    assert gate["blocked"] is False
+    assert gate["reason"] == "counter_trend_override_high_conviction"
+    assert gate["sizeMultiplier"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Change 4: Per-side standalone gate for VWMA Hull
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_gate_uses_per_side_min_confidence_short():
+    signal = {
+        "strategy": "vwma_hull",
+        "signal": "short",
+        "confidence": 0.80,
+        "strength": 0.50,
+    }
+    cfg = {
+        "standalone_strategy_gates": {
+            "global": {"enabled": True},
+            "vwma_hull": {
+                "enabled": True,
+                "min_confidence": 0.70,
+                "min_confidence_short": 0.85,
+                "min_strength": 0.20,
+            },
+        }
+    }
+    gate = hyperliquid_standalone_entry_gate(signal, cfg)
+    assert gate["isStandalone"] is True
+    assert gate["allowed"] is False
+    assert "confidence_0.80_lt_0.85" in gate["reason"]
+
+
+def test_standalone_gate_uses_per_side_confidence_long_uses_default():
+    signal = {
+        "strategy": "vwma_hull",
+        "signal": "long",
+        "confidence": 0.72,
+        "strength": 0.50,
+    }
+    cfg = {
+        "standalone_strategy_gates": {
+            "global": {"enabled": True},
+            "vwma_hull": {
+                "enabled": True,
+                "min_confidence": 0.70,
+                "min_confidence_short": 0.85,
+                "min_strength": 0.20,
+            },
+        }
+    }
+    gate = hyperliquid_standalone_entry_gate(signal, cfg)
+    assert gate["isStandalone"] is True
+    assert gate["allowed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Change 5: Re-entry cooldown
+# ---------------------------------------------------------------------------
+
+
+def test_reentry_cooldown_blocks_within_window():
+    now = datetime(2026, 5, 26, 14, 0, 0)
+    closed_trades = [
+        {
+            "coin": "WLD",
+            "position_side": "long",
+            "realized_pnl": 1.50,
+            "exit_time": (now - timedelta(minutes=15)).isoformat(),
+        }
+    ]
+    result = hyperliquid_reentry_cooldown_check(
+        "WLD", "long", closed_trades, cooldown_minutes=30, now=now,
+    )
+    assert result["blocked"] is True
+    assert "reentry_cooldown" in result["reason"]
+
+
+def test_reentry_cooldown_allows_after_window():
+    now = datetime(2026, 5, 26, 14, 0, 0)
+    closed_trades = [
+        {
+            "coin": "WLD",
+            "position_side": "long",
+            "realized_pnl": 1.50,
+            "exit_time": (now - timedelta(minutes=45)).isoformat(),
+        }
+    ]
+    result = hyperliquid_reentry_cooldown_check(
+        "WLD", "long", closed_trades, cooldown_minutes=30, now=now,
+    )
+    assert result["blocked"] is False
+
+
+def test_reentry_cooldown_does_not_cross_sides():
+    now = datetime(2026, 5, 26, 14, 0, 0)
+    closed_trades = [
+        {
+            "coin": "WLD",
+            "position_side": "short",
+            "realized_pnl": -0.50,
+            "exit_time": (now - timedelta(minutes=5)).isoformat(),
+        }
+    ]
+    result = hyperliquid_reentry_cooldown_check(
+        "WLD", "long", closed_trades, cooldown_minutes=30, now=now,
+    )
+    assert result["blocked"] is False
+
+
+# ---------------------------------------------------------------------------
+# Change 6: Session-aware position sizing
+# ---------------------------------------------------------------------------
+
+
+def test_is_caution_window_inside():
+    cfg = {
+        "session_sizing": {
+            "enabled": True,
+            "caution_multiplier": 0.5,
+            "caution_windows": [{"start_utc": 10, "end_utc": 12}],
+        }
+    }
+    is_caution, mult = is_caution_window(10, cfg)
+    assert is_caution is True
+    assert mult == pytest.approx(0.5)
+
+    is_caution2, _ = is_caution_window(11, cfg)
+    assert is_caution2 is True
+
+
+def test_is_caution_window_outside():
+    cfg = {
+        "session_sizing": {
+            "enabled": True,
+            "caution_multiplier": 0.5,
+            "caution_windows": [{"start_utc": 10, "end_utc": 12}],
+        }
+    }
+    is_caution, mult = is_caution_window(12, cfg)
+    assert is_caution is False
+    assert mult == pytest.approx(1.0)
+
+
+def test_is_caution_window_disabled():
+    cfg = {
+        "session_sizing": {
+            "enabled": False,
+            "caution_multiplier": 0.5,
+            "caution_windows": [{"start_utc": 10, "end_utc": 12}],
+        }
+    }
+    is_caution, mult = is_caution_window(11, cfg)
+    assert is_caution is False
+    assert mult == pytest.approx(1.0)
+
+
+def test_is_caution_window_wrapping():
+    """A window from 22:00 to 02:00 UTC should wrap around midnight."""
+    cfg = {
+        "session_sizing": {
+            "enabled": True,
+            "caution_multiplier": 0.4,
+            "caution_windows": [{"start_utc": 22, "end_utc": 2}],
+        }
+    }
+    is_caution, mult = is_caution_window(23, cfg)
+    assert is_caution is True
+    assert mult == pytest.approx(0.4)
+
+    is_caution2, _ = is_caution_window(1, cfg)
+    assert is_caution2 is True
+
+    is_caution3, _ = is_caution_window(3, cfg)
+    assert is_caution3 is False

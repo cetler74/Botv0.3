@@ -1711,7 +1711,7 @@ strategies_hyperliquid:
       stop_loss_pct: 1.5
       take_profit_pct: 2.5
   heikin_ashi:
-    enabled: true
+    enabled: false  # 2026-05-26: disabled — 0% WR on 28 closed shorts (-$29.24 lifetime), 0/4 today (-$4.91). See design spec.
     parameters:
       allow_long: true
       allow_short: true
@@ -1961,8 +1961,8 @@ trading:
     signal_source: hyperliquid_strategies
     strategy_consensus:
       min_agreement: 50
-      min_confidence_long: 0.55
-      min_confidence_short: 0.55
+      min_confidence_long: 0.62
+      min_confidence_short: 0.62
     # Perpetual paper exits are position-close decisions, not opposite entry
     # signals. Keep exits centralized in stop loss / trailing profit protection
     # so a short entry is never confused with a spot-style sell signal.
@@ -1979,8 +1979,17 @@ trading:
     max_margin_per_trade: 100.0
     max_notional_per_trade: 200.0
     max_open_positions: 6
-    min_confidence_long: 0.55
-    min_confidence_short: 0.55
+    min_confidence_long: 0.62
+    min_confidence_short: 0.62
+    # 2026-05-26: re-entry cooldown after ANY exit on same coin+side (not just losses).
+    perp_reentry_cooldown_minutes: 30
+    # 2026-05-26: session-aware position sizing — reduce size during choppy windows.
+    session_sizing:
+      enabled: true
+      caution_multiplier: 0.5
+      caution_windows:
+        - start_utc: 10
+          end_utc: 12
     # Fixed downside stop is enabled so losing positions do not wait for max-hold exits.
     fixed_stop_loss_enabled: true
     stop_loss_pct: 1.5
@@ -2023,12 +2032,13 @@ trading:
           min_confidence: 0.85
           min_strength: 0.65
       heikin_ashi:
-        enabled: true
+        enabled: false  # 2026-05-26: strategy disabled
         min_confidence: 0.75
         min_strength: 0.50
       vwma_hull:
         enabled: true
         min_confidence: 0.70
+        min_confidence_short: 0.85  # 2026-05-26: shorts underperform — raise bar for short side
         min_strength: 0.20
       macd_momentum:
         enabled: true

@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 HL_DEFAULT_TIMEFRAMES = ["1h", "4h", "15m", "5m"]
 
+DEPRECATED_STRATEGIES = {
+    "heikin_ashi": (
+        "heikin_ashi is deprecated (2026-05-26): 0% WR on 28 closed shorts "
+        "(-$29.24 lifetime perp), 0/4 today (-$4.91). "
+        "Disable in config or review design spec before re-enabling."
+    ),
+}
+
 
 class HyperliquidExchangeAdapter:
     """Fetch HL OHLCV via exchange-service."""
@@ -79,6 +87,9 @@ class HyperliquidStrategyManager:
                 continue
             if not strategy_config.get("enabled", False):
                 continue
+            deprecation_msg = DEPRECATED_STRATEGIES.get(strategy_name)
+            if deprecation_msg:
+                logger.warning("[HLStrategy] %s", deprecation_msg)
             mapping = HYPERLIQUID_STRATEGY_MAPPING.get(strategy_name)
             if not mapping:
                 logger.warning("[HLStrategy] No mapping for %s", strategy_name)
