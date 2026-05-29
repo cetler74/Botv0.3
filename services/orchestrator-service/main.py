@@ -5484,6 +5484,19 @@ class TradingOrchestrator:
                                 coin,
                                 exc,
                             )
+                    if not exit_reason:
+                        try:
+                            structural = await self._hyperliquid_perp_structural_exit_signal(
+                                trade, coin, cfg
+                            )
+                            if structural:
+                                exit_reason = structural
+                        except Exception as exc:
+                            logger.debug(
+                                "[HyperliquidPaper] structural exit skipped %s: %s",
+                                coin,
+                                exc,
+                            )
                     exit_eval = evaluate_paper_perp_exit(trade, current_price, exit_cfg)
                     if not exit_reason:
                         exit_reason = exit_eval.exit_reason
@@ -5693,6 +5706,7 @@ class TradingOrchestrator:
                             side, coin, chase_gate.get("reason"),
                         )
                         continue
+                    chase_size_mult = chase_gate.get("sizeMultiplier")
 
                     edge_gate = hyperliquid_min_edge_gate(mirrored, cfg)
                     if edge_gate.get("blocked"):
@@ -5840,6 +5854,14 @@ class TradingOrchestrator:
                     regime_size_mult = regime_gate.get("sizeMultiplier")
                     if regime_size_mult is not None:
                         size_multiplier *= float(regime_size_mult)
+                    if chase_size_mult is not None:
+                        size_multiplier *= float(chase_size_mult)
+                        logger.info(
+                            "[HyperliquidPaper] %s %s trend-chase unproven: "
+                            "sizing *= %.2f (regime=%s)",
+                            side, coin, float(chase_size_mult), market_regime,
+                        )
+                    winner_strong = False
                     pnl_tier_cfg = (cfg.get("strategy_pnl_sizing") or {})
                     if pnl_tier_cfg.get("enabled", True) is not False:
                         pnl_tier = hyperliquid_strategy_pnl_multiplier(
@@ -5868,6 +5890,7 @@ class TradingOrchestrator:
                             ),
                         )
                         size_multiplier *= float(pnl_tier.get("multiplier", 1.0))
+                        winner_strong = pnl_tier.get("tier") == "strong"
                         logger.info(
                             "[HyperliquidPaper] %s pnl-tier=%s mult=%.2f lookback=%d "
                             "trades pnl=%.2f reason=%s",
@@ -5894,6 +5917,20 @@ class TradingOrchestrator:
                             "sizing *= %.2f for %s %s",
                             utc_hour, caution_mult, side, coin,
                         )
+                    # Phase B (2026-05-29): concentrate capital into proven winners.
+                    # Floor the compounded multiplier for strong-tier strategies so
+                    # caution / regime / chase penalties cannot starve a strategy
+                    # that is carrying the book (e.g. swing_hull_rsi_ema PF 2.10).
+                    winner_floor = float(
+                        pnl_tier_cfg.get("winner_floor_multiplier", 0.0) or 0.0
+                    )
+                    if winner_strong and winner_floor > 0 and size_multiplier < winner_floor:
+                        logger.info(
+                            "[HyperliquidPaper] %s %s strong-tier winner floor: "
+                            "sizing %.2f -> %.2f",
+                            side, coin, size_multiplier, winner_floor,
+                        )
+                        size_multiplier = winner_floor
                     scaled_max_margin = max_margin * size_multiplier
                     scaled_max_notional = max_notional * size_multiplier
                     margin_used = min(scaled_max_margin, scaled_max_notional / leverage)
@@ -10027,6 +10064,76 @@ class TradingOrchestrator:
         if df is None or df.empty:
             return False, None
         return stub.structural_long_exit_from_ohlcv(df)
+
+    async def _hyperliquid_perp_structural_exit_signal(
+        self,
+        trade: Dict[str, Any],
+        coin: str,
+        hl_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Structural long exit for HL paper perps (vwma_hull / swing_hull_rsi_ema)."""
+        exits_cfg = (hl_cfg or {}).get("structural_exits") or {}
+        if not bool(exits_cfg.get("enabled", True)):
+            return None
+        side = str(trade.get("position_side") or "long").lower()
+        if side != "long":
+            return None
+        source = str(trade.get("source_strategy") or "").strip().lower()
+        if not source:
+            return None
+        allowed_raw = exits_cfg.get("strategies") or ["vwma_hull", "swing_hull_rsi_ema"]
+        allowed = {str(s).strip().lower() for s in allowed_raw if str(s).strip()}
+        if allowed and source not in allowed:
+            return None
+
+        root = getattr(self, "_config", None) or {}
+        strat_root = root.get("strategies_hyperliquid") or {}
+        strat_block = strat_root.get(source) or {}
+        params = strat_block.get("parameters") or {}
+        if not bool(strat_block.get("enabled", True)):
+            return None
+        if params.get("orchestrator_structural_exit_enabled", True) is False:
+            return None
+
+        min_hold_minutes = float(params.get("structural_exit_min_hold_minutes", 0) or 0)
+        if min_hold_minutes > 0:
+            age_minutes = self._trade_age_minutes(trade)
+            if age_minutes < min_hold_minutes:
+                return None
+
+        tf = str(params.get("structural_exit_timeframe") or "1h")
+        pair = f"{str(coin).upper()}/USDC"
+        df = await self._fetch_ohlcv_dataframe_for_structural(
+            "hyperliquid", pair, timeframe=tf, limit=160
+        )
+        if df is None or df.empty:
+            return None
+
+        stub_cfg = {"parameters": params}
+        try:
+            if source == "vwma_hull":
+                from strategy.hyperliquid.vwma_hull_perp import VwmaHullPerpStrategy
+
+                stub = VwmaHullPerpStrategy(stub_cfg, None, None)
+            elif source == "swing_hull_rsi_ema":
+                from strategy.hyperliquid.swing_hull_rsi_ema_perp import (
+                    SwingHullRsiEmaPerpStrategy,
+                )
+
+                stub = SwingHullRsiEmaPerpStrategy(stub_cfg, None, None)
+            else:
+                return None
+            hit, tag = stub.structural_long_exit_from_ohlcv(df)
+            if hit:
+                return f"paper_{source}_structural_{tag or 'signal'}"
+        except Exception as exc:
+            logger.debug(
+                "[HyperliquidPaper] structural exit failed %s/%s: %s",
+                coin,
+                source,
+                exc,
+            )
+        return None
 
     async def _fetch_mid_price_from_orderbook(self, exchange_name: str, pair: str) -> float:
         """Mid (bid+ask)/2 from order book when ticker and OHLCV are unavailable."""

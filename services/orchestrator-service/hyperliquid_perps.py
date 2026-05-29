@@ -232,6 +232,10 @@ class PaperPerpExitConfig:
     # Highest priority — used regardless of ATR availability.
     per_coin_stop_overrides: Dict[str, float] = field(default_factory=dict)
 
+    # Ported from spot stagnant_loser (2026-05-28): pre-empt full SL on never-armed chop.
+    stagnant_loser_enabled: bool = True
+    stagnant_loser: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class PaperPerpExitResult:
@@ -246,8 +250,11 @@ def paper_perp_exit_config_from_yaml(
     """Build exit config from hyperliquid_perps + global trading sections."""
     hl_cfg = hl_cfg or {}
     trading_cfg = trading_cfg or {}
-    trailing = trading_cfg.get("trailing_stop") or {}
-    pp = trading_cfg.get("profit_protection") or {}
+    # Perp-specific overrides win over global spot trailing / profit protection.
+    trailing = hl_cfg.get("trailing_stop") or trading_cfg.get("trailing_stop") or {}
+    pp = hl_cfg.get("profit_protection") or trading_cfg.get("profit_protection") or {}
+    stagnant_raw = hl_cfg.get("stagnant_loser") or trading_cfg.get("stagnant_loser") or {}
+    stagnant_loser = dict(stagnant_raw) if isinstance(stagnant_raw, dict) else {}
 
     overall_dec = float(trading_cfg.get("overall_profit_take_exit_pct", 0.045) or 0.0)
     overall_pct = overall_dec * 100.0 if overall_dec > 0 else 0.0
@@ -322,6 +329,12 @@ def paper_perp_exit_config_from_yaml(
     except (TypeError, ValueError):
         max_hold_hard = 360
 
+    stagnant_enabled = hl_cfg.get("stagnant_loser_enabled")
+    if stagnant_enabled is None:
+        stagnant_enabled = True
+    else:
+        stagnant_enabled = bool(stagnant_enabled)
+
     return PaperPerpExitConfig(
         use_spot_exit_rules=use_spot,
         fixed_stop_loss_enabled=bool(hl_cfg.get("fixed_stop_loss_enabled", True)),
@@ -348,6 +361,8 @@ def paper_perp_exit_config_from_yaml(
         stop_loss_atr_min_pct=atr_min_pct,
         stop_loss_atr_max_pct=atr_max_pct,
         per_coin_stop_overrides=overrides,
+        stagnant_loser_enabled=stagnant_enabled,
+        stagnant_loser=stagnant_loser,
     )
 
 
@@ -1072,6 +1087,112 @@ def _max_holding_decision(
     return None, changed
 
 
+def _stagnant_loser_decision(
+    trade: Dict[str, Any],
+    side: str,
+    entry_price: float,
+    pct: float,
+    peak_pct: float,
+    cfg: PaperPerpExitConfig,
+    metadata: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Pre-empt full stop-loss on trades that never arm profit protection (spot parity)."""
+    if not cfg.stagnant_loser_enabled or entry_price <= 0:
+        return None
+
+    meta = metadata or {}
+    if meta.get("salvage_mode"):
+        return None
+
+    age_minutes = _elapsed_minutes_since_entry(trade, now=now)
+    if age_minutes is None:
+        return None
+    # Let max-hold salvage handle underwater positions past the soft cap.
+    if cfg.max_holding_minutes > 0 and age_minutes >= cfg.max_holding_minutes:
+        return None
+
+    sl = cfg.stagnant_loser or {}
+    try:
+        min_age_minutes = float(sl.get("min_age_minutes", 25.0) or 25.0)
+    except (TypeError, ValueError):
+        min_age_minutes = 25.0
+    try:
+        base_peak_cap_pct = float(sl.get("peak_cap_pct", 0.55) or 0.55)
+    except (TypeError, ValueError):
+        base_peak_cap_pct = 0.55
+
+    pp_act_dec = cfg.profit_protection_activation_decimal
+    if pp_act_dec > 0:
+        activation_peak_cap = (pp_act_dec * 100.0) * 0.92
+        base_peak_cap_pct = min(base_peak_cap_pct, activation_peak_cap)
+
+    try:
+        base_loss_trigger_pct = float(sl.get("loss_trigger_pct", -0.65) or -0.65)
+    except (TypeError, ValueError):
+        base_loss_trigger_pct = -0.65
+    try:
+        volatility_ref_pct = float(sl.get("volatility_reference_pct", 0.8) or 0.8)
+    except (TypeError, ValueError):
+        volatility_ref_pct = 0.8
+    try:
+        peak_cap_slope = float(sl.get("peak_cap_slope", 0.35) or 0.35)
+    except (TypeError, ValueError):
+        peak_cap_slope = 0.35
+    try:
+        loss_trigger_slope = float(sl.get("loss_trigger_slope", 0.45) or 0.45)
+    except (TypeError, ValueError):
+        loss_trigger_slope = 0.45
+    try:
+        min_age_floor = float(sl.get("min_age_floor_minutes", 20.0) or 20.0)
+    except (TypeError, ValueError):
+        min_age_floor = 20.0
+    try:
+        min_age_ceiling = float(sl.get("min_age_ceiling_minutes", 45.0) or 45.0)
+    except (TypeError, ValueError):
+        min_age_ceiling = 45.0
+
+    vol_factor = abs(float(pct)) / max(0.1, volatility_ref_pct)
+    dynamic_age_minutes = min_age_minutes / max(0.75, vol_factor)
+    dynamic_age_minutes = max(min_age_floor, min(min_age_ceiling, dynamic_age_minutes))
+    dynamic_peak_cap_pct = base_peak_cap_pct + (max(0.0, vol_factor - 1.0) * peak_cap_slope)
+    dynamic_loss_trigger_pct = base_loss_trigger_pct - (
+        max(0.0, vol_factor - 1.0) * loss_trigger_slope
+    )
+
+    try:
+        fast_fail_peak = float(sl.get("fast_fail_peak_pct", 0.15) or 0.15)
+    except (TypeError, ValueError):
+        fast_fail_peak = 0.15
+    try:
+        fast_fail_age = float(sl.get("fast_fail_min_age_minutes", 10.0) or 10.0)
+    except (TypeError, ValueError):
+        fast_fail_age = 10.0
+    try:
+        fast_fail_loss = float(sl.get("fast_fail_loss_pct", -0.40) or -0.40)
+    except (TypeError, ValueError):
+        fast_fail_loss = -0.40
+
+    fast_fail = (
+        age_minutes >= fast_fail_age
+        and peak_pct <= fast_fail_peak
+        and pct <= fast_fail_loss
+    )
+    stagnant_standard = (
+        age_minutes >= dynamic_age_minutes
+        and peak_pct <= dynamic_peak_cap_pct
+        and pct <= dynamic_loss_trigger_pct
+    )
+    if not fast_fail and not stagnant_standard:
+        return None
+
+    tag = "fast_fail" if fast_fail else "divergence"
+    return (
+        f"paper_stagnant_loser_{tag}@{pct:.2f}%"
+        f"_peak{peak_pct:.2f}%_age{age_minutes:.0f}m"
+    )
+
+
 def evaluate_paper_perp_exit(
     trade: Dict[str, Any],
     current_price: float,
@@ -1113,6 +1234,12 @@ def evaluate_paper_perp_exit(
             return PaperPerpExitResult("paper_take_profit", metadata)
         return PaperPerpExitResult(None, metadata)
 
+    stagnant_exit = _stagnant_loser_decision(
+        trade, side, entry_price, pct, peak_pct, cfg, metadata=metadata, now=now
+    )
+    if stagnant_exit:
+        return PaperPerpExitResult(stagnant_exit, metadata)
+
     if cfg.overall_take_profit_pct > 0 and pct >= cfg.overall_take_profit_pct:
         return PaperPerpExitResult(
             f"paper_overall_take_profit_{cfg.overall_take_profit_pct:.2f}%@{pct:.2f}%",
@@ -1128,6 +1255,7 @@ def evaluate_paper_perp_exit(
     if (
         cfg.profit_protection_enabled
         and peak_pct >= pp_activation_pct
+        and peak_pct >= trailing_activation_pct
         and not pp_status
         and not trail_active
     ):
@@ -1146,12 +1274,21 @@ def evaluate_paper_perp_exit(
     ):
         pp_trigger = float(metadata.get("trail_stop_trigger") or 0.0)
         if pp_trigger > 0:
-            if side == "long" and current_price > entry_price and current_price <= pp_trigger:
+            # Do not realize sub-floor gross (e.g. 0.22% when floor is 0.35%) — polling
+            # gaps can cross the trigger price without locking the intended minimum.
+            fee_round_trip_pct = cfg.fee_rate_per_side * 2.0 * 100.0
+            min_pp_exit_pct = max(
+                profit_guarantee_pct,
+                fee_round_trip_pct + (cfg.profit_protection_fee_buffer * 100.0),
+            )
+            if pct + 1e-9 < min_pp_exit_pct:
+                pass
+            elif side == "long" and current_price > entry_price and current_price <= pp_trigger:
                 return PaperPerpExitResult(
                     f"paper_profit_protection_breach@{pct:.2f}%",
                     metadata,
                 )
-            if side == "short" and current_price < entry_price and current_price >= pp_trigger:
+            elif side == "short" and current_price < entry_price and current_price >= pp_trigger:
                 return PaperPerpExitResult(
                     f"paper_profit_protection_breach@{pct:.2f}%",
                     metadata,
@@ -1600,6 +1737,9 @@ def _extract_indicators(signal: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+_TREND_CHASE_UNPROVEN_SIZE_MULTIPLIER = 0.5
+
+
 def hyperliquid_trend_chase_gate(
     signal: Dict[str, Any],
     regime: str,
@@ -1662,10 +1802,15 @@ def hyperliquid_trend_chase_gate(
             rsi_value = None
 
     if pullback_pct is None and rsi_value is None:
+        # Phase C (2026-05-29): with-trend entries in an active chase regime that
+        # cannot prove a pullback / non-extended RSI are the top lifetime leak
+        # (trending_up/long -$51.78). Keep them tradeable but at half size
+        # instead of full pass so we stop top/bottom chasing at full notional.
         return {
             "blocked": False,
             "reason": "trend_chase_no_indicators",
             "passthrough": True,
+            "sizeMultiplier": _TREND_CHASE_UNPROVEN_SIZE_MULTIPLIER,
         }
 
     pullback_ok = pullback_pct is not None and pullback_pct >= min_pullback_pct

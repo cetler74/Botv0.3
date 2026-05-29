@@ -39,6 +39,13 @@ DEPRECATED_STRATEGIES = {
         "heikin_ashi. Disable in config or review profit-plan spec before "
         "re-enabling."
     ),
+    "breakout_retest_long": (
+        "breakout_retest_long is deprecated (2026-05-29): top lifetime loser "
+        "-$52.79 on 37 closed paper trades (43.2% WR, PF 0.26). Higher "
+        "confidence gating (0.80) did not fix the top-chasing entries in "
+        "trending_up. Disable in config or review profit-plan spec before "
+        "re-enabling."
+    ),
 }
 
 
@@ -95,7 +102,8 @@ class HyperliquidStrategyManager:
                 continue
             deprecation_msg = DEPRECATED_STRATEGIES.get(strategy_name)
             if deprecation_msg:
-                logger.warning("[HLStrategy] %s", deprecation_msg)
+                logger.warning("[HLStrategy] Skipping deprecated strategy %s: %s", strategy_name, deprecation_msg)
+                continue
             mapping = HYPERLIQUID_STRATEGY_MAPPING.get(strategy_name)
             if not mapping:
                 logger.warning("[HLStrategy] No mapping for %s", strategy_name)

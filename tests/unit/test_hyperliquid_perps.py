@@ -1248,6 +1248,199 @@ def test_config_yaml_carries_phase3_overrides():
     assert cfg.per_coin_stop_overrides == {"WLD": 1.2, "ONDO": 1.2}
 
 
+def test_perp_trailing_override_prefers_hyperliquid_perps_section():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0075,
+                "step_percentage": 0.0050,
+                "tightened_step_percentage": 0.0030,
+                "dynamic_tightening_enabled": True,
+                "tighten_profit_threshold": 0.0150,
+                "breakeven_floor_percentage": 0.0050,
+                "min_trigger_distance_percentage": 0.0050,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0075},
+        },
+        {
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0035,
+                "step_percentage": 0.0025,
+                "breakeven_floor_percentage": 0.0035,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0035},
+        },
+    )
+    assert cfg.trailing_activation_decimal == pytest.approx(0.0075)
+    assert cfg.trailing_step_decimal == pytest.approx(0.0050)
+    assert cfg.breakeven_floor_decimal == pytest.approx(0.0050)
+    assert cfg.profit_protection_activation_decimal == pytest.approx(0.0075)
+
+
+def test_stagnant_loser_fast_fail_long():
+    now = datetime(2026, 5, 28, 12, 0, 0)
+    cfg = PaperPerpExitConfig(
+        use_spot_exit_rules=True,
+        fixed_stop_loss_enabled=False,
+        stagnant_loser_enabled=True,
+        stagnant_loser={
+            "fast_fail_min_age_minutes": 10,
+            "fast_fail_peak_pct": 0.15,
+            "fast_fail_loss_pct": -0.40,
+        },
+        profit_protection_enabled=False,
+        trailing_enabled=False,
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": (now - timedelta(minutes=15)).isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.5, cfg, now=now)
+    assert result.exit_reason is not None
+    assert "paper_stagnant_loser_fast_fail" in result.exit_reason
+
+
+def test_stagnant_loser_fast_fail_short():
+    now = datetime(2026, 5, 28, 12, 0, 0)
+    cfg = PaperPerpExitConfig(
+        use_spot_exit_rules=True,
+        fixed_stop_loss_enabled=False,
+        stagnant_loser_enabled=True,
+        stagnant_loser={
+            "fast_fail_min_age_minutes": 10,
+            "fast_fail_peak_pct": 0.15,
+            "fast_fail_loss_pct": -0.40,
+        },
+        profit_protection_enabled=False,
+        trailing_enabled=False,
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "short",
+        "entry_time": (now - timedelta(minutes=15)).isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 100.5, cfg, now=now)
+    assert result.exit_reason is not None
+    assert "paper_stagnant_loser_fast_fail" in result.exit_reason
+
+
+def test_stagnant_loser_disabled_skips_exit():
+    now = datetime(2026, 5, 28, 12, 0, 0)
+    cfg = PaperPerpExitConfig(
+        use_spot_exit_rules=True,
+        fixed_stop_loss_enabled=False,
+        stagnant_loser_enabled=False,
+        stagnant_loser={
+            "fast_fail_min_age_minutes": 10,
+            "fast_fail_peak_pct": 0.15,
+            "fast_fail_loss_pct": -0.40,
+        },
+        profit_protection_enabled=False,
+        trailing_enabled=False,
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": (now - timedelta(minutes=15)).isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.5, cfg, now=now)
+    assert result.exit_reason is None
+
+
+def test_profit_protection_loss_guard_skips_breach_below_entry_long():
+    cfg = _spot_like_exit_cfg()
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "highest_price": 100.5,
+            "profit_protection": "profit_guaranteed",
+            "trail_stop_trigger": 100.35,
+        },
+    }
+    result = evaluate_paper_perp_exit(trade, 99.8, cfg)
+    assert result.exit_reason is None
+
+
+def test_profit_protection_skips_breach_below_floor_short():
+    """ENA-like: armed PP must not exit at 0.22% when floor is 0.35%."""
+    cfg = _spot_like_exit_cfg()
+    trade = {
+        "entry_price": 0.087331,
+        "position_side": "short",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "lowest_price": 0.087025,
+            "profit_protection": "profit_guaranteed",
+            "trail_stop_trigger": 0.087331 * (1.0 - cfg.breakeven_floor_decimal),
+        },
+    }
+    result = evaluate_paper_perp_exit(trade, 0.087135, cfg)
+    assert result.exit_reason is None
+
+
+def test_profit_protection_does_not_arm_before_trailing_activation():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0075,
+                "step_percentage": 0.0050,
+                "breakeven_floor_percentage": 0.0050,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0035},
+        },
+        {},
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "short",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {},
+    }
+    # Peak ~0.40% — above PP threshold but below trailing activation (0.75%).
+    result = evaluate_paper_perp_exit(trade, 99.60, cfg)
+    assert result.metadata.get("profit_protection") is None
+
+
+def test_profit_protection_breach_exits_at_floor_short():
+    cfg = _spot_like_exit_cfg()
+    floor_px = 100.0 * (1.0 - cfg.breakeven_floor_decimal)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "short",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "lowest_price": 99.0,
+            "profit_protection": "profit_guaranteed",
+            "trail_stop_trigger": floor_px,
+        },
+    }
+    result = evaluate_paper_perp_exit(trade, floor_px, cfg)
+    assert result.exit_reason is not None
+    assert "profit_protection_breach" in result.exit_reason
+
+
+def test_config_yaml_carries_perp_trailing_and_stagnant_flags():
+    config_path = Path(ROOT) / "config" / "config.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    hl = cfg["trading"]["hyperliquid_perps"]
+    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0075)
+    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0075)
+    assert hl["stagnant_loser_enabled"] is True
+    assert hl["structural_exits"]["enabled"] is True
+    assert "vwma_hull" in hl["structural_exits"]["strategies"]
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 (2026-05-27): Trend-chase guard
 # ---------------------------------------------------------------------------
@@ -1286,6 +1479,22 @@ def test_trend_chase_passthrough_when_indicators_missing():
     assert result["blocked"] is False
     assert result["passthrough"] is True
     assert result["reason"] == "trend_chase_no_indicators"
+    # Phase C (2026-05-29): unproven with-trend entries get half size.
+    assert result["sizeMultiplier"] == pytest.approx(0.5)
+
+
+def test_trend_chase_unproven_short_gets_half_size():
+    sig = _chase_signal("short")
+    result = hyperliquid_trend_chase_gate(sig, "trending_down")
+    assert result["blocked"] is False
+    assert result["sizeMultiplier"] == pytest.approx(0.5)
+
+
+def test_trend_chase_inactive_has_no_size_penalty():
+    sig = _chase_signal("long")
+    result = hyperliquid_trend_chase_gate(sig, "sideways")
+    assert result["blocked"] is False
+    assert result.get("sizeMultiplier") is None
 
 
 def test_trend_chase_blocks_long_with_overbought_rsi_no_pullback():
