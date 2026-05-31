@@ -19,4 +19,8 @@ HYPERLIQUID_STRATEGY_MAPPING = {
         "strategy.hyperliquid.sma_reclaim_bull_flag_perp",
         "SmaReclaimBullFlagPerpStrategy",
     ),
+    "rsi_stoch_reversal_5m": (
+        "strategy.hyperliquid.rsi_stoch_reversal_5m_perp",
+        "RsiStochReversal5mPerpStrategy",
+    ),
 }

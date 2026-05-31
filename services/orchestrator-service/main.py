@@ -94,9 +94,11 @@ from hyperliquid_perps import (
     filter_allowed_coin,
     find_mirror_spot_pair,
     hyperliquid_coin_entry_block,
+    hyperliquid_daily_loss_halt,
     hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
+    hyperliquid_risk_based_notional,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
@@ -112,7 +114,9 @@ from hyperliquid_perps import (
     pnl_percentage,
     position_sides_from_signal,
     select_mirrored_signal,
+    signal_position_size_multiplier,
     sma_reclaim_bull_flag_specialist_gate,
+    stop_distance_pct_from_signal,
 )
 from hyperliquid_pair_selector import select_top_hyperliquid_perps
 from hyperliquid_balance import fetch_hyperliquid_wallet_balance
@@ -127,6 +131,18 @@ trades_pnl = Histogram('orchestrator_trades_pnl', 'Trade PnL distribution', ['ex
 active_trades = Gauge('orchestrator_active_trades', 'Number of active trades', ['exchange', 'pair'], registry=custom_registry)
 balance_total = Gauge('orchestrator_balance_total', 'Total balance', ['exchange', 'currency'], registry=custom_registry)
 balance_available = Gauge('orchestrator_balance_available', 'Available balance', ['exchange', 'currency'], registry=custom_registry)
+active_pairs_gauge = Gauge(
+    'orchestrator_active_pairs',
+    'Pairs loaded in orchestrator pair rotation',
+    ['market_type'],
+    registry=custom_registry,
+)
+active_exchanges_gauge = Gauge(
+    'orchestrator_active_exchanges',
+    'Exchanges with non-empty pair selections',
+    ['market_type'],
+    registry=custom_registry,
+)
 cycle_duration = Histogram('orchestrator_cycle_duration_seconds', 'Duration of trading cycles', ['cycle_type'], registry=custom_registry)
 signals_generated = Counter('orchestrator_signals_total', 'Total signals generated', ['exchange', 'pair', 'strategy', 'signal_type'], registry=custom_registry)
 momentum_filter_decisions = Counter('orchestrator_momentum_filter_total', 'Momentum filter decisions', ['exchange', 'pair', 'decision'], registry=custom_registry)
@@ -509,10 +525,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _refresh_orchestrator_inventory_metrics() -> None:
+    """Expose configured pair universe counts for Grafana (spot vs HL perp)."""
+    spot_pairs = sum(len(v or []) for v in (orchestrator.pair_selections or {}).values())
+    spot_exchanges = sum(1 for v in (orchestrator.pair_selections or {}).values() if v)
+    perp_pairs = len(orchestrator.hyperliquid_pair_pairs or orchestrator.hyperliquid_pair_selections or [])
+    active_pairs_gauge.labels(market_type='spot').set(spot_pairs)
+    active_pairs_gauge.labels(market_type='perp').set(perp_pairs)
+    active_exchanges_gauge.labels(market_type='spot').set(spot_exchanges)
+    active_exchanges_gauge.labels(market_type='perp').set(1 if perp_pairs > 0 else 0)
+
+
 # Metrics endpoint
 @app.get("/metrics")
 async def get_metrics():
     """Prometheus metrics endpoint"""
+    _refresh_orchestrator_inventory_metrics()
     return Response(generate_latest(custom_registry), media_type=CONTENT_TYPE_LATEST)
 
 # Data Models
@@ -1499,6 +1527,7 @@ class TradingOrchestrator:
                 "macd_ema_vwap_scalper",
                 "supertrend",
                 "swing_hull_rsi_ema",
+                "rsi_stoch_reversal_5m",
             }
             consensus_strategies = {
                 name: data
@@ -1527,6 +1556,7 @@ class TradingOrchestrator:
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "sma_reclaim_bull_flag",
+                "rsi_stoch_reversal_5m",
             )
             for strat_name in standalone_buy_strategies:
                 strat_raw = strategies.get(strat_name, {}) or {}
@@ -3177,7 +3207,8 @@ class TradingOrchestrator:
             redis_health_task = None
             
             logger.info("✅ Trading loop initialized successfully - starting main cycle")
-            
+            asyncio.create_task(self._fast_entry_loop())
+
             while self.running:
                 try:
                     self._apply_trading_loop_tunings()
@@ -3640,6 +3671,27 @@ class TradingOrchestrator:
                     or "rsi_gate=false" in entry_reason_lc
                 )
             )
+            is_rsi_stoch_5m_trade = (
+                str(trade.get("strategy") or "").lower() == "rsi_stoch_reversal_5m"
+            )
+            if is_rsi_stoch_5m_trade:
+                rsi_stoch_risk = trading_config.get("rsi_stoch_reversal_5m_risk", {}) or {}
+                pp_activation_decimal = float(
+                    rsi_stoch_risk.get("profit_activation_threshold", pp_activation_decimal)
+                    or pp_activation_decimal
+                )
+                trailing_trigger_decimal = float(
+                    rsi_stoch_risk.get("trailing_activation_threshold", trailing_trigger_decimal)
+                    or trailing_trigger_decimal
+                )
+                trailing_trigger_pct = trailing_trigger_decimal * 100
+                logger.warning(
+                    "[Trade %s] [RsiStoch5mRisk] Using 0.5%% activation profile: "
+                    "pp=%.3f%% trail=%.3f%%",
+                    trade_id,
+                    pp_activation_decimal * 100.0,
+                    trailing_trigger_pct,
+                )
             if is_macd_continuation_trade:
                 cont_risk_cfg = trading_config.get("macd_continuation_risk", {}) or {}
                 pp_activation_decimal = float(
@@ -4984,29 +5036,54 @@ class TradingOrchestrator:
             return {}
 
     async def _run_hyperliquid_perps_cycle(self, deadline: Optional[float] = None) -> None:
-        """Mirror spot strategy signals into isolated Hyperliquid paper perp trades."""
+        """Hyperliquid perp paper mirror or live rsi_stoch execution."""
         cfg = self._hyperliquid_perps_cfg()
         if not bool(cfg.get("enabled", False)):
             return
         mode = str(cfg.get("mode", "paper")).lower()
-        if bool(cfg.get("allow_live_orders", False)):
-            logger.error("[HyperliquidPaper] allow_live_orders=true is ignored by paper engine; no live orders are sent")
 
         await self._refresh_hyperliquid_pair_selections(cfg)
         await self._refresh_hyperliquid_balance(cfg)
-
-        if mode != "paper":
-            logger.debug("[HyperliquidPaper] mode=%s — balance refreshed; paper mirror skipped", mode)
-            return
 
         mids = await self._fetch_hyperliquid_mids()
         if not mids:
             return
 
+        if mode == "live":
+            if bool(cfg.get("live_kill_switch", False)):
+                logger.warning("[HyperliquidLive] live_kill_switch active — no new entries")
+                return
+            if not bool(cfg.get("allow_live_orders", False)):
+                logger.error(
+                    "[HyperliquidLive] mode=live but allow_live_orders=false — blocked"
+                )
+                return
+            from hyperliquid_live_orders import is_live_trading_configured
+
+            if not is_live_trading_configured():
+                logger.error(
+                    "[HyperliquidLive] mode=live but HYPERLIQUID_PRIVATE_KEY unset"
+                )
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            await self._run_hyperliquid_strategy_entries(
+                mids, cfg, deadline=deadline, execution_mode="live"
+            )
+            return
+
+        if mode != "paper":
+            logger.debug(
+                "[HyperliquidPaper] mode=%s — only paper/live supported", mode
+            )
+            return
+
         await self._update_hyperliquid_paper_positions(mids, cfg)
         if deadline is not None and time.monotonic() >= deadline:
             return
-        await self._run_hyperliquid_strategy_entries(mids, cfg, deadline=deadline)
+        await self._run_hyperliquid_strategy_entries(
+            mids, cfg, deadline=deadline, execution_mode="paper"
+        )
 
     async def _hyperliquid_runtime_blocked_coins(self, cfg: Dict[str, Any]) -> List[str]:
         """Coins blocked by current paper-position or recent realized-loss gates."""
@@ -5441,7 +5518,6 @@ class TradingOrchestrator:
         try:
             fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
             trading_cfg = (self._config or {}).get("trading", {}) or {}
-            exit_cfg = paper_perp_exit_config_from_yaml(cfg, trading_cfg)
             use_strategy_exits = bool(cfg.get("use_strategy_exits", False))
             async with httpx.AsyncClient(timeout=20.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
@@ -5497,7 +5573,15 @@ class TradingOrchestrator:
                                 coin,
                                 exc,
                             )
-                    exit_eval = evaluate_paper_perp_exit(trade, current_price, exit_cfg)
+                    exit_eval = evaluate_paper_perp_exit(
+                        trade,
+                        current_price,
+                        paper_perp_exit_config_from_yaml(
+                            cfg,
+                            trading_cfg,
+                            strategy_name=str(trade.get("source_strategy") or ""),
+                        ),
+                    )
                     if not exit_reason:
                         exit_reason = exit_eval.exit_reason
                     payload: Dict[str, Any] = {
@@ -5534,13 +5618,27 @@ class TradingOrchestrator:
         mids: Dict[str, float],
         cfg: Dict[str, Any],
         deadline: Optional[float] = None,
+        coin_filter: Optional[List[str]] = None,
+        fast_signal_by_coin: Optional[Dict[str, Dict[str, Any]]] = None,
+        execution_mode: str = "paper",
     ) -> None:
         try:
             signal_source = str(cfg.get("signal_source", "mirror_spot") or "mirror_spot").lower()
             leverage = float(cfg.get("default_leverage", 2.0) or 2.0)
-            max_margin = float(cfg.get("max_margin_per_trade", 25.0) or 25.0)
-            max_notional = float(cfg.get("max_notional_per_trade", 50.0) or 50.0)
-            max_open = int(cfg.get("max_open_positions", 5) or 5)
+            if execution_mode == "live":
+                max_margin = float(cfg.get("live_max_margin_per_trade", 25.0) or 25.0)
+                max_notional = float(
+                    cfg.get("live_max_notional_per_trade", max_margin * leverage)
+                    or max_margin * leverage
+                )
+            else:
+                max_margin = float(cfg.get("max_margin_per_trade", 25.0) or 25.0)
+                max_notional = float(cfg.get("max_notional_per_trade", 50.0) or 50.0)
+            max_open = int(
+                cfg.get("live_max_open_positions", cfg.get("max_open_positions", 5))
+                if execution_mode == "live"
+                else cfg.get("max_open_positions", 5)
+            ) or 5
             consensus_cfg = cfg.get("strategy_consensus") or {}
             min_long_conf = float(
                 consensus_cfg.get("min_confidence_long", cfg.get("min_confidence_long", 0.55))
@@ -5569,7 +5667,12 @@ class TradingOrchestrator:
             available_balance = await self._fetch_hyperliquid_available_balance()
 
             async with httpx.AsyncClient(timeout=30.0) as client:
-                open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
+                open_path = (
+                    "/api/v1/perps/live-trades/open"
+                    if execution_mode == "live"
+                    else "/api/v1/perps/paper-trades/open"
+                )
+                open_resp = await client.get(f"{database_service_url}{open_path}")
                 open_trades = (open_resp.json() or {}).get("trades", []) if open_resp.status_code == 200 else []
                 closed_resp = await client.get(
                     f"{database_service_url}/api/v1/perps/paper-trades",
@@ -5587,6 +5690,19 @@ class TradingOrchestrator:
                 if len(open_trades or []) >= max_open:
                     return
 
+                account_equity = float(cfg.get("starting_balance_usd", 5000.0) or 5000.0)
+                daily_halt = hyperliquid_daily_loss_halt(
+                    closed_trades, account_equity, cfg,
+                )
+                if daily_halt.get("blocked"):
+                    logger.warning(
+                        "[HyperliquidPaper] Daily loss halt active: pnl=$%.2f limit=$%.2f (%.1f%% equity)",
+                        float(daily_halt.get("dailyPnl") or 0.0),
+                        float(daily_halt.get("limitUsd") or 0.0),
+                        float(daily_halt.get("maxDailyLossPct") or 0.0) * 100.0,
+                    )
+                    return
+
                 opened = 0
                 for coin in hl_coins:
                     if deadline is not None and time.monotonic() >= deadline:
@@ -5595,6 +5711,8 @@ class TradingOrchestrator:
                         return
 
                     coin = str(coin).upper()
+                    if coin_filter and coin not in {str(c).upper() for c in coin_filter}:
+                        continue
                     price = mids.get(coin)
                     if not price:
                         continue
@@ -5618,42 +5736,142 @@ class TradingOrchestrator:
                             block.get("entryBlockMessage"),
                         )
                         continue
-                    try:
-                        if signal_source == "hyperliquid_strategies":
-                            signals_url = (
-                                f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin}"
-                            )
-                        else:
-                            spot_ex, spot_pair = find_mirror_spot_pair(
-                                coin, mirror_exchanges, self.pair_selections
-                            )
-                            if not spot_ex or not spot_pair:
-                                logger.debug(
-                                    "[HyperliquidPaper] No mirror spot pair for HL coin %s",
-                                    coin,
-                                )
-                                continue
-                            exchange_name = spot_ex
-                            pair = spot_pair
-                            strategy_pair = pair.replace("/", "")
-                            signals_url = (
-                                f"{strategy_service_url}/api/v1/signals/{spot_ex}/{strategy_pair}"
-                            )
-                        signals_resp = await client.get(signals_url, timeout=90.0)
-                        if signals_resp.status_code != 200:
-                            continue
-                        signals_data = signals_resp.json()
-                    except Exception as e:
-                        logger.debug(
-                            "[HyperliquidPaper] Signal fetch failed for %s: %s",
-                            coin,
-                            e,
+                    mirrored: Optional[Dict[str, Any]] = None
+                    signals_data: Dict[str, Any] = {}
+                    fast_payload = (fast_signal_by_coin or {}).get(coin)
+                    if fast_payload:
+                        from strategy.fast_signal_cache import (
+                            mirrored_perp_signal_from_fast_payload,
+                            signals_data_from_fast_perp_payload,
                         )
-                        continue
 
-                    mirrored = select_mirrored_signal(signals_data)
+                        mirrored = mirrored_perp_signal_from_fast_payload(fast_payload)
+                        if not mirrored:
+                            continue
+                        signals_data = signals_data_from_fast_perp_payload(
+                            fast_payload, coin
+                        )
+                        logger.info(
+                            "[HyperliquidPaper] Fast-signal entry path %s %s "
+                            "strategy=%s conf=%.2f",
+                            mirrored.get("signal"),
+                            coin,
+                            mirrored.get("strategy"),
+                            float(mirrored.get("confidence") or 0),
+                        )
+                    else:
+                        try:
+                            if signal_source == "hyperliquid_strategies":
+                                signals_url = (
+                                    f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin}"
+                                )
+                            else:
+                                spot_ex, spot_pair = find_mirror_spot_pair(
+                                    coin, mirror_exchanges, self.pair_selections
+                                )
+                                if not spot_ex or not spot_pair:
+                                    logger.debug(
+                                        "[HyperliquidPaper] No mirror spot pair for HL coin %s",
+                                        coin,
+                                    )
+                                    continue
+                                exchange_name = spot_ex
+                                pair = spot_pair
+                                strategy_pair = pair.replace("/", "")
+                                signals_url = (
+                                    f"{strategy_service_url}/api/v1/signals/{spot_ex}/{strategy_pair}"
+                                )
+                            signals_resp = await client.get(signals_url, timeout=90.0)
+                            if signals_resp.status_code != 200:
+                                continue
+                            signals_data = signals_resp.json()
+                        except Exception as e:
+                            logger.debug(
+                                "[HyperliquidPaper] Signal fetch failed for %s: %s",
+                                coin,
+                                e,
+                            )
+                            continue
+
+                    if mirrored is None:
+                        mirrored = select_mirrored_signal(signals_data)
                     if not mirrored:
                         continue
+
+                    entry_path = "cycle_slow"
+                    src_strat = str(mirrored.get("strategy") or "")
+                    if src_strat == "rsi_stoch_reversal_5m":
+                        from strategy.fast_signal_cache import (
+                            mirrored_perp_signal_from_fast_payload,
+                            normalize_perp_side,
+                            signals_data_from_fast_perp_payload,
+                            validate_rsi_stoch_actionable,
+                        )
+
+                        live_payload = await self._fetch_hl_rsi_stoch_raw(coin)
+                        if not live_payload:
+                            logger.info(
+                                "[HyperliquidPaper] Blocked rsi_stoch %s: no live payload",
+                                coin,
+                            )
+                            continue
+                        hl_params, hl_allow_short = self._hl_rsi_stoch_params()
+                        ok, vreason = validate_rsi_stoch_actionable(
+                            live_payload,
+                            allow_short=hl_allow_short,
+                            params=hl_params,
+                        )
+                        if not ok:
+                            logger.info(
+                                "[HyperliquidPaper] Blocked rsi_stoch %s: %s",
+                                coin,
+                                vreason,
+                            )
+                            continue
+                        validated = mirrored_perp_signal_from_fast_payload(live_payload)
+                        if not validated:
+                            continue
+                        validated_side = normalize_perp_side(
+                            str(validated.get("signal") or "")
+                        )
+                        mirrored_side = position_sides_from_signal(
+                            mirrored.get("signal")
+                        )
+                        if validated_side and mirrored_side and validated_side != mirrored_side:
+                            logger.info(
+                                "[HyperliquidPaper] Blocked rsi_stoch %s: "
+                                "consensus=%s validated=%s",
+                                coin,
+                                mirrored_side,
+                                validated_side,
+                            )
+                            continue
+                        mirrored = validated
+                        signals_data = signals_data_from_fast_perp_payload(
+                            live_payload, coin
+                        )
+                        entry_path = (
+                            "fast_live_validated"
+                            if fast_payload
+                            else "cycle_slow_validated"
+                        )
+
+                    if execution_mode == "live":
+                        allow = [
+                            str(s).strip().lower()
+                            for s in (
+                                cfg.get("live_strategy_allowlist")
+                                or ["rsi_stoch_reversal_5m"]
+                            )
+                        ]
+                        if src_strat.lower() not in allow:
+                            logger.info(
+                                "[HyperliquidLive] Skip %s: strategy %s not allowlisted",
+                                coin,
+                                src_strat,
+                            )
+                            continue
+
                     side = position_sides_from_signal(mirrored.get("signal"))
                     if side not in {"long", "short"}:
                         continue
@@ -5931,9 +6149,30 @@ class TradingOrchestrator:
                             side, coin, size_multiplier, winner_floor,
                         )
                         size_multiplier = winner_floor
+                    signal_size_mult = signal_position_size_multiplier(mirrored)
+                    if signal_size_mult is not None:
+                        size_multiplier *= signal_size_mult
+                        logger.info(
+                            "[HyperliquidPaper] %s %s strategy size hint: mult=%.2f",
+                            side, coin, signal_size_mult,
+                        )
+                    size_multiplier = max(0.0, min(1.0, size_multiplier))
                     scaled_max_margin = max_margin * size_multiplier
                     scaled_max_notional = max_notional * size_multiplier
-                    margin_used = min(scaled_max_margin, scaled_max_notional / leverage)
+                    stop_dist_pct = stop_distance_pct_from_signal(mirrored, cfg)
+                    risk_notional = hyperliquid_risk_based_notional(
+                        account_equity,
+                        stop_dist_pct,
+                        cfg,
+                        size_multiplier=size_multiplier,
+                    )
+                    if risk_notional is not None and risk_notional > 0:
+                        notional = min(risk_notional, scaled_max_notional)
+                        margin_used = min(notional / leverage, scaled_max_margin)
+                        notional = min(notional, margin_used * leverage)
+                    else:
+                        margin_used = min(scaled_max_margin, scaled_max_notional / leverage)
+                        notional = min(scaled_max_notional, margin_used * leverage)
                     if available_balance is None:
                         logger.warning(
                             "[HyperliquidPaper] Blocking %s entry because HL available balance is unavailable",
@@ -5948,7 +6187,6 @@ class TradingOrchestrator:
                             coin,
                         )
                         continue
-                    notional = min(scaled_max_notional, margin_used * leverage)
                     size = notional / price
                     if size <= 0:
                         continue
@@ -5988,12 +6226,51 @@ class TradingOrchestrator:
                             "hl_selector": True,
                             "signal_source": signal_source,
                             "position_size_multiplier": size_multiplier,
+                            "stop_distance_pct": stop_dist_pct,
+                            "risk_based_notional": risk_notional,
                             "stable_regime": (signals_data or {}).get("stable_regime"),
                             "market_regime": (signals_data or {}).get("market_regime"),
                             "hl_recommended": (signals_data or {}).get("recommended"),
                             **_perp_entry_atr_metadata(mirrored, price),
                         },
                     }
+                    if str(payload["source_strategy"]) == "rsi_stoch_reversal_5m":
+                        payload["metadata"].update(
+                            self._rsi_stoch_audit_metadata(
+                                mirrored,
+                                entry_path=entry_path,
+                                fast_payload=fast_payload,
+                            )
+                        )
+
+                    if execution_mode == "live":
+                        from hyperliquid_live_orders import HyperliquidLiveOrderExecutor
+
+                        live_exec = HyperliquidLiveOrderExecutor(
+                            cfg, database_service_url=database_service_url
+                        )
+                        live_result = await live_exec.open_position(
+                            coin=coin,
+                            side=side,
+                            size=size,
+                            strategy=str(payload["source_strategy"]),
+                            trade_payload=payload,
+                        )
+                        if live_result.get("ok"):
+                            open_keys.add((coin, side))
+                            opened += 1
+                            available_balance = max(
+                                0.0, available_balance - margin_used
+                            )
+                        else:
+                            logger.warning(
+                                "[HyperliquidLive] Entry failed %s %s: %s",
+                                side,
+                                coin,
+                                live_result.get("error"),
+                            )
+                        continue
+
                     create_resp = await client.post(
                         f"{database_service_url}/api/v1/perps/paper-trades",
                         json=payload,
@@ -6573,6 +6850,264 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning("[EntryGuardRefresh] Guard source refresh failed: %s", e)
 
+    def _hl_rsi_stoch_params(self) -> Tuple[Dict[str, Any], bool]:
+        strat_root = (self._config or {}).get("strategies_hyperliquid") or {}
+        rsi_cfg = strat_root.get("rsi_stoch_reversal_5m") or {}
+        params = rsi_cfg.get("parameters") or {}
+        return params, bool(params.get("allow_short", False))
+
+    async def _fetch_spot_rsi_stoch_raw(
+        self, exchange: str, pair: str
+    ) -> Optional[Dict[str, Any]]:
+        from strategy.fast_signal_cache import (
+            STRATEGY_KEY,
+            fast_payload_from_hl_strategy_signal,
+        )
+
+        sym = str(pair or "").replace("/", "")
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.get(
+                    f"{strategy_service_url}/api/v1/signals/{exchange}/"
+                    f"{sym}/{STRATEGY_KEY}"
+                )
+            if resp.status_code != 200:
+                return None
+            live = resp.json() or {}
+            live["signal"] = str(live.get("signal") or "hold").lower()
+            return fast_payload_from_hl_strategy_signal(live)
+        except Exception as exc:
+            logger.debug(
+                "[FastEntry] Spot rsi_stoch fetch failed %s %s: %s",
+                exchange,
+                pair,
+                exc,
+            )
+            return None
+
+    async def _fetch_hl_rsi_stoch_raw(self, coin: str) -> Optional[Dict[str, Any]]:
+        """Fetch strategy-service HL rsi_stoch payload (any signal, including hold)."""
+        from strategy.fast_signal_cache import (
+            STRATEGY_KEY,
+            fast_payload_from_hl_strategy_signal,
+        )
+
+        coin_u = str(coin or "").upper()
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.get(
+                    f"{strategy_service_url}/api/v1/signals/hyperliquid/"
+                    f"{coin_u}/{STRATEGY_KEY}"
+                )
+            if resp.status_code != 200:
+                return None
+            return fast_payload_from_hl_strategy_signal(resp.json() or {})
+        except Exception as exc:
+            logger.debug(
+                "[FastEntry] Live HL rsi_stoch fetch failed for %s: %s",
+                coin_u,
+                exc,
+            )
+            return None
+
+    async def _fetch_hl_rsi_stoch_live_signal(
+        self, coin: str
+    ) -> Optional[Dict[str, Any]]:
+        """Actionable HL rsi_stoch only (rule-validated)."""
+        from strategy.fast_signal_cache import (
+            normalize_perp_side,
+            validate_rsi_stoch_actionable,
+        )
+
+        payload = await self._fetch_hl_rsi_stoch_raw(coin)
+        if not payload:
+            return None
+        params, allow_short = self._hl_rsi_stoch_params()
+        ok, reason = validate_rsi_stoch_actionable(
+            payload, allow_short=allow_short, params=params
+        )
+        if not ok or not normalize_perp_side(str(payload.get("signal") or "")):
+            logger.info(
+                "[HL rsi_stoch] %s not actionable: %s",
+                str(coin).upper(),
+                reason,
+            )
+            return None
+        return payload
+
+    def _rsi_stoch_audit_metadata(
+        self,
+        mirrored: Dict[str, Any],
+        *,
+        entry_path: str,
+        fast_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        from datetime import datetime, timezone
+
+        ind = (
+            (mirrored.get("details") or {}).get("state", {}).get("indicators") or {}
+        )
+        if not isinstance(ind, dict):
+            ind = {}
+        meta: Dict[str, Any] = {
+            "entry_path": entry_path,
+            "signal_validated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        for key in (
+            "rsi",
+            "stoch_rsi_k",
+            "stoch_rsi_d",
+            "bar_close_time",
+            "entry_reason",
+            "entry_price",
+        ):
+            if ind.get(key) is not None:
+                meta[key] = ind.get(key)
+        if fast_payload:
+            meta["fast_redis_signal"] = str(fast_payload.get("signal") or "")
+        return meta
+
+    async def _fast_entry_loop(self) -> None:
+        """Redis-first fast entries for configured standalone strategies (30s)."""
+        from strategy.fast_signal_cache import read_fast_signal, signal_age_seconds
+
+        logger.info("[FastEntry] Starting fast entry loop")
+        while self.running:
+            interval = 30.0
+            try:
+                cfg = await self._get_config_value("trading.fast_entry", {}) or {}
+                if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+                    await asyncio.sleep(interval)
+                    continue
+                interval = float(cfg.get("interval_seconds", 30) or 30)
+                max_age = float(cfg.get("redis_max_age_seconds", 40) or 40)
+                await self._refresh_entry_guard_sources()
+                redis_client = getattr(self.redis_order_manager, "redis_client", None)
+
+                for exchange_name, pairs in (self.pair_selections or {}).items():
+                    for pair in pairs or []:
+                        sym = str(pair or "").replace("/", "")
+                        payload = await read_fast_signal(
+                            redis_client, exchange_name, sym
+                        )
+                        if not payload:
+                            continue
+                        age = signal_age_seconds(payload)
+                        if age is None or age > max_age:
+                            continue
+                        if str(payload.get("signal", "")).lower() == "buy":
+                            from strategy.fast_signal_cache import (
+                                validate_rsi_stoch_actionable,
+                            )
+
+                            spot_strat = (
+                                ((self._config or {}).get("strategies") or {}).get(
+                                    "rsi_stoch_reversal_5m"
+                                )
+                                or {}
+                            )
+                            spot_params = spot_strat.get("parameters") or {}
+                            live_spot = await self._fetch_spot_rsi_stoch_raw(
+                                exchange_name, pair
+                            )
+                            if not live_spot:
+                                logger.info(
+                                    "[FastEntry] Skip spot %s %s: no live rsi_stoch",
+                                    exchange_name,
+                                    pair,
+                                )
+                                continue
+                            ok, vreason = validate_rsi_stoch_actionable(
+                                live_spot,
+                                allow_short=bool(spot_params.get("allow_short", False)),
+                                params=spot_params,
+                            )
+                            if not ok or str(live_spot.get("signal", "")).lower() != "buy":
+                                logger.info(
+                                    "[FastEntry] Skip spot %s %s: %s",
+                                    exchange_name,
+                                    pair,
+                                    vreason,
+                                )
+                                continue
+                            logger.info(
+                                "[FastEntry] Spot trigger %s %s validated (age=%.1fs)",
+                                exchange_name,
+                                pair,
+                                age,
+                            )
+                            await self._check_pair_entry(
+                                exchange_name,
+                                pair,
+                                fast_rsi_stoch_payload=live_spot,
+                            )
+
+                hl_cfg = self._hyperliquid_perps_cfg()
+                mids = await self._fetch_hyperliquid_mids()
+                fast_hl_by_coin: Dict[str, Dict[str, Any]] = {}
+                from strategy.fast_signal_cache import (
+                    normalize_perp_side,
+                    validate_rsi_stoch_actionable,
+                )
+
+                hl_params, hl_allow_short = self._hl_rsi_stoch_params()
+                for coin in self.hyperliquid_pair_selections or []:
+                    coin_u = str(coin).upper()
+                    payload = await read_fast_signal(
+                        redis_client, "hyperliquid", coin_u
+                    )
+                    if not payload:
+                        continue
+                    age = signal_age_seconds(payload)
+                    if age is None or age > max_age:
+                        continue
+                    redis_side = normalize_perp_side(str(payload.get("signal", "")))
+                    if not redis_side:
+                        continue
+                    live_payload = await self._fetch_hl_rsi_stoch_raw(coin_u)
+                    if not live_payload:
+                        logger.info(
+                            "[FastEntry] Skip HL %s: no live rsi_stoch response",
+                            coin_u,
+                        )
+                        continue
+                    ok, vreason = validate_rsi_stoch_actionable(
+                        live_payload,
+                        allow_short=hl_allow_short,
+                        params=hl_params,
+                    )
+                    if not ok:
+                        logger.info(
+                            "[FastEntry] Skip HL %s: validator %s",
+                            coin_u,
+                            vreason,
+                        )
+                        continue
+                    live_side = normalize_perp_side(str(live_payload.get("signal", "")))
+                    if live_side != redis_side:
+                        logger.warning(
+                            "[FastEntry] Skip HL %s: Redis=%s live=%s (stale fast cache)",
+                            coin_u,
+                            redis_side,
+                            live_side or "hold",
+                        )
+                        continue
+                    fast_hl_by_coin[coin_u] = live_payload
+                if fast_hl_by_coin and mids:
+                    logger.info(
+                        "[FastEntry] HL trigger coins=%s (full entry guards)",
+                        list(fast_hl_by_coin.keys()),
+                    )
+                    await self._run_hyperliquid_strategy_entries(
+                        mids,
+                        hl_cfg,
+                        coin_filter=list(fast_hl_by_coin.keys()),
+                        fast_signal_by_coin=fast_hl_by_coin,
+                    )
+            except Exception as exc:
+                logger.error("[FastEntry] loop error: %s", exc)
+            await asyncio.sleep(interval)
+
     async def _check_no_negative_unrealized_on_same_pair(
         self, exchange_name: str, pair: str
     ) -> bool:
@@ -7126,7 +7661,13 @@ class TradingOrchestrator:
 
         return blocks, block_details
 
-    async def _check_pair_entry(self, exchange_name: str, pair: str) -> None:
+    async def _check_pair_entry(
+        self,
+        exchange_name: str,
+        pair: str,
+        *,
+        fast_rsi_stoch_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Check if a pair should be entered - each strategy is independent with detailed logging"""
         pair_reserved = False
         try:
@@ -7239,6 +7780,20 @@ class TradingOrchestrator:
 
             if not signals_data:
                 return
+            if fast_rsi_stoch_payload:
+                from strategy.fast_signal_cache import merge_rsi_stoch_spot_buy_into_signals
+
+                if merge_rsi_stoch_spot_buy_into_signals(
+                    signals_data, fast_rsi_stoch_payload
+                ):
+                    logger.info(
+                        "[FastEntry] Spot merged Redis rsi_stoch BUY into %s %s "
+                        "(conf=%.2f str=%.2f)",
+                        exchange_name,
+                        pair,
+                        float(fast_rsi_stoch_payload.get("confidence") or 0),
+                        float(fast_rsi_stoch_payload.get("strength") or 0),
+                    )
             resolved_policy = self._resolve_regime_policy(signals_data)
             stable_regime = resolved_policy.get("stable_regime", "unknown")
             policy_version = resolved_policy.get("policy_version", "unversioned")
@@ -7352,6 +7907,7 @@ class TradingOrchestrator:
                 "breakout_retest_long",
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
+                "rsi_stoch_reversal_5m",
             }
             consensus_strategies = {
                 name: data
@@ -7424,6 +7980,11 @@ class TradingOrchestrator:
                 for name in intraday_standalone_names
                 if str((strategies.get(name, {}) or {}).get("signal", "hold")).lower() == "buy"
             }
+            rsi_stoch_strategy_data = strategies.get("rsi_stoch_reversal_5m", {}) or {}
+            rsi_stoch_is_buy_override = (
+                str(rsi_stoch_strategy_data.get("signal", "hold")).lower() == "buy"
+            )
+            standalone_buy_overrides = bool(intraday_buy_overrides) or rsi_stoch_is_buy_override
             if macd_is_buy_override:
                 logger.warning(
                     "[MACDOverride] %s %s: forcing BUY execution from macd_momentum "
@@ -7510,6 +8071,18 @@ class TradingOrchestrator:
                     c_conf,
                     c_agreement,
                 )
+            if rsi_stoch_is_buy_override:
+                logger.warning(
+                    "[RsiStochReversalStandalone] %s %s: BUY from rsi_stoch_reversal_5m "
+                    "(independent of consensus; conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
+                    exchange_name,
+                    pair,
+                    float(rsi_stoch_strategy_data.get("confidence", 0) or 0),
+                    float(rsi_stoch_strategy_data.get("strength", 0) or 0),
+                    c_signal,
+                    c_conf,
+                    c_agreement,
+                )
 
             if fallback_enabled and c_signal != "buy" and buy_votes:
                 buy_votes.sort(reverse=True)
@@ -7530,7 +8103,7 @@ class TradingOrchestrator:
                         c_signal, c_conf, len(sell_votes)
                     )
 
-            if c_signal != 'buy' and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
+            if c_signal != 'buy' and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not standalone_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus is {c_signal.upper()} for {pair} on {exchange_name}; "
                     f"entry blocked (confidence={c_conf:.2f}, agreement={c_agreement:.1f}%)"
@@ -7556,21 +8129,21 @@ class TradingOrchestrator:
                     exchange_name, stable_regime, "rejected", "forced_override_blocked"
                 )
                 return
-            if c_conf <= min_confidence and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
+            if c_conf <= min_confidence and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not standalone_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
                     f"confidence {c_conf:.2f} <= min {min_confidence:.2f}"
                 )
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "consensus_confidence")
                 return
-            if c_agreement < min_agreement and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
+            if c_agreement < min_agreement and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not standalone_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
                     f"agreement {c_agreement:.1f}% < min {min_agreement:.1f}%"
                 )
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "consensus_agreement")
                 return
-            if c_sell_veto_max >= sell_veto_threshold and not c_primary_override and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
+            if c_sell_veto_max >= sell_veto_threshold and not c_primary_override and not fallback_triggered and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not standalone_buy_overrides:
                 logger.info(
                     f"📄 [SUMMARY] Consensus BUY rejected for {pair} on {exchange_name}: "
                     f"sell-veto {c_sell_veto_max:.2f} >= {sell_veto_threshold:.2f}"
@@ -7589,7 +8162,7 @@ class TradingOrchestrator:
                             strategy_name,
                         )
                     )
-            if not buy_candidates and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not intraday_buy_overrides:
+            if not buy_candidates and not macd_is_buy_override and not rsi_is_buy_override and not rsi_checklist_is_buy_override and not scalper_is_buy_override and not supertrend_is_buy_override and not swing_hull_is_buy_override and not standalone_buy_overrides:
                 logger.info(f"📄 [SUMMARY] Consensus BUY but no concrete BUY candidate found for {pair} on {exchange_name}")
                 self._record_regime_entry_decision(exchange_name, stable_regime, "rejected", "no_buy_candidates")
                 return
@@ -7639,6 +8212,11 @@ class TradingOrchestrator:
                     reverse=True,
                 )
                 best_conf, best_strength, best_strategy = intraday_ranked[0]
+            if rsi_stoch_is_buy_override:
+                rsi_conf = float(rsi_stoch_strategy_data.get("confidence", 0) or 0)
+                rsi_str = float(rsi_stoch_strategy_data.get("strength", 0) or 0)
+                if not intraday_buy_overrides or (rsi_conf, rsi_str) >= (best_conf, best_strength):
+                    best_conf, best_strength, best_strategy = rsi_conf, rsi_str, "rsi_stoch_reversal_5m"
 
             is_standalone_entry = (
                 macd_is_buy_override
@@ -7647,7 +8225,7 @@ class TradingOrchestrator:
                 or scalper_is_buy_override
                 or supertrend_is_buy_override
                 or swing_hull_is_buy_override
-                or bool(intraday_buy_overrides)
+                or standalone_buy_overrides
             )
             if is_standalone_entry:
                 if not await self._standalone_entry_gate_allowed(
@@ -11310,6 +11888,17 @@ class TradingOrchestrator:
                         except Exception as balance_error:
                             logger.error(f"Error getting balance for {exchange_name}: {balance_error}")
             logger.info(f"[DEBUG] Final in-memory balances after update: {self.balances}")
+            for exchange_name, bal in self.balances.items():
+                try:
+                    currency = 'USDC' if exchange_name != 'cryptocom' else 'USD'
+                    balance_total.labels(exchange=exchange_name, currency=currency).set(
+                        float(bal.get('total') or 0)
+                    )
+                    balance_available.labels(exchange=exchange_name, currency=currency).set(
+                        float(bal.get('available') or 0)
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Error updating balances: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")

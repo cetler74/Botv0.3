@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code (repo root context)
 COPY services/database-service/*.py ./
 COPY core/hyperliquid_ledger.py ./hyperliquid_ledger.py
+COPY core/perp_paper_pnl_report.py ./perp_paper_pnl_report.py
+COPY core/hyperliquid_live_readiness.py ./hyperliquid_live_readiness.py
 
 # Expose port
 EXPOSE 8002

@@ -163,10 +163,10 @@ def test_deprecated_strategy_logs_warning(monkeypatch, caplog):
         )
 
     assert any("heikin_ashi is deprecated" in msg for msg in caplog.messages)
-    assert "heikin_ashi" in manager.strategies
+    assert "heikin_ashi" not in manager.strategies
 
 
-def test_deprecated_engulfing_multi_tf_logs_warning(monkeypatch, caplog):
+def test_deprecated_engulfing_multi_tf_skipped(monkeypatch, caplog):
     import hyperliquid_strategy_manager as manager_module
 
     monkeypatch.setitem(
@@ -187,4 +187,4 @@ def test_deprecated_engulfing_multi_tf_logs_warning(monkeypatch, caplog):
         )
 
     assert any("engulfing_multi_tf is deprecated" in msg for msg in caplog.messages)
-    assert "engulfing_multi_tf" in manager.strategies
+    assert "engulfing_multi_tf" not in manager.strategies

@@ -5,6 +5,7 @@ Strategy analysis and signal generation
 
 import asyncio
 import logging
+import time
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
@@ -86,9 +87,26 @@ strategy_registry = CollectorRegistry()
 
 # Prometheus Metrics
 strategy_analyses = Counter('strategy_analyses_total', 'Total strategy analyses performed', ['strategy', 'exchange', 'pair', 'result'], registry=strategy_registry)
+strategy_pair_runs = Counter(
+    'strategy_pair_runs_total',
+    'One increment per pair analysis cycle (all strategies in that run)',
+    ['exchange', 'pair', 'result'],
+    registry=strategy_registry,
+)
+strategy_consensus_signals = Counter(
+    'strategy_consensus_signals_total',
+    'Consensus signal outcome per pair analysis',
+    ['exchange', 'pair', 'signal'],
+    registry=strategy_registry,
+)
 analysis_duration = Histogram('strategy_analysis_duration_seconds', 'Strategy analysis duration', ['strategy'], registry=strategy_registry)
 signals_generated = Counter('strategy_signals_total', 'Total signals generated', ['strategy', 'signal_type'], registry=strategy_registry)
-active_strategies = Gauge('strategy_active_strategies', 'Number of active strategies', registry=strategy_registry)
+active_strategies = Gauge(
+    'strategy_active_strategies',
+    'Number of enabled strategy modules',
+    ['market_type'],
+    registry=strategy_registry,
+)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -96,6 +114,16 @@ app = FastAPI(
     description="Strategy analysis and signal generation",
     version="1.0.0"
 )
+
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator(
+        registry=strategy_registry,
+        should_group_status_codes=True,
+        excluded_handlers={"/metrics", "/health", "/ready", "/live"},
+    ).instrument(app)
+except ImportError:
+    pass
 
 # Configure custom JSON encoder
 app.json_encoder = NumpyJSONEncoder
@@ -229,6 +257,8 @@ class HealthResponse(BaseModel):
     version: str
     strategies_loaded: int
     total_strategies: int
+    spot_strategies_loaded: int = 0
+    perp_strategies_loaded: int = 0
 
 # Global variables
 strategies = {}
@@ -240,7 +270,9 @@ pair_last_snapshots: Dict[str, Dict[str, Any]] = {}
 strategy_cumulative_runs: Dict[str, int] = {}
 # Align with orchestrator default entry bar (see trading.min_confidence_threshold in config)
 SNAPSHOT_ENTRY_CONFIDENCE = 0.3
+FAST_SIGNAL_CACHE_SECONDS = 30
 strategy_manager = None
+fast_signal_redis_client = None
 hyperliquid_strategy_manager = None
 hl_signal_cache: Dict[str, Any] = {}
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
@@ -425,6 +457,7 @@ def _record_pair_strategy_snapshot(
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "sma_reclaim_bull_flag",
+                "rsi_stoch_reversal_5m",
             }:
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 if isinstance(indicators, dict):
@@ -545,6 +578,7 @@ def _record_pair_strategy_snapshot(
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "sma_reclaim_bull_flag",
+                "rsi_stoch_reversal_5m",
             }:
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 if isinstance(indicators, dict):
@@ -610,6 +644,7 @@ def _record_pair_strategy_snapshot(
                         "vwap_bounce_scalping",
                         "small_size_momentum_scalp",
                         "sma_reclaim_bull_flag",
+                        "rsi_stoch_reversal_5m",
                     }
                     else None
                 ),
@@ -859,6 +894,10 @@ class StrategyManager:
                 'module': 'sma_reclaim_bull_flag_strategy',
                 'class': 'SmaReclaimBullFlagStrategy',
             },
+            'rsi_stoch_reversal_5m': {
+                'module': 'rsi_stoch_reversal_5m_strategy',
+                'class': 'RsiStochReversal5mStrategy',
+            },
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
@@ -1003,6 +1042,7 @@ class StrategyManager:
                     "vwap_bounce_scalping",
                     "small_size_momentum_scalp",
                     "sma_reclaim_bull_flag",
+                    "rsi_stoch_reversal_5m",
                 ):
                     if (
                         standalone_name in strategies
@@ -1062,6 +1102,7 @@ class StrategyManager:
                     continue
                     
                 try:
+                    _analysis_start = time.time()
                     logger.info(f"🔍 [STRATEGY ANALYSIS] {strategy_name} analyzing {pair} on {exchange_name} (regime: {market_regime.value})")
                     strategy_instance = strategy_data['instance']
                     
@@ -1095,10 +1136,31 @@ class StrategyManager:
                         strategy_instance.state = SimpleNamespace()
                         strategy_instance.state.market_regime = market_regime.value
                     
-                    # Generate signal - pass full market_data AND the exchange adapter for strategies that need multiple timeframes
+                    # Generate signal — rsi_stoch uses 5m closed bar only (not multi-TF bundle).
+                    signal_market_data = market_data
+                    if strategy_name == "rsi_stoch_reversal_5m":
+                        entry_tf = str(
+                            (strategy_data.get("config") or {})
+                            .get("parameters", {})
+                            .get("entry_timeframe", "5m")
+                            or "5m"
+                        ).lower()
+                        ohlcv_5m = market_data.get(entry_tf)
+                        if ohlcv_5m is None or len(ohlcv_5m) < 30:
+                            logger.warning(
+                                "[rsi_stoch_reversal_5m] Missing %s data for %s on %s, skipping",
+                                entry_tf,
+                                pair,
+                                exchange_name,
+                            )
+                            continue
+                        signal_market_data = {entry_tf: ohlcv_5m}
                     logger.info(f"🎯 [SIGNAL GENERATION] {strategy_name} generating signal for {pair} on {exchange_name}")
                     signal, confidence, strength = await strategy_instance.generate_signal(
-                        market_data, pair=pair, timeframe=primary_timeframe, exchange_adapter=exchange_specific_adapter
+                        signal_market_data,
+                        pair=pair,
+                        timeframe=primary_timeframe,
+                        exchange_adapter=exchange_specific_adapter,
                     )
                     
                     # CRITICAL: Sanitize confidence and strength values to prevent JSON serialization errors
@@ -1152,8 +1214,18 @@ class StrategyManager:
                     strategy_data['last_analysis'] = datetime.utcnow()
                     strategies_analyzed += 1
                     _bump_strategy_cumulative_run(strategy_name)
+                    strategy_analyses.labels(
+                        strategy=strategy_name, exchange=exchange_name, pair=pair, result="ok"
+                    ).inc()
+                    analysis_duration.labels(strategy=strategy_name).observe(time.time() - _analysis_start)
+                    if signal in ("buy", "sell", "long", "short"):
+                        signals_generated.labels(strategy=strategy_name, signal_type=str(signal).lower()).inc()
                     
                 except Exception as e:
+                    strategy_analyses.labels(
+                        strategy=strategy_name, exchange=exchange_name, pair=pair, result="error"
+                    ).inc()
+                    analysis_duration.labels(strategy=strategy_name).observe(time.time() - _analysis_start)
                     logger.error(f"Error analyzing {pair} with {strategy_name}: {e}")
                     analysis_results['strategies'][strategy_name] = {
                         'error': str(e),
@@ -1202,6 +1274,12 @@ class StrategyManager:
             )
             
             consensus = analysis_results['consensus']
+            consensus_signal = str(consensus.get('signal', 'hold')).lower()
+            strategy_consensus_signals.labels(
+                exchange=exchange_name,
+                pair=pair,
+                signal=consensus_signal if consensus_signal in ('buy', 'sell', 'hold') else 'hold',
+            ).inc()
             consensus_emoji = "🟢" if consensus['signal'] == "buy" else "🔴" if consensus['signal'] == "sell" else "⚪"
             logger.info(f"🎯 [CONSENSUS RESULT] {pair} on {exchange_name}: {consensus_emoji} {consensus['signal'].upper()} | "
                        f"Confidence: {consensus['confidence']:.2f} | Agreement: {consensus['agreement']:.2f} | "
@@ -1212,6 +1290,7 @@ class StrategyManager:
             signal_cache[cache_key] = analysis_results
 
             _record_pair_strategy_snapshot(exchange_name, pair, analysis_results)
+            strategy_pair_runs.labels(exchange=exchange_name, pair=pair, result='ok').inc()
 
             return analysis_results
 
@@ -1224,6 +1303,7 @@ class StrategyManager:
                 analysis_status="error",
                 detail=str(e),
             )
+            strategy_pair_runs.labels(exchange=exchange_name, pair=pair, result='error').inc()
             return {}
             
     # SPOT day-trading consensus thresholds (PnL-FIX v7).
@@ -1368,6 +1448,17 @@ class StrategyManager:
                     "vwap_bounce_scalping",
                     "small_size_momentum_scalp",
                 }:
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
+                if strategy_name == "rsi_stoch_reversal_5m":
                     valid_signals.append({
                         'strategy': strategy_name,
                         'signal': signal,
@@ -2034,6 +2125,151 @@ async def _fetch_pairs_for_exchange(client: httpx.AsyncClient, exchange: str) ->
     return []
 
 
+async def _fast_signal_enabled() -> bool:
+    try:
+        spot_cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
+        hl_cfg = {}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(f"{config_service_url}/api/v1/config/strategies-hyperliquid")
+            if resp.status_code == 200:
+                hl_cfg = (resp.json() or {}).get("rsi_stoch_reversal_5m") or {}
+        params = dict(spot_cfg.get("parameters") or {})
+        params_hl = dict(hl_cfg.get("parameters") or {})
+        if params.get("fast_signal_enabled") is False or params_hl.get("fast_signal_enabled") is False:
+            return False
+        return bool(spot_cfg.get("enabled")) or bool(hl_cfg.get("enabled"))
+    except Exception:
+        return False
+
+
+async def _fetch_hl_coins_for_fast_signal() -> List[str]:
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(f"{database_service_url}/api/v1/pairs/hyperliquid")
+            if resp.status_code == 200:
+                pairs = resp.json().get("pairs") or []
+                coins = []
+                for p in pairs:
+                    raw = str(p or "").upper()
+                    if "/" in raw:
+                        coins.append(raw.split("/", 1)[0])
+                    else:
+                        coins.append(raw.replace("USD-PERP", "").replace("USDC", "").replace("USD", ""))
+                return [c for c in coins if c]
+    except Exception as exc:
+        logger.debug("[FastSignal] HL pairs fetch failed: %s", exc)
+    return []
+
+
+async def rsi_stoch_reversal_5m_fast_loop() -> None:
+    """Publish rsi_stoch_reversal_5m signals to Redis every 30s."""
+    from strategy.fast_signal_cache import publish_fast_signal
+
+    def _hl_rsi_params() -> tuple:
+        if hyperliquid_strategy_manager:
+            cfg = (
+                hyperliquid_strategy_manager.strategies.get("rsi_stoch_reversal_5m")
+                or {}
+            )
+            params = cfg.get("parameters") or {}
+            return params, bool(params.get("allow_short", False))
+        return {}, False
+
+    def _spot_rsi_params() -> tuple:
+        cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
+        params = cfg.get("parameters") or {}
+        return params, bool(params.get("allow_short", False))
+
+    global fast_signal_redis_client
+    logger.info("[FastSignal] Starting rsi_stoch_reversal_5m fast publisher loop")
+    interval = 30.0
+    while True:
+        try:
+            if not await _fast_signal_enabled():
+                await asyncio.sleep(interval)
+                continue
+            if fast_signal_redis_client is None:
+                from strategy.fast_signal_cache import create_redis_client
+
+                fast_signal_redis_client = await create_redis_client()
+
+            spot_cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
+            spot_enabled = bool(spot_cfg.get("enabled"))
+            hl_enabled = False
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(
+                        f"{config_service_url}/api/v1/config/strategies-hyperliquid"
+                    )
+                    if resp.status_code == 200:
+                        hl_enabled = bool(
+                            (resp.json() or {}).get("rsi_stoch_reversal_5m", {}).get("enabled")
+                        )
+            except Exception:
+                pass
+
+            if hl_enabled and hyperliquid_strategy_manager:
+                for coin in await _fetch_hl_coins_for_fast_signal():
+                    results = await hyperliquid_strategy_manager.analyze_coin(
+                        coin,
+                        ["5m"],
+                        strategy_allowlist=["rsi_stoch_reversal_5m"],
+                    )
+                    strat = (results.get("strategies") or {}).get("rsi_stoch_reversal_5m") or {}
+                    sig = str(strat.get("signal") or "hold").lower()
+                    conf = float(strat.get("confidence") or 0)
+                    strength = float(strat.get("strength") or 0)
+                    indicators = ((strat.get("state") or {}).get("indicators") or {})
+                    hl_params, hl_allow_short = _hl_rsi_params()
+                    await publish_fast_signal(
+                        fast_signal_redis_client,
+                        "hyperliquid",
+                        coin,
+                        sig,
+                        conf,
+                        strength,
+                        indicators if isinstance(indicators, dict) else {},
+                        allow_short=hl_allow_short,
+                        params=hl_params,
+                    )
+
+            if spot_enabled and strategy_manager:
+                exchanges = ["binance", "bybit", "cryptocom"]
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    for exchange in exchanges:
+                        pairs = await _fetch_pairs_for_exchange(client, exchange)
+                        for pair in pairs:
+                            result = await strategy_manager.analyze_pair(
+                                exchange,
+                                pair,
+                                ["5m"],
+                                strategy_allowlist=["rsi_stoch_reversal_5m"],
+                            )
+                            strat = (result.get("strategies") or {}).get(
+                                "rsi_stoch_reversal_5m"
+                            ) or {}
+                            sig = str(strat.get("signal") or "hold").lower()
+                            conf = float(strat.get("confidence") or 0)
+                            strength = float(strat.get("strength") or 0)
+                            indicators = ((strat.get("state") or {}).get("indicators") or {})
+                            sym = pair.replace("/", "")
+                            spot_params, spot_allow_short = _spot_rsi_params()
+                            await publish_fast_signal(
+                                fast_signal_redis_client,
+                                exchange,
+                                sym,
+                                sig,
+                                conf,
+                                strength,
+                                indicators if isinstance(indicators, dict) else {},
+                                allow_short=spot_allow_short,
+                                params=spot_params,
+                            )
+        except Exception as exc:
+            logger.error("[FastSignal] loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
 async def continuous_strategy_analysis():
     """Continuous strategy analysis loop"""
     logger.info("🔄 Starting continuous strategy analysis loop")
@@ -2119,22 +2355,46 @@ async def continuous_strategy_analysis():
             logger.error(f"❌ Error in continuous strategy analysis: {e}")
             await asyncio.sleep(60)  # Wait longer on error
 
+def _count_active_spot_strategies() -> int:
+    """Spot StrategyManager modules (Crypto.com / Binance / Bybit)."""
+    return sum(1 for s in strategies.values() if s.get("enabled"))
+
+
+def _count_active_perp_strategies() -> int:
+    """Hyperliquid perp modules (isolated manager, strategies_hyperliquid config)."""
+    if not hyperliquid_strategy_manager:
+        return 0
+    return len(hyperliquid_strategy_manager.strategies)
+
+
+def _update_active_strategy_metrics() -> tuple[int, int]:
+    spot_count = _count_active_spot_strategies()
+    perp_count = _count_active_perp_strategies()
+    active_strategies.labels(market_type="spot").set(spot_count)
+    active_strategies.labels(market_type="perp").set(perp_count)
+    return spot_count, perp_count
+
+
 # API Endpoints
 @app.get("/metrics")
 async def get_metrics():
     """Prometheus metrics endpoint"""
+    _update_active_strategy_metrics()
     return Response(generate_latest(strategy_registry), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
-    enabled_count = sum(1 for s in strategies.values() if s['enabled'])
+    spot_count, perp_count = _update_active_strategy_metrics()
+    enabled_count = spot_count + perp_count
     return HealthResponse(
-        status="healthy" if enabled_count > 0 else "degraded",
+        status="healthy" if spot_count > 0 or perp_count > 0 else "degraded",
         timestamp=datetime.utcnow(),
         version="1.0.0",
         strategies_loaded=enabled_count,
-        total_strategies=len(strategies)
+        total_strategies=len(strategies) + perp_count,
+        spot_strategies_loaded=spot_count,
+        perp_strategies_loaded=perp_count,
     )
 
 @app.get("/ready")
@@ -2343,13 +2603,58 @@ async def get_hyperliquid_strategy_signal(coin: str, strategy_name: str):
     if not hyperliquid_strategy_manager:
         raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
     symbol = str(coin or "").upper().replace("/", "")
+    bucket = FAST_SIGNAL_CACHE_SECONDS if strategy_name == "rsi_stoch_reversal_5m" else 300
+    cache_key = f"hl_{symbol}_{strategy_name}_{int(datetime.utcnow().timestamp() / bucket)}"
+    if cache_key in hl_signal_cache:
+        return hl_signal_cache[cache_key]
     results = await hyperliquid_strategy_manager.analyze_coin(
-        symbol, strategy_allowlist=[strategy_name]
+        symbol,
+        ["5m"] if strategy_name == "rsi_stoch_reversal_5m" else None,
+        strategy_allowlist=[strategy_name],
     )
     strat = (results.get("strategies") or {}).get(strategy_name)
     if not strat:
         raise HTTPException(status_code=404, detail=f"Strategy {strategy_name} not found")
-    return {"coin": symbol, "strategy": strategy_name, **strat}
+    payload = {"coin": symbol, "strategy": strategy_name, **strat}
+    hl_signal_cache[cache_key] = payload
+    return payload
+
+
+@app.get("/api/v1/signals/{exchange}/{pair}/{strategy_name}")
+async def get_spot_strategy_signal(exchange: str, pair: str, strategy_name: str):
+    """Single-strategy signal for fast entry fallback (30s cache for rsi_stoch_reversal_5m)."""
+    if not strategy_manager:
+        raise HTTPException(status_code=503, detail="Strategy manager not initialized")
+    formatted_pair = pair
+    if "/" not in pair:
+        if len(pair) >= 7 and pair.endswith("USDC"):
+            formatted_pair = f"{pair[:-4]}/USDC"
+        elif len(pair) >= 6 and pair.endswith("USD"):
+            formatted_pair = f"{pair[:-3]}/USD"
+    bucket = FAST_SIGNAL_CACHE_SECONDS if strategy_name == "rsi_stoch_reversal_5m" else 300
+    cache_key = f"{exchange}_{formatted_pair}_{strategy_name}_{int(datetime.utcnow().timestamp() / bucket)}"
+    if cache_key in signal_cache:
+        return signal_cache[cache_key]
+    tfs = ["5m"] if strategy_name == "rsi_stoch_reversal_5m" else DEFAULT_ANALYSIS_TIMEFRAMES
+    analysis_results = await strategy_manager.analyze_pair(
+        exchange,
+        formatted_pair,
+        tfs,
+        strategy_allowlist=[strategy_name],
+    )
+    if not analysis_results:
+        raise HTTPException(status_code=404, detail="No signals available")
+    strat = (analysis_results.get("strategies") or {}).get(strategy_name)
+    if not strat:
+        raise HTTPException(status_code=404, detail=f"Strategy {strategy_name} not found")
+    payload = {
+        "exchange": exchange,
+        "pair": formatted_pair,
+        "strategy": strategy_name,
+        **strat,
+    }
+    signal_cache[cache_key] = payload
+    return payload
 
 
 @app.get("/api/v1/signals/{exchange}/{pair}")
@@ -2623,10 +2928,12 @@ async def startup_event():
     logger.info("Starting Strategy Service...")
     await initialize_strategies()
     await initialize_hyperliquid_strategies()
+    _update_active_strategy_metrics()
     
     # Start continuous strategy analysis in background
     asyncio.create_task(continuous_strategy_analysis())
-    
+    asyncio.create_task(rsi_stoch_reversal_5m_fast_loop())
+
     logger.info("Strategy Service started successfully")
 
 @app.on_event("shutdown")

@@ -9,6 +9,23 @@ alerts:
     balance_low: 50
     daily_loss: 0.05
     trade_failure: 3
+monitoring:
+  prometheus:
+    scrape_interval_seconds: 15
+    retention_hours: 200
+  alerts:
+    telegram_enabled: true
+    balance_low_usd: 50
+    daily_loss_fraction: 0.05
+    perp_paper_loss_usd_24h: 500
+    no_trades_for_minutes: 30
+    redis_stream_max_length: 10000
+    cpu_percent: 80
+    memory_percent: 80
+    disk_percent: 85
+    postgres_connections_percent: 80
+    postgres_db_max_size_gb: 10
+    postgres_cache_hit_ratio_min: 0.90
 balance_manager:
   check_interval_seconds: 30
   max_balance_usage: 0.9
@@ -1256,7 +1273,7 @@ strategies:
     - 1m
   breakout_retest_long:
     # Standalone intraday long: break resistance, retest old resistance as support, reclaim on volume.
-    enabled: true
+    enabled: false  # 2026-05-29: disabled on spot — only fires in trending_up/breakout (both net losers); shares top-chase failure retired on perps. No proven spot edge (5 trades, -$1.00).
     parameters:
       trend_timeframe: 15m
       entry_timeframe: 5m
@@ -1411,8 +1428,33 @@ strategies:
     - 1d
     - 5m
     - 1m
+  rsi_stoch_reversal_5m:
+    # Spot long-only: RSI<30 + Stoch K&D<30 + K>D on closed 5m (same rules as HL long).
+    enabled: true
+    parameters:
+      entry_timeframe: 5m
+      rsi_period: 14
+      rsi_oversold: 30
+      stoch_oversold: 30
+      stoch_overbought: 80
+      stoch_rsi_length: 14
+      stoch_k_smooth: 3
+      stoch_d_smooth: 3
+      buy_confidence: 0.72
+      buy_strength: 0.70
+      sell_confidence: 0.72
+      sell_strength: 0.70
+      allow_long: true
+      allow_short: false
+      fast_signal_enabled: true
+      fast_signal_interval_seconds: 30
+      blocked_regimes:
+      - trending_down
+      - low_volatility
+    target_timeframes:
+    - 5m
   rsi_oversold_override:
-    enabled: false
+    enabled: true  # 2026-05-29: re-enabled (fee-aware expansion). Lifetime breakeven (193 trades, PF 1.01, +$1.93); restricted below to its viable regimes + off bybit, with strategy_expectancy_guard as auto-probation backstop. Simulation mode.
     parameters:
       # Independent override strategy (15m trigger + 1h safety guards):
       # - Base trigger: 15m RSI oversold.
@@ -1705,7 +1747,7 @@ strategies_hyperliquid:
     enabled: true
     parameters:
       allow_long: true
-      allow_short: true
+      allow_short: false  # 2026-05-31 24h review: shorts -$2.49 book-wide; vwma 33% WR PF 0.32
       hull_period: 55
       min_confidence_score: 0.55
       stop_loss_pct: 1.5
@@ -1810,6 +1852,31 @@ strategies_hyperliquid:
       buy_confidence: 0.68
       stop_loss_pct: 1.0
       take_profit_pct: 1.8
+  rsi_stoch_reversal_5m:
+    # HL perp: long RSI<30 + Stoch K&D<30 + K>D; short Stoch K&D>80 + D>K.
+    enabled: true
+    parameters:
+      entry_timeframe: 5m
+      rsi_period: 14
+      rsi_oversold: 30
+      stoch_oversold: 30
+      stoch_overbought: 80
+      stoch_rsi_length: 14
+      stoch_k_smooth: 3
+      stoch_d_smooth: 3
+      buy_confidence: 0.72
+      buy_strength: 0.70
+      sell_confidence: 0.72
+      sell_strength: 0.70
+      allow_long: true
+      allow_short: true
+      fast_signal_enabled: true
+      fast_signal_interval_seconds: 30
+      blocked_regimes:
+      - trending_down
+      - low_volatility
+    target_timeframes:
+    - 5m
   sma_reclaim_bull_flag:
     enabled: true
     parameters:
@@ -1968,8 +2035,8 @@ trading:
     signal_source: hyperliquid_strategies
     strategy_consensus:
       min_agreement: 50
-      min_confidence_long: 0.62
-      min_confidence_short: 0.62
+      min_confidence_long: 0.64
+      min_confidence_short: 0.68
     # Perpetual paper exits are position-close decisions, not opposite entry
     # signals. Keep exits centralized in stop loss / trailing profit protection
     # so a short entry is never confused with a spot-style sell signal.
@@ -1979,6 +2046,23 @@ trading:
     wallet_address: "${HYPERLIQUID_WALLET_ADDRESS}"
     fee_rate_per_side: 0.001
     allow_live_orders: false
+    # Manual live pilot (rsi_stoch only). Set mode: live + allow_live_orders: true after
+    # scripts/check_hl_live_readiness.py passes and ./scripts/apply_config.sh.
+    live_strategy_allowlist:
+      - rsi_stoch_reversal_5m
+    live_max_margin_per_trade: 25
+    live_max_open_positions: 2
+    live_kill_switch: false
+    live_promotion:
+      enabled: false
+      strategy: rsi_stoch_reversal_5m
+      min_closed_trades: 30
+      lookback_hours: 168
+      min_realized_pnl_usd: 25.0
+      min_profit_factor: 1.2
+      min_win_rate: 0.52
+      max_consecutive_losses: 4
+      require_positive_last_24h: true
     default_leverage: 2.0
     # Paper sizing: margin is the collateral locked; notional is exposure.
     # Target full paper-balance deployment across the 20-pair HL universe.
@@ -1986,10 +2070,11 @@ trading:
     max_margin_per_trade: 100.0
     max_notional_per_trade: 200.0
     max_open_positions: 6
-    min_confidence_long: 0.62
-    min_confidence_short: 0.62
+    min_confidence_long: 0.64
+    min_confidence_short: 0.68
     # 2026-05-26: re-entry cooldown after ANY exit on same coin+side (not just losses).
-    perp_reentry_cooldown_minutes: 30
+    # 2026-05-31: 30 -> 45 after 24h review — stagnant-loser churn on repeat coin+side entries.
+    perp_reentry_cooldown_minutes: 45
     # Phase 4 (2026-05-27): session-aware sizing/blocking driven by lifetime
     # paper PnL distribution per UTC hour:
     #   worst: 13 (-$24.33), 21 (-$21.80), 19 (-$15.94), 2 (-$14.88), 4 (-$13.89)
@@ -2012,6 +2097,10 @@ trading:
       # entirely in those hours (caution sizing covers the surrounding hours).
       block_windows_enabled: true
       block_windows:
+        - start_utc: 1
+          end_utc: 2       # 2026-05-31 24h review: 3 trades -$1.15 at 01 UTC
+        - start_utc: 12
+          end_utc: 13      # 2026-05-31 24h review: 3 trades -$1.87 at 12 UTC
         - start_utc: 13
           end_utc: 14
         - start_utc: 19
@@ -2046,26 +2135,20 @@ trading:
       ONDO: 1.2
       HYPE: 1.2
       LIT: 1.2
-    # Phase 2026-05-28: perp-specific trailing (wider than spot 0.35%/0.25% so winners
-    # pay for losers). Spot keeps trading.trailing_stop unchanged.
+    # 2026-05-31: arm protection at +0.35% peak; lock/guarantee +0.50% minimum on exit;
+    # trail arms at +0.65% (floor + tightened step) with tighter 0.15% callback.
     trailing_stop:
       enabled: true
-      activation_threshold: 0.0075
-      # 2026-05-29 (Phase C): widen step 0.0050 -> 0.0065 and push the tighten
-      # threshold 0.0150 -> 0.0200 so winners (the profit center, trailing PF
-      # 20.6) run longer before the stop tightens. avg_win was too small to pay
-      # for losers; give trends more room.
-      step_percentage: 0.0065
-      tightened_step_percentage: 0.0030
+      activation_threshold: 0.0035
+      step_percentage: 0.0020
+      tightened_step_percentage: 0.0015
       dynamic_tightening_enabled: true
-      tighten_profit_threshold: 0.0200
+      tighten_profit_threshold: 0.0050
       breakeven_floor_percentage: 0.0050
       min_trigger_distance_percentage: 0.0050
     profit_protection:
       enabled: true
-      # Arm only after peak clears trailing activation (0.75%); breach requires
-      # gross >= breakeven floor (0.50%) so ~$14 notional nets >~$0.04 after fees.
-      activation_threshold: 0.0075
+      activation_threshold: 0.0035
     # Stagnant loser: inherit trading.stagnant_loser thresholds unless overridden here.
     stagnant_loser_enabled: true
     # Orchestrator structural exits for top HL strategies (long-only; mirrors spot path).
@@ -2084,8 +2167,53 @@ trading:
       # 2026-05-29 (Phase C): raised 0.40 -> 0.50. The 46 paper_stop_loss trades
       # (-$134 lifetime) were low-edge entries firing into chop; require a larger
       # expected move before committing notional.
-      min_edge_pct: 0.50
+      # 2026-05-31: 0.50 -> 0.60 after 24h review — 8/18 closes via stagnant_loser
+      # (chop entries with no follow-through).
+      min_edge_pct: 0.60
       edge_multiplier: 2.0
+    # 2026-05-31: halt new HL paper entries when today's realized PnL breaches budget.
+    daily_loss_halt:
+      enabled: true
+      max_daily_loss_pct: 0.03
+    # 2026-05-31: risk-% sizing — notional = (equity × risk%) / (stop_distance / 100).
+    risk_based_sizing:
+      enabled: true
+      risk_per_trade_pct: 0.0075
+    # 2026-05-31: per-strategy-family exit profiles (scalp vs swing).
+    exit_profiles:
+      rsi_stoch_reversal_5m:
+        strategies:
+          - rsi_stoch_reversal_5m
+      scalp:
+        strategies:
+          - small_size_momentum_scalp
+          - vwap_bounce_scalping
+          - pullback_long_scalping
+          - macd_ema_vwap_scalper
+        max_holding_minutes: 45
+        max_holding_minutes_hard: 90
+        stop_loss_pct: 0.9
+        stagnant_loser:
+          min_age_minutes: 12
+          peak_cap_pct: 0.35
+          loss_trigger_pct: -0.50
+          fast_fail_peak_pct: 0.10
+          fast_fail_min_age_minutes: 5
+          fast_fail_loss_pct: -0.35
+        trailing_stop:
+          activation_threshold: 0.0045
+          step_percentage: 0.0030
+          breakeven_floor_percentage: 0.0045
+          min_trigger_distance_percentage: 0.0045
+        profit_protection:
+          activation_threshold: 0.0045
+      swing:
+        strategies:
+          - swing_hull_rsi_ema
+          - vwma_hull
+          - macd_momentum
+          - multi_timeframe_confluence
+          - supertrend
     # Phase 7 (2026-05-27): PnL-weighted strategy sizing tier. Multiplies the
     # per-trade size by 0.4 / 0.7 / 1.0 based on rolling realized PnL on
     # closed paper trades for that strategy. Independent of standalone gate
@@ -2157,8 +2285,8 @@ trading:
         min_strength: 0.50
       vwma_hull:
         enabled: true
-        min_confidence: 0.70
-        min_confidence_short: 0.85  # 2026-05-26: shorts underperform — raise bar for short side
+        min_confidence: 0.72  # 2026-05-31 24h review: -$0.97 on 6 closes, PF 0.32
+        min_confidence_short: 0.85  # shorts disabled at strategy level; gate kept as belt-and-suspenders
         min_strength: 0.20
       macd_momentum:
         enabled: true
@@ -2170,7 +2298,8 @@ trading:
         min_strength: 0.50
       swing_hull_rsi_ema:
         enabled: true
-        min_confidence: 0.62
+        min_confidence: 0.65
+        min_confidence_short: 0.72  # 2026-05-31 24h review: shorts net -$2.49
         min_strength: 0.60
       pullback_long_scalping:
         enabled: true
@@ -2193,7 +2322,8 @@ trading:
         min_strength: 0.55
       small_size_momentum_scalp:
         enabled: true
-        min_confidence: 0.70
+        min_confidence: 0.72
+        min_confidence_short: 0.72
         min_strength: 0.55
       breakout_retest_long:
         enabled: false  # 2026-05-29: gate disabled to match strategy disable above (top lifetime loser -$52.79, PF 0.26).
@@ -2201,6 +2331,10 @@ trading:
         min_confidence: 0.80
         min_confidence_long: 0.80
         min_strength: 0.70
+      rsi_stoch_reversal_5m:
+        enabled: true
+        min_confidence: 0.70
+        min_strength: 0.65
       engulfing_multi_tf:
         enabled: false  # 2026-05-27: gate disabled to match strategy disable above
         min_confidence: 0.72
@@ -2314,8 +2448,8 @@ trading:
     # NEW: Fee-aware profit guarantee settings
     partial_exit_levels: [0.008, 0.013, 0.018, 0.023]  # CRITICAL: Fee-adjusted levels (0.8%, 1.3%, 1.8%, 2.3%)
     partial_exit_sizes: [0.3, 0.3, 0.2, 0.2]  # Exit 30%, 30%, 20%, 20% at each level
-    guaranteed_min_profit: 0.0035
-    break_even_plus: 0.0035
+    guaranteed_min_profit: 0.0050
+    break_even_plus: 0.0050
   # PnL-FIX v3 — Risk: tighter stop; winners are managed by trailing_stop / profit protection (no global fixed TP %).
   # Old config: SL 3.0% vs trailing activation 0.5% = avg loser $12 vs avg winner $4 (1:0.33).
   stop_loss_percentage: 0.015   # PnL-FIX v3: was 0.030 (3% → 1.5%)
@@ -2343,10 +2477,17 @@ trading:
   # SPOT longs only when stable regime is bullish / reversal (orchestrator-enforced).
   long_entry_allowed_regimes:
     enabled: true
+    # 2026-05-29: added trending_down (+$52.53 lifetime, PF 1.59) and sideways
+    # (+$24.74, PF 1.27) — the two regimes where spot longs are NET POSITIVE but
+    # were previously never allowed. The prior allowlist only permitted the three
+    # net-losing regimes (trending_up -$94, breakout -$29, reversal_zone -$18).
+    # strategy_expectancy_guard remains the per-strategy auto-probation backstop.
     regimes:
     - trending_up
     - breakout
     - reversal_zone
+    - trending_down
+    - sideways
   # Standalone MACD execution: min quality + regime allowlist (not 0.52 / strength 0).
   macd_buy_override:
     enabled: true
@@ -2371,6 +2512,15 @@ trading:
     early_fail_after_minutes: 30
     early_fail_required_peak_pct: 0.20
     early_fail_pnl_below_pct: 0.0
+  rsi_stoch_reversal_5m_risk:
+    profit_activation_threshold: 0.0050
+    trailing_activation_threshold: 0.0050
+  fast_entry:
+    enabled: true
+    interval_seconds: 30
+    redis_max_age_seconds: 40
+    strategies:
+    - rsi_stoch_reversal_5m
   # Per-strategy min quality + spread for standalone BUY (replaces blind entry_quality_gate bypass).
   # Min price / spread / venue before standalone BUY (blocks sub-cent meme pairs on Bybit).
   standalone_pair_guards:
@@ -2406,6 +2556,9 @@ trading:
     sma_reclaim_bull_flag:
       min_last_price_usd: 0.01
       max_spread_percentage: 0.30
+    rsi_stoch_reversal_5m:
+      min_last_price_usd: 0.01
+      max_spread_percentage: 0.32
   standalone_entry_quality:
     enabled: true
     max_spread_percentage: 0.38
@@ -2421,6 +2574,11 @@ trading:
     rsi_oversold_checklist:
       min_confidence: 0.70
       min_strength: 0.35
+    rsi_oversold_override:
+      # 2026-05-29: high bar for the re-enabled override (its internal buy_confidence
+      # is already 0.95) to keep it fee-aware and selective.
+      min_confidence: 0.80
+      min_strength: 0.40
     macd_momentum:
       min_confidence: 0.72
       min_strength: 0.35
@@ -2439,6 +2597,9 @@ trading:
     sma_reclaim_bull_flag:
       min_confidence: 0.76
       min_strength: 0.38
+    rsi_stoch_reversal_5m:
+      min_confidence: 0.70
+      min_strength: 0.65
   # Apply 24h momentum band filter to these standalone strategies (not macd_momentum).
   standalone_apply_momentum_filter:
   - macd_ema_vwap_scalper
@@ -2459,10 +2620,30 @@ trading:
       - bybit
     rsi_oversold_checklist:
       enabled: true
+      # 2026-05-29: added trending_down + sideways. This is the proven spot winner
+      # (+$31.52, 68% WR, PF 3.89) and is already tuned for sideways via
+      # reclaim_by_regime, but config previously blocked it from those regimes.
       regimes:
       - trending_up
       - breakout
       - reversal_zone
+      - trending_down
+      - sideways
+    rsi_oversold_override:
+      enabled: true
+      # 2026-05-29: re-enabled, fee-aware expansion. Trend-confirmed oversold
+      # reclaim (requires price>EMA20 + MACD bias); excludes trending_down/
+      # high_volatility internally. Allowed in sideways + reversal_zone + breakout
+      # (+ trending_up where it has uptrend structure); kept off bybit (worst venue,
+      # 39% WR). expectancy_guard auto-probations if it bleeds.
+      regimes:
+      - trending_up
+      - breakout
+      - reversal_zone
+      - sideways
+      allowed_exchanges:
+      - binance
+      - cryptocom
     macd_ema_vwap_scalper:
       enabled: true
       regimes:
@@ -2476,7 +2657,7 @@ trading:
       - breakout
       - reversal_zone
     breakout_retest_long:
-      enabled: true
+      enabled: false  # 2026-05-29: disabled to match strategy disable above.
       regimes:
       - trending_up
       - breakout
@@ -2506,10 +2687,14 @@ trading:
       - bybit
     sma_reclaim_bull_flag:
       enabled: true
+      # 2026-05-29: added sideways (range reclaim is a valid bull-flag context in
+      # the +$24.74 sideways regime). Left trending_down off — bull-flag reclaim is
+      # long-biased continuation, less suited to downtrends.
       regimes:
       - trending_up
       - reversal_zone
       - breakout
+      - sideways
       allowed_exchanges:
       - binance
       - bybit
@@ -2664,17 +2849,15 @@ trading:
     # budget), tighten callback to 0.6% so we don't give back 1.2% of a
     # winner, and add a HARD safety floor that ensures any active trail
     # exits at MINIMUM +0.30% net of fees (was hardcoded +0.10% in code).
-    step_percentage: 0.0025             # Base trailing distance: 0.25% callback for earlier protection
+    step_percentage: 0.0020             # Base trailing distance: 0.20% callback
     dynamic_tightening_enabled: true    # Tighten trail after sufficient profit
-    tighten_profit_threshold: 0.0035    # Tighten once peak PnL exceeds +0.35%
-    tightened_step_percentage: 0.0020   # Tightened trailing distance: 0.20%
+    tighten_profit_threshold: 0.0050    # Tighten once peak PnL exceeds +0.50% floor
+    tightened_step_percentage: 0.0015   # Tightened trailing distance: 0.15%
     activation_threshold: 0.0035
     max_trail_distance: 0.0025          # (currently unused)
-    min_trigger_distance_percentage: 0.0035
-    # PnL-FIX v13 (2026-05): floor tuned to *measured fee model* in profit_protection
-    # (0.1% entry + 0.1% exit = 0.20% of notional, proportional) plus ~0.25% cushion for
-    # spread/min-fee reality on small caps — NOT below round-trip fee %.
-    breakeven_floor_percentage: 0.0035  # +0.35% minimum lock above entry (price space)
+    min_trigger_distance_percentage: 0.0050
+    # Arm at +0.35% peak; guaranteed exit floor +0.50% (fees 0.20% + 0.30% cushion).
+    breakeven_floor_percentage: 0.0050  # +0.50% minimum lock above entry (price space)
     # PnL-FIX v8 (Q1+Q2+Q3): tighter tick handling for the trail-stop manager.
     #   check_interval_seconds: how often the polling loop scans active stops
     #     (used as a safety-net on top of the new event-driven WS callback).
@@ -2776,6 +2959,10 @@ realtime:
   enable_websocket_prices: false
   stale_price_threshold_seconds: 30
   rest_poll_interval_seconds: 1
+  # Price-feed DB retention (trading.real_time_prices). Stops 1M+ row scans / low cache-hit alerts.
+  real_time_prices:
+    max_rows_per_pair: 200
+    max_age_hours: 48
   ws:
     reconnect_backoff_seconds:
     - 1

@@ -26,7 +26,7 @@ def compute_stoch_rsi(
     try:
         result = ta.stochrsi(
             close.astype(float),
-            length=rsi_length,
+            length=stoch_length,
             rsi_length=rsi_length,
             k=k_smooth,
             d=d_smooth,
@@ -35,8 +35,15 @@ def compute_stoch_rsi(
         return None, None
     if result is None or result.empty:
         return None, None
-    k_col = next((c for c in result.columns if str(c).upper().startswith("STOCHRSIk")), None)
-    d_col = next((c for c in result.columns if str(c).upper().startswith("STOCHRSId")), None)
+    # pandas_ta columns are STOCHRSIk_* / STOCHRSId_*; .upper() yields STOCHRSIK / STOCHRSID.
+    k_col = next(
+        (c for c in result.columns if str(c).upper().startswith("STOCHRSIK")),
+        None,
+    )
+    d_col = next(
+        (c for c in result.columns if str(c).upper().startswith("STOCHRSID")),
+        None,
+    )
     if not k_col or not d_col:
         return None, None
     return result[k_col], result[d_col]

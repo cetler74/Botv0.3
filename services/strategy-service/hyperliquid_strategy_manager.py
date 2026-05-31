@@ -67,10 +67,8 @@ class HyperliquidExchangeAdapter:
             data = payload.get("data") if isinstance(payload, dict) else None
             if not data:
                 return None
-            df = ohlcv_dict_to_df(data)
-            if df is not None and len(df) > 1:
-                df = df.iloc[:-1]
-            return df
+            # Forming-candle drop is handled in rsi_stoch engine via prepare_closed_ohlcv.
+            return ohlcv_dict_to_df(data)
 
 
 class HyperliquidStrategyManager:

@@ -51,6 +51,7 @@ from pydantic import BaseModel
 import uvicorn
 import os
 from hyperliquid_ledger import compute_hyperliquid_balance_amounts
+from perp_paper_pnl_report import build_paper_pnl_report
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
 
 # Import centralized trade closure service
@@ -122,6 +123,40 @@ class Trade(BaseModel):
     trail_stop_trigger: Optional[float] = None
     current_price: Optional[float] = None
     entry_id: Optional[str] = None
+
+
+class PerpLiveTrade(BaseModel):
+    """Live Hyperliquid perp ledger (separate from paper)."""
+    trade_id: str
+    venue: str = "hyperliquid"
+    coin: str
+    pair: Optional[str] = None
+    source_exchange: Optional[str] = None
+    source_pair: Optional[str] = None
+    source_strategy: str
+    source_signal: str = "live"
+    position_side: str
+    leverage: float = 2.0
+    margin_used: float = 0.0
+    notional_size: float = 0.0
+    position_size: float
+    entry_price: float = 0.0
+    current_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    status: str = "OPEN"
+    entry_time: datetime
+    exit_time: Optional[datetime] = None
+    unrealized_pnl: Optional[float] = 0.0
+    realized_pnl: Optional[float] = 0.0
+    fees: Optional[float] = 0.0
+    funding: Optional[float] = 0.0
+    confidence: Optional[float] = 0.0
+    strength: Optional[float] = 0.0
+    consensus_confidence: Optional[float] = 0.0
+    consensus_agreement: Optional[float] = 0.0
+    mode: str = "live"
+    exit_reason: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class PerpPaperTrade(BaseModel):
@@ -863,6 +898,16 @@ class DatabaseManager:
                 
     async def execute_query(self, query: str, params: Optional[Tuple] = None) -> List[Dict[str, Any]]:
         """Execute a query and return results"""
+        import time as _time
+        q = (query or "").strip()
+        op = q.split()[0].upper() if q else "UNKNOWN"
+        table = "unknown"
+        if " FROM " in q.upper():
+            try:
+                table = q.upper().split(" FROM ")[1].split()[0].strip('"').split(".")[-1].lower()
+            except Exception:
+                pass
+        start = _time.perf_counter()
         async with self.get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
@@ -872,8 +917,14 @@ class DatabaseManager:
                         cursor.execute(query, params)
                 except Exception as e:
                     import traceback
+                    elapsed = _time.perf_counter() - start
+                    db_queries_total.labels(operation=op, table=table, status="error").inc()
+                    db_query_duration.labels(operation=op, table=table).observe(elapsed)
                     logger.error(f"Query failed: {e}\nSQL: {query}\nParams: {params}\n{traceback.format_exc()}")
                     raise
+                elapsed = _time.perf_counter() - start
+                db_queries_total.labels(operation=op, table=table, status="ok").inc()
+                db_query_duration.labels(operation=op, table=table).observe(elapsed)
                 if query.strip().upper().startswith('SELECT'):
                     return cursor.fetchall()
                 conn.commit()
@@ -1423,6 +1474,7 @@ async def initialize_database():
         await ensure_trade_fee_columns(db_manager)
         await ensure_macd_analysis_log_table(db_manager)
         await ensure_perp_paper_trades_table(db_manager)
+        await ensure_perp_live_trades_table(db_manager)
         
         # Initialize materializer (Phase 3)
         materializer = EventMaterializer(db_manager)
@@ -1554,6 +1606,61 @@ async def ensure_perp_paper_trades_table(manager: "DatabaseManager") -> None:
         logger.error(f"Failed ensuring perp_paper_trades table: {e}")
         raise
 
+
+async def ensure_perp_live_trades_table(manager: "DatabaseManager") -> None:
+    """Live HL perp ledger — never mixed with trading.perp_paper_trades."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.perp_live_trades (
+                trade_id UUID PRIMARY KEY,
+                venue TEXT NOT NULL DEFAULT 'hyperliquid',
+                coin TEXT NOT NULL,
+                pair TEXT,
+                source_exchange TEXT,
+                source_pair TEXT,
+                source_strategy TEXT NOT NULL,
+                source_signal TEXT NOT NULL,
+                position_side TEXT NOT NULL CHECK (position_side IN ('long', 'short')),
+                leverage DOUBLE PRECISION NOT NULL DEFAULT 2.0,
+                margin_used DOUBLE PRECISION NOT NULL DEFAULT 0,
+                notional_size DOUBLE PRECISION NOT NULL DEFAULT 0,
+                position_size DOUBLE PRECISION NOT NULL,
+                entry_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+                current_price DOUBLE PRECISION,
+                exit_price DOUBLE PRECISION,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                entry_time TIMESTAMPTZ NOT NULL,
+                exit_time TIMESTAMPTZ,
+                unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                realized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                fees DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                funding DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                strength DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                consensus_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                consensus_agreement DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                mode TEXT NOT NULL DEFAULT 'live',
+                exit_reason TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_perp_live_trades_status
+            ON trading.perp_live_trades (status);
+            CREATE INDEX IF NOT EXISTS idx_perp_live_trades_coin_status
+            ON trading.perp_live_trades (coin, status);
+            CREATE INDEX IF NOT EXISTS idx_perp_live_trades_source_strategy
+            ON trading.perp_live_trades (source_strategy);
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured perp_live_trades table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring perp_live_trades table: {e}")
+        raise
+
 # API Endpoints
 @app.get("/metrics")
 async def get_metrics():
@@ -1564,6 +1671,9 @@ async def get_metrics():
 async def health_check():
     """Health check endpoint"""
     pool_stats = await db_manager.get_pool_stats() if db_manager else {}
+    if pool_stats:
+        db_connections_active.set(int(pool_stats.get("active_connections", 0)))
+        db_pool_size.set(int(pool_stats.get("pool_size", 0)))
     return HealthResponse(
         status="healthy" if db_manager else "unhealthy",
         timestamp=datetime.utcnow(),
@@ -1829,6 +1939,80 @@ async def get_trades(
         logger.error(f"Failed to get trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/v1/trades/stats/summary")
+async def get_trades_stats_summary(hours: float = Query(24, ge=0, le=24 * 365)):
+    """Lightweight trade counts for monitoring KPIs (Prometheus kpi-exporter)."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        if hours > 0:
+            closed_row = await db_manager.execute_single_query(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM trading.trades
+                WHERE UPPER(status) = 'CLOSED'
+                  AND exit_time IS NOT NULL
+                  AND exit_time >= NOW() - (%s * INTERVAL '1 hour')
+                """,
+                (hours,),
+            )
+        else:
+            closed_row = await db_manager.execute_single_query(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM trading.trades
+                WHERE UPPER(status) = 'CLOSED'
+                """
+            )
+        open_row = await db_manager.execute_single_query(
+            """
+            SELECT COUNT(*)::int AS count
+            FROM trading.trades
+            WHERE UPPER(status) IN ('OPEN', 'PENDING', 'ACTIVE')
+            """
+        )
+        failed_row = await db_manager.execute_single_query(
+            """
+            SELECT COUNT(*)::int AS count
+            FROM trading.trades
+            WHERE UPPER(status) = 'FAILED'
+              AND created_at >= NOW() - (%s * INTERVAL '1 hour')
+            """,
+            (hours if hours > 0 else 24,),
+        )
+        pnl_row = await db_manager.execute_single_query(
+            """
+            SELECT
+                COALESCE(SUM(realized_pnl) FILTER (
+                    WHERE UPPER(status) = 'CLOSED'
+                      AND exit_time IS NOT NULL
+                      AND exit_time >= NOW() - (%s * INTERVAL '1 hour')
+                ), 0) AS realized_pnl_24h,
+                COALESCE(SUM(realized_pnl) FILTER (
+                    WHERE UPPER(status) = 'CLOSED'
+                ), 0) AS realized_pnl_all_time,
+                COALESCE(SUM(unrealized_pnl) FILTER (
+                    WHERE UPPER(status) IN ('OPEN', 'PENDING', 'ACTIVE')
+                ), 0) AS unrealized_pnl_open
+            FROM trading.trades
+            """,
+            (hours if hours > 0 else 24,),
+        )
+        return {
+            "hours": hours,
+            "closed_trades": int((closed_row or {}).get("count") or 0),
+            "open_trades": int((open_row or {}).get("count") or 0),
+            "failed_trades": int((failed_row or {}).get("count") or 0),
+            "realized_pnl_24h": float((pnl_row or {}).get("realized_pnl_24h") or 0),
+            "realized_pnl_all_time": float((pnl_row or {}).get("realized_pnl_all_time") or 0),
+            "unrealized_pnl_open": float((pnl_row or {}).get("unrealized_pnl_open") or 0),
+        }
+    except Exception as e:
+        logger.error(f"Failed to get trades stats summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/trades/stats/monthly-realized")
 async def get_monthly_realized_stats(months: int = Query(14, ge=1, le=120)):
     """
@@ -2015,6 +2199,160 @@ async def get_open_perp_paper_trades(coin: Optional[str] = None):
     return await get_perp_paper_trades(status="OPEN", coin=coin, limit=1000, offset=0)
 
 
+@app.post("/api/v1/perps/live-trades")
+async def create_perp_live_trade(trade: PerpLiveTrade):
+    """Create a live perpetual trade record (exchange fill tracked in metadata)."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.perp_live_trades (
+                trade_id, venue, coin, pair, source_exchange, source_pair,
+                source_strategy, source_signal, position_side, leverage,
+                margin_used, notional_size, position_size, entry_price,
+                current_price, exit_price, status, entry_time, exit_time,
+                unrealized_pnl, realized_pnl, fees, funding, confidence,
+                strength, consensus_confidence, consensus_agreement, mode,
+                exit_reason, metadata
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+        """
+        await db_manager.execute_query(
+            query,
+            (
+                trade.trade_id,
+                trade.venue,
+                trade.coin.upper(),
+                trade.pair,
+                trade.source_exchange,
+                trade.source_pair,
+                trade.source_strategy,
+                trade.source_signal,
+                trade.position_side.lower(),
+                trade.leverage,
+                trade.margin_used,
+                trade.notional_size,
+                trade.position_size,
+                trade.entry_price,
+                trade.current_price or trade.entry_price,
+                trade.exit_price,
+                normalize_status(trade.status, "trade"),
+                trade.entry_time,
+                trade.exit_time,
+                trade.unrealized_pnl or 0.0,
+                trade.realized_pnl or 0.0,
+                trade.fees or 0.0,
+                trade.funding or 0.0,
+                trade.confidence or 0.0,
+                trade.strength or 0.0,
+                trade.consensus_confidence or 0.0,
+                trade.consensus_agreement or 0.0,
+                trade.mode,
+                trade.exit_reason,
+                Json(trade.metadata or {}),
+            ),
+        )
+        return {"trade_id": trade.trade_id, "status": "created"}
+    except Exception as e:
+        logger.error(f"Failed to create perp live trade: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/live-trades/open")
+async def get_open_perp_live_trades(coin: Optional[str] = None):
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["status = 'OPEN'"]
+        params: List[Any] = []
+        if coin:
+            where.append("coin = %s")
+            params.append(coin.upper())
+        query = f"""
+            SELECT * FROM trading.perp_live_trades
+            WHERE {' AND '.join(where)}
+            ORDER BY entry_time DESC
+            LIMIT 1000
+        """
+        rows = await db_manager.fetch_all(query, tuple(params))
+        return {"trades": rows or []}
+    except Exception as e:
+        logger.error(f"Failed to list open live trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/v1/perps/live-trades/{trade_id}")
+async def update_perp_live_trade(trade_id: str, update_data: Dict[str, Any]):
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        fields = []
+        params: List[Any] = []
+        for key in (
+            "status",
+            "exit_time",
+            "exit_reason",
+            "exit_price",
+            "realized_pnl",
+            "current_price",
+        ):
+            if key in update_data:
+                fields.append(f"{key} = %s")
+                params.append(update_data[key])
+        meta_patch = update_data.get("metadata_patch")
+        if meta_patch:
+            fields.append("metadata = metadata || %s::jsonb")
+            params.append(Json(meta_patch))
+        if not fields:
+            return {"trade_id": trade_id, "status": "noop"}
+        fields.append("updated_at = NOW()")
+        params.append(trade_id)
+        query = f"""
+            UPDATE trading.perp_live_trades
+            SET {', '.join(fields)}
+            WHERE trade_id = %s
+        """
+        await db_manager.execute_query(query, tuple(params))
+        return {"trade_id": trade_id, "status": "updated"}
+    except Exception as e:
+        logger.error(f"Failed to update perp live trade: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/paper-readiness/rsi_stoch")
+async def get_rsi_stoch_paper_readiness():
+    """Paper go/no-go for manual live promotion (informational only)."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        from hyperliquid_live_readiness import evaluate_live_readiness
+
+        config_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8009")
+        promo: Dict[str, Any] = {}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f"{config_url}/api/v1/config/trading")
+                if resp.status_code == 200:
+                    trading = resp.json() or {}
+                    promo = (
+                        (trading.get("hyperliquid_perps") or {}).get("live_promotion")
+                        or {}
+                    )
+        except Exception:
+            pass
+        rows = await db_manager.fetch_all(
+            "SELECT * FROM trading.perp_paper_trades ORDER BY entry_time DESC LIMIT 2000",
+            (),
+        )
+        return evaluate_live_readiness(rows or [], promo)
+    except Exception as e:
+        logger.error(f"Paper readiness check failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.put("/api/v1/perps/paper-trades/{trade_id}")
 async def update_perp_paper_trade(trade_id: str, update_data: Dict[str, Any]):
     """Update an isolated paper perpetual trade."""
@@ -2121,6 +2459,35 @@ async def get_perp_paper_summary():
         return {"summary": summary, "by_side": by_side, "by_strategy": by_strategy, "balance": hl_balance}
     except Exception as e:
         logger.error(f"Failed to get perp paper summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/paper-pnl-report")
+async def get_perp_paper_pnl_report(
+    hours: float = Query(24.0, ge=0),
+    limit: int = Query(2000, ge=1, le=2000),
+):
+    """Multi-dimensional paper-perp PnL report (same logic as scripts/report_hl_paper_pnl.py)."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        cap = min(limit, 2000)
+        rows: List[Dict[str, Any]] = []
+        for status in ("CLOSED", "OPEN"):
+            chunk = await db_manager.execute_query(
+                """
+                SELECT *, coin AS symbol
+                FROM trading.perp_paper_trades
+                WHERE status = %s
+                ORDER BY entry_time DESC
+                LIMIT %s
+                """,
+                (status, cap),
+            )
+            rows.extend(chunk or [])
+        return build_paper_pnl_report(rows, hours=hours, limit=cap)
+    except Exception as e:
+        logger.error(f"Failed to get perp paper PnL report: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3779,6 +4146,84 @@ async def get_unresolved_alerts(level: Optional[str] = None):
     except Exception as e:
         logger.error(f"Failed to get unresolved alerts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/alerts/unresolved/count")
+async def get_unresolved_alerts_count(level: Optional[str] = None):
+    """Count unresolved alerts (for Prometheus KPI exporter; avoids loading all rows)."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        if level:
+            row = await db_manager.execute_single_query(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM trading.alerts
+                WHERE resolved = false AND level = %s
+                """,
+                (level,),
+            )
+        else:
+            row = await db_manager.execute_single_query(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM trading.alerts
+                WHERE resolved = false
+                """
+            )
+        return {"count": int((row or {}).get("count") or 0)}
+    except Exception as e:
+        logger.error(f"Failed to count unresolved alerts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/alerts/resolve-bulk")
+async def resolve_alerts_bulk(
+    category: Optional[str] = None,
+    exchange: Optional[str] = None,
+    older_than_hours: Optional[int] = None,
+):
+    """Mark matching unresolved alerts resolved (ops / alert backlog cleanup)."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        clauses = ["resolved = false"]
+        params: List[Any] = []
+        if category:
+            clauses.append("category = %s")
+            params.append(category)
+        if exchange:
+            clauses.append("LOWER(exchange) = LOWER(%s)")
+            params.append(exchange)
+        if older_than_hours is not None:
+            clauses.append("created_at < NOW() - (%s::text || ' hours')::interval")
+            params.append(str(int(older_than_hours)))
+        where_sql = " AND ".join(clauses)
+        row = await db_manager.execute_single_query(
+            f"""
+            WITH updated AS (
+                UPDATE trading.alerts
+                SET resolved = true, resolved_at = CURRENT_TIMESTAMP
+                WHERE {where_sql}
+                RETURNING alert_id
+            )
+            SELECT COUNT(*)::int AS count FROM updated
+            """,
+            tuple(params),
+        )
+        resolved = int((row or {}).get("count") or 0)
+        logger.info(
+            "Bulk-resolved %s alerts (category=%s exchange=%s older_than_hours=%s)",
+            resolved,
+            category,
+            exchange,
+            older_than_hours,
+        )
+        return {"resolved": resolved}
+    except Exception as e:
+        logger.error(f"Failed bulk alert resolve: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.put("/api/v1/alerts/{alert_id}/resolve")
 async def resolve_alert(alert_id: str):

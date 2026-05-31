@@ -11,7 +11,12 @@ This directory contains the complete monitoring stack for the multi-exchange tra
 ## Services and Ports
 
 - Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000 (admin/admin)
+- Grafana: http://localhost:3030 (admin / `GRAFANA_ADMIN_PASSWORD` or default admin)
+- Alertmanager: http://localhost:9093
+- Node exporter: http://localhost:9100/metrics
+- cAdvisor: http://localhost:8088
+- Postgres exporter: http://localhost:9187/metrics
+- KPI exporter: http://localhost:8015/metrics
 
 ## Dashboards
 
@@ -97,11 +102,11 @@ The system includes comprehensive alerting for:
 
 ### 1. Start Monitoring Stack
 ```bash
-docker-compose up -d prometheus grafana
+docker compose --profile monitoring up -d prometheus alertmanager grafana redis-exporter node-exporter cadvisor postgres-exporter kpi-exporter
 ```
 
 ### 2. Access Grafana
-1. Navigate to http://localhost:3000
+1. Navigate to http://localhost:3030
 2. Login with admin/admin
 3. Dashboards will be automatically provisioned
 
@@ -117,8 +122,9 @@ To enable alert notifications:
 - `orchestrator_trades_total`: Total trades by exchange, pair, side, status
 - `orchestrator_trades_pnl`: P&L distribution histogram
 - `orchestrator_balance_total`: Current balance by exchange
-- `orchestrator_active_pairs`: Number of active trading pairs
-- `orchestrator_active_exchanges`: Number of active exchanges
+- `orchestrator_active_pairs{market_type="spot"|"perp"}`: Pairs in orchestrator rotation
+- `orchestrator_active_exchanges{market_type="spot"|"perp"}`: Exchanges with pair selections
+- `trading_spot_realized_pnl_usd` / `trading_spot_realized_pnl_24h_usd`: Spot PnL from database
 
 ### Database Service Metrics
 - `database_queries_total`: Total queries by operation, table, status
@@ -134,7 +140,20 @@ To enable alert notifications:
 - `strategy_analyses_total`: Analyses by strategy, exchange, pair, result
 - `strategy_analysis_duration_seconds`: Analysis duration histogram
 - `strategy_signals_total`: Signals by strategy, signal_type
-- `strategy_active_strategies`: Number of active strategies
+- `strategy_active_strategies{market_type="spot"|"perp"}`: Enabled strategy modules per market (spot vs Hyperliquid perps)
+
+## Hyperliquid live pilot (rsi_stoch only)
+
+Manual go-live checklist — does **not** auto-enable live orders:
+
+1. Deploy Phase 1 (closed-bar contract + `validate_rsi_stoch_actionable` on fast/slow paths). Confirm logs show `[FastEntry] Skip HL … validator …` when rules fail.
+2. Paper soak ≥48h; run `python3 scripts/report_hl_paper_pnl.py` and `python3 scripts/check_hl_live_readiness.py` (exit 0 required).
+3. Set `trading.hyperliquid_perps.mode: live`, `allow_live_orders: true`, small `live_max_margin_per_trade` / `live_max_open_positions`, `live_strategy_allowlist: [rsi_stoch_reversal_5m]`. Set `HYPERLIQUID_PRIVATE_KEY` in `.env`.
+4. `./scripts/apply_config.sh` — rebuilds baked-config images and restarts strategy + orchestrator.
+5. Monitor first live fills vs `bar_close_time` / `entry_path` in `trading.perp_live_trades.metadata`.
+6. Emergency: `live_kill_switch: true` then `apply_config.sh`.
+
+Prometheus: `trading_hl_rsi_stoch_live_readiness` (1 = paper metrics meet `live_promotion` thresholds). HL user WebSocket fill reconciliation is a follow-up after the pilot.
 
 ## Troubleshooting
 
@@ -175,6 +194,78 @@ curl http://localhost:9090/api/v1/rules
 docker logs trading-bot-prometheus
 docker logs trading-bot-grafana
 ```
+
+## Troubleshooting
+
+### Grafana ERR_CONNECTION_REFUSED (local)
+Monitoring uses profile `monitoring` and port **3030** (not 3000 or 8000):
+
+```bash
+docker compose --profile monitoring up -d prometheus grafana kpi-exporter
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3030/api/health   # expect 200
+```
+
+### DNS_PROBE_FINISHED_NXDOMAIN (Cloudflare / public URL)
+
+This is **not a Grafana or Docker bug** — the browser cannot resolve the hostname in DNS.
+
+Verified on this host (2026-05-30):
+- `portugalexpatdirectory.com` — zone exists in Cloudflare (NS ok) but **no A record** on apex
+- `bot.portugalexpatdirectory.com` — **NXDOMAIN** (no DNS record)
+- `grafana.portugalexpatdirectory.com` — **NXDOMAIN** (no DNS record)
+
+**Fix in Cloudflare Dashboard:**
+
+1. **Websites** → `portugalexpatdirectory.com` → status **Active**
+2. **Zero Trust** → **Networks** → **Tunnels** → your tunnel → **Public Hostname** → Add:
+   - `bot` → `http://127.0.0.1:8006`
+   - `grafana` → `http://127.0.0.1:3030`
+3. Confirm DNS auto-created: **DNS** → Records → CNAME `bot` / `grafana` → `*.cfargotunnel.com` (proxied)
+4. Run connector: `cloudflared tunnel run --token <from Zero Trust>`
+5. Use **subdomains only** — do **not** open `https://portugalexpatdirectory.com` (apex has no record)
+
+Check script: `./scripts/verify_tunnel_dashboard.sh`
+
+**Quick test without DNS:** `cloudflared tunnel --url http://127.0.0.1:3030` (temporary `*.trycloudflare.com` URL)
+
+Local access always works: http://127.0.0.1:3030 (Grafana), http://127.0.0.1:8006 (dashboard)
+
+### Grafana via Cloudflare (502 / blank / redirect loop)
+1. Tunnel must point to `http://127.0.0.1:3030` — see `config/cloudflared.example.yml`.
+2. Do **not** use port 3000 (container internal) or 8000 (blocked in this project).
+3. Set in `.env` when using a public subdomain:
+   ```
+   GRAFANA_ROOT_URL=https://grafana.yourdomain.com
+   GRAFANA_DOMAIN=grafana.yourdomain.com
+   ```
+4. Rebuild Grafana after env change:
+   ```bash
+   docker compose --profile monitoring build grafana
+   docker compose --profile monitoring up -d grafana
+   ```
+
+### Panels show "No data" after metric changes
+Rebuild and restart services that export new metrics, then wait one scrape interval (15s):
+
+```bash
+docker compose build strategy-service orchestrator-service database-service
+docker compose up -d strategy-service orchestrator-service database-service
+docker compose --profile monitoring build grafana kpi-exporter
+docker compose --profile monitoring up -d grafana kpi-exporter
+```
+
+Verify in Prometheus:
+```bash
+curl -sG 'http://127.0.0.1:9090/api/v1/query' \
+  --data-urlencode 'query=strategy_active_strategies{market_type="spot"}'
+curl -sG 'http://127.0.0.1:9090/api/v1/query' \
+  --data-urlencode 'query=trading_spot_realized_pnl_usd'
+```
+
+Expected: spot strategies = 3, perp = 12, spot realized PnL = numeric value.
+
+### Balance / trade-rate panels empty
+`orchestrator_balance_total` and `orchestrator_trades_total` only appear after orchestrator refreshes balances or closes a trade. KPI panels using `trading_spot_*` from kpi-exporter are the database source of truth.
 
 ## Customization
 
