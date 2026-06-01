@@ -1838,6 +1838,158 @@ def hyperliquid_trend_chase_gate(
 
 
 # ---------------------------------------------------------------------------
+# Risk-based sizing helpers (used by orchestrator HL entry path)
+# ---------------------------------------------------------------------------
+
+
+def _indicator_sources(signal: Dict[str, Any]) -> List[Mapping[str, Any]]:
+    sources: List[Mapping[str, Any]] = []
+    if not isinstance(signal, dict):
+        return sources
+    details = signal.get("details") or {}
+    if isinstance(details, dict):
+        state = details.get("state") or {}
+        if isinstance(state, dict):
+            indicators = state.get("indicators") or {}
+            if isinstance(indicators, dict):
+                sources.append(indicators)
+    for key in ("indicators", "state"):
+        block = signal.get(key)
+        if isinstance(block, dict):
+            if key == "state":
+                ind = block.get("indicators")
+                if isinstance(ind, dict):
+                    sources.append(ind)
+            else:
+                sources.append(block)
+    return sources
+
+
+def _first_pct_from_signal(signal: Dict[str, Any], *keys: str) -> Optional[float]:
+    for source in _indicator_sources(signal):
+        for key in keys:
+            raw = source.get(key)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0:
+                continue
+            if value < 0.1:
+                value *= 100.0
+            return value
+    return None
+
+
+def stop_distance_pct_from_signal(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Effective stop distance in percent for risk-based sizing."""
+    stop = _first_pct_from_signal(signal, "stop_loss_pct", "sl_pct", "stop_pct")
+    if stop is not None:
+        return stop
+    return float((hl_cfg or {}).get("stop_loss_pct", 1.5) or 1.5)
+
+
+def signal_position_size_multiplier(signal: Dict[str, Any]) -> Optional[float]:
+    """Optional per-signal size hint from strategy indicators."""
+    for source in _indicator_sources(signal):
+        for key in ("position_size_multiplier", "size_multiplier"):
+            if key not in source:
+                continue
+            try:
+                value = float(source.get(key))
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < value <= 2.0:
+                return value
+    return None
+
+
+def hyperliquid_risk_based_notional(
+    account_equity: float,
+    stop_distance_pct: float,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    size_multiplier: float = 1.0,
+) -> Optional[float]:
+    """
+    Risk-% position sizing: notional = (equity × risk%) / (stop_distance / 100).
+    Returns None when disabled; caller falls back to fixed caps.
+    """
+    risk_cfg = ((hl_cfg or {}).get("risk_based_sizing") or {})
+    enabled = risk_cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return None
+    if account_equity <= 0 or stop_distance_pct <= 0:
+        return None
+    mult = max(0.0, min(1.0, float(size_multiplier or 1.0)))
+    risk_pct = _safe_float(risk_cfg.get("risk_per_trade_pct", 0.0075), 0.0075)
+    max_cap = _safe_float((hl_cfg or {}).get("max_notional_per_trade", 200.0), 200.0)
+    risk_usd = account_equity * risk_pct * mult
+    notional = risk_usd / (stop_distance_pct / 100.0)
+    return min(notional, max_cap * mult)
+
+
+def hyperliquid_daily_loss_halt(
+    closed_trades: List[Dict[str, Any]],
+    account_equity: float,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Block new entries when today's realized PnL breaches the daily loss budget."""
+    halt_cfg = ((hl_cfg or {}).get("daily_loss_halt") or {})
+    enabled = halt_cfg.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {"blocked": False, "reason": "daily_loss_halt_disabled"}
+    max_pct = _safe_float(
+        halt_cfg.get(
+            "max_daily_loss_pct",
+            ((hl_cfg or {}).get("max_daily_loss_pct", 0.03)),
+        ),
+        0.03,
+    )
+    if max_pct <= 0 or account_equity <= 0:
+        return {"blocked": False, "reason": "daily_loss_halt_disabled"}
+    now_dt = now or datetime.utcnow()
+    if now_dt.tzinfo is not None:
+        now_dt = now_dt.replace(tzinfo=None)
+    today = now_dt.date()
+    daily_pnl = 0.0
+    for row in closed_trades or []:
+        if str(row.get("status") or "").upper() != "CLOSED":
+            continue
+        ts = _parse_dt(row.get("exit_time")) or _parse_dt(row.get("entry_time"))
+        if not ts:
+            continue
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        if ts.date() != today:
+            continue
+        daily_pnl += float(row.get("realized_pnl") or 0.0)
+    limit = -account_equity * max_pct
+    if daily_pnl <= limit:
+        return {
+            "blocked": True,
+            "reason": "daily_loss_halt",
+            "dailyPnl": daily_pnl,
+            "limitUsd": limit,
+            "maxDailyLossPct": max_pct,
+        }
+    return {
+        "blocked": False,
+        "reason": "daily_loss_ok",
+        "dailyPnl": daily_pnl,
+        "limitUsd": limit,
+        "maxDailyLossPct": max_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Change 5b: Per-coin re-entry cooldown (any exit, not just losses)
 # ---------------------------------------------------------------------------
 
