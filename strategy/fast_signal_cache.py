@@ -154,26 +154,8 @@ async def publish_fast_signal(
         return False
     key = redis_key(venue, symbol)
     sig_lc = str(signal or "hold").lower()
-    ind = indicators or {}
-
-    if sig_lc in {"buy", "long", "short", "sell"}:
-        ok, reason = validate_rsi_stoch_actionable(
-            {"signal": sig_lc, "indicators": ind},
-            allow_short=allow_short,
-            params=params,
-        )
-        if not ok:
-            logger.info(
-                "[FastSignal] skip publish %s %s %s: %s",
-                venue,
-                symbol,
-                sig_lc,
-                reason,
-            )
-            return await clear_fast_signal(redis_client, venue, symbol)
-
     if sig_lc in {"hold", ""}:
-        return await clear_fast_signal(redis_client, venue, symbol)
+        return True
 
     payload = _normalize_payload(signal, confidence, strength, indicators)
     try:

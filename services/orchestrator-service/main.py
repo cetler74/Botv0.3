@@ -5800,61 +5800,6 @@ class TradingOrchestrator:
 
                     entry_path = "cycle_slow"
                     src_strat = str(mirrored.get("strategy") or "")
-                    if src_strat == "rsi_stoch_reversal_5m":
-                        from strategy.fast_signal_cache import (
-                            mirrored_perp_signal_from_fast_payload,
-                            normalize_perp_side,
-                            signals_data_from_fast_perp_payload,
-                            validate_rsi_stoch_actionable,
-                        )
-
-                        live_payload = await self._fetch_hl_rsi_stoch_raw(coin)
-                        if not live_payload:
-                            logger.info(
-                                "[HyperliquidPaper] Blocked rsi_stoch %s: no live payload",
-                                coin,
-                            )
-                            continue
-                        hl_params, hl_allow_short = self._hl_rsi_stoch_params()
-                        ok, vreason = validate_rsi_stoch_actionable(
-                            live_payload,
-                            allow_short=hl_allow_short,
-                            params=hl_params,
-                        )
-                        if not ok:
-                            logger.info(
-                                "[HyperliquidPaper] Blocked rsi_stoch %s: %s",
-                                coin,
-                                vreason,
-                            )
-                            continue
-                        validated = mirrored_perp_signal_from_fast_payload(live_payload)
-                        if not validated:
-                            continue
-                        validated_side = normalize_perp_side(
-                            str(validated.get("signal") or "")
-                        )
-                        mirrored_side = position_sides_from_signal(
-                            mirrored.get("signal")
-                        )
-                        if validated_side and mirrored_side and validated_side != mirrored_side:
-                            logger.info(
-                                "[HyperliquidPaper] Blocked rsi_stoch %s: "
-                                "consensus=%s validated=%s",
-                                coin,
-                                mirrored_side,
-                                validated_side,
-                            )
-                            continue
-                        mirrored = validated
-                        signals_data = signals_data_from_fast_perp_payload(
-                            live_payload, coin
-                        )
-                        entry_path = (
-                            "fast_live_validated"
-                            if fast_payload
-                            else "cycle_slow_validated"
-                        )
 
                     if execution_mode == "live":
                         allow = [
@@ -6923,15 +6868,7 @@ class TradingOrchestrator:
         if not payload:
             return None
         params, allow_short = self._hl_rsi_stoch_params()
-        ok, reason = validate_rsi_stoch_actionable(
-            payload, allow_short=allow_short, params=params
-        )
-        if not ok or not normalize_perp_side(str(payload.get("signal") or "")):
-            logger.info(
-                "[HL rsi_stoch] %s not actionable: %s",
-                str(coin).upper(),
-                reason,
-            )
+        if not normalize_perp_side(str(payload.get("signal") or "")):
             return None
         return payload
 
@@ -6996,42 +6933,8 @@ class TradingOrchestrator:
                         if age is None or age > max_age:
                             continue
                         if str(payload.get("signal", "")).lower() == "buy":
-                            from strategy.fast_signal_cache import (
-                                validate_rsi_stoch_actionable,
-                            )
-
-                            spot_strat = (
-                                ((self._config or {}).get("strategies") or {}).get(
-                                    "rsi_stoch_reversal_5m"
-                                )
-                                or {}
-                            )
-                            spot_params = spot_strat.get("parameters") or {}
-                            live_spot = await self._fetch_spot_rsi_stoch_raw(
-                                exchange_name, pair
-                            )
-                            if not live_spot:
-                                logger.info(
-                                    "[FastEntry] Skip spot %s %s: no live rsi_stoch",
-                                    exchange_name,
-                                    pair,
-                                )
-                                continue
-                            ok, vreason = validate_rsi_stoch_actionable(
-                                live_spot,
-                                allow_short=bool(spot_params.get("allow_short", False)),
-                                params=spot_params,
-                            )
-                            if not ok or str(live_spot.get("signal", "")).lower() != "buy":
-                                logger.info(
-                                    "[FastEntry] Skip spot %s %s: %s",
-                                    exchange_name,
-                                    pair,
-                                    vreason,
-                                )
-                                continue
                             logger.info(
-                                "[FastEntry] Spot trigger %s %s validated (age=%.1fs)",
+                                "[FastEntry] Spot trigger %s %s from Redis (age=%.1fs)",
                                 exchange_name,
                                 pair,
                                 age,
@@ -7039,18 +6942,14 @@ class TradingOrchestrator:
                             await self._check_pair_entry(
                                 exchange_name,
                                 pair,
-                                fast_rsi_stoch_payload=live_spot,
+                                fast_rsi_stoch_payload=payload,
                             )
 
                 hl_cfg = self._hyperliquid_perps_cfg()
                 mids = await self._fetch_hyperliquid_mids()
                 fast_hl_by_coin: Dict[str, Dict[str, Any]] = {}
-                from strategy.fast_signal_cache import (
-                    normalize_perp_side,
-                    validate_rsi_stoch_actionable,
-                )
+                from strategy.fast_signal_cache import normalize_perp_side
 
-                hl_params, hl_allow_short = self._hl_rsi_stoch_params()
                 for coin in self.hyperliquid_pair_selections or []:
                     coin_u = str(coin).upper()
                     payload = await read_fast_signal(
@@ -7069,18 +6968,6 @@ class TradingOrchestrator:
                         logger.info(
                             "[FastEntry] Skip HL %s: no live rsi_stoch response",
                             coin_u,
-                        )
-                        continue
-                    ok, vreason = validate_rsi_stoch_actionable(
-                        live_payload,
-                        allow_short=hl_allow_short,
-                        params=hl_params,
-                    )
-                    if not ok:
-                        logger.info(
-                            "[FastEntry] Skip HL %s: validator %s",
-                            coin_u,
-                            vreason,
                         )
                         continue
                     live_side = normalize_perp_side(str(live_payload.get("signal", "")))
