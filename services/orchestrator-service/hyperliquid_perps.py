@@ -32,6 +32,7 @@ HYPERLIQUID_STRATEGY_FAMILIES = {
     "rsi_oversold_override": "reversal_reclaim",
     "breakout_retest_long": "pattern_breakout",
     "engulfing_multi_tf": "pattern_breakout",
+    "rsi_stoch_reversal_5m": "reversal_reclaim",
 }
 
 
@@ -47,6 +48,7 @@ DEFAULT_STANDALONE_STRATEGY_GATES = {
     "small_size_momentum_scalp": {"min_confidence": 0.70, "min_strength": 0.55, "size_multiplier": None},
     "breakout_retest_long": {"min_confidence": 0.70, "min_strength": 0.70, "size_multiplier": None},
     "engulfing_multi_tf": {"min_confidence": 0.72, "min_strength": 0.70, "size_multiplier": None},
+    "rsi_stoch_reversal_5m": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
 }
 
 

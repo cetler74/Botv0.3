@@ -5271,8 +5271,13 @@ class TradingOrchestrator:
                                 )
                             else:
                                 agreement = float(mirrored.get("consensus_agreement") or 0.0)
+                                standalone_gate = hyperliquid_standalone_entry_gate(
+                                    mirrored,
+                                    cfg,
+                                )
                                 bypass_consensus = bool(
                                     specialist_gate.get("bypassConsensus")
+                                    or standalone_gate.get("bypassConsensus")
                                 )
                                 if min_agreement > 0 and agreement < min_agreement and not bypass_consensus:
                                     signal_gate_reason = (

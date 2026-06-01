@@ -270,6 +270,35 @@ def test_hyperliquid_standalone_gate_allows_heterogeneous_strategy_without_globa
     assert gate["reason"] == "standalone_gate_pass"
 
 
+def test_rsi_stoch_standalone_bypasses_low_consensus_agreement():
+    """XMR-style case: rsi_stoch long at 0.72 conf must not require 50% global agreement."""
+    signal = {
+        "strategy": "rsi_stoch_reversal_5m",
+        "signal": "long",
+        "confidence": 0.72,
+        "strength": 0.70,
+        "consensus_agreement": 7.7,
+        "consensus_confidence": 0.06,
+    }
+    cfg = {
+        "standalone_strategy_gates": {
+            "global": {"enabled": True},
+            "rsi_stoch_reversal_5m": {
+                "enabled": True,
+                "min_confidence": 0.70,
+                "min_strength": 0.65,
+            },
+        }
+    }
+
+    gate = hyperliquid_standalone_entry_gate(signal, cfg)
+
+    assert gate["isStandalone"] is True
+    assert gate["allowed"] is True
+    assert gate["bypassConsensus"] is True
+    assert gate["family"] == "reversal_reclaim"
+
+
 def test_hyperliquid_standalone_gate_blocks_strong_opposite_signal():
     signal = {
         "strategy": "breakout_retest_long",
