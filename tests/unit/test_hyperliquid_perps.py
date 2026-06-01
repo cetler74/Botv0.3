@@ -16,9 +16,11 @@ from hyperliquid_perps import (  # noqa: E402
     calculate_perp_pnl,
     evaluate_paper_perp_exit,
     hyperliquid_coin_entry_block,
+    hyperliquid_daily_loss_halt,
     hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
+    hyperliquid_risk_based_notional,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
@@ -36,6 +38,7 @@ from hyperliquid_perps import (  # noqa: E402
     select_mirrored_signal,
     sma_reclaim_bull_flag_specialist_gate,
     should_close_paper_perp,
+    stop_distance_pct_from_signal,
 )
 
 
@@ -1434,8 +1437,8 @@ def test_config_yaml_carries_perp_trailing_and_stagnant_flags():
     config_path = Path(ROOT) / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
     hl = cfg["trading"]["hyperliquid_perps"]
-    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0075)
-    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0075)
+    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0035)
+    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0035)
     assert hl["stagnant_loser_enabled"] is True
     assert hl["structural_exits"]["enabled"] is True
     assert "vwma_hull" in hl["structural_exits"]["strategies"]
@@ -1754,3 +1757,72 @@ def test_pnl_tier_empty_strategy_name():
     )
     assert result["tier"] == "normal"
     assert result["reason"] == "strategy_unknown"
+
+
+def test_daily_loss_halt_blocks_when_budget_breached():
+    now = datetime(2026, 6, 1, 15, 0, 0)
+    trades = [
+        {
+            "status": "CLOSED",
+            "exit_time": "2026-06-01T10:00:00+00:00",
+            "realized_pnl": -200.0,
+        }
+    ]
+    result = hyperliquid_daily_loss_halt(
+        trades,
+        account_equity=5000.0,
+        hl_cfg={"daily_loss_halt": {"enabled": True, "max_daily_loss_pct": 0.03}},
+        now=now,
+    )
+    assert result["blocked"] is True
+    assert result["dailyPnl"] == pytest.approx(-200.0)
+    assert result["limitUsd"] == pytest.approx(150.0)
+
+
+def test_risk_based_notional_scales_with_stop_distance():
+    notional = hyperliquid_risk_based_notional(
+        5000.0,
+        1.5,
+        {"risk_based_sizing": {"enabled": True, "risk_per_trade_pct": 0.0075}},
+        size_multiplier=1.0,
+    )
+    assert notional == pytest.approx(2500.0)
+
+
+def test_stop_distance_pct_from_signal_prefers_indicators():
+    signal = {
+        "details": {
+            "indicators": {"stop_loss_pct": 0.012},
+        }
+    }
+    assert stop_distance_pct_from_signal(signal, {"stop_loss_pct": 1.5}) == pytest.approx(1.2)
+
+
+def test_exit_profile_applies_scalp_overrides():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "max_holding_minutes": 240,
+            "max_holding_minutes_hard": 360,
+            "stop_loss_pct": 1.5,
+            "trailing_stop": {"enabled": True, "activation_threshold": 0.0035},
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0035},
+            "exit_profiles": {
+                "scalp": {
+                    "strategies": ["macd_ema_vwap_scalper"],
+                    "max_holding_minutes": 45,
+                    "max_holding_minutes_hard": 90,
+                    "stop_loss_pct": 0.9,
+                    "trailing_stop": {"activation_threshold": 0.0045},
+                    "stagnant_loser": {"min_age_minutes": 12},
+                }
+            },
+        },
+        {},
+        strategy_name="macd_ema_vwap_scalper",
+    )
+    assert cfg.max_holding_minutes == 45
+    assert cfg.max_holding_minutes_hard == 90
+    assert cfg.stop_loss_pct == pytest.approx(0.9)
+    assert cfg.trailing_activation_decimal == pytest.approx(0.0045)
+    assert cfg.stagnant_loser.get("min_age_minutes") == pytest.approx(12)

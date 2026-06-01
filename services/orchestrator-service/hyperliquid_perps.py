@@ -243,13 +243,75 @@ class PaperPerpExitResult:
     metadata: Dict[str, Any]
 
 
+def _resolve_exit_profile(
+    hl_cfg: Dict[str, Any],
+    strategy_name: str,
+) -> Dict[str, Any]:
+    """Return the first exit_profiles entry whose strategies list contains strategy_name."""
+    profiles = (hl_cfg or {}).get("exit_profiles") or {}
+    if not isinstance(profiles, dict):
+        return {}
+    strat_lc = str(strategy_name or "").strip().lower()
+    if not strat_lc:
+        return {}
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        strategies = profile.get("strategies") or []
+        if any(str(s).strip().lower() == strat_lc for s in strategies):
+            return dict(profile)
+    return {}
+
+
+def _merge_nested_dict(
+    base: Optional[Dict[str, Any]],
+    override: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = dict(base or {})
+    if isinstance(override, dict):
+        merged.update(override)
+    return merged
+
+
+def _apply_exit_profile_overrides(
+    hl_cfg: Dict[str, Any],
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Overlay per-strategy-family exit profile onto hyperliquid_perps config."""
+    if not profile:
+        return dict(hl_cfg or {})
+    out = dict(hl_cfg or {})
+    for key in ("max_holding_minutes", "max_holding_minutes_hard", "stop_loss_pct"):
+        if key in profile:
+            out[key] = profile[key]
+    out["trailing_stop"] = _merge_nested_dict(
+        out.get("trailing_stop"),
+        profile.get("trailing_stop") if isinstance(profile.get("trailing_stop"), dict) else None,
+    )
+    out["profit_protection"] = _merge_nested_dict(
+        out.get("profit_protection"),
+        profile.get("profit_protection") if isinstance(profile.get("profit_protection"), dict) else None,
+    )
+    if isinstance(profile.get("stagnant_loser"), dict):
+        out["stagnant_loser"] = _merge_nested_dict(
+            out.get("stagnant_loser"),
+            profile.get("stagnant_loser"),
+        )
+    return out
+
+
 def paper_perp_exit_config_from_yaml(
     hl_cfg: Dict[str, Any],
     trading_cfg: Dict[str, Any],
+    *,
+    strategy_name: str = "",
 ) -> PaperPerpExitConfig:
     """Build exit config from hyperliquid_perps + global trading sections."""
     hl_cfg = hl_cfg or {}
     trading_cfg = trading_cfg or {}
+    profile = _resolve_exit_profile(hl_cfg, strategy_name)
+    if profile:
+        hl_cfg = _apply_exit_profile_overrides(hl_cfg, profile)
     # Perp-specific overrides win over global spot trailing / profit protection.
     trailing = hl_cfg.get("trailing_stop") or trading_cfg.get("trailing_stop") or {}
     pp = hl_cfg.get("profit_protection") or trading_cfg.get("profit_protection") or {}
@@ -1956,3 +2018,139 @@ def is_block_window(
         return False
     windows: List[Dict[str, Any]] = session_cfg.get("block_windows") or []
     return _hour_in_windows(utc_hour, windows)
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-31: Daily loss halt, risk-based sizing, stop distance helpers
+# ---------------------------------------------------------------------------
+
+
+def stop_distance_pct_from_signal(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """
+    Effective stop distance in percent for risk-based notional sizing.
+
+    Prefers signal indicators, then strategy parameters, then HL default stop.
+    """
+    cfg = hl_cfg or {}
+    default_pct = _safe_float(cfg.get("stop_loss_pct", 1.5), 1.5)
+
+    def _normalize_stop(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        try:
+            value = abs(float(raw))
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        if value < 0.1:
+            return value * 100.0
+        return value
+
+    indicators = _extract_indicators(signal or {})
+    for key in ("stop_loss_pct", "sl_pct", "stop_pct", "entry_atr_pct", "atr_pct"):
+        parsed = _normalize_stop(indicators.get(key))
+        if parsed is not None:
+            return parsed
+
+    details = (signal or {}).get("details") or {}
+    if isinstance(details, dict):
+        for source in (details.get("parameters"), details.get("indicators"), details):
+            if not isinstance(source, dict):
+                continue
+            for key in ("stop_loss_pct", "sl_pct", "stop_pct"):
+                parsed = _normalize_stop(source.get(key))
+                if parsed is not None:
+                    return parsed
+
+    atr_cfg = cfg.get("stop_loss_atr") or {}
+    if atr_cfg.get("enabled"):
+        atr_pct = _normalize_stop(indicators.get("atr_pct") or indicators.get("entry_atr_pct"))
+        if atr_pct is not None:
+            mult = _safe_float(atr_cfg.get("mult", 1.8), 1.8)
+            min_pct = _safe_float(atr_cfg.get("min_pct", 0.9), 0.9)
+            max_pct = _safe_float(atr_cfg.get("max_pct", 3.0), 3.0)
+            return max(min_pct, min(max_pct, atr_pct * mult))
+
+    return default_pct
+
+
+def hyperliquid_risk_based_notional(
+    account_equity: float,
+    stop_dist_pct: float,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    size_multiplier: float = 1.0,
+) -> Optional[float]:
+    """
+    Risk-percent notional: (equity × risk%) / (stop_distance / 100).
+
+    Returns None when disabled or inputs are invalid (caller falls back to
+    margin/notional caps).
+    """
+    rb_cfg = ((hl_cfg or {}).get("risk_based_sizing") or {})
+    enabled = rb_cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return None
+
+    risk_pct = _safe_float(rb_cfg.get("risk_per_trade_pct", 0.0075), 0.0075)
+    if account_equity <= 0 or stop_dist_pct <= 0 or risk_pct <= 0:
+        return None
+
+    mult = max(0.0, min(1.0, float(size_multiplier or 1.0)))
+    risk_usd = account_equity * risk_pct * mult
+    return risk_usd / (stop_dist_pct / 100.0)
+
+
+def hyperliquid_daily_loss_halt(
+    closed_trades: Iterable[Dict[str, Any]],
+    account_equity: float,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Halt new HL paper entries when today's realized PnL breaches the budget."""
+    halt_cfg = ((hl_cfg or {}).get("daily_loss_halt") or {})
+    enabled = halt_cfg.get("enabled", False)
+    max_pct = _safe_float(halt_cfg.get("max_daily_loss_pct", 0.03), 0.03)
+    limit_usd = max(0.0, float(account_equity or 0.0) * max_pct)
+
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "blocked": False,
+            "reason": "daily_loss_halt_disabled",
+            "dailyPnl": 0.0,
+            "limitUsd": limit_usd,
+            "maxDailyLossPct": max_pct,
+        }
+
+    now_dt = now or datetime.utcnow()
+    if now_dt.tzinfo:
+        now_dt = now_dt.replace(tzinfo=None)
+    day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    daily_pnl = 0.0
+    for trade in closed_trades or []:
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("status") or "").upper() != "CLOSED":
+            continue
+        exit_dt = _parse_paper_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_dt is None or exit_dt < day_start:
+            continue
+        try:
+            daily_pnl += float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+    blocked = daily_pnl <= -limit_usd if limit_usd > 0 else False
+    return {
+        "blocked": blocked,
+        "reason": "daily_loss_halt" if blocked else "daily_loss_ok",
+        "dailyPnl": daily_pnl,
+        "limitUsd": limit_usd,
+        "maxDailyLossPct": max_pct,
+    }
