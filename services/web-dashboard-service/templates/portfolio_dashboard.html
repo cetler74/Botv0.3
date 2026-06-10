@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hyperliquid Paper Perps</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260528" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260528-lines2">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260608-section-collapse">
 </head>
 <body>
     <header class="pi-topbar">
@@ -21,6 +21,8 @@
             <span class="pi-pill pi-pill-hl" id="hl-mode-pill">HL: Paper</span>
             <span class="pi-pill" id="hl-engine-pill">Engine: …</span>
             <span class="pi-pill" id="hl-orchestrator-pill">Orchestrator: …</span>
+            <span class="pi-pill" id="perp-entry-cycle-top">Entry: N/A</span>
+            <span class="pi-pill" id="perp-exit-cycle-top">Exit: N/A</span>
             <button type="button" class="pi-theme-toggle" id="theme-toggle" title="Theme: System">
                 <i class="fas fa-circle-half-stroke"></i><span>System</span>
             </button>
@@ -30,12 +32,28 @@
     <main class="pi-shell">
         <section class="pi-hero pi-hero-hl">
             <div class="pi-hero-main">
-                <p class="pi-eyebrow">Hyperliquid venue · <span id="hl-balance-source">paper</span></p>
+                <div class="pi-hero-head">
+                    <p class="pi-eyebrow">Hyperliquid venue · <span id="hl-balance-source">paper</span></p>
+                    <a href="/spot-dashboard" class="pi-hero-nav-link pi-hero-nav-link-spot" title="Open spot trading dashboard">
+                        <i class="fas fa-coins" aria-hidden="true"></i>
+                        <span>Spot trading</span>
+                    </a>
+                </div>
+                <p class="pi-hero-balance-label">Settled balance</p>
                 <div class="pi-portfolio-value" id="hero-equity">$0.00</div>
+                <p class="pi-hero-balance-journey" id="hero-balance-journey">—</p>
+                <p class="pi-hero-mark-to-market">
+                    Mark-to-market equity:
+                    <strong id="hero-mark-to-market">$0.00</strong>
+                </p>
                 <div class="pi-portfolio-sub">
                     <span id="hero-available">Available: $0.00</span>
                     <span id="trading-status">Status: loading</span>
                     <span id="updated-at">Updating...</span>
+                </div>
+                <div class="pi-cycle-strip" aria-label="Hyperliquid cycle health">
+                    <span class="pi-pill" id="perp-entry-cycle">Perps entry last run: N/A</span>
+                    <span class="pi-pill" id="perp-exit-cycle">Perps exit/update last run: N/A</span>
                 </div>
             </div>
             <div class="pi-kpi-grid">
@@ -74,6 +92,464 @@
             </div>
         </section>
 
+        <section class="pi-panel pi-pnl-report" id="pnl-report-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Last 24 hours</p>
+                    <h2>PnL analysis</h2>
+                </div>
+                <span class="pi-muted" id="pnl-report-window">—</span>
+            </div>
+            <div class="pi-kpi-grid pi-pnl-kpi-grid">
+                <article class="pi-kpi">
+                    <span>Closed</span>
+                    <strong id="pnl-closed">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open</span>
+                    <strong id="pnl-open">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Net realized</span>
+                    <strong id="pnl-realized">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Gross before fees</span>
+                    <strong id="pnl-gross-before-fees">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Fees</span>
+                    <strong id="pnl-fees">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Fee drag</span>
+                    <strong id="pnl-fee-drag">n/a</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Funding</span>
+                    <strong id="pnl-funding">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Win rate</span>
+                    <strong id="pnl-win-rate">0.0%</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg win</span>
+                    <strong id="pnl-avg-win">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg loss</span>
+                    <strong id="pnl-avg-loss">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Profit factor</span>
+                    <strong id="pnl-pf">n/a</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg win hold</span>
+                    <strong id="pnl-win-hold">0 min</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg loss hold</span>
+                    <strong id="pnl-loss-hold">0 min</strong>
+                </article>
+            </div>
+            <div class="pi-filter-bar pi-pnl-tabs" role="tablist" aria-label="PnL breakdown">
+                <button type="button" class="pi-filter-btn active" data-pnl-tab="strategy">Strategy</button>
+                <button type="button" class="pi-filter-btn" data-pnl-tab="positionSide">Side</button>
+                <button type="button" class="pi-filter-btn" data-pnl-tab="regimeSide">Regime×Side</button>
+                <button type="button" class="pi-filter-btn" data-pnl-tab="exitBucket">Exit</button>
+                <button type="button" class="pi-filter-btn" data-pnl-tab="utcHour">UTC hour</button>
+                <button type="button" class="pi-filter-btn" data-pnl-tab="coin">Coin</button>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-pnl-breakdown-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Label</th>
+                            <th>Closed</th>
+                            <th>Open</th>
+                            <th>PnL</th>
+                            <th>Avg</th>
+                            <th>WR%</th>
+                            <th>PF</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pnl-breakdown-body">
+                        <tr><td colspan="7" class="pi-empty">Loading 24h breakdown...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="pnl-breakdown-pagination">
+                <p id="pnl-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="pnl-page-size">
+                        Rows
+                        <select id="pnl-page-size" class="pi-select" aria-label="PnL breakdown rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="pnl-prev" aria-label="Previous PnL page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="pnl-next" aria-label="Next PnL page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-adaptive-control" id="adaptive-control-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Adaptive PnL control</p>
+                    <h2>Live changes and outcomes</h2>
+                </div>
+                <div class="pi-head-actions">
+                    <span class="pi-muted" id="adaptive-evaluated-at">Not evaluated</span>
+                    <button type="button" class="pi-page-btn" id="adaptive-download">
+                        <i class="fas fa-download" aria-hidden="true"></i>
+                        Download snapshot
+                    </button>
+                </div>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <article class="pi-kpi">
+                    <span>Status</span>
+                    <strong id="adaptive-status">N/A</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Sample closed</span>
+                    <strong id="adaptive-sample">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Lookback</span>
+                    <strong id="adaptive-lookback">0h</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Live changes</span>
+                    <strong id="adaptive-active-count">0</strong>
+                </article>
+            </div>
+            <p class="pi-adaptive-note" id="adaptive-summary">
+                Waiting for the orchestrator to evaluate rolling paper-perp evidence.
+            </p>
+            <p class="pi-adaptive-note" id="adaptive-reload-status">
+                Reload status: pending reload verification.
+            </p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Status</th>
+                            <th>Why</th>
+                            <th>Config change</th>
+                            <th>Live since</th>
+                            <th>Evidence</th>
+                            <th>Outcome since change</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adaptive-decisions-body">
+                        <tr><td colspan="6" class="pi-empty">No adaptive decisions loaded yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="adaptive-decisions-pagination">
+                <p id="adaptive-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="adaptive-page-size">
+                        Rows
+                        <select id="adaptive-page-size" class="pi-select" aria-label="Adaptive decision rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="adaptive-prev" aria-label="Previous adaptive page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="adaptive-next" aria-label="Next adaptive page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-supply-demand-audit" id="supply-demand-audit-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Price action · 3-step audit</p>
+                    <h2>Supply / Demand 3-Step</h2>
+                </div>
+                <span class="pi-muted" id="sd-audit-window">Last 24h</span>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Step 1 pass</span>
+                    <strong id="sd-step1-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Step 2 pass</span>
+                    <strong id="sd-step2-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Step 3 pass</span>
+                    <strong id="sd-step3-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Evaluations</span>
+                    <strong id="sd-eval-count">0</strong>
+                </div>
+            </div>
+            <p class="pi-adaptive-note" id="sd-audit-summary">No supply/demand evaluations in the last 24 hours.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Trend</th>
+                            <th>Signal</th>
+                            <th>R:R</th>
+                            <th>Steps</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="sd-audit-body">
+                        <tr><td colspan="6" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="sd-audit-pagination">
+                <p id="sd-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="sd-page-size">
+                        Rows
+                        <select id="sd-page-size" class="pi-select" aria-label="Supply/demand audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="sd-prev" aria-label="Previous supply/demand page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="sd-next" aria-label="Next supply/demand page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-arc-audit" id="arc-audit-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">ARC · Daytrade audit</p>
+                    <h2>Area · Range · Candle</h2>
+                </div>
+                <span class="pi-muted" id="arc-audit-window">Last 24h</span>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi"><span class="pi-kpi-label">Area pass</span><strong id="arc-area-rate">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Range pass</span><strong id="arc-range-rate">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Candle pass</span><strong id="arc-candle-rate">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Evaluations</span><strong id="arc-eval-count">0</strong></div>
+            </div>
+            <p class="pi-adaptive-note" id="arc-audit-summary">No ARC evaluations in the last 24 hours.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Zone</th>
+                            <th>Signal</th>
+                            <th>Move %</th>
+                            <th>R:R</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="arc-audit-body">
+                        <tr><td colspan="6" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-dual-sma-audit" id="dual-sma-audit-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Dual-SMA · Daytrade audit</p>
+                    <h2>Dual SMA 20/200</h2>
+                </div>
+                <span class="pi-muted" id="dsma-audit-window">Last 24h</span>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Daily pass</span>
+                    <strong id="dsma-daily-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">15m pass</span>
+                    <strong id="dsma-15m-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">5m pass</span>
+                    <strong id="dsma-5m-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Evaluations</span>
+                    <strong id="dsma-eval-count">0</strong>
+                </div>
+            </div>
+            <p class="pi-adaptive-note" id="dsma-audit-summary">No dual-SMA evaluations in the last 24 hours.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Daily bias</th>
+                            <th>15m trend</th>
+                            <th>5m signal</th>
+                            <th>Ext %</th>
+                            <th>R:R</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dsma-audit-body">
+                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="dsma-audit-pagination">
+                <p id="dsma-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="dsma-page-size">
+                        Rows
+                        <select id="dsma-page-size" class="pi-select" aria-label="Dual-SMA audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="dsma-prev" aria-label="Previous dual-SMA page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="dsma-next" aria-label="Next dual-SMA page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-orb-scalp-audit" id="orb-scalp-audit-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">ORB · 5m scalp audit</p>
+                    <h2>ORB 5m Scalp (Casper SMC)</h2>
+                </div>
+                <span class="pi-muted" id="orb-audit-window">Last 24h</span>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Breakout pass</span>
+                    <strong id="orb-breakout-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Retest pass</span>
+                    <strong id="orb-retest-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Signal R:R</span>
+                    <strong id="orb-rr-rate">0</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Evaluations</span>
+                    <strong id="orb-eval-count">0</strong>
+                </div>
+            </div>
+            <p class="pi-adaptive-note" id="orb-audit-summary">No ORB 5m scalp evaluations in the last 24 hours.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>State</th>
+                            <th>Direction</th>
+                            <th>Signal</th>
+                            <th>R:R</th>
+                            <th>OR mid</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="orb-audit-body">
+                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="orb-audit-pagination">
+                <p id="orb-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="orb-page-size">
+                        Rows
+                        <select id="orb-page-size" class="pi-select" aria-label="ORB 5m scalp audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="orb-prev" aria-label="Previous ORB page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="orb-next" aria-label="Next ORB page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-ema50-bp-audit" id="ema50-bp-audit-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">EMA50 · Breakout pullback audit</p>
+                    <h2>EMA50 Breakout Pullback</h2>
+                </div>
+                <span class="pi-muted" id="ebp-audit-window">Last 24h</span>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Breakout pass</span>
+                    <strong id="ebp-breakout-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Pullback pass</span>
+                    <strong id="ebp-pullback-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Trigger pass</span>
+                    <strong id="ebp-trigger-rate">0%</strong>
+                </div>
+                <div class="pi-kpi">
+                    <span class="pi-kpi-label">Evaluations</span>
+                    <strong id="ebp-eval-count">0</strong>
+                </div>
+            </div>
+            <p class="pi-adaptive-note" id="ebp-audit-summary">No EMA50 breakout-pullback evaluations in the last 24 hours.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>State</th>
+                            <th>Direction</th>
+                            <th>Signal</th>
+                            <th>R:R</th>
+                            <th>Entry block</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ebp-audit-body">
+                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="ebp-audit-pagination">
+                <p id="ebp-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="ebp-page-size">
+                        Rows
+                        <select id="ebp-page-size" class="pi-select" aria-label="EMA50 breakout-pullback audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="ebp-prev" aria-label="Previous EMA50 page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="ebp-next" aria-label="Next EMA50 page">Next</button>
+                </div>
+            </div>
+        </section>
+
         <section class="pi-panel pi-positions pi-hl-watchlist">
             <div class="pi-panel-head">
                 <div>
@@ -83,12 +559,23 @@
                 <div class="pi-head-actions">
                     <label class="pi-toggle">
                         <input type="checkbox" id="watchlist-active-only" />
-                        Active only
+                        Top 20 &amp; open only
                     </label>
                     <span id="watchlist-count" class="pi-muted">0 coins</span>
                 </div>
             </div>
-            <div class="pi-table-tools">
+            <div class="pi-table-tools pi-watchlist-toolbar">
+                <label class="pi-field-label" for="watchlist-status-filter">
+                    Status
+                    <select id="watchlist-status-filter" class="pi-select" aria-label="Filter pairs by status">
+                        <option value="all">All statuses</option>
+                        <option value="open">Open position</option>
+                        <option value="blocked">Blocked</option>
+                        <option value="under_analysis">Under analysis</option>
+                        <option value="inactive">Not in top 20</option>
+                        <option value="no_price">No price</option>
+                    </select>
+                </label>
                 <details class="pi-column-menu" data-column-menu="watchlist">
                     <summary><i class="fas fa-table-columns"></i> Columns</summary>
                     <div class="pi-column-popover">
@@ -97,13 +584,29 @@
                     </div>
                 </details>
             </div>
+            <p id="hl-global-block-banner" class="pi-alert pi-alert-risk" hidden></p>
             <div class="pi-table-wrap">
-                <table class="pi-table pi-mobile-record-table">
+                <table class="pi-table pi-horizontal-table">
                     <thead id="hl-watchlist-head"></thead>
                     <tbody id="hl-watchlist-body">
                         <tr><td colspan="7" class="pi-empty">Loading watchlist...</td></tr>
                     </tbody>
                 </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="hl-watchlist-pagination">
+                <p id="watchlist-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="watchlist-page-size">
+                        Rows
+                        <select id="watchlist-page-size" class="pi-select" aria-label="Rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="watchlist-prev" aria-label="Previous page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="watchlist-next" aria-label="Next page">Next</button>
+                </div>
             </div>
             <p class="pi-perp-subline pi-rules-hint" id="entry-rules-hint">Entry rules loading...</p>
             <p class="pi-perp-subline pi-rules-hint">Margin is collateral locked. Notional exposure is margin multiplied by leverage. Size is the coin quantity opened.</p>
@@ -132,12 +635,27 @@
                 </details>
             </div>
             <div class="pi-table-wrap">
-                <table class="pi-table pi-perp-table pi-mobile-record-table">
+                <table class="pi-table pi-perp-table pi-horizontal-table">
                     <thead id="perp-paper-trades-head"></thead>
                     <tbody id="perp-paper-trades-body">
                         <tr><td colspan="19" class="pi-empty">Loading paper trades...</td></tr>
                     </tbody>
                 </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="perp-trades-pagination">
+                <p id="trades-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="trades-page-size">
+                        Rows
+                        <select id="trades-page-size" class="pi-select" aria-label="Trade rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="trades-prev" aria-label="Previous trade page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="trades-next" aria-label="Next trade page">Next</button>
+                </div>
             </div>
         </section>
 
@@ -146,6 +664,7 @@
         </section>
     </main>
 
-    <script src="/static/js/portfolio-dashboard.js?v=20260528-lines2"></script>
+    <script src="/static/js/portfolio-panel-collapse.js?v=20260608-section-collapse"></script>
+    <script src="/static/js/portfolio-dashboard.js?v=20260609-orb-pagination-fix"></script>
 </body>
 </html>

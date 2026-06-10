@@ -149,3 +149,13 @@ groups:
         annotations:
           summary: "All strategies generating same signal"
           description: "All strategies are generating the same type of signal, which may indicate a problem with diversification."
+
+      - alert: UnresolvedDbAlerts
+        expr: trading_alerts_unresolved_critical_total > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: trading-bot
+        annotations:
+          summary: "Unresolved critical database alerts"
+          description: "{{ $value }} unresolved CRITICAL alert(s) in the database."

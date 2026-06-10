@@ -38,10 +38,12 @@ def test_prepare_closed_ohlcv_drops_forming_candle():
 
 
 def test_engine_uses_last_row_after_prepare_not_prior_bar():
-    params = EngineParams(stoch_overbought=80.0)
+    params = EngineParams(rsi_overbought=80.0, stoch_overbought=80.0)
     df = _ohlcv(120)
+    rsi = np.full(120, 50.0)
     k_hi = np.full(120, 50.0)
     d_hi = np.full(120, 50.0)
+    rsi[-1] = 85.0
     k_hi[-1] = 85.0
     d_hi[-1] = 90.0
     k_hi[-2] = 50.0
@@ -50,7 +52,7 @@ def test_engine_uses_last_row_after_prepare_not_prior_bar():
 
     with patch(
         "strategy.playbooks.rsi_stoch_reversal_5m_engine._rsi_series",
-        return_value=pd.Series([50.0] * 120),
+        return_value=pd.Series(rsi),
     ), patch(
         "strategy.playbooks.rsi_stoch_reversal_5m_engine.compute_stoch_rsi",
         return_value=(pd.Series(k_hi), pd.Series(d_hi)),

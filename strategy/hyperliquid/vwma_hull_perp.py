@@ -1048,6 +1048,19 @@ class VwmaHullPerpStrategy(BasePerpStrategy):
                         signal, confidence, strength = 'hold', 0.0, 0.0
                         reason = [f'veto_rsi_lte_floor_{rsi_now:.1f}']
 
+            if signal == 'short' and not self.allow_short:
+                self.logger.info(
+                    f"[VWMAHullStrategy] {pair} HOLD — short side disabled by config"
+                )
+                signal, confidence, strength = 'hold', 0.0, 0.0
+                reason = ['veto_short_disabled']
+            elif signal == 'long' and not self.allow_long:
+                self.logger.info(
+                    f"[VWMAHullStrategy] {pair} HOLD — long side disabled by config"
+                )
+                signal, confidence, strength = 'hold', 0.0, 0.0
+                reason = ['veto_long_disabled']
+
             if signal in ('long', 'short') and confidence < self.min_confidence_score:
                 self.logger.info(
                     f"[VWMAHullStrategy] {pair} HOLD — min_confidence_score: {confidence:.3f} < "

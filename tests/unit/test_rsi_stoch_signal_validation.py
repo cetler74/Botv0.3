@@ -19,7 +19,7 @@ def test_validator_rejects_short_when_stoch_not_overbought():
         _payload(
             "short",
             entry_reason="stoch_overbought_cross",
-            rsi=56.0,
+            rsi=85.0,
             stoch_rsi_k=77.29,
             stoch_rsi_d=87.08,
             bar_close_time=_recent_bar(),
@@ -48,7 +48,58 @@ def test_validator_accepts_long_fixture():
     assert reason == "long_ok"
 
 
+def test_validator_accepts_long_when_stoch_k_equals_d():
+    ok, reason = validate_rsi_stoch_actionable(
+        _payload(
+            "long",
+            entry_reason="rsi_oversold_stoch_cross",
+            rsi=28.0,
+            stoch_rsi_k=18.0,
+            stoch_rsi_d=18.0,
+            bar_close_time=_recent_bar(),
+        ),
+        allow_short=False,
+        params=EngineParams(),
+    )
+    assert ok
+    assert reason == "long_ok"
+
+
 def test_validator_accepts_short_fixture():
+    ok, reason = validate_rsi_stoch_actionable(
+        _payload(
+            "short",
+            entry_reason="stoch_overbought_cross",
+            rsi=85.0,
+            stoch_rsi_k=85.0,
+            stoch_rsi_d=90.0,
+            bar_close_time=_recent_bar(),
+        ),
+        allow_short=True,
+        params=EngineParams(stoch_overbought=80.0),
+    )
+    assert ok
+    assert reason == "short_ok"
+
+
+def test_validator_accepts_short_when_stoch_d_equals_k():
+    ok, reason = validate_rsi_stoch_actionable(
+        _payload(
+            "short",
+            entry_reason="stoch_overbought_cross",
+            rsi=85.0,
+            stoch_rsi_k=90.0,
+            stoch_rsi_d=90.0,
+            bar_close_time=_recent_bar(),
+        ),
+        allow_short=True,
+        params=EngineParams(stoch_overbought=80.0),
+    )
+    assert ok
+    assert reason == "short_ok"
+
+
+def test_validator_rejects_short_when_rsi_not_overbought():
     ok, reason = validate_rsi_stoch_actionable(
         _payload(
             "short",
@@ -59,10 +110,10 @@ def test_validator_accepts_short_fixture():
             bar_close_time=_recent_bar(),
         ),
         allow_short=True,
-        params=EngineParams(stoch_overbought=80.0),
+        params=EngineParams(rsi_overbought=80.0, stoch_overbought=80.0),
     )
-    assert ok
-    assert reason == "short_ok"
+    assert not ok
+    assert reason == "short_rules_failed"
 
 
 def test_validator_rejects_without_entry_reason():

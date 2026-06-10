@@ -47,7 +47,7 @@ import uuid
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import os
 from hyperliquid_ledger import compute_hyperliquid_balance_amounts
@@ -192,6 +192,166 @@ class PerpPaperTrade(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class AdaptivePnlDecisionSync(BaseModel):
+    records: List[Dict[str, Any]]
+    active_decision_keys: Optional[List[str]] = None
+    release_missing_active: bool = True
+    source: str = "orchestrator"
+    synced_at: Optional[datetime] = None
+
+
+class SupplyDemandAnalysisLogIn(BaseModel):
+    log_ts: datetime
+    venue: str
+    symbol: str
+    asset_class: Optional[str] = None
+    timeframe_mode: Optional[str] = None
+    structure_timeframe: Optional[str] = None
+    entry_timeframe: Optional[str] = None
+    trend_direction: Optional[str] = None
+    signal: Optional[str] = None
+    step1_pass: Optional[bool] = None
+    step2_pass: Optional[bool] = None
+    step3_pass: Optional[bool] = None
+    step1_reason: Optional[str] = None
+    step2_reason: Optional[str] = None
+    step3_reason: Optional[str] = None
+    entry_reason: Optional[str] = None
+    reward_risk: Optional[float] = None
+    entry_price: Optional[float] = None
+    stop_hint: Optional[float] = None
+    target_hint: Optional[float] = None
+    record: Dict[str, Any] = Field(default_factory=dict)
+    candle_ts: Optional[datetime] = None
+    source: str = "strategy-service"
+
+
+class DualSmaAnalysisLogIn(BaseModel):
+    log_ts: datetime
+    venue: str
+    symbol: str
+    asset_class: Optional[str] = None
+    daily_bias: Optional[str] = None
+    trend_15m: Optional[str] = None
+    entry_signal_5m: Optional[str] = None
+    signal: Optional[str] = None
+    sma20_slope: Optional[float] = None
+    price_vs_sma20_pct: Optional[float] = None
+    price_vs_sma200_pct: Optional[float] = None
+    extension_distance_pct: Optional[float] = None
+    daily_gap_vs_sma200_pct: Optional[float] = None
+    sma200_flat: Optional[bool] = None
+    squeeze_detected: Optional[bool] = None
+    daily_pass: Optional[bool] = None
+    confirm_15m_pass: Optional[bool] = None
+    entry_5m_pass: Optional[bool] = None
+    precision_pass: Optional[bool] = None
+    daily_reason: Optional[str] = None
+    confirm_15m_reason: Optional[str] = None
+    entry_5m_reason: Optional[str] = None
+    precision_reason: Optional[str] = None
+    entry_reason: Optional[str] = None
+    reward_risk: Optional[float] = None
+    entry_price: Optional[float] = None
+    stop_hint: Optional[float] = None
+    target_hint: Optional[float] = None
+    record: Dict[str, Any] = Field(default_factory=dict)
+    candle_ts: Optional[datetime] = None
+    source: str = "strategy-service"
+
+
+class ArcAnalysisLogIn(BaseModel):
+    log_ts: datetime
+    venue: str
+    symbol: str
+    asset_class: Optional[str] = None
+    box_high: Optional[float] = None
+    box_low: Optional[float] = None
+    swing_high: Optional[float] = None
+    swing_low: Optional[float] = None
+    range_size: Optional[float] = None
+    range_pct_move: Optional[float] = None
+    range_geometry_tag: Optional[str] = None
+    zone: Optional[str] = None
+    zone_level: Optional[str] = None
+    area_pass: Optional[bool] = None
+    range_pass: Optional[bool] = None
+    candle_pass: Optional[bool] = None
+    area_reason: Optional[str] = None
+    range_reason: Optional[str] = None
+    candle_reason: Optional[str] = None
+    signal: Optional[str] = None
+    setup_state: Optional[str] = None
+    entry_price: Optional[float] = None
+    stop_hint: Optional[float] = None
+    target_hint: Optional[float] = None
+    target_50: Optional[float] = None
+    target_100: Optional[float] = None
+    reward_risk: Optional[float] = None
+    invalidation_reason: Optional[str] = None
+    entry_reason: Optional[str] = None
+    record: Dict[str, Any] = Field(default_factory=dict)
+    candle_ts: Optional[datetime] = None
+    source: str = "strategy-service"
+
+
+class Orb5mScalpAnalysisLogIn(BaseModel):
+    log_ts: datetime
+    venue: str
+    symbol: str
+    asset_class: Optional[str] = None
+    timeframe: str = "5m"
+    setup_state: Optional[str] = None
+    direction: Optional[str] = None
+    signal: Optional[str] = None
+    or_high: Optional[float] = None
+    or_low: Optional[float] = None
+    or_mid: Optional[float] = None
+    breakout_valid: Optional[bool] = None
+    retest_valid: Optional[bool] = None
+    breakout_reason: Optional[str] = None
+    retest_reason: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    entry_price: Optional[float] = None
+    stop_hint: Optional[float] = None
+    target_hint: Optional[float] = None
+    reward_risk: Optional[float] = None
+    entry_reason: Optional[str] = None
+    invalidation_reason: Optional[str] = None
+    record: Dict[str, Any] = Field(default_factory=dict)
+    candle_ts: Optional[datetime] = None
+    source: str = "strategy-service"
+
+
+class Ema50BreakoutPullbackAnalysisLogIn(BaseModel):
+    log_ts: datetime
+    venue: str
+    symbol: str
+    asset_class: Optional[str] = None
+    timeframe: str = "4h"
+    setup_state: Optional[str] = None
+    direction: Optional[str] = None
+    ema50_side: Optional[str] = None
+    signal: Optional[str] = None
+    breakout_pass: Optional[bool] = None
+    pullback_pass: Optional[bool] = None
+    trigger_pass: Optional[bool] = None
+    breakout_reason: Optional[str] = None
+    pullback_reason: Optional[str] = None
+    trigger_reason: Optional[str] = None
+    swing_level: Optional[float] = None
+    ema50_value: Optional[float] = None
+    entry_price: Optional[float] = None
+    stop_hint: Optional[float] = None
+    target_hint: Optional[float] = None
+    reward_risk: Optional[float] = None
+    entry_reason: Optional[str] = None
+    invalidation_reason: Optional[str] = None
+    record: Dict[str, Any] = Field(default_factory=dict)
+    candle_ts: Optional[datetime] = None
+    source: str = "strategy-service"
+
+
 class MacdAnalysisLogIn(BaseModel):
     log_ts: datetime
     exchange: Optional[str] = None
@@ -303,6 +463,12 @@ def normalize_status(status: Optional[str], entity_type: str = "trade") -> str:
     
     # Default fallbacks
     return "OPEN" if entity_type == "trade" else "PENDING"
+
+
+PERP_PAPER_ACCOUNTING_INCLUDED_SQL = (
+    "COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'"
+)
+
 
 # Phase 2: Event Sourcing Helpers (moved after DatabaseManager class definition)
 async def append_event(
@@ -1285,6 +1451,7 @@ async def get_derived_hyperliquid_balance() -> Dict[str, float]:
             COALESCE(SUM(margin_used) FILTER (WHERE status = 'OPEN'), 0) AS margin_used
         FROM trading.perp_paper_trades
         WHERE LOWER(venue) = 'hyperliquid'
+          AND COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'
         """
     ) or {}
 
@@ -1473,8 +1640,14 @@ async def initialize_database():
         # Auto-heal critical fee-tracking columns required by trade update flow.
         await ensure_trade_fee_columns(db_manager)
         await ensure_macd_analysis_log_table(db_manager)
+        await ensure_supply_demand_analysis_log_table(db_manager)
+        await ensure_dual_sma_analysis_log_table(db_manager)
+        await ensure_arc_analysis_log_table(db_manager)
+        await ensure_ema50_breakout_pullback_analysis_log_table(db_manager)
+        await ensure_orb_5m_scalp_analysis_log_table(db_manager)
         await ensure_perp_paper_trades_table(db_manager)
         await ensure_perp_live_trades_table(db_manager)
+        await ensure_hyperliquid_adaptive_pnl_decisions_table(db_manager)
         
         # Initialize materializer (Phase 3)
         materializer = EventMaterializer(db_manager)
@@ -1547,6 +1720,283 @@ async def ensure_macd_analysis_log_table(manager: "DatabaseManager") -> None:
         logger.info("✅ Ensured strategy_macd_analysis_log table exists")
     except Exception as e:
         logger.error(f"Failed ensuring strategy_macd_analysis_log table: {e}")
+        raise
+
+
+async def ensure_supply_demand_analysis_log_table(manager: "DatabaseManager") -> None:
+    """Ensure persistence table for supply/demand 3-step audit snapshots."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.strategy_supply_demand_analysis_log (
+                id BIGSERIAL PRIMARY KEY,
+                log_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_class TEXT,
+                timeframe_mode TEXT,
+                structure_timeframe TEXT,
+                entry_timeframe TEXT,
+                trend_direction TEXT,
+                signal TEXT,
+                step1_pass BOOLEAN,
+                step2_pass BOOLEAN,
+                step3_pass BOOLEAN,
+                step1_reason TEXT,
+                step2_reason TEXT,
+                step3_reason TEXT,
+                entry_reason TEXT,
+                reward_risk NUMERIC,
+                entry_price NUMERIC,
+                stop_hint NUMERIC,
+                target_hint NUMERIC,
+                record JSONB NOT NULL DEFAULT '{}'::jsonb,
+                candle_ts TIMESTAMPTZ,
+                source TEXT NOT NULL DEFAULT 'strategy-service',
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_sd_audit_log_ts
+            ON trading.strategy_supply_demand_analysis_log (log_ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_sd_audit_venue_symbol
+            ON trading.strategy_supply_demand_analysis_log (venue, symbol);
+            CREATE INDEX IF NOT EXISTS idx_sd_audit_steps
+            ON trading.strategy_supply_demand_analysis_log (step1_pass, step2_pass, step3_pass);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_sd_audit_venue_symbol_candle_source
+            ON trading.strategy_supply_demand_analysis_log (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL;
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured strategy_supply_demand_analysis_log table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring strategy_supply_demand_analysis_log table: {e}")
+        raise
+
+
+async def ensure_dual_sma_analysis_log_table(manager: "DatabaseManager") -> None:
+    """Ensure persistence table for dual-SMA daytrade audit snapshots."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.strategy_dual_sma_analysis_log (
+                id BIGSERIAL PRIMARY KEY,
+                log_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_class TEXT,
+                daily_bias TEXT,
+                trend_15m TEXT,
+                entry_signal_5m TEXT,
+                signal TEXT,
+                sma20_slope NUMERIC,
+                price_vs_sma20_pct NUMERIC,
+                price_vs_sma200_pct NUMERIC,
+                extension_distance_pct NUMERIC,
+                daily_gap_vs_sma200_pct NUMERIC,
+                sma200_flat BOOLEAN,
+                squeeze_detected BOOLEAN,
+                daily_pass BOOLEAN,
+                confirm_15m_pass BOOLEAN,
+                entry_5m_pass BOOLEAN,
+                precision_pass BOOLEAN,
+                daily_reason TEXT,
+                confirm_15m_reason TEXT,
+                entry_5m_reason TEXT,
+                precision_reason TEXT,
+                entry_reason TEXT,
+                reward_risk NUMERIC,
+                entry_price NUMERIC,
+                stop_hint NUMERIC,
+                target_hint NUMERIC,
+                record JSONB NOT NULL DEFAULT '{}'::jsonb,
+                candle_ts TIMESTAMPTZ,
+                source TEXT NOT NULL DEFAULT 'strategy-service',
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_dual_sma_audit_log_ts
+            ON trading.strategy_dual_sma_analysis_log (log_ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_dual_sma_audit_venue_symbol
+            ON trading.strategy_dual_sma_analysis_log (venue, symbol);
+            CREATE INDEX IF NOT EXISTS idx_dual_sma_audit_gates
+            ON trading.strategy_dual_sma_analysis_log (daily_pass, confirm_15m_pass, entry_5m_pass);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_dual_sma_audit_venue_symbol_candle_source
+            ON trading.strategy_dual_sma_analysis_log (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL;
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured strategy_dual_sma_analysis_log table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring strategy_dual_sma_analysis_log table: {e}")
+        raise
+
+
+async def ensure_arc_analysis_log_table(manager: "DatabaseManager") -> None:
+    """Ensure persistence table for ARC daytrade audit snapshots."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.strategy_arc_analysis_log (
+                id BIGSERIAL PRIMARY KEY,
+                log_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_class TEXT,
+                box_high NUMERIC,
+                box_low NUMERIC,
+                swing_high NUMERIC,
+                swing_low NUMERIC,
+                range_size NUMERIC,
+                range_pct_move NUMERIC,
+                range_geometry_tag TEXT,
+                zone TEXT,
+                zone_level TEXT,
+                area_pass BOOLEAN,
+                range_pass BOOLEAN,
+                candle_pass BOOLEAN,
+                area_reason TEXT,
+                range_reason TEXT,
+                candle_reason TEXT,
+                signal TEXT,
+                setup_state TEXT,
+                entry_price NUMERIC,
+                stop_hint NUMERIC,
+                target_hint NUMERIC,
+                target_50 NUMERIC,
+                target_100 NUMERIC,
+                reward_risk NUMERIC,
+                invalidation_reason TEXT,
+                entry_reason TEXT,
+                record JSONB NOT NULL DEFAULT '{}'::jsonb,
+                candle_ts TIMESTAMPTZ,
+                source TEXT NOT NULL DEFAULT 'strategy-service',
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_arc_audit_log_ts
+            ON trading.strategy_arc_analysis_log (log_ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_arc_audit_venue_symbol
+            ON trading.strategy_arc_analysis_log (venue, symbol);
+            CREATE INDEX IF NOT EXISTS idx_arc_audit_gates
+            ON trading.strategy_arc_analysis_log (area_pass, range_pass, candle_pass);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_arc_audit_venue_symbol_candle_source
+            ON trading.strategy_arc_analysis_log (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL;
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured strategy_arc_analysis_log table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring strategy_arc_analysis_log table: {e}")
+        raise
+
+
+async def ensure_ema50_breakout_pullback_analysis_log_table(manager: "DatabaseManager") -> None:
+    """Ensure persistence table for EMA50 breakout-pullback audit snapshots."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.strategy_ema50_breakout_pullback_analysis_log (
+                id BIGSERIAL PRIMARY KEY,
+                log_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_class TEXT,
+                timeframe TEXT NOT NULL DEFAULT '4h',
+                setup_state TEXT,
+                direction TEXT,
+                ema50_side TEXT,
+                signal TEXT,
+                breakout_pass BOOLEAN,
+                pullback_pass BOOLEAN,
+                trigger_pass BOOLEAN,
+                breakout_reason TEXT,
+                pullback_reason TEXT,
+                trigger_reason TEXT,
+                swing_level NUMERIC,
+                ema50_value NUMERIC,
+                entry_price NUMERIC,
+                stop_hint NUMERIC,
+                target_hint NUMERIC,
+                reward_risk NUMERIC,
+                entry_reason TEXT,
+                invalidation_reason TEXT,
+                record JSONB NOT NULL DEFAULT '{}'::jsonb,
+                candle_ts TIMESTAMPTZ,
+                source TEXT NOT NULL DEFAULT 'strategy-service',
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_ema50_bp_audit_log_ts
+            ON trading.strategy_ema50_breakout_pullback_analysis_log (log_ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_ema50_bp_audit_venue_symbol
+            ON trading.strategy_ema50_breakout_pullback_analysis_log (venue, symbol);
+            CREATE INDEX IF NOT EXISTS idx_ema50_bp_audit_gates
+            ON trading.strategy_ema50_breakout_pullback_analysis_log (breakout_pass, pullback_pass, trigger_pass);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_ema50_bp_audit_venue_symbol_candle_source
+            ON trading.strategy_ema50_breakout_pullback_analysis_log (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL;
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured strategy_ema50_breakout_pullback_analysis_log table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring strategy_ema50_breakout_pullback_analysis_log table: {e}")
+        raise
+
+
+async def ensure_orb_5m_scalp_analysis_log_table(manager: "DatabaseManager") -> None:
+    """Ensure persistence table for ORB 5m scalp audit snapshots."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.strategy_orb_5m_scalp_analysis_log (
+                id BIGSERIAL PRIMARY KEY,
+                log_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                asset_class TEXT,
+                timeframe TEXT NOT NULL DEFAULT '5m',
+                setup_state TEXT,
+                direction TEXT,
+                signal TEXT,
+                or_high NUMERIC,
+                or_low NUMERIC,
+                or_mid NUMERIC,
+                breakout_valid BOOLEAN,
+                retest_valid BOOLEAN,
+                breakout_reason TEXT,
+                retest_reason TEXT,
+                rejection_reason TEXT,
+                entry_price NUMERIC,
+                stop_hint NUMERIC,
+                target_hint NUMERIC,
+                reward_risk NUMERIC,
+                entry_reason TEXT,
+                invalidation_reason TEXT,
+                record JSONB NOT NULL DEFAULT '{}'::jsonb,
+                candle_ts TIMESTAMPTZ,
+                source TEXT NOT NULL DEFAULT 'strategy-service',
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_orb_5m_scalp_audit_log_ts
+            ON trading.strategy_orb_5m_scalp_analysis_log (log_ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_orb_5m_scalp_audit_venue_symbol
+            ON trading.strategy_orb_5m_scalp_analysis_log (venue, symbol);
+            CREATE INDEX IF NOT EXISTS idx_orb_5m_scalp_audit_gates
+            ON trading.strategy_orb_5m_scalp_analysis_log (breakout_valid, retest_valid);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_orb_5m_scalp_audit_venue_symbol_candle_source
+            ON trading.strategy_orb_5m_scalp_analysis_log (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL;
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured strategy_orb_5m_scalp_analysis_log table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring strategy_orb_5m_scalp_analysis_log table: {e}")
         raise
 
 
@@ -1659,6 +2109,71 @@ async def ensure_perp_live_trades_table(manager: "DatabaseManager") -> None:
         logger.info("✅ Ensured perp_live_trades table exists")
     except Exception as e:
         logger.error(f"Failed ensuring perp_live_trades table: {e}")
+        raise
+
+
+async def ensure_hyperliquid_adaptive_pnl_decisions_table(manager: "DatabaseManager") -> None:
+    """Ensure durable audit table for adaptive paper-perp control decisions."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.hyperliquid_adaptive_pnl_decisions (
+                id BIGSERIAL PRIMARY KEY,
+                decision_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                decision_type TEXT,
+                action TEXT,
+                target_type TEXT,
+                target TEXT,
+                side TEXT,
+                config_path TEXT,
+                old_value JSONB,
+                new_value JSONB,
+                situation TEXT,
+                intended_effect TEXT,
+                evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+                current_outcome JSONB NOT NULL DEFAULT '{}'::jsonb,
+                live_since TIMESTAMPTZ NOT NULL,
+                first_seen_at TIMESTAMPTZ,
+                last_seen_at TIMESTAMPTZ,
+                released_at TIMESTAMPTZ,
+                release_reason TEXT,
+                apply_status TEXT NOT NULL DEFAULT 'pending_reload',
+                applied_at TIMESTAMPTZ,
+                applied_to_cycle BIGINT,
+                reload_required BOOLEAN NOT NULL DEFAULT TRUE,
+                reload_verified_at TIMESTAMPTZ,
+                source TEXT NOT NULL DEFAULT 'orchestrator',
+                record JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (decision_key, live_since)
+            );
+        """
+        alter_sql = """
+            ALTER TABLE trading.hyperliquid_adaptive_pnl_decisions
+            ADD COLUMN IF NOT EXISTS decision_type TEXT,
+            ADD COLUMN IF NOT EXISTS apply_status TEXT NOT NULL DEFAULT 'pending_reload',
+            ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS applied_to_cycle BIGINT,
+            ADD COLUMN IF NOT EXISTS reload_required BOOLEAN NOT NULL DEFAULT TRUE,
+            ADD COLUMN IF NOT EXISTS reload_verified_at TIMESTAMPTZ;
+        """
+        idx_sql = """
+            CREATE INDEX IF NOT EXISTS idx_hl_adaptive_pnl_status
+            ON trading.hyperliquid_adaptive_pnl_decisions (status);
+            CREATE INDEX IF NOT EXISTS idx_hl_adaptive_pnl_decision_key
+            ON trading.hyperliquid_adaptive_pnl_decisions (decision_key);
+            CREATE INDEX IF NOT EXISTS idx_hl_adaptive_pnl_last_seen
+            ON trading.hyperliquid_adaptive_pnl_decisions (last_seen_at DESC NULLS LAST);
+            CREATE INDEX IF NOT EXISTS idx_hl_adaptive_pnl_target
+            ON trading.hyperliquid_adaptive_pnl_decisions (target_type, target, side);
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(alter_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured hyperliquid_adaptive_pnl_decisions table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring hyperliquid_adaptive_pnl_decisions table: {e}")
         raise
 
 # API Endpoints
@@ -2153,6 +2668,7 @@ async def get_perp_paper_trades(
     status: Optional[str] = None,
     coin: Optional[str] = None,
     position_side: Optional[str] = None,
+    include_accounting_excluded: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
@@ -2171,6 +2687,8 @@ async def get_perp_paper_trades(
         if position_side:
             where_conditions.append("position_side = %s")
             params.append(position_side.lower())
+        if not include_accounting_excluded:
+            where_conditions.append(PERP_PAPER_ACCOUNTING_INCLUDED_SQL)
 
         where_sql = (" WHERE " + " AND ".join(where_conditions)) if where_conditions else ""
         trades = await db_manager.execute_query(
@@ -2196,7 +2714,252 @@ async def get_perp_paper_trades(
 @app.get("/api/v1/perps/paper-trades/open")
 async def get_open_perp_paper_trades(coin: Optional[str] = None):
     """List open isolated paper perpetual trades."""
-    return await get_perp_paper_trades(status="OPEN", coin=coin, limit=1000, offset=0)
+    return await get_perp_paper_trades(
+        status="OPEN",
+        coin=coin,
+        include_accounting_excluded=False,
+        limit=1000,
+        offset=0,
+    )
+
+
+@app.post("/api/v1/perps/adaptive-pnl-decisions/sync")
+async def sync_hyperliquid_adaptive_pnl_decisions(payload: AdaptivePnlDecisionSync):
+    """Upsert durable adaptive paper-perp control decision audit records."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        synced = 0
+        now = payload.synced_at or datetime.utcnow()
+        active_keys_from_payload = payload.active_decision_keys is not None
+        active_keys = {
+            str(key).strip()
+            for key in (payload.active_decision_keys or [])
+            if str(key).strip()
+        }
+        query = """
+            INSERT INTO trading.hyperliquid_adaptive_pnl_decisions (
+                decision_key, status, decision_type, action, target_type, target, side,
+                config_path, old_value, new_value, situation, intended_effect,
+                evidence, current_outcome, live_since, first_seen_at, last_seen_at,
+                released_at, release_reason, apply_status, applied_at, applied_to_cycle,
+                reload_required, reload_verified_at, source, record, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (decision_key, live_since) DO UPDATE SET
+                status = EXCLUDED.status,
+                decision_type = EXCLUDED.decision_type,
+                action = EXCLUDED.action,
+                target_type = EXCLUDED.target_type,
+                target = EXCLUDED.target,
+                side = EXCLUDED.side,
+                config_path = EXCLUDED.config_path,
+                old_value = EXCLUDED.old_value,
+                new_value = EXCLUDED.new_value,
+                situation = EXCLUDED.situation,
+                intended_effect = EXCLUDED.intended_effect,
+                evidence = EXCLUDED.evidence,
+                current_outcome = EXCLUDED.current_outcome,
+                first_seen_at = EXCLUDED.first_seen_at,
+                last_seen_at = EXCLUDED.last_seen_at,
+                released_at = EXCLUDED.released_at,
+                release_reason = EXCLUDED.release_reason,
+                apply_status = EXCLUDED.apply_status,
+                applied_at = EXCLUDED.applied_at,
+                applied_to_cycle = EXCLUDED.applied_to_cycle,
+                reload_required = EXCLUDED.reload_required,
+                reload_verified_at = EXCLUDED.reload_verified_at,
+                source = EXCLUDED.source,
+                record = EXCLUDED.record,
+                updated_at = EXCLUDED.updated_at
+        """
+        for record in payload.records or []:
+            decision_key = str(record.get("decisionKey") or "").strip()
+            live_since = record.get("liveSince") or record.get("firstSeenAt") or now
+            status = str(record.get("status") or "active")
+            if not decision_key or not live_since:
+                continue
+            if status.lower() == "active":
+                if not active_keys_from_payload:
+                    active_keys.add(decision_key)
+                existing = await db_manager.execute_single_query(
+                    """
+                    SELECT live_since
+                    FROM trading.hyperliquid_adaptive_pnl_decisions
+                    WHERE decision_key = %s AND status = 'active'
+                    ORDER BY live_since ASC
+                    LIMIT 1
+                    """,
+                    (decision_key,),
+                )
+                existing_live_since = (existing or {}).get("live_since") or (existing or {}).get("liveSince")
+                if existing_live_since:
+                    live_since = existing_live_since
+            await db_manager.execute_query(
+                query,
+                (
+                    decision_key,
+                    status,
+                    record.get("decisionType") or record.get("type"),
+                    record.get("action"),
+                    record.get("targetType"),
+                    record.get("target") or record.get("strategy"),
+                    record.get("side"),
+                    record.get("configPath"),
+                    Json(record.get("oldValue")),
+                    Json(record.get("newValue")),
+                    record.get("situation"),
+                    record.get("intendedEffect"),
+                    Json(record.get("evidence") or {}),
+                    Json(record.get("currentOutcome") or {}),
+                    live_since,
+                    record.get("firstSeenAt") or live_since,
+                    record.get("lastSeenAt") or now,
+                    record.get("releasedAt"),
+                    record.get("releaseReason"),
+                    record.get("applyStatus") or record.get("apply_status") or "pending_reload",
+                    record.get("appliedAt") or record.get("applied_at"),
+                    record.get("appliedToCycle") or record.get("applied_to_cycle"),
+                    bool(
+                        record.get("reloadRequired")
+                        if record.get("reloadRequired") is not None
+                        else record.get("reload_required", True)
+                    ),
+                    record.get("reloadVerifiedAt") or record.get("reload_verified_at"),
+                    payload.source,
+                    Json(record),
+                    now,
+                ),
+            )
+            if status.lower() == "active":
+                await db_manager.execute_query(
+                    """
+                    UPDATE trading.hyperliquid_adaptive_pnl_decisions
+                    SET status = 'released',
+                        released_at = COALESCE(released_at, %s),
+                        release_reason = COALESCE(
+                            release_reason,
+                            'Superseded by refreshed adaptive decision with the same key.'
+                        ),
+                        updated_at = %s
+                    WHERE decision_key = %s
+                      AND status = 'active'
+                      AND live_since <> %s
+                    """,
+                    (now, now, decision_key, live_since),
+                )
+            synced += 1
+        if payload.release_missing_active:
+            if active_keys:
+                ordered_keys = sorted(active_keys)
+                placeholders = ", ".join(["%s"] * len(ordered_keys))
+                await db_manager.execute_query(
+                    f"""
+                    UPDATE trading.hyperliquid_adaptive_pnl_decisions
+                    SET status = 'released',
+                        released_at = COALESCE(released_at, %s),
+                        release_reason = COALESCE(
+                            release_reason,
+                            'No longer present in latest adaptive control evaluation; rolling evidence improved or controller disabled.'
+                        ),
+                        updated_at = %s
+                    WHERE status = 'active'
+                      AND decision_key NOT IN ({placeholders})
+                    """,
+                    (now, now, *ordered_keys),
+                )
+            else:
+                await db_manager.execute_query(
+                    """
+                    UPDATE trading.hyperliquid_adaptive_pnl_decisions
+                    SET status = 'released',
+                        released_at = COALESCE(released_at, %s),
+                        release_reason = COALESCE(
+                            release_reason,
+                            'No active adaptive decisions remain in latest evaluation; rolling evidence improved or controller disabled.'
+                        ),
+                        updated_at = %s
+                    WHERE status = 'active'
+                    """,
+                    (now, now),
+                )
+        return {"status": "ok", "synced": synced, "syncedAt": now}
+    except Exception as e:
+        logger.error(f"Failed to sync adaptive PnL decisions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/perps/adaptive-pnl-decisions")
+async def get_hyperliquid_adaptive_pnl_decisions(
+    status: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Read durable adaptive paper-perp control decision audit records."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = []
+        params: List[Any] = []
+        if status:
+            where.append("status = %s")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = await db_manager.execute_query(
+            f"""
+            SELECT
+                decision_key AS "decisionKey",
+                status,
+                decision_type AS "type",
+                decision_type AS "decisionType",
+                action,
+                target_type AS "targetType",
+                target,
+                side,
+                config_path AS "configPath",
+                old_value AS "oldValue",
+                new_value AS "newValue",
+                situation,
+                intended_effect AS "intendedEffect",
+                evidence,
+                current_outcome AS "currentOutcome",
+                live_since AS "liveSince",
+                first_seen_at AS "firstSeenAt",
+                last_seen_at AS "lastSeenAt",
+                released_at AS "releasedAt",
+                release_reason AS "releaseReason",
+                apply_status AS "applyStatus",
+                applied_at AS "appliedAt",
+                applied_to_cycle AS "appliedToCycle",
+                reload_required AS "reloadRequired",
+                reload_verified_at AS "reloadVerifiedAt",
+                source,
+                record,
+                created_at AS "createdAt",
+                updated_at AS "updatedAt"
+            FROM trading.hyperliquid_adaptive_pnl_decisions
+            {where_sql}
+            ORDER BY COALESCE(last_seen_at, live_since, created_at) DESC
+            LIMIT %s
+            """,
+            tuple(params + [limit]),
+        )
+        total_row = await db_manager.execute_single_query(
+            f"SELECT COUNT(*) AS total FROM trading.hyperliquid_adaptive_pnl_decisions {where_sql}",
+            tuple(params) if params else (),
+        )
+        return {
+            "records": rows,
+            "total": total_row.get("total", 0) if total_row else len(rows),
+            "source": "postgres",
+        }
+    except Exception as e:
+        logger.error(f"Failed to get adaptive PnL decisions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/v1/perps/live-trades")
@@ -2344,7 +3107,13 @@ async def get_rsi_stoch_paper_readiness():
         except Exception:
             pass
         rows = await db_manager.fetch_all(
-            "SELECT * FROM trading.perp_paper_trades ORDER BY entry_time DESC LIMIT 2000",
+            """
+            SELECT *
+            FROM trading.perp_paper_trades
+            WHERE COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'
+            ORDER BY entry_time DESC
+            LIMIT 2000
+            """,
             (),
         )
         return evaluate_live_readiness(rows or [], promo)
@@ -2412,6 +3181,7 @@ async def get_perp_paper_summary():
                 COUNT(*) FILTER (WHERE status = 'CLOSED' AND realized_pnl > 0) AS winning_trades,
                 COUNT(*) FILTER (WHERE status = 'CLOSED' AND realized_pnl < 0) AS losing_trades
             FROM trading.perp_paper_trades
+            WHERE COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'
             """
         ) or {}
         by_side = await db_manager.execute_query(
@@ -2424,6 +3194,7 @@ async def get_perp_paper_summary():
                 COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
                 COALESCE(SUM(unrealized_pnl) FILTER (WHERE status = 'OPEN'), 0) AS unrealized_pnl
             FROM trading.perp_paper_trades
+            WHERE COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'
             GROUP BY position_side
             ORDER BY position_side
             """
@@ -2439,6 +3210,7 @@ async def get_perp_paper_summary():
                 COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
                 COALESCE(SUM(unrealized_pnl) FILTER (WHERE status = 'OPEN'), 0) AS unrealized_pnl
             FROM trading.perp_paper_trades
+            WHERE COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'
             GROUP BY source_strategy, position_side
             ORDER BY realized_pnl DESC, total_trades DESC
             LIMIT 50
@@ -2455,6 +3227,9 @@ async def get_perp_paper_summary():
         summary["starting_balance"] = hl_balance["starting_balance"]
         summary["margin_used"] = hl_balance["margin_used"]
         summary["balance_source"] = hl_balance["balance_source"]
+        summary["mark_to_market_equity"] = (
+            float(hl_balance["equity"]) + float(summary.get("unrealized_pnl") or 0)
+        )
 
         return {"summary": summary, "by_side": by_side, "by_strategy": by_strategy, "balance": hl_balance}
     except Exception as e:
@@ -2479,6 +3254,7 @@ async def get_perp_paper_pnl_report(
                 SELECT *, coin AS symbol
                 FROM trading.perp_paper_trades
                 WHERE status = %s
+                  AND COALESCE(metadata->>'accounting_excluded', 'false') <> 'true'
                 ORDER BY entry_time DESC
                 LIMIT %s
                 """,
@@ -2556,7 +3332,11 @@ async def update_trade(trade_id: str, update_data: Dict[str, Any]):
                       'profit_protection_trigger', 'trail_stop', 'trail_stop_trigger',
                       'exit_reason', 'fees', 'status', 'entry_id', 'position_size', 'entry_price',
                       'entry_fee_amount', 'entry_fee_currency', 'exit_fee_amount', 
-                      'exit_fee_currency', 'total_fees_usd']:
+                      'exit_fee_currency', 'total_fees_usd', 'exit_state', 'trigger_reason',
+                      'trigger_price', 'trigger_detected_price', 'trigger_price_source',
+                      'trigger_feed_quality', 'trigger_detected_at', 'cancel_attempted_at',
+                      'cancel_attempt_result', 'exit_submitted_at', 'exit_submit_route',
+                      'first_fill_at', 'slippage_bps_vs_trigger', 'exit_failure_reason']:
                 # Normalize status values for consistency
                 if key == 'status':
                     value = normalize_status(value, "trade")
@@ -4543,6 +5323,657 @@ async def get_macd_analysis_logs(
         return {"rows": rows, "count": len(rows)}
     except Exception as e:
         logger.error(f"Failed to get macd analysis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/supply-demand-analysis-logs")
+async def create_supply_demand_analysis_log(payload: SupplyDemandAnalysisLogIn):
+    """Persist one supply/demand 3-step evaluation audit row."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.strategy_supply_demand_analysis_log (
+                log_ts, venue, symbol, asset_class, timeframe_mode,
+                structure_timeframe, entry_timeframe, trend_direction, signal,
+                step1_pass, step2_pass, step3_pass,
+                step1_reason, step2_reason, step3_reason, entry_reason,
+                reward_risk, entry_price, stop_hint, target_hint,
+                record, candle_ts, source
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL
+            DO UPDATE SET
+                log_ts = EXCLUDED.log_ts,
+                asset_class = EXCLUDED.asset_class,
+                timeframe_mode = EXCLUDED.timeframe_mode,
+                structure_timeframe = EXCLUDED.structure_timeframe,
+                entry_timeframe = EXCLUDED.entry_timeframe,
+                trend_direction = EXCLUDED.trend_direction,
+                signal = EXCLUDED.signal,
+                step1_pass = EXCLUDED.step1_pass,
+                step2_pass = EXCLUDED.step2_pass,
+                step3_pass = EXCLUDED.step3_pass,
+                step1_reason = EXCLUDED.step1_reason,
+                step2_reason = EXCLUDED.step2_reason,
+                step3_reason = EXCLUDED.step3_reason,
+                entry_reason = EXCLUDED.entry_reason,
+                reward_risk = EXCLUDED.reward_risk,
+                entry_price = EXCLUDED.entry_price,
+                stop_hint = EXCLUDED.stop_hint,
+                target_hint = EXCLUDED.target_hint,
+                record = EXCLUDED.record,
+                ingested_at = NOW()
+            RETURNING id
+        """
+        params = (
+            payload.log_ts,
+            payload.venue,
+            payload.symbol,
+            payload.asset_class,
+            payload.timeframe_mode,
+            payload.structure_timeframe,
+            payload.entry_timeframe,
+            payload.trend_direction,
+            payload.signal,
+            payload.step1_pass,
+            payload.step2_pass,
+            payload.step3_pass,
+            payload.step1_reason,
+            payload.step2_reason,
+            payload.step3_reason,
+            payload.entry_reason,
+            payload.reward_risk,
+            payload.entry_price,
+            payload.stop_hint,
+            payload.target_hint,
+            Json(payload.record or {}),
+            payload.candle_ts,
+            payload.source,
+        )
+        inserted = await db_manager.execute_single_query(query, params)
+        return {"status": "ok", "inserted": bool(inserted), "id": (inserted or {}).get("id")}
+    except Exception as e:
+        logger.error(f"Failed to create supply/demand analysis log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/supply-demand-analysis-logs")
+async def get_supply_demand_analysis_logs(
+    venue: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=5000),
+):
+    """Read supply/demand audit logs for dashboard usage."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["log_ts >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [hours]
+        if venue:
+            where.append("LOWER(venue) = LOWER(%s)")
+            params.append(venue)
+        if symbol:
+            where.append("UPPER(symbol) = UPPER(%s)")
+            params.append(symbol)
+        params.append(limit)
+        query = f"""
+            SELECT
+                id, log_ts, venue, symbol, asset_class, timeframe_mode,
+                structure_timeframe, entry_timeframe, trend_direction, signal,
+                step1_pass, step2_pass, step3_pass,
+                step1_reason, step2_reason, step3_reason, entry_reason,
+                reward_risk, entry_price, stop_hint, target_hint,
+                record, candle_ts, source, ingested_at
+            FROM trading.strategy_supply_demand_analysis_log
+            WHERE {" AND ".join(where)}
+            ORDER BY log_ts DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(query, tuple(params))
+        try:
+            from supply_demand_audit_summary import build_supply_demand_audit_summary
+        except ImportError:  # pragma: no cover
+            from core.supply_demand_audit_summary import build_supply_demand_audit_summary
+        summary = build_supply_demand_audit_summary(rows or [])
+        return {"rows": rows, "count": len(rows), "summary": summary}
+    except Exception as e:
+        logger.error(f"Failed to read supply/demand analysis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/dual-sma-analysis-logs")
+async def create_dual_sma_analysis_log(payload: DualSmaAnalysisLogIn):
+    """Persist one dual-SMA daytrade evaluation audit row."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.strategy_dual_sma_analysis_log (
+                log_ts, venue, symbol, asset_class, daily_bias, trend_15m,
+                entry_signal_5m, signal, sma20_slope, price_vs_sma20_pct,
+                price_vs_sma200_pct, extension_distance_pct, daily_gap_vs_sma200_pct,
+                sma200_flat, squeeze_detected, daily_pass, confirm_15m_pass,
+                entry_5m_pass, precision_pass, daily_reason, confirm_15m_reason,
+                entry_5m_reason, precision_reason, entry_reason,
+                reward_risk, entry_price, stop_hint, target_hint,
+                record, candle_ts, source
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL
+            DO UPDATE SET
+                log_ts = EXCLUDED.log_ts,
+                asset_class = EXCLUDED.asset_class,
+                daily_bias = EXCLUDED.daily_bias,
+                trend_15m = EXCLUDED.trend_15m,
+                entry_signal_5m = EXCLUDED.entry_signal_5m,
+                signal = EXCLUDED.signal,
+                sma20_slope = EXCLUDED.sma20_slope,
+                price_vs_sma20_pct = EXCLUDED.price_vs_sma20_pct,
+                price_vs_sma200_pct = EXCLUDED.price_vs_sma200_pct,
+                extension_distance_pct = EXCLUDED.extension_distance_pct,
+                daily_gap_vs_sma200_pct = EXCLUDED.daily_gap_vs_sma200_pct,
+                sma200_flat = EXCLUDED.sma200_flat,
+                squeeze_detected = EXCLUDED.squeeze_detected,
+                daily_pass = EXCLUDED.daily_pass,
+                confirm_15m_pass = EXCLUDED.confirm_15m_pass,
+                entry_5m_pass = EXCLUDED.entry_5m_pass,
+                precision_pass = EXCLUDED.precision_pass,
+                daily_reason = EXCLUDED.daily_reason,
+                confirm_15m_reason = EXCLUDED.confirm_15m_reason,
+                entry_5m_reason = EXCLUDED.entry_5m_reason,
+                precision_reason = EXCLUDED.precision_reason,
+                entry_reason = EXCLUDED.entry_reason,
+                reward_risk = EXCLUDED.reward_risk,
+                entry_price = EXCLUDED.entry_price,
+                stop_hint = EXCLUDED.stop_hint,
+                target_hint = EXCLUDED.target_hint,
+                record = EXCLUDED.record,
+                ingested_at = NOW()
+            RETURNING id
+        """
+        params = (
+            payload.log_ts,
+            payload.venue,
+            payload.symbol,
+            payload.asset_class,
+            payload.daily_bias,
+            payload.trend_15m,
+            payload.entry_signal_5m,
+            payload.signal,
+            payload.sma20_slope,
+            payload.price_vs_sma20_pct,
+            payload.price_vs_sma200_pct,
+            payload.extension_distance_pct,
+            payload.daily_gap_vs_sma200_pct,
+            payload.sma200_flat,
+            payload.squeeze_detected,
+            payload.daily_pass,
+            payload.confirm_15m_pass,
+            payload.entry_5m_pass,
+            payload.precision_pass,
+            payload.daily_reason,
+            payload.confirm_15m_reason,
+            payload.entry_5m_reason,
+            payload.precision_reason,
+            payload.entry_reason,
+            payload.reward_risk,
+            payload.entry_price,
+            payload.stop_hint,
+            payload.target_hint,
+            Json(payload.record or {}),
+            payload.candle_ts,
+            payload.source,
+        )
+        inserted = await db_manager.execute_single_query(query, params)
+        return {"status": "ok", "inserted": bool(inserted), "id": (inserted or {}).get("id")}
+    except Exception as e:
+        logger.error(f"Failed to create dual-SMA analysis log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/dual-sma-analysis-logs")
+async def get_dual_sma_analysis_logs(
+    venue: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=5000),
+):
+    """Read dual-SMA audit logs for dashboard usage."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["log_ts >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [hours]
+        if venue:
+            where.append("LOWER(venue) = LOWER(%s)")
+            params.append(venue)
+        if symbol:
+            where.append("UPPER(symbol) = UPPER(%s)")
+            params.append(symbol)
+        params.append(limit)
+        query = f"""
+            SELECT
+                id, log_ts, venue, symbol, asset_class, daily_bias, trend_15m,
+                entry_signal_5m, signal, sma20_slope, price_vs_sma20_pct,
+                price_vs_sma200_pct, extension_distance_pct, daily_gap_vs_sma200_pct,
+                sma200_flat, squeeze_detected, daily_pass, confirm_15m_pass,
+                entry_5m_pass, precision_pass, daily_reason, confirm_15m_reason,
+                entry_5m_reason, precision_reason, entry_reason,
+                reward_risk, entry_price, stop_hint, target_hint,
+                record, candle_ts, source, ingested_at
+            FROM trading.strategy_dual_sma_analysis_log
+            WHERE {" AND ".join(where)}
+            ORDER BY log_ts DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(query, tuple(params))
+        try:
+            from dual_sma_audit_summary import build_dual_sma_audit_summary
+        except ImportError:  # pragma: no cover
+            from core.dual_sma_audit_summary import build_dual_sma_audit_summary
+        summary = build_dual_sma_audit_summary(rows or [])
+        return {"rows": rows, "count": len(rows), "summary": summary}
+    except Exception as e:
+        logger.error(f"Failed to read dual-SMA analysis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/arc-analysis-logs")
+async def create_arc_analysis_log(payload: ArcAnalysisLogIn):
+    """Persist one ARC daytrade evaluation audit row."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.strategy_arc_analysis_log (
+                log_ts, venue, symbol, asset_class, box_high, box_low, swing_high,
+                swing_low, range_size, range_pct_move, range_geometry_tag, zone,
+                zone_level, area_pass, range_pass, candle_pass, area_reason,
+                range_reason, candle_reason, signal, setup_state, entry_price,
+                stop_hint, target_hint, target_50, target_100, reward_risk,
+                invalidation_reason, entry_reason, record, candle_ts, source
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL
+            DO UPDATE SET
+                log_ts = EXCLUDED.log_ts,
+                asset_class = EXCLUDED.asset_class,
+                box_high = EXCLUDED.box_high,
+                box_low = EXCLUDED.box_low,
+                swing_high = EXCLUDED.swing_high,
+                swing_low = EXCLUDED.swing_low,
+                range_size = EXCLUDED.range_size,
+                range_pct_move = EXCLUDED.range_pct_move,
+                range_geometry_tag = EXCLUDED.range_geometry_tag,
+                zone = EXCLUDED.zone,
+                zone_level = EXCLUDED.zone_level,
+                area_pass = EXCLUDED.area_pass,
+                range_pass = EXCLUDED.range_pass,
+                candle_pass = EXCLUDED.candle_pass,
+                area_reason = EXCLUDED.area_reason,
+                range_reason = EXCLUDED.range_reason,
+                candle_reason = EXCLUDED.candle_reason,
+                signal = EXCLUDED.signal,
+                setup_state = EXCLUDED.setup_state,
+                entry_price = EXCLUDED.entry_price,
+                stop_hint = EXCLUDED.stop_hint,
+                target_hint = EXCLUDED.target_hint,
+                target_50 = EXCLUDED.target_50,
+                target_100 = EXCLUDED.target_100,
+                reward_risk = EXCLUDED.reward_risk,
+                invalidation_reason = EXCLUDED.invalidation_reason,
+                entry_reason = EXCLUDED.entry_reason,
+                record = EXCLUDED.record,
+                ingested_at = NOW()
+            RETURNING id
+        """
+        params = (
+            payload.log_ts,
+            payload.venue,
+            payload.symbol,
+            payload.asset_class,
+            payload.box_high,
+            payload.box_low,
+            payload.swing_high,
+            payload.swing_low,
+            payload.range_size,
+            payload.range_pct_move,
+            payload.range_geometry_tag,
+            payload.zone,
+            payload.zone_level,
+            payload.area_pass,
+            payload.range_pass,
+            payload.candle_pass,
+            payload.area_reason,
+            payload.range_reason,
+            payload.candle_reason,
+            payload.signal,
+            payload.setup_state,
+            payload.entry_price,
+            payload.stop_hint,
+            payload.target_hint,
+            payload.target_50,
+            payload.target_100,
+            payload.reward_risk,
+            payload.invalidation_reason,
+            payload.entry_reason,
+            Json(payload.record or {}),
+            payload.candle_ts,
+            payload.source,
+        )
+        inserted = await db_manager.execute_single_query(query, params)
+        return {"status": "ok", "inserted": bool(inserted), "id": (inserted or {}).get("id")}
+    except Exception as e:
+        logger.error(f"Failed to create ARC analysis log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/arc-analysis-logs")
+async def get_arc_analysis_logs(
+    venue: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=5000),
+):
+    """Read ARC audit logs for dashboard usage."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["log_ts >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [hours]
+        if venue:
+            where.append("LOWER(venue) = LOWER(%s)")
+            params.append(venue)
+        if symbol:
+            where.append("UPPER(symbol) = UPPER(%s)")
+            params.append(symbol)
+        params.append(limit)
+        query = f"""
+            SELECT
+                id, log_ts, venue, symbol, asset_class, box_high, box_low,
+                swing_high, swing_low, range_size, range_pct_move,
+                range_geometry_tag, zone, zone_level, area_pass, range_pass,
+                candle_pass, area_reason, range_reason, candle_reason, signal,
+                setup_state, entry_price, stop_hint, target_hint, target_50,
+                target_100, reward_risk, invalidation_reason, entry_reason,
+                record, candle_ts, source, ingested_at
+            FROM trading.strategy_arc_analysis_log
+            WHERE {" AND ".join(where)}
+            ORDER BY log_ts DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(query, tuple(params))
+        try:
+            from arc_audit_summary import build_arc_audit_summary
+        except ImportError:  # pragma: no cover
+            from core.arc_audit_summary import build_arc_audit_summary
+        summary = build_arc_audit_summary(rows or [])
+        return {"rows": rows, "count": len(rows), "summary": summary}
+    except Exception as e:
+        logger.error(f"Failed to read ARC analysis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/ema50-breakout-pullback-analysis-logs")
+async def create_ema50_breakout_pullback_analysis_log(payload: Ema50BreakoutPullbackAnalysisLogIn):
+    """Persist one EMA50 breakout-pullback evaluation audit row."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.strategy_ema50_breakout_pullback_analysis_log (
+                log_ts, venue, symbol, asset_class, timeframe, setup_state, direction,
+                ema50_side, signal, breakout_pass, pullback_pass, trigger_pass,
+                breakout_reason, pullback_reason, trigger_reason, swing_level,
+                ema50_value, entry_price, stop_hint, target_hint, reward_risk,
+                entry_reason, invalidation_reason, record, candle_ts, source
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL
+            DO UPDATE SET
+                log_ts = EXCLUDED.log_ts,
+                asset_class = EXCLUDED.asset_class,
+                timeframe = EXCLUDED.timeframe,
+                setup_state = EXCLUDED.setup_state,
+                direction = EXCLUDED.direction,
+                ema50_side = EXCLUDED.ema50_side,
+                signal = EXCLUDED.signal,
+                breakout_pass = EXCLUDED.breakout_pass,
+                pullback_pass = EXCLUDED.pullback_pass,
+                trigger_pass = EXCLUDED.trigger_pass,
+                breakout_reason = EXCLUDED.breakout_reason,
+                pullback_reason = EXCLUDED.pullback_reason,
+                trigger_reason = EXCLUDED.trigger_reason,
+                swing_level = EXCLUDED.swing_level,
+                ema50_value = EXCLUDED.ema50_value,
+                entry_price = EXCLUDED.entry_price,
+                stop_hint = EXCLUDED.stop_hint,
+                target_hint = EXCLUDED.target_hint,
+                reward_risk = EXCLUDED.reward_risk,
+                entry_reason = EXCLUDED.entry_reason,
+                invalidation_reason = EXCLUDED.invalidation_reason,
+                record = EXCLUDED.record
+            RETURNING id
+        """
+        record_json = json.dumps(payload.record or {})
+        row = await db_manager.execute_query(
+            query,
+            (
+                payload.log_ts,
+                payload.venue,
+                payload.symbol,
+                payload.asset_class,
+                payload.timeframe,
+                payload.setup_state,
+                payload.direction,
+                payload.ema50_side,
+                payload.signal,
+                payload.breakout_pass,
+                payload.pullback_pass,
+                payload.trigger_pass,
+                payload.breakout_reason,
+                payload.pullback_reason,
+                payload.trigger_reason,
+                payload.swing_level,
+                payload.ema50_value,
+                payload.entry_price,
+                payload.stop_hint,
+                payload.target_hint,
+                payload.reward_risk,
+                payload.entry_reason,
+                payload.invalidation_reason,
+                record_json,
+                payload.candle_ts,
+                payload.source,
+            ),
+        )
+        return {"status": "ok", "id": row[0]["id"] if row else None}
+    except Exception as e:
+        logger.error(f"Failed to persist EMA50 breakout-pullback analysis log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/orb-5m-scalp-analysis-logs")
+async def create_orb_5m_scalp_analysis_log(payload: Orb5mScalpAnalysisLogIn):
+    """Persist one ORB 5m scalp evaluation audit row."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        query = """
+            INSERT INTO trading.strategy_orb_5m_scalp_analysis_log (
+                log_ts, venue, symbol, asset_class, timeframe, setup_state, direction,
+                signal, or_high, or_low, or_mid, breakout_valid, retest_valid,
+                breakout_reason, retest_reason, rejection_reason, entry_price, stop_hint,
+                target_hint, reward_risk, entry_reason, invalidation_reason, record,
+                candle_ts, source
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (venue, symbol, candle_ts, source)
+            WHERE candle_ts IS NOT NULL
+            DO UPDATE SET
+                log_ts = EXCLUDED.log_ts,
+                asset_class = EXCLUDED.asset_class,
+                timeframe = EXCLUDED.timeframe,
+                setup_state = EXCLUDED.setup_state,
+                direction = EXCLUDED.direction,
+                signal = EXCLUDED.signal,
+                or_high = EXCLUDED.or_high,
+                or_low = EXCLUDED.or_low,
+                or_mid = EXCLUDED.or_mid,
+                breakout_valid = EXCLUDED.breakout_valid,
+                retest_valid = EXCLUDED.retest_valid,
+                breakout_reason = EXCLUDED.breakout_reason,
+                retest_reason = EXCLUDED.retest_reason,
+                rejection_reason = EXCLUDED.rejection_reason,
+                entry_price = EXCLUDED.entry_price,
+                stop_hint = EXCLUDED.stop_hint,
+                target_hint = EXCLUDED.target_hint,
+                reward_risk = EXCLUDED.reward_risk,
+                entry_reason = EXCLUDED.entry_reason,
+                invalidation_reason = EXCLUDED.invalidation_reason,
+                record = EXCLUDED.record
+            RETURNING id
+        """
+        record_json = json.dumps(payload.record or {})
+        row = await db_manager.execute_query(
+            query,
+            (
+                payload.log_ts,
+                payload.venue,
+                payload.symbol,
+                payload.asset_class,
+                payload.timeframe,
+                payload.setup_state,
+                payload.direction,
+                payload.signal,
+                payload.or_high,
+                payload.or_low,
+                payload.or_mid,
+                payload.breakout_valid,
+                payload.retest_valid,
+                payload.breakout_reason,
+                payload.retest_reason,
+                payload.rejection_reason,
+                payload.entry_price,
+                payload.stop_hint,
+                payload.target_hint,
+                payload.reward_risk,
+                payload.entry_reason,
+                payload.invalidation_reason,
+                record_json,
+                payload.candle_ts,
+                payload.source,
+            ),
+        )
+        return {"status": "ok", "id": row[0]["id"] if row else None}
+    except Exception as e:
+        logger.error(f"Failed to persist ORB 5m scalp analysis log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/orb-5m-scalp-analysis-logs")
+async def get_orb_5m_scalp_analysis_logs(
+    venue: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=5000),
+):
+    """Read ORB 5m scalp audit logs for dashboard usage."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["log_ts >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [hours]
+        if venue:
+            where.append("LOWER(venue) = LOWER(%s)")
+            params.append(venue)
+        if symbol:
+            where.append("UPPER(symbol) = UPPER(%s)")
+            params.append(symbol)
+        params.append(limit)
+        query = f"""
+            SELECT
+                id, log_ts, venue, symbol, asset_class, timeframe, setup_state,
+                direction, signal, or_high, or_low, or_mid, breakout_valid,
+                retest_valid, breakout_reason, retest_reason, rejection_reason,
+                entry_price, stop_hint, target_hint, reward_risk, entry_reason,
+                invalidation_reason, record, candle_ts, source, ingested_at
+            FROM trading.strategy_orb_5m_scalp_analysis_log
+            WHERE {" AND ".join(where)}
+            ORDER BY log_ts DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(query, tuple(params))
+        try:
+            from orb_5m_scalp_audit_summary import build_orb_5m_scalp_audit_summary
+        except ImportError:  # pragma: no cover
+            from core.orb_5m_scalp_audit_summary import build_orb_5m_scalp_audit_summary
+        summary = build_orb_5m_scalp_audit_summary(rows or [])
+        return {"rows": rows, "count": len(rows), "summary": summary}
+    except Exception as e:
+        logger.error(f"Failed to read ORB 5m scalp analysis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/ema50-breakout-pullback-analysis-logs")
+async def get_ema50_breakout_pullback_analysis_logs(
+    venue: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=5000),
+):
+    """Read EMA50 breakout-pullback audit logs for dashboard usage."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = ["log_ts >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [hours]
+        if venue:
+            where.append("LOWER(venue) = LOWER(%s)")
+            params.append(venue)
+        if symbol:
+            where.append("UPPER(symbol) = UPPER(%s)")
+            params.append(symbol)
+        params.append(limit)
+        query = f"""
+            SELECT
+                id, log_ts, venue, symbol, asset_class, timeframe, setup_state,
+                direction, ema50_side, signal, breakout_pass, pullback_pass,
+                trigger_pass, breakout_reason, pullback_reason, trigger_reason,
+                swing_level, ema50_value, entry_price, stop_hint, target_hint,
+                reward_risk, entry_reason, invalidation_reason, record, candle_ts,
+                source, ingested_at
+            FROM trading.strategy_ema50_breakout_pullback_analysis_log
+            WHERE {" AND ".join(where)}
+            ORDER BY log_ts DESC
+            LIMIT %s
+        """
+        rows = await db_manager.execute_query(query, tuple(params))
+        try:
+            from ema50_breakout_pullback_audit_summary import build_ema50_breakout_pullback_audit_summary
+        except ImportError:  # pragma: no cover
+            from core.ema50_breakout_pullback_audit_summary import build_ema50_breakout_pullback_audit_summary
+        summary = build_ema50_breakout_pullback_audit_summary(rows or [])
+        return {"rows": rows, "count": len(rows), "summary": summary}
+    except Exception as e:
+        logger.error(f"Failed to read EMA50 breakout-pullback analysis logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

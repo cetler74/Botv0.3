@@ -221,6 +221,9 @@ services:
       - TELEGRAM_AUTO_REPORT_ENABLED=${TELEGRAM_AUTO_REPORT_ENABLED:-false}
       - TELEGRAM_REPORT_INTERVAL_SECONDS=${TELEGRAM_REPORT_INTERVAL_SECONDS:-3600}
       - TELEGRAM_LAST_DAY_TRADE_LIMIT=${TELEGRAM_LAST_DAY_TRADE_LIMIT:-15}
+      - HL_ADAPTIVE_PNL_AUDIT_PATH=/app/config/hyperliquid_adaptive_pnl_audit.json
+    volumes:
+      - config_data:/app/config
     networks:
       - trading-bot-network
     depends_on:
@@ -414,6 +417,7 @@ services:
       - EXCHANGE_SERVICE_URL=http://exchange-service:8003
       - STRATEGY_SERVICE_URL=http://strategy-service:8004
       - ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8005
+      - REDIS_URL=redis://redis:6379
       - ORDER_SYNC_SERVICE_URL=http://order-sync-service:8008
       - POSITION_SYNC_SERVICE_URL=http://position-sync-service:8009
       - DASHBOARD_UI_VERSION=${DASHBOARD_UI_VERSION:-legacy}
@@ -428,6 +432,8 @@ services:
     networks:
       - trading-bot-network
     depends_on:
+      redis:
+        condition: service_healthy
       config-service:
         condition: service_healthy
       database-service:
@@ -463,6 +469,29 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8009/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Trading KPI Exporter for Prometheus
+  kpi-exporter:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile.kpi-exporter
+    container_name: trading-bot-kpi-exporter
+    ports:
+      - "127.0.0.1:8015:8015"
+    environment:
+      - DATABASE_SERVICE_URL=http://database-service:8002
+      - POLL_INTERVAL_SECONDS=60
+    networks:
+      - trading-bot-network
+    depends_on:
+      database-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8015/metrics', timeout=5).read()"]
       interval: 30s
       timeout: 10s
       retries: 3

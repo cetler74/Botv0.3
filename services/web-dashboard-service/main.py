@@ -5,14 +5,14 @@ User interface and real-time monitoring
 
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple, Callable
 from datetime import datetime, timedelta
 import json
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 import uvicorn
@@ -108,6 +108,7 @@ NEWS_RSS_FEEDS = [
 
 # WebSocket connections
 active_connections: List[WebSocket] = []
+service_started_at = time.time()
 
 
 def _cache_get(key: str) -> Any:
@@ -119,6 +120,43 @@ def _cache_get(key: str) -> Any:
         _external_cache.pop(key, None)
         return None
     return value
+
+
+def _flatten_trade_protection_state(trade: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose protection fields stored in metadata for dashboard views."""
+    if not isinstance(trade, dict):
+        return trade
+
+    normalized = dict(trade)
+    metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+    for key in (
+        "profit_protection",
+        "profit_protection_trigger",
+        "trail_stop",
+        "trail_stop_trigger",
+        "highest_price",
+    ):
+        if normalized.get(key) is None and metadata.get(key) is not None:
+            normalized[key] = metadata.get(key)
+    return normalized
+
+
+def _flatten_perp_trade_protection_state(trade: Dict[str, Any]) -> Dict[str, Any]:
+    return _flatten_trade_protection_state(trade)
+
+
+def _flatten_perp_trade_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = dict(payload)
+    trades = normalized.get("trades")
+    if isinstance(trades, list):
+        normalized["trades"] = [
+            _flatten_perp_trade_protection_state(trade)
+            for trade in trades
+        ]
+    return normalized
 
 
 def _cache_set(key: str, value: Any, ttl_seconds: int) -> Any:
@@ -535,6 +573,35 @@ async def health_check():
         total_services=len(services)
     )
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrape endpoint for the web dashboard service."""
+    health = await health_check()
+    status_value = 1 if health.status == "healthy" else 0
+    uptime_seconds = max(0.0, time.time() - service_started_at)
+    lines = [
+        "# HELP web_dashboard_service_up Web dashboard service health status.",
+        "# TYPE web_dashboard_service_up gauge",
+        f'web_dashboard_service_up{{status="{health.status}"}} {status_value}',
+        "# HELP web_dashboard_dependencies_connected Number of connected dependency services.",
+        "# TYPE web_dashboard_dependencies_connected gauge",
+        f"web_dashboard_dependencies_connected {health.services_connected}",
+        "# HELP web_dashboard_dependencies_total Total dependency services checked.",
+        "# TYPE web_dashboard_dependencies_total gauge",
+        f"web_dashboard_dependencies_total {health.total_services}",
+        "# HELP web_dashboard_websocket_connections Active dashboard websocket connections.",
+        "# TYPE web_dashboard_websocket_connections gauge",
+        f"web_dashboard_websocket_connections {len(websocket_manager.active_connections)}",
+        "# HELP web_dashboard_external_cache_items Cached external API items.",
+        "# TYPE web_dashboard_external_cache_items gauge",
+        f"web_dashboard_external_cache_items {len(_external_cache)}",
+        "# HELP web_dashboard_uptime_seconds Web dashboard service uptime in seconds.",
+        "# TYPE web_dashboard_uptime_seconds gauge",
+        f"web_dashboard_uptime_seconds {uptime_seconds:.0f}",
+        "",
+    ]
+    return Response("\n".join(lines), media_type="text/plain; version=0.0.4")
+
 @app.get("/ready")
 async def readiness_check():
     """Readiness check endpoint"""
@@ -674,6 +741,11 @@ async def legacy_dashboard(request: Request):
 async def portfolio_dashboard(request: Request):
     """New portfolio intelligence dashboard."""
     return templates.TemplateResponse("portfolio_dashboard.html", {"request": request})
+
+@app.get("/spot-dashboard", response_class=HTMLResponse)
+async def spot_dashboard(request: Request):
+    """Spot trading intelligence dashboard."""
+    return templates.TemplateResponse("spot_dashboard.html", {"request": request})
 
 @app.get("/dashboard-original", response_class=HTMLResponse)
 async def original_dashboard(request: Request):
@@ -1647,6 +1719,22 @@ async def get_perps_paper_summary():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/perps/paper-pnl-report")
+async def get_perps_paper_pnl_report(hours: float = 24.0, limit: int = 2000):
+    """Multi-dimensional paper-perp PnL report (24h default)."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{database_service_url}/api/v1/perps/paper-pnl-report",
+                params={"hours": hours, "limit": limit},
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error getting paper-perp PnL report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/perps/paper-trades")
 async def get_perps_paper_trades(status: Optional[str] = None, limit: int = 100):
     """Get Hyperliquid paper-perp trades."""
@@ -1660,7 +1748,7 @@ async def get_perps_paper_trades(status: Optional[str] = None, limit: int = 100)
                 params=params,
             )
             response.raise_for_status()
-            return response.json()
+            return _flatten_perp_trade_payload(response.json())
     except Exception as e:
         logger.error(f"Error getting paper-perp trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1734,36 +1822,71 @@ async def _fetch_service_health(client: httpx.AsyncClient, name: str, url: str) 
 
 
 def _pair_to_hyperliquid_coin(pair: str) -> str:
-    raw = str(pair or "").upper().strip()
+    raw = str(pair or "").strip()
     if "/" in raw:
         return raw.split("/", 1)[0]
+    if ":" in raw:
+        dex, base = raw.split(":", 1)
+        raw = f"{dex.lower()}:{base.upper()}"
+    else:
+        raw = raw.upper()
     for suffix in ("USDC", "USDT", "USD"):
         if raw.endswith(suffix):
             return raw[: -len(suffix)]
     return raw
 
 
-async def _fetch_hyperliquid_mids(client: httpx.AsyncClient) -> Dict[str, float]:
+def _display_hyperliquid_coin(pair_or_coin: str) -> str:
+    coin = _pair_to_hyperliquid_coin(pair_or_coin)
+    if ":" in coin:
+        return coin.split(":", 1)[1]
+    return coin
+
+
+def _hyperliquid_tradfi_dexes_from_cfg(hl_cfg: Dict[str, Any]) -> List[str]:
+    tradfi = (((hl_cfg or {}).get("pair_selector") or {}).get("tradfi") or {})
+    enabled = tradfi.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return []
+    return [
+        str(dex).strip().lower()
+        for dex in (tradfi.get("dexes") or ["xyz"])
+        if str(dex).strip()
+    ]
+
+
+async def _fetch_hyperliquid_mids(
+    client: httpx.AsyncClient,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, float]:
     try:
-        response = await client.post(
-            "https://api.hyperliquid.xyz/info",
-            json={"type": "allMids"},
-            timeout=10.0,
+        requests = [{"type": "allMids"}]
+        requests.extend(
+            {"type": "allMids", "dex": dex}
+            for dex in _hyperliquid_tradfi_dexes_from_cfg(hl_cfg or {})
         )
-        response.raise_for_status()
-        data = response.json() or {}
+        payloads = []
+        for req in requests:
+            response = await client.post(
+                "https://api.hyperliquid.xyz/info",
+                json=req,
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            payloads.append(response.json() or {})
     except Exception as exc:
         logger.warning("Hyperliquid mids fetch failed: %s", exc)
         return {}
     mids: Dict[str, float] = {}
-    if isinstance(data, dict):
-        for coin, raw_price in data.items():
-            try:
-                price = float(raw_price)
-            except (TypeError, ValueError):
-                continue
-            if price > 0:
-                mids[str(coin).upper()] = price
+    for data in payloads:
+        if isinstance(data, dict):
+            for coin, raw_price in data.items():
+                try:
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    mids[_pair_to_hyperliquid_coin(str(coin))] = price
     return mids
 
 
@@ -1783,120 +1906,67 @@ def _build_hyperliquid_watchlist(
     open_trades: List[Dict[str, Any]],
     closed_trades: Optional[List[Dict[str, Any]]] = None,
     hl_selected_pairs: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    selected_from_db = [
-        _pair_to_hyperliquid_coin(p) for p in (hl_selected_pairs or []) if str(p).strip()
-    ]
-    coins = list(dict.fromkeys(selected_from_db))
-    open_by_coin: Dict[str, List[Dict[str, Any]]] = {}
-    for trade in open_trades or []:
-        coin = str(trade.get("coin") or "").upper()
-        if coin:
-            open_by_coin.setdefault(coin, []).append(trade)
-    closed_by_coin: Dict[str, List[Dict[str, Any]]] = {}
-    for trade in closed_trades or []:
-        coin = _pair_to_hyperliquid_coin(
-            str(trade.get("coin") or trade.get("pair") or trade.get("source_pair") or "")
+    *,
+    trading_status: Optional[Dict[str, Any]] = None,
+    paper_summary: Optional[Dict[str, Any]] = None,
+    config_payload: Optional[Dict[str, Any]] = None,
+    liquid_candidate_coins: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from hyperliquid_watchlist import build_hyperliquid_watchlist
+
+    global_pair_selector = {}
+    if isinstance(config_payload, dict):
+        global_pair_selector = config_payload.get("pair_selector") or {}
+        if not global_pair_selector:
+            nested = config_payload.get("config") or {}
+            if isinstance(nested, dict):
+                global_pair_selector = nested.get("pair_selector") or {}
+
+    watchlist, global_block = build_hyperliquid_watchlist(
+        hl_cfg,
+        mids,
+        open_trades,
+        closed_trades,
+        hl_selected_pairs,
+        trading_status=trading_status,
+        paper_summary=paper_summary,
+        global_pair_selector=global_pair_selector,
+        liquid_candidate_coins=liquid_candidate_coins,
+    )
+    return watchlist, global_block
+
+
+_hl_cycle_redis_client = None
+
+
+async def _get_hl_cycle_redis_client():
+    global _hl_cycle_redis_client
+    if _hl_cycle_redis_client is not None:
+        return _hl_cycle_redis_client
+    try:
+        from cycle_analysis_snapshot import create_redis_client
+
+        _hl_cycle_redis_client = await create_redis_client()
+    except Exception:
+        _hl_cycle_redis_client = None
+    return _hl_cycle_redis_client
+
+
+async def _attach_hl_cycle_analysis(watchlist: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not watchlist:
+        return watchlist
+    try:
+        from cycle_analysis_snapshot import (
+            merge_hl_cycle_analysis_into_watchlist,
+            normalize_hl_coin,
+            read_hl_cycle_snapshots,
         )
-        if coin:
-            closed_by_coin.setdefault(coin, []).append(trade)
-
-    def _parse_dt(value: Any) -> Optional[datetime]:
-        if isinstance(value, datetime):
-            return value.replace(tzinfo=None) if value.tzinfo else value
-        if not value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
-        except Exception:
-            return None
-
-    block_hours = _safe_float(hl_cfg.get("block_after_negative_realized_hours"), 12.0)
-    now = datetime.utcnow()
-
-    def _entry_block_for(coin: str, coin_opens: List[Dict[str, Any]]) -> Dict[str, Any]:
-        for trade in coin_opens:
-            upnl = _safe_float(trade.get("unrealized_pnl"))
-            if upnl < 0:
-                return {
-                    "entryBlocked": True,
-                    "entryBlockReason": "open_unrealized_negative",
-                    "entryBlockUntil": None,
-                    "entryBlockMessage": f"open paper position is underwater (${upnl:.2f})",
-                }
-        latest_loss_time = None
-        latest_loss_pnl = 0.0
-        for trade in closed_by_coin.get(coin, []):
-            rpnl = _safe_float(trade.get("realized_pnl"))
-            if rpnl >= 0:
-                continue
-            exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
-            if exit_time is None:
-                continue
-            if latest_loss_time is None or exit_time > latest_loss_time:
-                latest_loss_time = exit_time
-                latest_loss_pnl = rpnl
-        if latest_loss_time and block_hours > 0:
-            until = latest_loss_time + timedelta(hours=block_hours)
-            if until > now:
-                return {
-                    "entryBlocked": True,
-                    "entryBlockReason": "recent_negative_realized_12h",
-                    "entryBlockUntil": until.isoformat() + "+00:00",
-                    "entryBlockMessage": f"realized loss ${latest_loss_pnl:.2f}; cooldown until {until.isoformat()} UTC",
-                }
-        return {
-            "entryBlocked": False,
-            "entryBlockReason": None,
-            "entryBlockUntil": None,
-            "entryBlockMessage": "",
-        }
-
-    watchlist: List[Dict[str, Any]] = []
-    for coin in coins:
-        mid = mids.get(coin)
-        coin_opens = open_by_coin.get(coin, [])
-        has_open = bool(coin_opens)
-        if has_open:
-            status = "open"
-        elif mid:
-            status = "under_analysis"
-        else:
-            status = "no_price"
-
-        first_open = coin_opens[0] if coin_opens else {}
-        entry_block = _entry_block_for(coin, coin_opens)
-        if not mid:
-            entry_block = {
-                "entryBlocked": True,
-                "entryBlockReason": "no_price",
-                "entryBlockUntil": None,
-                "entryBlockMessage": "no Hyperliquid mid price available",
-            }
-        watchlist.append({
-            "coin": coin,
-            "pair": f"{coin}/USD-PERP",
-            "midPrice": mid,
-            "status": status,
-            "hasOpenPosition": has_open,
-            "openSide": first_open.get("position_side"),
-            "openTradeId": first_open.get("trade_id"),
-            "unrealizedPnl": sum(_safe_float(t.get("unrealized_pnl")) for t in coin_opens),
-            **entry_block,
-        })
-
-    status_order = {
-        "open": 0,
-        "under_analysis": 1,
-        "active": 1,
-        "mirroring": 1,
-        "selected": 1,
-        "allowed_no_mirror": 1,
-        "no_price": 2,
-    }
-    watchlist.sort(key=lambda row: (status_order.get(row.get("status"), 9), row.get("coin", "")))
-    return watchlist
+    except Exception:
+        return watchlist
+    coins = [normalize_hl_coin(str(row.get("coin") or "")) for row in watchlist if row.get("coin")]
+    redis_client = await _get_hl_cycle_redis_client()
+    snapshots = await read_hl_cycle_snapshots(redis_client, coins)
+    return merge_hl_cycle_analysis_into_watchlist(watchlist, snapshots)
 
 
 def _perp_portfolio_summary(
@@ -1914,8 +1984,14 @@ def _perp_portfolio_summary(
         elif side == "short":
             short_open = count
     bal = hl_balance or {}
+    settled = _safe_float(
+        paper_summary.get("equity") or bal.get("equity") or bal.get("balance")
+    )
+    unrealized = _safe_float(paper_summary.get("unrealized_pnl") or bal.get("unrealized_pnl"))
     return {
-        "equity": _safe_float(paper_summary.get("equity") or bal.get("equity") or bal.get("balance")),
+        "equity": settled,
+        "settledBalance": settled,
+        "markToMarketEquity": settled + unrealized,
         "availableBalance": _safe_float(
             paper_summary.get("available_balance") or bal.get("available_balance")
         ),
@@ -1946,6 +2022,477 @@ def _nested_config(config_payload: Any, *keys: str) -> Dict[str, Any]:
     return node if isinstance(node, dict) else {}
 
 
+SPOT_EXCHANGES = ("binance", "bybit", "cryptocom")
+HL_AUDIT_VENUE = "hyperliquid"
+
+
+def _load_audit_summary_builder(module_names: List[str], func_name: str) -> Callable:
+    for module_name in module_names:
+        try:
+            module = __import__(module_name, fromlist=[func_name])
+            return getattr(module, func_name)
+        except ImportError:
+            continue
+    raise ImportError(f"Could not import {func_name} from {module_names}")
+
+
+async def _fetch_spot_strategy_audit(
+    client: httpx.AsyncClient,
+    path: str,
+    summary_builder: Callable[[List[Dict[str, Any]]], Dict[str, Any]],
+    *,
+    hours: int = 24,
+    limit_per_venue: int = 100,
+) -> Dict[str, Any]:
+    """Fetch audit logs per spot exchange so HL rows cannot crowd out spot pairs."""
+    try:
+        from dashboard_audit_venues import merge_venue_audit_payloads
+    except ImportError:  # pragma: no cover
+        from core.dashboard_audit_venues import merge_venue_audit_payloads
+
+    payloads = await asyncio.gather(
+        *[
+            _fetch_json(
+                client,
+                path,
+                default={},
+                params={"hours": hours, "limit": limit_per_venue, "venue": venue},
+            )
+            for venue in SPOT_EXCHANGES
+        ]
+    )
+    return merge_venue_audit_payloads(
+        payloads,
+        summary_builder,
+        max_rows=limit_per_venue * len(SPOT_EXCHANGES),
+    )
+
+
+async def _fetch_hl_strategy_audit(
+    client: httpx.AsyncClient,
+    path: str,
+    summary_builder: Callable[[List[Dict[str, Any]]], Dict[str, Any]],
+    *,
+    hours: int = 24,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """Fetch audit logs for Hyperliquid perps only (portfolio dashboard)."""
+    payload = await _fetch_json(
+        client,
+        path,
+        default={},
+        params={"hours": hours, "limit": limit, "venue": HL_AUDIT_VENUE},
+    )
+    rows = list((payload or {}).get("rows") or [])
+    summary = summary_builder(rows)
+    return {"rows": rows, "count": len(rows), "summary": summary}
+
+
+def _spot_quote_for_exchange(exchange: str) -> str:
+    return "USD" if str(exchange).lower() == "cryptocom" else "USDC"
+
+
+def _spot_display_pair(pair: str, exchange: str = "") -> str:
+    raw = str(pair or "").strip().upper()
+    if not raw:
+        return ""
+    if "/" in raw:
+        return raw
+    quote = _spot_quote_for_exchange(exchange)
+    for suffix in ("USDC", "USDT", "USD"):
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            return f"{raw[:-len(suffix)]}/{suffix}"
+    return f"{raw}/{quote}" if exchange else raw
+
+
+def _spot_trade_pnl(trade: Dict[str, Any]) -> float:
+    if _trade_status(trade) == "CLOSED":
+        return _safe_float(trade.get("realized_pnl") or trade.get("pnl"))
+    return _safe_float(trade.get("unrealized_pnl"))
+
+
+def _spot_trade_time(trade: Dict[str, Any]) -> str:
+    if _trade_status(trade) == "CLOSED":
+        return str(trade.get("exit_time") or trade.get("entry_time") or "")
+    return str(trade.get("entry_time") or "")
+
+
+def _spot_analysis_label(row: Dict[str, Any]) -> str:
+    if row.get("hasOpenPosition"):
+        pnl = _safe_float(row.get("unrealizedPnl"))
+        if pnl > 0:
+            return "Open winner"
+        if pnl < 0:
+            return "Open drawdown"
+        return "Open flat"
+    if _safe_int(row.get("closedTrades24h")) > 0:
+        pnl_24h = _safe_float(row.get("pnl24h"))
+        return "Profitable recently" if pnl_24h > 0 else "Needs review"
+    return "Under analysis"
+
+
+def _build_spot_exchange_analysis(
+    portfolio_payload: Dict[str, Any],
+    open_trades: List[Dict[str, Any]],
+    closed_trades: List[Dict[str, Any]],
+    pairs_by_exchange: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    exchanges = portfolio_payload.get("exchanges") if isinstance(portfolio_payload, dict) else {}
+    exchanges = exchanges if isinstance(exchanges, dict) else {}
+    rows: List[Dict[str, Any]] = []
+    for exchange in SPOT_EXCHANGES:
+        open_for_exchange = [t for t in open_trades if _trade_exchange(t) == exchange]
+        closed_for_exchange = [t for t in closed_trades if _trade_exchange(t) == exchange]
+        wins = sum(1 for t in closed_for_exchange if _spot_trade_pnl(t) > 0)
+        losses = sum(1 for t in closed_for_exchange if _spot_trade_pnl(t) < 0)
+        closed_pnl = sum(_spot_trade_pnl(t) for t in closed_for_exchange)
+        open_unrealized = sum(_safe_float(t.get("unrealized_pnl")) for t in open_for_exchange)
+        ex_balance = exchanges.get(exchange) or {}
+        closed_count = len(closed_for_exchange)
+        rows.append({
+            "exchange": exchange,
+            "quote": _spot_quote_for_exchange(exchange),
+            "balance": _safe_float(ex_balance.get("balance")),
+            "availableBalance": _safe_float(ex_balance.get("available_balance") or ex_balance.get("available")),
+            "investedAmount": _safe_float(ex_balance.get("invested_amount")),
+            "totalPnl": _safe_float(ex_balance.get("total_pnl"), closed_pnl),
+            "dailyPnl": _safe_float(ex_balance.get("daily_pnl")),
+            "openTrades": len(open_for_exchange),
+            "closedTrades": closed_count,
+            "winningTrades": wins,
+            "losingTrades": losses,
+            "winRate": (wins / closed_count * 100.0) if closed_count else 0.0,
+            "unrealizedPnl": open_unrealized,
+            "pairCount": len(pairs_by_exchange.get(exchange, [])),
+        })
+    return rows
+
+
+def _build_spot_pair_analysis(
+    open_trades: List[Dict[str, Any]],
+    closed_trades: List[Dict[str, Any]],
+    pairs_by_exchange: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    now = datetime.utcnow()
+    cutoff_24h = now - timedelta(hours=24)
+    rows_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for exchange, pairs in pairs_by_exchange.items():
+        for pair in pairs or []:
+            display_pair = _spot_display_pair(pair, exchange)
+            if not display_pair:
+                continue
+            rows_by_key[(exchange, display_pair.upper())] = {
+                "exchange": exchange,
+                "pair": display_pair,
+                "quote": _spot_quote_for_exchange(exchange),
+                "hasOpenPosition": False,
+                "openTrades": 0,
+                "entryPrice": 0.0,
+                "currentPrice": 0.0,
+                "positionSize": 0.0,
+                "unrealizedPnl": 0.0,
+                "strategy": "",
+                "closedTrades24h": 0,
+                "pnl24h": 0.0,
+                "winRate24h": 0.0,
+                "lastExitReason": "",
+                "lastTradeAt": "",
+                "status": "under_analysis",
+            }
+
+    for trade in open_trades:
+        exchange = _trade_exchange(trade)
+        pair = _spot_display_pair(_trade_pair(trade), exchange)
+        if not exchange or not pair:
+            continue
+        key = (exchange, pair.upper())
+        row = rows_by_key.setdefault(key, {
+            "exchange": exchange,
+            "pair": pair,
+            "quote": _spot_quote_for_exchange(exchange),
+            "closedTrades24h": 0,
+            "pnl24h": 0.0,
+            "winRate24h": 0.0,
+        })
+        row.update({
+            "hasOpenPosition": True,
+            "status": "open",
+            "openTrades": _safe_int(row.get("openTrades")) + 1,
+            "entryPrice": _safe_float(trade.get("entry_price")),
+            "currentPrice": _safe_float(trade.get("current_price") or trade.get("entry_price")),
+            "positionSize": _safe_float(trade.get("position_size")),
+            "unrealizedPnl": _safe_float(row.get("unrealizedPnl")) + _safe_float(trade.get("unrealized_pnl")),
+            "strategy": str(trade.get("strategy") or row.get("strategy") or ""),
+            "lastTradeAt": _spot_trade_time(trade) or str(row.get("lastTradeAt") or ""),
+        })
+
+    closed_24h_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for trade in closed_trades:
+        exchange = _trade_exchange(trade)
+        pair = _spot_display_pair(_trade_pair(trade), exchange)
+        if not exchange or not pair:
+            continue
+        key = (exchange, pair.upper())
+        row = rows_by_key.setdefault(key, {
+            "exchange": exchange,
+            "pair": pair,
+            "quote": _spot_quote_for_exchange(exchange),
+            "hasOpenPosition": False,
+            "openTrades": 0,
+            "unrealizedPnl": 0.0,
+            "status": "under_analysis",
+        })
+        trade_time = _spot_trade_time(trade)
+        try:
+            parsed_time = datetime.fromisoformat(trade_time.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            parsed_time = None
+        if not row.get("lastTradeAt") or trade_time > str(row.get("lastTradeAt") or ""):
+            row["lastTradeAt"] = trade_time
+            row["lastExitReason"] = str(trade.get("exit_reason") or "")
+            row["strategy"] = str(trade.get("strategy") or row.get("strategy") or "")
+        if parsed_time and parsed_time >= cutoff_24h:
+            pnl = _spot_trade_pnl(trade)
+            row["closedTrades24h"] = _safe_int(row.get("closedTrades24h")) + 1
+            row["pnl24h"] = _safe_float(row.get("pnl24h")) + pnl
+            counts = closed_24h_counts.setdefault(key, {"wins": 0, "closed": 0})
+            counts["closed"] += 1
+            if pnl > 0:
+                counts["wins"] += 1
+
+    for key, counts in closed_24h_counts.items():
+        if key in rows_by_key and counts["closed"]:
+            rows_by_key[key]["winRate24h"] = counts["wins"] / counts["closed"] * 100.0
+
+    rows = list(rows_by_key.values())
+    for row in rows:
+        row["analysis"] = _spot_analysis_label(row)
+    return sorted(
+        rows,
+        key=lambda r: (
+            0 if r.get("hasOpenPosition") else 1,
+            str(r.get("exchange") or ""),
+            str(r.get("pair") or ""),
+        ),
+    )
+
+
+def _build_spot_exit_rules(config_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Spot exit thresholds from global trading config (orchestrator-managed exits)."""
+    trading_cfg = _nested_config(config_payload, "trading")
+    trailing_cfg = trading_cfg.get("trailing_stop") or {}
+    profit_protection_cfg = trading_cfg.get("profit_protection") or {}
+    sim_cfg = trading_cfg.get("simulation") or {}
+    fee_rate = _safe_float(sim_cfg.get("fee_rate_per_side"), 0.001)
+    fee_buffer = _safe_float(profit_protection_cfg.get("estimated_exit_fee"), fee_rate) * 2
+    effective_floor = max(
+        _safe_float(trailing_cfg.get("breakeven_floor_percentage"), 0.014),
+        fee_buffer + 0.0015,
+    )
+    stop_loss_pct = _safe_float(trading_cfg.get("stop_loss_percentage"), 0.015)
+    return {
+        "fixedStopLossEnabled": stop_loss_pct > 0,
+        "stopLossPct": stop_loss_pct * 100 if stop_loss_pct <= 1 else stop_loss_pct,
+        "profitProtectionActivationPct": _safe_float(
+            profit_protection_cfg.get("activation_threshold"), 0.015
+        ),
+        "trailingActivationPct": _safe_float(
+            trailing_cfg.get("activation_threshold"), 0.018
+        ),
+        "trailingStepPct": _safe_float(trailing_cfg.get("step_percentage"), 0.004),
+        "tightenedTrailingStepPct": _safe_float(
+            trailing_cfg.get("tightened_step_percentage"), 0.003
+        ),
+        "breakevenFloorPct": effective_floor,
+        "profitProtectionEnabled": bool(profit_protection_cfg.get("enabled", True)),
+        "trailingStopEnabled": bool(trailing_cfg.get("enabled", True)),
+    }
+
+
+def _spot_portfolio_summary(portfolio_payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "equity": _safe_float(portfolio_payload.get("total_balance")),
+        "availableBalance": _safe_float(portfolio_payload.get("available_balance")),
+        "investedAmount": sum(
+            _safe_float((ex or {}).get("invested_amount"))
+            for ex in (portfolio_payload.get("exchanges") or {}).values()
+            if isinstance(ex, dict)
+        ),
+        "realizedPnl": _safe_float(portfolio_payload.get("total_pnl")),
+        "dailyPnl": _safe_float(portfolio_payload.get("daily_pnl")),
+        "unrealizedPnl": _safe_float(portfolio_payload.get("total_unrealized_pnl")),
+        "openTrades": _safe_int(portfolio_payload.get("active_trades")),
+        "totalTrades": _safe_int(portfolio_payload.get("total_trades")),
+        "dailyTotalTrades": _safe_int(portfolio_payload.get("daily_total_trades")),
+        "dailyClosedTrades": _safe_int(portfolio_payload.get("daily_closed_trades")),
+        "winRate": _safe_float(portfolio_payload.get("win_rate")),
+        "openInProfit": _safe_int(portfolio_payload.get("open_positions_in_profit")),
+        "openInLoss": _safe_int(portfolio_payload.get("open_positions_in_loss")),
+    }
+
+
+@app.get("/api/v1/dashboard/spot-intelligence")
+async def get_spot_intelligence():
+    """Spot trading dashboard payload with per-exchange and per-pair analysis."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        config_task = _fetch_json(client, f"{config_service_url}/api/v1/config/all", default={})
+        portfolio_task = _fetch_json(client, f"{database_service_url}/api/v1/portfolio/summary", default={})
+        trading_status_task = _fetch_json(
+            client, f"{orchestrator_service_url}/api/v1/trading/status", default={}
+        )
+        open_trades_task = _fetch_json(client, f"{database_service_url}/api/v1/trades/open", default={})
+        closed_trades_task = _fetch_json(
+            client,
+            f"{database_service_url}/api/v1/trades",
+            default={},
+            params={"status": "CLOSED", "limit": 2000, "sort_by": "exit_time", "sort_order": "desc"},
+        )
+        pairs_tasks = {
+            exchange: _fetch_json(client, f"{database_service_url}/api/v1/pairs/{exchange}", default={})
+            for exchange in SPOT_EXCHANGES
+        }
+        service_health_tasks = [
+            _fetch_service_health(client, name, url)
+            for name, url in (
+                ("config", config_service_url),
+                ("database", database_service_url),
+                ("exchange", exchange_service_url),
+                ("strategy", strategy_service_url),
+                ("orchestrator", orchestrator_service_url),
+            )
+        ]
+        build_supply_demand_summary = _load_audit_summary_builder(
+            ["supply_demand_audit_summary", "core.supply_demand_audit_summary"],
+            "build_supply_demand_audit_summary",
+        )
+        build_dual_sma_summary = _load_audit_summary_builder(
+            ["dual_sma_audit_summary", "core.dual_sma_audit_summary"],
+            "build_dual_sma_audit_summary",
+        )
+        build_arc_summary = _load_audit_summary_builder(
+            ["arc_audit_summary", "core.arc_audit_summary"],
+            "build_arc_audit_summary",
+        )
+        build_ema50_summary = _load_audit_summary_builder(
+            ["ema50_breakout_pullback_audit_summary", "core.ema50_breakout_pullback_audit_summary"],
+            "build_ema50_breakout_pullback_audit_summary",
+        )
+        supply_demand_audit_task = _fetch_spot_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/supply-demand-analysis-logs",
+            build_supply_demand_summary,
+            hours=24,
+            limit_per_venue=100,
+        )
+        dual_sma_audit_task = _fetch_spot_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/dual-sma-analysis-logs",
+            build_dual_sma_summary,
+            hours=24,
+            limit_per_venue=100,
+        )
+        arc_audit_task = _fetch_spot_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/arc-analysis-logs",
+            build_arc_summary,
+            hours=24,
+            limit_per_venue=100,
+        )
+        ema50_bp_audit_task = _fetch_spot_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/ema50-breakout-pullback-analysis-logs",
+            build_ema50_summary,
+            hours=24,
+            limit_per_venue=100,
+        )
+
+        config_payload, portfolio_payload, trading_status, open_payload, closed_payload, supply_demand_audit, dual_sma_audit, arc_audit, ema50_bp_audit, *rest = await asyncio.gather(
+            config_task,
+            portfolio_task,
+            trading_status_task,
+            open_trades_task,
+            closed_trades_task,
+            supply_demand_audit_task,
+            dual_sma_audit_task,
+            arc_audit_task,
+            ema50_bp_audit_task,
+            *pairs_tasks.values(),
+            *service_health_tasks,
+        )
+        pair_payloads = rest[: len(pairs_tasks)]
+        service_health_results = rest[len(pairs_tasks):]
+
+        open_trades = [
+            _flatten_trade_protection_state(trade)
+            for trade in _extract_trade_list(open_payload)
+        ]
+        closed_trades = [
+            _flatten_trade_protection_state(trade)
+            for trade in _extract_trade_list(closed_payload)
+        ]
+        spot_exit_rules = _build_spot_exit_rules(
+            config_payload if isinstance(config_payload, dict) else {}
+        )
+        pairs_by_exchange: Dict[str, List[str]] = {}
+        for exchange, payload in zip(pairs_tasks.keys(), pair_payloads):
+            pairs_by_exchange[exchange] = list((payload or {}).get("pairs") or [])
+
+        service_health = dict(service_health_results)
+        exchange_status = [
+            {"exchange": name, "status": service_health.get(name, "unknown")}
+            for name in ("config", "database", "exchange", "strategy", "orchestrator")
+        ]
+        exchange_analysis = _build_spot_exchange_analysis(
+            portfolio_payload if isinstance(portfolio_payload, dict) else {},
+            open_trades,
+            closed_trades,
+            pairs_by_exchange,
+        )
+        pair_analysis = _build_spot_pair_analysis(open_trades, closed_trades, pairs_by_exchange)
+
+        try:
+            from spot_pnl_report import build_spot_pnl_report
+        except ImportError:  # pragma: no cover - local dev imports
+            from core.spot_pnl_report import build_spot_pnl_report
+
+        spot_pnl_report = build_spot_pnl_report(open_trades, closed_trades, hours=24, limit=2000)
+
+        return {
+            "timestamp": _iso_now(),
+            "uiVersion": dashboard_ui_version,
+            "marketType": "spot",
+            "portfolio": _spot_portfolio_summary(portfolio_payload if isinstance(portfolio_payload, dict) else {}),
+            "spotPnlReport": spot_pnl_report,
+            "supplyDemandAudit": supply_demand_audit if isinstance(supply_demand_audit, dict) else {},
+            "dualSmaAudit": dual_sma_audit if isinstance(dual_sma_audit, dict) else {},
+            "arcAudit": arc_audit if isinstance(arc_audit, dict) else {},
+            "ema50BreakoutPullbackAudit": ema50_bp_audit if isinstance(ema50_bp_audit, dict) else {},
+            "spot": {
+                "exchanges": exchange_analysis,
+                "pairs": pair_analysis,
+                "quoteRules": {
+                    exchange: _spot_quote_for_exchange(exchange)
+                    for exchange in SPOT_EXCHANGES
+                },
+                "rules": {
+                    "positionSide": "long_only",
+                    "shorting": False,
+                    "leverage": "none",
+                },
+                "exitRules": spot_exit_rules,
+            },
+            "spotTrades": {
+                "open": open_trades,
+                "closed": closed_trades,
+                "totalOpen": len(open_trades),
+                "totalClosed": _safe_int((closed_payload or {}).get("total")) or len(closed_trades),
+            },
+            "exchangeStatus": exchange_status,
+            "tradingStatus": trading_status if isinstance(trading_status, dict) else {},
+        }
+
+
 @app.get("/api/v1/dashboard/portfolio-intelligence")
 async def get_portfolio_intelligence():
     """Hyperliquid perpetual paper-trading dashboard payload."""
@@ -1965,6 +2512,12 @@ async def get_portfolio_intelligence():
             )
         ]
         perps_summary_task = _fetch_json(client, f"{database_service_url}/api/v1/perps/paper-summary", default={})
+        perps_pnl_report_task = _fetch_json(
+            client,
+            f"{database_service_url}/api/v1/perps/paper-pnl-report",
+            default={},
+            params={"hours": 24, "limit": 2000},
+        )
         perps_open_task = _fetch_json(
             client,
             f"{database_service_url}/api/v1/perps/paper-trades/open",
@@ -1974,7 +2527,73 @@ async def get_portfolio_intelligence():
             client,
             f"{database_service_url}/api/v1/perps/paper-trades",
             default={},
-            params={"status": "CLOSED", "limit": 100},
+            params={"status": "CLOSED", "limit": 200},
+        )
+        adaptive_control_task = _fetch_json(
+            client,
+            f"{orchestrator_service_url}/api/v1/perps/adaptive-pnl-control",
+            default={},
+        )
+        adaptive_history_task = _fetch_json(
+            client,
+            f"{database_service_url}/api/v1/perps/adaptive-pnl-decisions",
+            default={},
+            params={"limit": 100},
+        )
+        build_supply_demand_summary = _load_audit_summary_builder(
+            ["supply_demand_audit_summary", "core.supply_demand_audit_summary"],
+            "build_supply_demand_audit_summary",
+        )
+        build_dual_sma_summary = _load_audit_summary_builder(
+            ["dual_sma_audit_summary", "core.dual_sma_audit_summary"],
+            "build_dual_sma_audit_summary",
+        )
+        build_arc_summary = _load_audit_summary_builder(
+            ["arc_audit_summary", "core.arc_audit_summary"],
+            "build_arc_audit_summary",
+        )
+        build_ema50_summary = _load_audit_summary_builder(
+            ["ema50_breakout_pullback_audit_summary", "core.ema50_breakout_pullback_audit_summary"],
+            "build_ema50_breakout_pullback_audit_summary",
+        )
+        build_orb_summary = _load_audit_summary_builder(
+            ["orb_5m_scalp_audit_summary", "core.orb_5m_scalp_audit_summary"],
+            "build_orb_5m_scalp_audit_summary",
+        )
+        supply_demand_audit_task = _fetch_hl_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/supply-demand-analysis-logs",
+            build_supply_demand_summary,
+            hours=24,
+            limit=200,
+        )
+        dual_sma_audit_task = _fetch_hl_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/dual-sma-analysis-logs",
+            build_dual_sma_summary,
+            hours=24,
+            limit=200,
+        )
+        arc_audit_task = _fetch_hl_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/arc-analysis-logs",
+            build_arc_summary,
+            hours=24,
+            limit=200,
+        )
+        ema50_bp_audit_task = _fetch_hl_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/ema50-breakout-pullback-analysis-logs",
+            build_ema50_summary,
+            hours=24,
+            limit=200,
+        )
+        orb_scalp_audit_task = _fetch_hl_strategy_audit(
+            client,
+            f"{database_service_url}/api/v1/analytics/orb-5m-scalp-analysis-logs",
+            build_orb_summary,
+            hours=24,
+            limit=200,
         )
         hl_pairs_task = _fetch_json(client, f"{database_service_url}/api/v1/pairs/hyperliquid", default={})
         mids_task = _fetch_hyperliquid_mids(client)
@@ -1984,8 +2603,16 @@ async def get_portfolio_intelligence():
             trading_status,
             *service_health_results,
             perps_summary,
+            perps_pnl_report,
             perps_open,
             perps_closed,
+            adaptive_control,
+            adaptive_history,
+            supply_demand_audit,
+            dual_sma_audit,
+            arc_audit,
+            ema50_bp_audit,
+            orb_scalp_audit,
             hl_pairs_payload,
             mids,
         ) = await asyncio.gather(
@@ -1993,30 +2620,67 @@ async def get_portfolio_intelligence():
             trading_status_task,
             *service_health_tasks,
             perps_summary_task,
+            perps_pnl_report_task,
             perps_open_task,
             perps_closed_task,
+            adaptive_control_task,
+            adaptive_history_task,
+            supply_demand_audit_task,
+            dual_sma_audit_task,
+            arc_audit_task,
+            ema50_bp_audit_task,
+            orb_scalp_audit_task,
             hl_pairs_task,
             mids_task,
         )
         hl_cfg = _hyperliquid_perps_config_from_all(config_payload)
+        if _hyperliquid_tradfi_dexes_from_cfg(hl_cfg):
+            mids = await _fetch_hyperliquid_mids(client, hl_cfg)
         hl_selected_pairs = list((hl_pairs_payload or {}).get("pairs") or [])
+        perps_open = _flatten_perp_trade_payload(perps_open or {})
+        perps_closed = _flatten_perp_trade_payload(perps_closed or {})
         open_trades = (perps_open or {}).get("trades", []) if isinstance(perps_open, dict) else []
         closed_trades = (perps_closed or {}).get("trades", []) if isinstance(perps_closed, dict) else []
         paper_summary = (perps_summary or {}).get("summary", {}) if isinstance(perps_summary, dict) else {}
         by_side = (perps_summary or {}).get("by_side", []) if isinstance(perps_summary, dict) else []
         hl_balance = (perps_summary or {}).get("balance", {}) if isinstance(perps_summary, dict) else {}
 
-        watchlist = _build_hyperliquid_watchlist(
+        from hyperliquid_watchlist import fetch_hl_liquid_candidate_coins
+
+        liquid_candidates = await fetch_hl_liquid_candidate_coins(
+            hl_cfg,
+            _nested_config(config_payload, "pair_selector") or {},
+            client=client,
+        )
+        watchlist, global_entry_block = _build_hyperliquid_watchlist(
             hl_cfg,
             mids,
             open_trades,
             closed_trades,
             hl_selected_pairs,
+            trading_status=trading_status if isinstance(trading_status, dict) else {},
+            paper_summary=paper_summary,
+            config_payload=config_payload if isinstance(config_payload, dict) else {},
+            liquid_candidate_coins=liquid_candidates,
+        )
+        watchlist = await _attach_hl_cycle_analysis(watchlist)
+        try:
+            from ema50_entry_block_reason import enrich_ema50_audit_entry_blocks
+        except ImportError:  # pragma: no cover
+            from core.ema50_entry_block_reason import enrich_ema50_audit_entry_blocks
+        ema50_bp_audit = enrich_ema50_audit_entry_blocks(
+            ema50_bp_audit if isinstance(ema50_bp_audit, dict) else {},
+            global_entry_block=global_entry_block,
+            open_trades=open_trades,
+            closed_trades=closed_trades,
+            hl_cfg=hl_cfg,
         )
         portfolio = _perp_portfolio_summary(paper_summary, by_side, hl_balance)
         trading_cfg = _nested_config(config_payload, "trading")
-        trailing_cfg = trading_cfg.get("trailing_stop") or {}
-        profit_protection_cfg = trading_cfg.get("profit_protection") or {}
+        trailing_cfg = hl_cfg.get("trailing_stop") or trading_cfg.get("trailing_stop") or {}
+        profit_protection_cfg = (
+            hl_cfg.get("profit_protection") or trading_cfg.get("profit_protection") or {}
+        )
 
         entry_rules = {
             "minConfidenceLong": _safe_float(hl_cfg.get("min_confidence_long")),
@@ -2073,6 +2737,12 @@ async def get_portfolio_intelligence():
             for name in ("config", "database", "exchange", "strategy", "orchestrator")
         ]
 
+        adaptive_payload = adaptive_control if isinstance(adaptive_control, dict) else {}
+        if isinstance(adaptive_payload, dict):
+            adaptive_payload["decisionHistory"] = (
+                adaptive_history if isinstance(adaptive_history, dict) else {}
+            )
+
         return {
             "timestamp": _iso_now(),
             "uiVersion": dashboard_ui_version,
@@ -2082,13 +2752,14 @@ async def get_portfolio_intelligence():
                     "enabled": bool(hl_cfg.get("enabled", False)),
                     "mode": str(hl_cfg.get("mode", "paper")),
                     "selectedSymbols": [
-                        _pair_to_hyperliquid_coin(p) for p in (hl_selected_pairs or []) if str(p).strip()
+                        _display_hyperliquid_coin(p) for p in (hl_selected_pairs or []) if str(p).strip()
                     ],
                     "mirrorSourceExchanges": list(hl_cfg.get("mirror_source_exchanges") or []),
                     "maxOpenPositions": _safe_int(hl_cfg.get("max_open_positions")),
                     "entryRules": entry_rules,
                 },
                 "watchlist": watchlist,
+                "globalEntryBlock": global_entry_block,
                 "midsFetchedAt": _iso_now(),
             },
             "paperPerps": {
@@ -2096,6 +2767,13 @@ async def get_portfolio_intelligence():
                 "bySide": by_side,
                 "byStrategy": (perps_summary or {}).get("by_strategy", []) if isinstance(perps_summary, dict) else [],
             },
+            "paperPnlReport": perps_pnl_report if isinstance(perps_pnl_report, dict) else {},
+            "adaptiveControl": adaptive_payload,
+            "supplyDemandAudit": supply_demand_audit if isinstance(supply_demand_audit, dict) else {},
+            "dualSmaAudit": dual_sma_audit if isinstance(dual_sma_audit, dict) else {},
+            "arcAudit": arc_audit if isinstance(arc_audit, dict) else {},
+            "ema50BreakoutPullbackAudit": ema50_bp_audit if isinstance(ema50_bp_audit, dict) else {},
+            "orb5mScalpAudit": orb_scalp_audit if isinstance(orb_scalp_audit, dict) else {},
             "perpTrades": {
                 "open": open_trades,
                 "closed": closed_trades,

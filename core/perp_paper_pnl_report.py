@@ -57,17 +57,36 @@ def hold_minutes(trade: Dict[str, Any]) -> Optional[float]:
     return max(0.0, (exit_dt - entry).total_seconds() / 60.0)
 
 
+def trade_window_timestamp(trade: Dict[str, Any]) -> Optional[datetime]:
+    """Timestamp used for lookback windows: exit for closed (realized), entry for open."""
+    status = str(trade.get("status") or "").upper()
+    if status == "CLOSED":
+        return parse_ts(trade.get("exit_time")) or parse_ts(trade.get("entry_time"))
+    return parse_ts(trade.get("entry_time"))
+
+
 def filter_rows_by_hours(
     rows: List[Dict[str, Any]], hours: float
 ) -> List[Dict[str, Any]]:
+    rows = [row for row in rows if not is_accounting_excluded(row)]
     if hours <= 0:
         return rows
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    return [
-        r
-        for r in rows
-        if (parse_ts(r.get("entry_time")) or datetime.now(timezone.utc)) >= cutoff
-    ]
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        ts = trade_window_timestamp(row)
+        if ts is not None and ts >= cutoff:
+            filtered.append(row)
+    return filtered
+
+
+def is_accounting_excluded(trade: Dict[str, Any]) -> bool:
+    """True when a paper-perp row is kept for audit but removed from accounting."""
+    metadata = _trade_metadata(trade)
+    raw = metadata.get("accounting_excluded")
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def aggregate_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -76,6 +95,7 @@ def aggregate_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     realized = sum(float(r.get("realized_pnl") or 0.0) for r in closed)
     fees = sum(float(r.get("fees") or 0.0) for r in closed)
     funding = sum(float(r.get("funding") or 0.0) for r in closed)
+    gross_before_fees = realized + fees + funding
     wins = [r for r in closed if float(r.get("realized_pnl") or 0.0) > 0]
     losses = [r for r in closed if float(r.get("realized_pnl") or 0.0) < 0]
     wins_sum = sum(float(r.get("realized_pnl") or 0.0) for r in wins)
@@ -87,7 +107,13 @@ def aggregate_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "closed": len(closed),
         "open": open_count,
         "realized": realized,
+        "grossBeforeFees": gross_before_fees,
         "fees": fees,
+        "feeDragPct": (
+            100.0 * fees / abs(gross_before_fees)
+            if abs(gross_before_fees) > 0
+            else None
+        ),
         "funding": funding,
         "wins": len(wins),
         "losses": len(losses),
@@ -162,13 +188,15 @@ def build_paper_pnl_report(
 ) -> Dict[str, Any]:
     """Build JSON-serializable report from raw trade rows."""
     filtered = filter_rows_by_hours(rows, hours)
-    entries = [
-        parse_ts(r.get("entry_time"))
-        for r in filtered
-        if r.get("entry_time")
-    ]
-    window_start = min(entries).isoformat() if entries else None
-    window_end = max(entries).isoformat() if entries else None
+    now = datetime.now(timezone.utc)
+    if hours > 0:
+        window_start = (now - timedelta(hours=hours)).isoformat()
+        window_end = now.isoformat()
+    else:
+        stamps = [trade_window_timestamp(r) for r in filtered]
+        stamps = [t for t in stamps if t is not None]
+        window_start = min(stamps).isoformat() if stamps else None
+        window_end = max(stamps).isoformat() if stamps else None
 
     return {
         "hours": hours,
@@ -200,8 +228,8 @@ def build_paper_pnl_report(
             "utcHour": group_breakdown(
                 filtered,
                 lambda r: (
-                    f"{parse_ts(r.get('entry_time')).astimezone(timezone.utc).hour:02d}"
-                    if parse_ts(r.get("entry_time"))
+                    f"{trade_window_timestamp(r).astimezone(timezone.utc).hour:02d}"
+                    if trade_window_timestamp(r)
                     else "??"
                 ),
                 sort_by_pnl=False,

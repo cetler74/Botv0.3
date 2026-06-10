@@ -115,6 +115,12 @@ def _hold_minutes(trade: Dict[str, Any]) -> Optional[float]:
     return max(0.0, (exit_dt - entry).total_seconds() / 60.0)
 
 
+def _window_ts(trade: Dict[str, Any]) -> Optional[datetime]:
+    if str(trade.get("status") or "").upper() == "CLOSED":
+        return _parse_ts(trade.get("exit_time")) or _parse_ts(trade.get("entry_time"))
+    return _parse_ts(trade.get("entry_time"))
+
+
 # ---------------------------------------------------------------------------
 # Aggregations
 
@@ -233,11 +239,9 @@ def main() -> int:
     if args.hours > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
         rows = [
-            r for r in rows
-            if (
-                _parse_ts(r.get("entry_time"))
-                or datetime.now(timezone.utc)
-            ) >= cutoff
+            row
+            for row in rows
+            if (ts := _window_ts(row)) is not None and ts >= cutoff
         ]
 
     if not rows:
@@ -245,14 +249,14 @@ def main() -> int:
         return 0
 
     agg = _aggregate(rows)
-    first_entry = min(
-        (_parse_ts(r.get("entry_time")) for r in rows if r.get("entry_time")),
-        default=None,
-    )
-    last_entry = max(
-        (_parse_ts(r.get("entry_time")) for r in rows if r.get("entry_time")),
-        default=None,
-    )
+    now = datetime.now(timezone.utc)
+    if args.hours > 0:
+        first_entry = now - timedelta(hours=args.hours)
+        last_entry = now
+    else:
+        stamps = [t for t in (_window_ts(r) for r in rows) if t]
+        first_entry = min(stamps, default=None)
+        last_entry = max(stamps, default=None)
 
     print("# Hyperliquid Paper Perps PnL Report")
     print(
@@ -295,12 +299,10 @@ def main() -> int:
         lambda r: _exit_bucket(r.get("exit_reason") or ""),
     )
     _print_grouped(
-        "By UTC hour (entry)",
+        "By UTC hour (exit for closed, entry for open)",
         rows,
         lambda r: (
-            f"{_parse_ts(r.get('entry_time')).astimezone(timezone.utc).hour:02d}"
-            if _parse_ts(r.get("entry_time"))
-            else "??"
+            f"{_window_ts(r).astimezone(timezone.utc).hour:02d}" if _window_ts(r) else "??"
         ),
         sort_by_pnl=False,
     )

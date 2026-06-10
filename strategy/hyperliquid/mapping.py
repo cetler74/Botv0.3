@@ -23,4 +23,28 @@ HYPERLIQUID_STRATEGY_MAPPING = {
         "strategy.hyperliquid.rsi_stoch_reversal_5m_perp",
         "RsiStochReversal5mPerpStrategy",
     ),
+    "rsi_stoch_reversal_1m": (
+        "strategy.hyperliquid.rsi_stoch_reversal_1m_perp",
+        "RsiStochReversal1mPerpStrategy",
+    ),
+    "supply_demand_3step": (
+        "strategy.hyperliquid.supply_demand_3step_perp",
+        "SupplyDemand3StepPerpStrategy",
+    ),
+    "dual_sma_daytrade": (
+        "strategy.hyperliquid.dual_sma_daytrade_perp",
+        "DualSmaDaytradePerpStrategy",
+    ),
+    "arc_daytrade": (
+        "strategy.hyperliquid.arc_daytrade_perp",
+        "ArcDaytradePerpStrategy",
+    ),
+    "ema50_breakout_pullback": (
+        "strategy.hyperliquid.ema50_breakout_pullback_perp",
+        "Ema50BreakoutPullbackPerpStrategy",
+    ),
+    "orb_5m_scalp": (
+        "strategy.hyperliquid.orb_5m_scalp_perp",
+        "Orb5mScalpPerpStrategy",
+    ),
 }

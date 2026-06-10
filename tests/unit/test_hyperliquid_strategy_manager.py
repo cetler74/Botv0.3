@@ -100,6 +100,41 @@ def test_hyperliquid_strategy_manager_includes_sma_reclaim_required_timeframes(m
 
 
 @pytest.mark.asyncio
+async def test_hyperliquid_strategy_manager_fetches_dual_sma_weekly_context_limit(monkeypatch):
+    import pandas as pd
+    import hyperliquid_strategy_manager as manager_module
+
+    requested = {}
+
+    class FakeAdapter:
+        def __init__(self, exchange_service_url):
+            self.exchange_service_url = exchange_service_url
+
+        async def get_ohlcv(self, exchange, coin, timeframe, limit=120):
+            requested[timeframe] = limit
+            idx = pd.date_range("2026-01-01", periods=30, freq="1h")
+            return pd.DataFrame(
+                {
+                    "open": [100.0] * 30,
+                    "high": [101.0] * 30,
+                    "low": [99.0] * 30,
+                    "close": [100.0] * 30,
+                    "volume": [1000.0] * 30,
+                },
+                index=idx,
+            )
+
+    monkeypatch.setattr(manager_module, "HyperliquidExchangeAdapter", FakeAdapter)
+    manager = manager_module.HyperliquidStrategyManager({}, "http://exchange-service:8003")
+
+    await manager._get_market_data("BTC", ["1d", "1w", "5m"])
+
+    assert requested["1d"] >= 260
+    assert requested["1w"] >= 220
+    assert requested["5m"] >= 260
+
+
+@pytest.mark.asyncio
 async def test_hyperliquid_strategy_manager_normalizes_short_signal(monkeypatch):
     import pandas as pd
     import hyperliquid_strategy_manager as manager_module

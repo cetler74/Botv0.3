@@ -1,5 +1,5 @@
 """
-Hyperliquid perp — RSI + StochRSI 5m (long: RSI<30, Stoch K&D<30, K>D; short: K&D>80, D>K).
+Hyperliquid perp — RSI + StochRSI 5m (long: RSI<30, Stoch K&D<30, K>D; short: RSI>80, Stoch K&D>80, D>K).
 """
 
 from __future__ import annotations

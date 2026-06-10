@@ -24,6 +24,7 @@ from binance_websocket_integration import binance_websocket, router as binance_w
 from cryptocom_websocket_integration import cryptocom_websocket, router as cryptocom_ws_router
 from bybit_websocket_integration import router as bybit_ws_router
 from health_monitor import HealthMonitorService, binance_websocket_health_check, cryptocom_websocket_health_check, redis_health_check
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -70,6 +71,15 @@ app.include_router(bybit_ws_router)
 
 # Global health monitor
 health_monitor: Optional[HealthMonitorService] = None
+
+exchange_service_connected_exchanges = Gauge(
+    "exchange_service_connected_exchanges",
+    "Number of exchange clients currently marked healthy in exchange-service",
+)
+exchange_service_total_exchanges = Gauge(
+    "exchange_service_total_exchanges",
+    "Total number of exchange clients configured in exchange-service",
+)
 
 class WebSocketExchangeHandler:
     """Exchange-specific WebSocket handler"""
@@ -1119,6 +1129,16 @@ async def readiness_check():
         raise HTTPException(status_code=503, detail="Exchange service not ready")
     return {"status": "ready", "exchanges": len(exchanges)}
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrape endpoint."""
+    connected_count = sum(
+        1 for ex in exchanges.values() if ex["health"]["status"] == "healthy"
+    )
+    exchange_service_connected_exchanges.set(connected_count)
+    exchange_service_total_exchanges.set(len(exchanges))
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 # Market Data Endpoints
 @app.get("/api/v1/market/ticker-live/{exchange}/{symbol:path}")
 async def get_ticker_live(exchange: str, symbol: str, stale_threshold_seconds: int = 30):
@@ -2042,6 +2062,26 @@ async def get_hyperliquid_ohlcv(symbol: str, timeframe: str = "1h", limit: int =
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _is_transient_public_market_error(error: Exception) -> bool:
+    """Return True for upstream/public market failures worth retrying, not storing as DB alerts."""
+    err = str(error).lower()
+    transient_markers = (
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+        "cloudflare",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(marker in err for marker in transient_markers)
+
+
 @app.get("/api/v1/market/ohlcv/{exchange}/{symbol:path}")
 async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: int = 100):
     """Get OHLCV (candlestick) data for a symbol - REQUIRED FOR STRATEGY SERVICE"""
@@ -2075,10 +2115,40 @@ async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: in
                 f"Invalid exchange instance for {exchange}: missing fetch_ohlcv method"
             )
 
+        max_retries = 4 if exchange == "cryptocom" else 2
+        retry_delay = 0.75
         start_time = time.time()
-        ohlcv = await exchange_instance.fetch_ohlcv(
-            exchange_symbol, timeframe=timeframe, limit=limit
-        )
+        ohlcv = None
+
+        for attempt in range(max_retries):
+            try:
+                ohlcv = await asyncio.wait_for(
+                    exchange_instance.fetch_ohlcv(
+                        exchange_symbol, timeframe=timeframe, limit=limit
+                    ),
+                    timeout=20.0,
+                )
+                break
+            except Exception as fetch_error:
+                if not _is_transient_public_market_error(fetch_error) or attempt == max_retries - 1:
+                    raise
+
+                logger.warning(
+                    "Transient OHLCV fetch failure for %s %s %s on %s "
+                    "(attempt %s/%s): %s. Retrying in %.2fs",
+                    exchange,
+                    exchange_symbol,
+                    timeframe,
+                    exchange,
+                    attempt + 1,
+                    max_retries,
+                    fetch_error,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+                await exchange_manager._rate_limit(exchange)
+
         response_time = time.time() - start_time
         
         # Update health
@@ -2107,6 +2177,24 @@ async def get_ohlcv(exchange: str, symbol: str, timeframe: str = "1h", limit: in
             logger.warning(f"Symbol {exchange_symbol} not found on {exchange}: {e}")
             raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found on {exchange}")
         
+        if _is_transient_public_market_error(e):
+            logger.warning(
+                "Transient OHLCV upstream failure after retries for %s %s %s: %s",
+                exchange,
+                symbol,
+                timeframe,
+                e,
+            )
+            if exchange in exchanges:
+                exchanges[exchange]["health"]["status"] = "degraded"
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"{exchange} OHLCV upstream temporarily unavailable for "
+                    f"{symbol} {timeframe}; retry later"
+                ),
+            )
+
         await exchange_manager._handle_exchange_error(exchange, e, f"get_ohlcv({symbol}, {timeframe})")
         raise HTTPException(status_code=500, detail=str(e))
 

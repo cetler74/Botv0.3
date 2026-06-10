@@ -306,6 +306,7 @@ def evaluate_sma_reclaim_bull_flag(
     if risk <= 0 or reward <= 0:
         return _hold_payload("invalid_stop_or_target")
     stop_pct = risk / price
+    target_pct = reward / price
     rr = reward / risk
     if stop_pct > params.max_stop_pct or stop_pct < params.min_stop_pct or rr < params.min_reward_risk:
         return _hold_payload(
@@ -338,6 +339,7 @@ def evaluate_sma_reclaim_bull_flag(
         "entry_price": price,
         "stop_hint": stop,
         "target_hint": target,
+        "target_pct": target_pct,
         "reward_risk": rr,
         "stop_pct": stop_pct,
         "entry_reason": entry_reason,

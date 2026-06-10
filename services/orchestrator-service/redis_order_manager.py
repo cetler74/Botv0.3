@@ -12,6 +12,8 @@ from typing import Dict, Any, Optional
 import httpx
 import redis.asyncio as redis
 
+from hyperliquid_perps import encode_setup_risk_entry_reason, setup_risk_metadata_from_signal
+
 logger = logging.getLogger(__name__)
 
 class RedisOrderManager:
@@ -27,8 +29,9 @@ class RedisOrderManager:
         )
         summary = (signal.get("strategy_gate_summary") or "").strip()
         if summary:
-            return f"{base} TA: {summary}"
-        return base
+            base = f"{base} TA: {summary}"
+        setup = setup_risk_metadata_from_signal(signal)
+        return encode_setup_risk_entry_reason(base, setup)
 
     def __init__(self, redis_url: str = "redis://redis:6379"):
         self.redis_url = redis_url
@@ -457,6 +460,7 @@ class RedisOrderManager:
                     "entry_gate_reason": signal.get("entry_gate_reason", "consensus_buy_pass"),
                     "consensus_confidence": signal.get("consensus_confidence"),
                     "consensus_agreement": signal.get("consensus_agreement"),
+                    "setup_risk": setup_risk_metadata_from_signal(signal),
                 },
             }
             

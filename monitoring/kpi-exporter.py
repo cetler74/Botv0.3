@@ -25,6 +25,15 @@ PERP_STRATEGY_PNL = Gauge(
     ["strategy"],
 )
 ALERTS_UNRESOLVED = Gauge("trading_alerts_unresolved_total", "Unresolved DB alerts count")
+ALERTS_UNRESOLVED_BY_LEVEL = Gauge(
+    "trading_alerts_unresolved_by_level_total",
+    "Unresolved DB alerts count by level",
+    ["level"],
+)
+ALERTS_UNRESOLVED_CRITICAL = Gauge(
+    "trading_alerts_unresolved_critical_total",
+    "Unresolved CRITICAL DB alerts count",
+)
 SPOT_CLOSED_24H = Gauge(
     "trading_spot_trades_closed_24h",
     "Spot trades closed in the last 24 hours (database)",
@@ -45,6 +54,51 @@ SPOT_UNREALIZED = Gauge(
 HL_RSI_STOCH_LIVE_READY = Gauge(
     "trading_hl_rsi_stoch_live_readiness",
     "1 when rsi_stoch HL paper metrics meet live_promotion thresholds (informational)",
+)
+SD_STEP_PASS_RATE = Gauge(
+    "trading_supply_demand_step_pass_rate",
+    "Supply/demand 3-step pass rate percent in audit window",
+    ["step", "venue"],
+)
+SD_SIGNALS_TOTAL = Gauge(
+    "trading_supply_demand_signals_total",
+    "Supply/demand evaluations by signal and asset class",
+    ["signal", "asset_class"],
+)
+DSMA_GATE_PASS_RATE = Gauge(
+    "trading_dual_sma_gate_pass_rate",
+    "Dual-SMA daytrade gate pass rate percent in audit window",
+    ["gate", "venue"],
+)
+DSMA_SIGNALS_TOTAL = Gauge(
+    "trading_dual_sma_signals_total",
+    "Dual-SMA evaluations by signal and daily bias",
+    ["signal", "bias"],
+)
+EMA50_BP_GATE_PASS_RATE = Gauge(
+    "trading_ema50_bp_gate_pass_rate",
+    "EMA50 breakout-pullback gate pass rate percent in audit window",
+    ["gate", "venue"],
+)
+EMA50_BP_SIGNALS_TOTAL = Gauge(
+    "trading_ema50_bp_signals_total",
+    "EMA50 breakout-pullback evaluations by signal and direction",
+    ["signal", "direction"],
+)
+EMA50_BP_SETUP_STATE_TOTAL = Gauge(
+    "trading_ema50_bp_setup_state_total",
+    "EMA50 breakout-pullback evaluations by setup state",
+    ["state", "venue"],
+)
+ARC_GATE_PASS_RATE = Gauge(
+    "trading_arc_gate_pass_rate",
+    "ARC daytrade gate pass rate percent in audit window",
+    ["gate", "venue"],
+)
+ARC_SIGNALS_TOTAL = Gauge(
+    "trading_arc_signals_total",
+    "ARC evaluations by signal and zone",
+    ["signal", "zone"],
 )
 
 
@@ -78,6 +132,73 @@ def _set_perp_metrics(report: dict) -> None:
         PERP_STRATEGY_PNL.labels(strategy=name).set(pnl)
 
 
+def _set_dual_sma_metrics(audit: dict) -> None:
+    summary = (audit or {}).get("summary") or {}
+    rates = summary.get("gatePassRates") or {}
+    for gate in ("daily", "confirm15m", "entry5m", "precision"):
+        DSMA_GATE_PASS_RATE.labels(gate=gate, venue="all").set(float(rates.get(gate) or 0))
+    by_signal = summary.get("bySignal") or {}
+    by_bias = summary.get("byDailyBias") or {}
+    for signal, count in by_signal.items():
+        for bias, bcount in by_bias.items():
+            if bcount:
+                DSMA_SIGNALS_TOTAL.labels(signal=str(signal), bias=str(bias)).set(float(count))
+                break
+        else:
+            DSMA_SIGNALS_TOTAL.labels(signal=str(signal), bias="unknown").set(float(count))
+
+
+def _set_ema50_bp_metrics(audit: dict) -> None:
+    summary = (audit or {}).get("summary") or {}
+    rates = summary.get("gatePassRates") or {}
+    for gate in ("breakout", "pullback", "trigger"):
+        EMA50_BP_GATE_PASS_RATE.labels(gate=gate, venue="all").set(float(rates.get(gate) or 0))
+    by_signal = summary.get("bySignal") or {}
+    by_direction = summary.get("byDirection") or {}
+    for signal, count in by_signal.items():
+        for direction, dcount in by_direction.items():
+            if dcount:
+                EMA50_BP_SIGNALS_TOTAL.labels(signal=str(signal), direction=str(direction)).set(float(count))
+                break
+        else:
+            EMA50_BP_SIGNALS_TOTAL.labels(signal=str(signal), direction="unknown").set(float(count))
+    state_counts = summary.get("setupStateCounts") or {}
+    for state, count in state_counts.items():
+        EMA50_BP_SETUP_STATE_TOTAL.labels(state=str(state), venue="all").set(float(count))
+
+
+def _set_arc_metrics(audit: dict) -> None:
+    summary = (audit or {}).get("summary") or {}
+    rates = summary.get("gatePassRates") or {}
+    for gate in ("area", "range", "candle"):
+        ARC_GATE_PASS_RATE.labels(gate=gate, venue="all").set(float(rates.get(gate) or 0))
+    by_signal = summary.get("bySignal") or {}
+    by_zone = summary.get("byZone") or {}
+    for signal, count in by_signal.items():
+        for zone, zcount in by_zone.items():
+            if zcount:
+                ARC_SIGNALS_TOTAL.labels(signal=str(signal), zone=str(zone)).set(float(count))
+                break
+        else:
+            ARC_SIGNALS_TOTAL.labels(signal=str(signal), zone="unknown").set(float(count))
+
+
+def _set_supply_demand_metrics(audit: dict) -> None:
+    summary = (audit or {}).get("summary") or {}
+    rates = summary.get("stepPassRates") or {}
+    for step in ("step1", "step2", "step3"):
+        SD_STEP_PASS_RATE.labels(step=step, venue="all").set(float(rates.get(step) or 0))
+    by_signal = summary.get("bySignal") or {}
+    by_asset = summary.get("byAssetClass") or {}
+    for signal, count in by_signal.items():
+        for asset, acount in by_asset.items():
+            if acount:
+                SD_SIGNALS_TOTAL.labels(signal=str(signal), asset_class=str(asset)).set(float(count))
+                break
+        else:
+            SD_SIGNALS_TOTAL.labels(signal=str(signal), asset_class="unknown").set(float(count))
+
+
 def _poll() -> None:
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -96,10 +217,56 @@ def _poll() -> None:
             else:
                 logger.warning("paper-readiness status=%s", ready_r.status_code)
 
+            sd_r = client.get(
+                f"{DATABASE_SERVICE_URL}/api/v1/analytics/supply-demand-analysis-logs",
+                params={"hours": 24, "limit": 500},
+            )
+            if sd_r.status_code == 200:
+                _set_supply_demand_metrics(sd_r.json())
+            else:
+                logger.warning("supply-demand-analysis-logs status=%s", sd_r.status_code)
+
+            dsma_r = client.get(
+                f"{DATABASE_SERVICE_URL}/api/v1/analytics/dual-sma-analysis-logs",
+                params={"hours": 24, "limit": 500},
+            )
+            if dsma_r.status_code == 200:
+                _set_dual_sma_metrics(dsma_r.json())
+            else:
+                logger.warning("dual-sma-analysis-logs status=%s", dsma_r.status_code)
+
+            arc_r = client.get(
+                f"{DATABASE_SERVICE_URL}/api/v1/analytics/arc-analysis-logs",
+                params={"hours": 24, "limit": 500},
+            )
+            if arc_r.status_code == 200:
+                _set_arc_metrics(arc_r.json())
+            else:
+                logger.warning("arc-analysis-logs status=%s", arc_r.status_code)
+
+            ebp_r = client.get(
+                f"{DATABASE_SERVICE_URL}/api/v1/analytics/ema50-breakout-pullback-analysis-logs",
+                params={"hours": 24, "limit": 500},
+            )
+            if ebp_r.status_code == 200:
+                _set_ema50_bp_metrics(ebp_r.json())
+            else:
+                logger.warning("ema50-breakout-pullback-analysis-logs status=%s", ebp_r.status_code)
+
             ar = client.get(f"{DATABASE_SERVICE_URL}/api/v1/alerts/unresolved/count")
             if ar.status_code == 200:
                 data = ar.json()
                 ALERTS_UNRESOLVED.set(int(data.get("count") or 0))
+            for level in ("WARNING", "CRITICAL"):
+                level_r = client.get(
+                    f"{DATABASE_SERVICE_URL}/api/v1/alerts/unresolved/count",
+                    params={"level": level},
+                )
+                if level_r.status_code == 200:
+                    count = int(level_r.json().get("count") or 0)
+                    ALERTS_UNRESOLVED_BY_LEVEL.labels(level=level).set(count)
+                    if level == "CRITICAL":
+                        ALERTS_UNRESOLVED_CRITICAL.set(count)
 
             ts = client.get(
                 f"{DATABASE_SERVICE_URL}/api/v1/trades/stats/summary",

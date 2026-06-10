@@ -8,6 +8,7 @@ signals into isolated paper positions so spot trading remains untouched.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -33,6 +34,12 @@ HYPERLIQUID_STRATEGY_FAMILIES = {
     "breakout_retest_long": "pattern_breakout",
     "engulfing_multi_tf": "pattern_breakout",
     "rsi_stoch_reversal_5m": "reversal_reclaim",
+    "rsi_stoch_reversal_1m": "reversal_reclaim",
+    "supply_demand_3step": "pattern_breakout",
+    "dual_sma_daytrade": "trend_retrace",
+    "arc_daytrade": "pattern_breakout",
+    "ema50_breakout_pullback": "pattern_breakout",
+    "orb_5m_scalp": "opening_range_breakout",
 }
 
 
@@ -49,14 +56,34 @@ DEFAULT_STANDALONE_STRATEGY_GATES = {
     "breakout_retest_long": {"min_confidence": 0.70, "min_strength": 0.70, "size_multiplier": None},
     "engulfing_multi_tf": {"min_confidence": 0.72, "min_strength": 0.70, "size_multiplier": None},
     "rsi_stoch_reversal_5m": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "rsi_stoch_reversal_1m": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "supply_demand_3step": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "dual_sma_daytrade": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "arc_daytrade": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "ema50_breakout_pullback": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
 }
+
+
+PRIORITY_STANDALONE_ENTRY_STRATEGIES = (
+    "rsi_stoch_reversal_5m",
+    "rsi_stoch_reversal_1m",
+    "supply_demand_3step",
+    "dual_sma_daytrade",
+    "arc_daytrade",
+    "ema50_breakout_pullback",
+)
 
 
 def pair_to_hyperliquid_coin(pair: str) -> str:
     """Convert BTC/USDC or BTCUSD-style symbols to Hyperliquid perp coin names."""
-    raw = str(pair or "").upper().strip()
+    raw = str(pair or "").strip()
     if "/" in raw:
         return raw.split("/", 1)[0]
+    if ":" in raw:
+        dex, base = raw.split(":", 1)
+        raw = f"{dex.lower()}:{base.upper()}"
+    else:
+        raw = raw.upper()
     for suffix in ("USDC", "USDT", "USD"):
         if raw.endswith(suffix):
             return raw[: -len(suffix)]
@@ -69,6 +96,66 @@ def position_sides_from_signal(signal: str) -> Optional[str]:
         return "long"
     if sig == "short":
         return "short"
+    return None
+
+
+def disabled_strategy_side_exit_reason(
+    trade: Mapping[str, Any],
+    root_config: Mapping[str, Any],
+) -> Optional[str]:
+    """Close legacy paper positions when their strategy side is now disabled."""
+    source = str(trade.get("source_strategy") or trade.get("strategy") or "").strip()
+    if not source:
+        return None
+    side = str(trade.get("position_side") or "").strip().lower()
+    if side not in {"long", "short"}:
+        return None
+
+    strat_root = (root_config or {}).get("strategies_hyperliquid") or {}
+    strat_cfg = strat_root.get(source) or {}
+    if not strat_cfg:
+        return None
+    if strat_cfg.get("enabled") is False:
+        return f"paper_disabled_strategy_{source}"
+
+    params = strat_cfg.get("parameters") or {}
+    if side == "long" and params.get("allow_long") is False:
+        return f"paper_disabled_side_{source}_long"
+    if side == "short" and params.get("allow_short") is False:
+        return f"paper_disabled_side_{source}_short"
+    return None
+
+
+def adaptive_blocked_regime_side_exit_reason(
+    trade: Mapping[str, Any],
+    hl_cfg: Mapping[str, Any],
+) -> Optional[str]:
+    """Close open paper positions when adaptive PnL control now blocks their regime/side."""
+    metadata = _metadata_dict(trade)
+    regime = str(
+        metadata.get("market_regime")
+        or metadata.get("stable_regime")
+        or trade.get("market_regime")
+        or ""
+    ).strip().lower()
+    side = str(trade.get("position_side") or "").strip().lower()
+    if not regime or side not in {"long", "short"}:
+        return None
+
+    adaptive = (hl_cfg or {}).get("_adaptive_pnl_control") or {}
+    for decision in adaptive.get("decisions") or []:
+        if str(decision.get("action") or "").strip().lower() != "block":
+            continue
+        if str(decision.get("targetType") or "").strip().lower() != "regime_side":
+            continue
+        if str(decision.get("target") or "").strip().lower() != regime:
+            continue
+        if str(decision.get("side") or "").strip().lower() != side:
+            continue
+        decision_type = str(decision.get("type") or decision.get("decisionType") or "block_regime_side")
+        safe_type = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in decision_type.lower())
+        safe_regime = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in regime)
+        return f"paper_{safe_type}_{safe_regime}_{side}"
     return None
 
 
@@ -151,6 +238,39 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
         return best_strategy_for(opposite)
 
     consensus = signals_data.get("consensus") or {}
+
+    for strategy_name in PRIORITY_STANDALONE_ENTRY_STRATEGIES:
+        data = strategies.get(strategy_name) or {}
+        if not isinstance(data, dict):
+            continue
+        side = normalize_perp_entry_signal(data.get("signal", ""))
+        if side not in {"long", "short"}:
+            continue
+        defaults = DEFAULT_STANDALONE_STRATEGY_GATES.get(strategy_name) or {}
+        conf = float(data.get("confidence", 0) or 0)
+        strength = float(data.get("strength", 0) or 0)
+        if (
+            conf < float(defaults.get("min_confidence", 0) or 0)
+            or strength < float(defaults.get("min_strength", 0) or 0)
+        ):
+            continue
+        selected = {
+            "strategy": strategy_name,
+            "signal": side,
+            "confidence": conf,
+            "strength": strength,
+            "consensus_confidence": float(consensus.get("confidence", 0) or 0),
+            "consensus_agreement": float(consensus.get("agreement", 0) or 0),
+            "details": data,
+            "standalone_priority": True,
+        }
+        opposite = strongest_opposite_for(side)
+        if opposite:
+            selected["opposite_strategy"] = opposite.get("strategy")
+            selected["opposite_confidence"] = float(opposite.get("confidence", 0) or 0)
+            selected["opposite_strength"] = float(opposite.get("strength", 0) or 0)
+        return selected
+
     c_signal = normalize_perp_entry_signal(consensus.get("signal", ""))
     if c_signal in {"long", "short"}:
         best = best_strategy_for(c_signal)
@@ -172,26 +292,298 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
             selected["opposite_strength"] = float(opposite.get("strength", 0) or 0)
         return selected
 
-    candidates = []
-    for side in ("long", "short"):
-        best = best_strategy_for(side)
-        if best:
-            candidates.append(best)
-    if not candidates:
-        return None
-    best = sorted(
-        candidates,
-        key=lambda row: (float(row.get("confidence", 0)), float(row.get("strength", 0))),
-        reverse=True,
-    )[0]
-    best["consensus_confidence"] = float(consensus.get("confidence", 0) or 0)
-    best["consensus_agreement"] = float(consensus.get("agreement", 0) or 0)
-    opposite = strongest_opposite_for(str(best.get("signal") or ""))
-    if opposite:
-        best["opposite_strategy"] = opposite.get("strategy")
-        best["opposite_confidence"] = float(opposite.get("confidence", 0) or 0)
-        best["opposite_strength"] = float(opposite.get("strength", 0) or 0)
-    return best
+    # Do not fall back to "loudest individual strategy wins" when consensus is
+    # HOLD. That path trades unlike the manual workflow: a non-priority strategy
+    # can open a position just because it has the highest raw confidence while
+    # the selected regime/consensus says no trade. Only explicit standalone
+    # playbooks above are allowed to bypass consensus.
+    return None
+
+
+def selected_mirrored_signal_metadata(
+    mirrored: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Audit-friendly metadata for the exact signal selected for perp entry."""
+    if not isinstance(mirrored, Mapping):
+        return {}
+    details = mirrored.get("details") or {}
+    if not isinstance(details, Mapping):
+        details = {}
+    state = details.get("state") or {}
+    if not isinstance(state, Mapping):
+        state = {}
+    indicators = state.get("indicators") or {}
+    if not isinstance(indicators, Mapping):
+        indicators = {}
+
+    reason = (
+        state.get("entry_reason")
+        or details.get("entry_reason")
+        or indicators.get("entry_reason_detail")
+        or ""
+    )
+    metadata = {
+        "strategy": mirrored.get("strategy"),
+        "signal": mirrored.get("signal"),
+        "confidence": mirrored.get("confidence"),
+        "strength": mirrored.get("strength"),
+        "consensus_confidence": mirrored.get("consensus_confidence"),
+        "consensus_agreement": mirrored.get("consensus_agreement"),
+    }
+    if mirrored.get("standalone_priority") is not None:
+        metadata["standalone_priority"] = bool(mirrored.get("standalone_priority"))
+    if reason:
+        metadata["reason"] = reason
+    for key in ("opposite_strategy", "opposite_confidence", "opposite_strength"):
+        if mirrored.get(key) is not None:
+            metadata[key] = mirrored.get(key)
+    setup_risk = setup_risk_metadata_from_signal(dict(mirrored))
+    if setup_risk:
+        metadata["setup_risk"] = setup_risk
+    return metadata
+
+
+SETUP_RISK_KEYS = (
+    "stop_hint",
+    "target_hint",
+    "stop_pct",
+    "target_pct",
+    "reward_risk",
+    "entry_price",
+    "breakeven_trigger_swing_high",
+    "partial_profit_sma_extension_pct",
+    "measured_move",
+    "entry_reason",
+    "setup",
+    "pattern_type",
+)
+
+
+def _setup_distance_pct(entry_price: float, price_hint: float) -> float:
+    """Absolute entry-to-level distance in percent (works for long and short)."""
+    if entry_price <= 0 or price_hint <= 0:
+        return 0.0
+    return abs(price_hint - entry_price) / entry_price * 100.0
+
+
+def _normalize_published_setup_pct(raw: float) -> float:
+    """Engines publish decimal fractions (<0.1); exits expect percent."""
+    if raw <= 0:
+        return 0.0
+    if raw < 0.1:
+        return raw * 100.0
+    return raw
+
+
+def resolve_setup_target_pct(
+    setup: Mapping[str, Any],
+    entry_price: float = 0.0,
+    min_target_pct: float = 0.0,
+) -> float:
+    """Resolve setup take-profit distance in percent for exit checks."""
+    if not isinstance(setup, dict):
+        return 0.0
+    entry_px = _safe_float(setup.get("entry_price"), entry_price)
+    target_hint = _safe_float(setup.get("target_hint"), 0.0)
+    if target_hint > 0 and entry_px > 0:
+        resolved = _setup_distance_pct(entry_px, target_hint)
+    else:
+        resolved = _normalize_published_setup_pct(_safe_float(setup.get("target_pct"), 0.0))
+    floor = _safe_float(min_target_pct, 0.0)
+    if floor > 0 and resolved > 0:
+        resolved = max(resolved, floor)
+    return resolved
+
+
+def resolve_setup_stop_pct(
+    setup: Mapping[str, Any],
+    entry_price: float = 0.0,
+) -> float:
+    """Resolve setup stop distance in percent for exit checks."""
+    if not isinstance(setup, dict):
+        return 0.0
+    entry_px = _safe_float(setup.get("entry_price"), entry_price)
+    stop_hint = _safe_float(setup.get("stop_hint"), 0.0)
+    if stop_hint > 0 and entry_px > 0:
+        return _setup_distance_pct(entry_px, stop_hint)
+    return _normalize_published_setup_pct(_safe_float(setup.get("stop_pct"), 0.0))
+
+
+def setup_risk_metadata_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract setup-aware stop/target metadata from a strategy signal."""
+    if not isinstance(signal, dict):
+        return {}
+    meta: Dict[str, Any] = {}
+    for source in _indicator_sources(signal):
+        for key in SETUP_RISK_KEYS:
+            if key not in source:
+                continue
+            value = source.get(key)
+            if value is None:
+                continue
+            meta[key] = value
+    if not meta:
+        strat_data = signal.get("strategy_data") or {}
+        if isinstance(strat_data, dict):
+            state = strat_data.get("state") or strat_data
+            indicators = state.get("indicators") if isinstance(state, dict) else {}
+            if isinstance(indicators, dict):
+                for key in SETUP_RISK_KEYS:
+                    if key in indicators and indicators.get(key) is not None:
+                        meta[key] = indicators.get(key)
+    if not meta:
+        return {}
+    entry_price = _safe_float(meta.get("entry_price"), 0.0)
+    target_hint = _safe_float(meta.get("target_hint"), 0.0)
+    stop_hint = _safe_float(meta.get("stop_hint"), 0.0)
+    if entry_price > 0 and stop_hint > 0:
+        meta["stop_pct"] = _setup_distance_pct(entry_price, stop_hint)
+    else:
+        stop_pct = _safe_float(meta.get("stop_pct"), 0.0)
+        if stop_pct > 0:
+            meta["stop_pct"] = _normalize_published_setup_pct(stop_pct)
+    if entry_price > 0 and target_hint > 0:
+        meta["target_pct"] = _setup_distance_pct(entry_price, target_hint)
+    else:
+        target_pct = _safe_float(meta.get("target_pct"), 0.0)
+        if target_pct > 0:
+            meta["target_pct"] = _normalize_published_setup_pct(target_pct)
+    meta["setup"] = str(meta.get("setup") or "sma_reclaim_bull_flag")
+    return meta
+
+
+def encode_setup_risk_entry_reason(base_reason: str, setup_risk: Dict[str, Any]) -> str:
+    """Persist setup risk on spot trades via entry_reason suffix."""
+    reason = str(base_reason or "").strip()
+    if not setup_risk:
+        return reason
+    try:
+        import json
+
+        payload = json.dumps(setup_risk, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        return reason
+    marker = f" [setup:{payload}]"
+    if marker in reason:
+        return reason
+    return f"{reason}{marker}" if reason else marker.strip()
+
+
+def parse_setup_risk_from_entry_reason(entry_reason: str) -> Dict[str, Any]:
+    text = str(entry_reason or "")
+    start = text.rfind(" [setup:")
+    if start < 0:
+        return {}
+    blob = text[start + len(" [setup:") :]
+    if blob.endswith("]"):
+        blob = blob[:-1]
+    try:
+        import json
+
+        parsed = json.loads(blob)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def setup_risk_from_trade_metadata(trade: Mapping[str, Any]) -> Dict[str, Any]:
+    """Read persisted setup risk from a paper/spot trade record."""
+    if not isinstance(trade, Mapping):
+        return {}
+    metadata = trade.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    setup = metadata.get("setup_risk")
+    if isinstance(setup, dict) and setup:
+        return dict(setup)
+    hl_selected = metadata.get("hl_selected") or {}
+    if isinstance(hl_selected, dict):
+        nested = hl_selected.get("setup_risk")
+        if isinstance(nested, dict) and nested:
+            return dict(nested)
+    parsed = parse_setup_risk_from_entry_reason(str(trade.get("entry_reason") or ""))
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def strategy_risk_per_trade_pct(
+    strategy: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Per-strategy risk budget override for risk-based notional sizing."""
+    key = str(strategy or "").strip().lower()
+    overrides = ((hl_cfg or {}).get("strategy_risk_overrides") or {})
+    if isinstance(overrides, dict):
+        strat_cfg = overrides.get(key) or {}
+        if isinstance(strat_cfg, dict) and strat_cfg.get("risk_per_trade_pct") is not None:
+            return _safe_float(strat_cfg.get("risk_per_trade_pct"), 0.0075)
+    risk_cfg = ((hl_cfg or {}).get("risk_based_sizing") or {})
+    return _safe_float(risk_cfg.get("risk_per_trade_pct", 0.0075), 0.0075)
+
+
+def strategy_max_notional(
+    strategy: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Per-strategy notional cap override."""
+    key = str(strategy or "").strip().lower()
+    overrides = ((hl_cfg or {}).get("strategy_notional_overrides") or {})
+    if isinstance(overrides, dict):
+        strat_cfg = overrides.get(key) or {}
+        if isinstance(strat_cfg, dict) and strat_cfg.get("max_notional_per_trade") is not None:
+            return _safe_float(strat_cfg.get("max_notional_per_trade"), 200.0)
+    return _safe_float((hl_cfg or {}).get("max_notional_per_trade", 200.0), 200.0)
+
+
+def strategy_min_notional(
+    strategy: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Per-strategy notional floor for skipping fee-dominated paper entries."""
+    key = str(strategy or "").strip().lower()
+    overrides = ((hl_cfg or {}).get("strategy_notional_overrides") or {})
+    if isinstance(overrides, dict):
+        strat_cfg = overrides.get(key) or {}
+        if isinstance(strat_cfg, dict) and strat_cfg.get("min_notional_per_trade") is not None:
+            return _safe_float(strat_cfg.get("min_notional_per_trade"), 0.0)
+    return _safe_float((hl_cfg or {}).get("min_notional_per_trade", 0.0), 0.0)
+
+
+def strategy_sizing_tier_multiplier(
+    strategy: str,
+    trading_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Relative sizing tier — sma_reclaim_bull_flag is configured as the top tier."""
+    key = str(strategy or "").strip().lower()
+    tiers = ((trading_cfg or {}).get("strategy_sizing_tiers") or {})
+    if not isinstance(tiers, dict):
+        return 1.0
+    multipliers = tiers.get("multipliers") or {}
+    if isinstance(multipliers, dict) and key in multipliers:
+        return max(0.0, min(1.5, _safe_float(multipliers.get(key), 1.0)))
+    ordered = [str(item or "").strip().lower() for item in (tiers.get("ordered") or [])]
+    default_mult = _safe_float(tiers.get("default_multiplier", 0.70), 0.70)
+    if key in ordered:
+        rank = ordered.index(key)
+        return max(0.0, min(1.5, 1.0 - rank * 0.15))
+    return max(0.0, min(1.5, default_mult))
+
+
+def strategy_min_size_multiplier(
+    strategy: str,
+    trading_cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Optional floor so adaptive loss haircuts cannot starve priority strategies."""
+    key = str(strategy or "").strip().lower()
+    tiers = ((trading_cfg or {}).get("strategy_sizing_tiers") or {})
+    if isinstance(tiers, dict):
+        floor_key = f"{key}_min_multiplier"
+        if tiers.get(floor_key) is not None:
+            return max(0.0, min(1.5, _safe_float(tiers.get(floor_key), 1.0)))
+    adaptive = ((trading_cfg or {}).get("adaptive_position_sizing") or {})
+    mins = (adaptive.get("strategy_min_multipliers") or {}) if isinstance(adaptive, dict) else {}
+    if isinstance(mins, dict) and key in mins:
+        return max(0.0, min(1.5, _safe_float(mins.get(key), 1.0)))
+    return None
 
 
 @dataclass(frozen=True)
@@ -208,16 +600,16 @@ class PaperPerpExitConfig:
     overall_take_profit_pct: float = 4.5
 
     trailing_enabled: bool = True
-    trailing_activation_decimal: float = 0.0075
-    trailing_step_decimal: float = 0.0050
-    tightened_step_decimal: float = 0.0030
+    trailing_activation_decimal: float = 0.0050
+    trailing_step_decimal: float = 0.0020
+    tightened_step_decimal: float = 0.0015
     dynamic_tightening_enabled: bool = True
-    tighten_profit_threshold_decimal: float = 0.0150
-    breakeven_floor_decimal: float = 0.0050
-    min_trigger_distance_decimal: float = 0.0050
+    tighten_profit_threshold_decimal: float = 0.0050
+    breakeven_floor_decimal: float = 0.0035
+    min_trigger_distance_decimal: float = 0.0035
 
     profit_protection_enabled: bool = True
-    profit_protection_activation_decimal: float = 0.0050
+    profit_protection_activation_decimal: float = 0.0035
     fee_rate_per_side: float = 0.001
     profit_protection_fee_buffer: float = 0.0015
     effective_profit_floor_decimal: float = 0.0035
@@ -238,20 +630,49 @@ class PaperPerpExitConfig:
     stagnant_loser_enabled: bool = True
     stagnant_loser: Dict[str, Any] = field(default_factory=dict)
 
+    use_setup_stops: bool = False
+    use_setup_targets: bool = False
+    breakeven_on_swing_high: bool = False
+    partial_profit_pct: float = 0.0
+    partial_profit_sma_extension_pct: float = 0.05
+
 
 @dataclass
 class PaperPerpExitResult:
     exit_reason: Optional[str]
     metadata: Dict[str, Any]
+    exit_price: Optional[float] = None
 
 
 def paper_perp_exit_config_from_yaml(
     hl_cfg: Dict[str, Any],
     trading_cfg: Dict[str, Any],
+    strategy_name: str = "",
 ) -> PaperPerpExitConfig:
     """Build exit config from hyperliquid_perps + global trading sections."""
     hl_cfg = hl_cfg or {}
     trading_cfg = trading_cfg or {}
+    strategy_key = str(strategy_name or "").strip().lower()
+    selected_profile: Dict[str, Any] = {}
+    for profile in (hl_cfg.get("exit_profiles") or {}).values():
+        if not isinstance(profile, dict):
+            continue
+        strategies = {
+            str(item or "").strip().lower() for item in (profile.get("strategies") or [])
+        }
+        if strategy_key and strategy_key in strategies:
+            selected_profile = profile
+            break
+    if selected_profile:
+        merged = dict(hl_cfg)
+        for key, value in selected_profile.items():
+            if key == "strategies":
+                continue
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
+        hl_cfg = merged
     # Perp-specific overrides win over global spot trailing / profit protection.
     trailing = hl_cfg.get("trailing_stop") or trading_cfg.get("trailing_stop") or {}
     pp = hl_cfg.get("profit_protection") or trading_cfg.get("profit_protection") or {}
@@ -263,7 +684,7 @@ def paper_perp_exit_config_from_yaml(
 
     stop_loss_pct = float(hl_cfg.get("stop_loss_pct", 1.5) or 1.5)
     spot_sl = trading_cfg.get("stop_loss_percentage")
-    if spot_sl is not None:
+    if spot_sl is not None and "stop_loss_pct" not in selected_profile:
         try:
             stop_loss_pct = abs(float(spot_sl) * 100.0)
         except (TypeError, ValueError):
@@ -278,15 +699,15 @@ def paper_perp_exit_config_from_yaml(
         except (TypeError, ValueError):
             return default
 
-    step = _dec("step_percentage", 0.0050)
+    step = _dec("step_percentage", 0.0020)
     tightened = _dec("tightened_step_percentage", step)
     if tightened <= 0:
         tightened = step
 
     try:
-        pp_activation = float(pp.get("activation_threshold", 0.0050) or 0.0050)
+        pp_activation = float(pp.get("activation_threshold", 0.0035) or 0.0035)
     except (TypeError, ValueError):
-        pp_activation = 0.0050
+        pp_activation = 0.0035
 
     try:
         fee_rate_per_side = float(hl_cfg.get("fee_rate_per_side", 0.001) or 0.001)
@@ -297,10 +718,43 @@ def paper_perp_exit_config_from_yaml(
     except (TypeError, ValueError):
         fee_buffer = 0.0015
     fee_floor = max(0.0, (fee_rate_per_side * 2.0) + fee_buffer)
-    breakeven_floor = max(_dec("breakeven_floor_percentage", 0.0050), fee_floor)
-    min_trigger_distance = max(_dec("min_trigger_distance_percentage", 0.0050), fee_floor)
-    trailing_activation = max(_dec("activation_threshold", 0.0075), fee_floor)
+    breakeven_floor = max(_dec("breakeven_floor_percentage", 0.0035), fee_floor)
+    min_trigger_distance = max(_dec("min_trigger_distance_percentage", 0.0035), fee_floor)
+    trailing_activation = max(_dec("activation_threshold", 0.0050), fee_floor)
     pp_activation = max(pp_activation, fee_floor)
+
+    if strategy_key == "rsi_stoch_reversal_5m":
+        risk_cfg = trading_cfg.get("rsi_stoch_reversal_5m_risk") or {}
+        try:
+            pp_activation = max(
+                float(risk_cfg.get("profit_activation_threshold", pp_activation) or pp_activation),
+                fee_floor,
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            trailing_activation = max(
+                float(risk_cfg.get("trailing_activation_threshold", trailing_activation) or trailing_activation),
+                fee_floor,
+            )
+        except (TypeError, ValueError):
+            pass
+    elif strategy_key == "macd_momentum":
+        risk_cfg = trading_cfg.get("macd_continuation_risk") or {}
+        try:
+            pp_activation = max(
+                float(risk_cfg.get("profit_activation_threshold", pp_activation) or pp_activation),
+                fee_floor,
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            trailing_activation = max(
+                float(risk_cfg.get("trailing_activation_threshold", trailing_activation) or trailing_activation),
+                fee_floor,
+            )
+        except (TypeError, ValueError):
+            pass
 
     atr_cfg = hl_cfg.get("stop_loss_atr") or {}
     atr_enabled = bool(atr_cfg.get("enabled", False))
@@ -350,7 +804,7 @@ def paper_perp_exit_config_from_yaml(
         trailing_step_decimal=step,
         tightened_step_decimal=tightened,
         dynamic_tightening_enabled=bool(trailing.get("dynamic_tightening_enabled", True)),
-        tighten_profit_threshold_decimal=_dec("tighten_profit_threshold", 0.0150),
+        tighten_profit_threshold_decimal=_dec("tighten_profit_threshold", 0.0050),
         breakeven_floor_decimal=breakeven_floor,
         min_trigger_distance_decimal=min_trigger_distance,
         profit_protection_enabled=bool(pp.get("enabled", True)),
@@ -365,6 +819,14 @@ def paper_perp_exit_config_from_yaml(
         per_coin_stop_overrides=overrides,
         stagnant_loser_enabled=stagnant_enabled,
         stagnant_loser=stagnant_loser,
+        use_setup_stops=bool(hl_cfg.get("use_setup_stops", False)),
+        use_setup_targets=bool(hl_cfg.get("use_setup_targets", False)),
+        breakeven_on_swing_high=bool(hl_cfg.get("breakeven_on_swing_high", False)),
+        partial_profit_pct=_safe_float(hl_cfg.get("partial_profit_pct", 0.0), 0.0),
+        partial_profit_sma_extension_pct=_safe_float(
+            hl_cfg.get("partial_profit_sma_extension_pct", 0.05),
+            0.05,
+        ),
     )
 
 
@@ -538,6 +1000,367 @@ def sma_reclaim_bull_flag_specialist_gate(
     }
 
 
+def supply_demand_3step_specialist_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated gate for supply/demand 3-step entries (long or short)."""
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    if strategy != "supply_demand_3step":
+        return {
+            "isSpecialist": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "not_supply_demand_3step",
+            "sizeMultiplier": None,
+        }
+
+    gates = (((hl_cfg or {}).get("specialist_strategy_gates") or {}).get(strategy) or {})
+    enabled = gates.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isSpecialist": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "specialist_gate_disabled",
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(gates.get("min_confidence", 0.70), 0.70)
+    min_strength = _safe_float(gates.get("min_strength", 0.65), 0.65)
+    min_rr = _safe_float(gates.get("min_reward_risk", 2.5), 2.5)
+    size_mult = _safe_float(gates.get("size_multiplier", 0.40), 0.40)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    details = (signal or {}).get("details") or {}
+    state = details.get("state") or {}
+    indicators = details.get("indicators") or state.get("indicators") or {}
+    rr = _safe_float(indicators.get("reward_risk"), 0.0)
+    setup = str(indicators.get("setup") or "").strip().lower()
+
+    failures = []
+    if side not in {"long", "short"}:
+        failures.append("not_directional")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if rr < min_rr:
+        failures.append(f"rr_{rr:.2f}_lt_{min_rr:.2f}")
+    if not indicators.get("step1_pass"):
+        failures.append("step1_fail")
+    if not indicators.get("step2_pass"):
+        failures.append("step2_fail")
+    if not indicators.get("step3_pass"):
+        failures.append("step3_fail")
+    if setup and setup != "supply_demand_3step":
+        failures.append(f"setup_{setup}")
+
+    return {
+        "isSpecialist": True,
+        "allowed": not failures,
+        "bypassConsensus": bool(gates.get("bypass_consensus", True)) and not failures,
+        "reason": ",".join(failures) if failures else "specialist_gate_pass",
+        "sizeMultiplier": max(0.0, min(1.0, size_mult)),
+    }
+
+
+def dual_sma_daytrade_specialist_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated gate for dual-SMA daytrade entries (long or short)."""
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    if strategy != "dual_sma_daytrade":
+        return {
+            "isSpecialist": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "not_dual_sma_daytrade",
+            "sizeMultiplier": None,
+        }
+
+    gates = (((hl_cfg or {}).get("specialist_strategy_gates") or {}).get(strategy) or {})
+    enabled = gates.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isSpecialist": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "specialist_gate_disabled",
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(gates.get("min_confidence", 0.70), 0.70)
+    min_strength = _safe_float(gates.get("min_strength", 0.65), 0.65)
+    min_rr = _safe_float(gates.get("min_reward_risk", 1.8), 1.8)
+    size_mult = _safe_float(gates.get("size_multiplier", 0.50), 0.50)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    details = (signal or {}).get("details") or {}
+    state = details.get("state") or {}
+    indicators = details.get("indicators") or state.get("indicators") or {}
+    rr = _safe_float(indicators.get("reward_risk"), 0.0)
+    setup = str(indicators.get("setup") or "").strip().lower()
+
+    failures = []
+    if side not in {"long", "short"}:
+        failures.append("not_directional")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if rr < min_rr:
+        failures.append(f"rr_{rr:.2f}_lt_{min_rr:.2f}")
+    if not indicators.get("daily_pass"):
+        failures.append("daily_fail")
+    if not indicators.get("confirm_15m_pass"):
+        failures.append("confirm_15m_fail")
+    if not indicators.get("entry_5m_pass"):
+        failures.append("entry_5m_fail")
+    if setup and setup != "dual_sma_daytrade":
+        failures.append(f"setup_{setup}")
+
+    return {
+        "isSpecialist": True,
+        "allowed": not failures,
+        "bypassConsensus": bool(gates.get("bypass_consensus", True)) and not failures,
+        "reason": ",".join(failures) if failures else "specialist_gate_pass",
+        "sizeMultiplier": max(0.0, min(1.0, size_mult)),
+    }
+
+
+def arc_daytrade_specialist_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated gate for ARC daytrade entries (long or short)."""
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    if strategy != "arc_daytrade":
+        return {
+            "isSpecialist": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "not_arc_daytrade",
+            "sizeMultiplier": None,
+        }
+
+    gates = (((hl_cfg or {}).get("specialist_strategy_gates") or {}).get(strategy) or {})
+    enabled = gates.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isSpecialist": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "specialist_gate_disabled",
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(gates.get("min_confidence", 0.70), 0.70)
+    min_strength = _safe_float(gates.get("min_strength", 0.65), 0.65)
+    min_rr = _safe_float(gates.get("min_reward_risk", 1.2), 1.2)
+    size_mult = _safe_float(gates.get("size_multiplier", 0.45), 0.45)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    details = (signal or {}).get("details") or {}
+    state = details.get("state") or {}
+    indicators = details.get("indicators") or state.get("indicators") or {}
+    rr = _safe_float(indicators.get("reward_risk"), 0.0)
+    setup = str(indicators.get("setup") or "").strip().lower()
+
+    failures = []
+    if side not in {"long", "short"}:
+        failures.append("not_directional")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if rr < min_rr:
+        failures.append(f"rr_{rr:.2f}_lt_{min_rr:.2f}")
+    if not indicators.get("area_pass"):
+        failures.append("area_fail")
+    if not indicators.get("range_pass"):
+        failures.append("range_fail")
+    if not indicators.get("candle_pass"):
+        failures.append("candle_fail")
+    if setup and setup != "arc_daytrade":
+        failures.append(f"setup_{setup}")
+
+    return {
+        "isSpecialist": True,
+        "allowed": not failures,
+        "bypassConsensus": bool(gates.get("bypass_consensus", True)) and not failures,
+        "reason": ",".join(failures) if failures else "specialist_gate_pass",
+        "sizeMultiplier": max(0.0, min(1.0, size_mult)),
+    }
+
+
+def ema50_breakout_pullback_specialist_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated gate for EMA50 breakout-pullback entries (long or short)."""
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    if strategy != "ema50_breakout_pullback":
+        return {
+            "isSpecialist": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "not_ema50_breakout_pullback",
+            "sizeMultiplier": None,
+        }
+
+    gates = (((hl_cfg or {}).get("specialist_strategy_gates") or {}).get(strategy) or {})
+    enabled = gates.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isSpecialist": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "specialist_gate_disabled",
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(gates.get("min_confidence", 0.70), 0.70)
+    min_strength = _safe_float(gates.get("min_strength", 0.65), 0.65)
+    min_rr = _safe_float(gates.get("min_reward_risk", 2.0), 2.0)
+    size_mult = _safe_float(gates.get("size_multiplier", 0.40), 0.40)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    details = (signal or {}).get("details") or {}
+    state = details.get("state") or {}
+    indicators = details.get("indicators") or state.get("indicators") or {}
+    rr = _safe_float(indicators.get("reward_risk"), 0.0)
+    setup = str(indicators.get("setup") or "").strip().lower()
+
+    failures = []
+    if side not in {"long", "short"}:
+        failures.append("not_directional")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if rr < min_rr:
+        failures.append(f"rr_{rr:.2f}_lt_{min_rr:.2f}")
+    if not indicators.get("breakout_pass"):
+        failures.append("breakout_fail")
+    if not indicators.get("pullback_pass"):
+        failures.append("pullback_fail")
+    if not indicators.get("trigger_pass"):
+        failures.append("trigger_fail")
+    if setup and setup != "ema50_breakout_pullback":
+        failures.append(f"setup_{setup}")
+
+    return {
+        "isSpecialist": True,
+        "allowed": not failures,
+        "bypassConsensus": bool(gates.get("bypass_consensus", True)) and not failures,
+        "reason": ",".join(failures) if failures else "specialist_gate_pass",
+        "sizeMultiplier": max(0.0, min(1.0, size_mult)),
+    }
+
+
+def orb_5m_scalp_specialist_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated gate for ORB 5m scalp entries (long or short)."""
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    if strategy != "orb_5m_scalp":
+        return {
+            "isSpecialist": False,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "not_orb_5m_scalp",
+            "sizeMultiplier": None,
+        }
+
+    gates = (((hl_cfg or {}).get("specialist_strategy_gates") or {}).get(strategy) or {})
+    enabled = gates.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {
+            "isSpecialist": True,
+            "allowed": False,
+            "bypassConsensus": False,
+            "reason": "specialist_gate_disabled",
+            "sizeMultiplier": None,
+        }
+
+    min_conf = _safe_float(gates.get("min_confidence", 0.70), 0.70)
+    min_strength = _safe_float(gates.get("min_strength", 0.65), 0.65)
+    min_rr = _safe_float(gates.get("min_reward_risk", 2.0), 2.0)
+    size_mult = _safe_float(gates.get("size_multiplier", 0.45), 0.45)
+
+    conf = _safe_float((signal or {}).get("confidence"), 0.0)
+    strength = _safe_float((signal or {}).get("strength"), 0.0)
+    details = (signal or {}).get("details") or {}
+    state = details.get("state") or {}
+    indicators = details.get("indicators") or state.get("indicators") or {}
+    rr = _safe_float(indicators.get("reward_risk"), 0.0)
+    setup = str(indicators.get("setup") or "").strip().lower()
+    session_state = str(indicators.get("session_state") or "").strip().lower()
+
+    failures = []
+    if side not in {"long", "short"}:
+        failures.append("not_directional")
+    if conf < min_conf:
+        failures.append(f"confidence_{conf:.2f}_lt_{min_conf:.2f}")
+    if strength < min_strength:
+        failures.append(f"strength_{strength:.2f}_lt_{min_strength:.2f}")
+    if rr < min_rr:
+        failures.append(f"rr_{rr:.2f}_lt_{min_rr:.2f}")
+    if not indicators.get("breakout_valid"):
+        failures.append("breakout_fail")
+    if not indicators.get("retest_valid"):
+        failures.append("retest_fail")
+    if session_state != "signal":
+        failures.append(f"session_state_{session_state or 'unknown'}")
+    if setup and setup != "orb_5m_scalp":
+        failures.append(f"setup_{setup}")
+
+    return {
+        "isSpecialist": True,
+        "allowed": not failures,
+        "bypassConsensus": bool(gates.get("bypass_consensus", True)) and not failures,
+        "reason": ",".join(failures) if failures else "specialist_gate_pass",
+        "sizeMultiplier": max(0.0, min(1.0, size_mult)),
+    }
+
+
+def specialist_entry_gate(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return the first matching specialist gate for the selected signal."""
+    for gate_fn in (
+        sma_reclaim_bull_flag_specialist_gate,
+        supply_demand_3step_specialist_gate,
+        dual_sma_daytrade_specialist_gate,
+        arc_daytrade_specialist_gate,
+        ema50_breakout_pullback_specialist_gate,
+        orb_5m_scalp_specialist_gate,
+    ):
+        result = gate_fn(signal, hl_cfg)
+        if result.get("isSpecialist"):
+            return result
+    return {
+        "isSpecialist": False,
+        "allowed": False,
+        "bypassConsensus": False,
+        "reason": "not_specialist_strategy",
+        "sizeMultiplier": None,
+    }
+
+
 def paper_perp_position_size_multiplier(
     signal: Dict[str, Any],
     hl_cfg: Optional[Dict[str, Any]] = None,
@@ -582,6 +1405,609 @@ def paper_perp_position_size_multiplier(
     )
     selected = strong_mult if strong else normal_mult if normal else weak_mult
     return max(0.0, min(1.0, selected))
+
+
+def _metadata_dict(trade: Mapping[str, Any]) -> Dict[str, Any]:
+    metadata = trade.get("metadata") or {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _trade_exit_time(trade: Mapping[str, Any]) -> Optional[datetime]:
+    return _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+
+
+def _exit_bucket_from_reason(reason: Any) -> str:
+    raw = str(reason or "").strip()
+    lowered = raw.lower()
+    if "trailing_stop" in lowered:
+        return "trailing_stop"
+    if "overall_take_profit" in lowered:
+        return "overall_take_profit"
+    if "profit_protection" in lowered:
+        return "profit_protection"
+    if "max_holding_time_flat" in lowered:
+        return "max_hold_flat"
+    if "max_holding_time" in lowered:
+        return "max_hold_hard"
+    if "stagnant_loser_fast_fail" in lowered:
+        return "paper_stagnant_loser_fast_fail"
+    if "stagnant_loser_divergence" in lowered:
+        return "paper_stagnant_loser_divergence"
+    if "stop_loss" in lowered:
+        return "paper_stop_loss"
+    return raw or "unknown"
+
+
+def _profit_factor(gross_profit: float, gross_loss: float) -> Optional[float]:
+    if gross_loss > 0:
+        return gross_profit / gross_loss
+    if gross_profit > 0:
+        return float("inf")
+    return None
+
+
+def _group_closed_paper_trades(
+    closed_trades: Iterable[Mapping[str, Any]],
+    *,
+    now: Optional[datetime],
+    lookback_hours: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    now_dt = now or datetime.utcnow()
+    if now_dt.tzinfo:
+        now_dt = now_dt.replace(tzinfo=None)
+    cutoff = now_dt - timedelta(hours=max(1.0, float(lookback_hours or 168.0)))
+    rows: List[Dict[str, Any]] = []
+    strategy_side: Dict[str, Dict[str, Any]] = {}
+    regime_side: Dict[str, Dict[str, Any]] = {}
+    exit_bucket: Dict[str, Dict[str, Any]] = {}
+
+    def _empty(key: str) -> Dict[str, Any]:
+        return {
+            "key": key,
+            "closed": 0,
+            "realized": 0.0,
+            "fees": 0.0,
+            "funding": 0.0,
+            "gross_before_fees": 0.0,
+            "notional": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+        }
+
+    def _add(group: Dict[str, Dict[str, Any]], key: str, row: Dict[str, Any]) -> None:
+        bucket = group.setdefault(key, _empty(key))
+        bucket["closed"] += 1
+        bucket["realized"] += row["realized"]
+        bucket["fees"] += row["fees"]
+        bucket["funding"] += row["funding"]
+        bucket["gross_before_fees"] += row["gross_before_fees"]
+        bucket["notional"] += row["notional"]
+        if row["realized"] > 0:
+            bucket["wins"] += 1
+            bucket["gross_profit"] += row["realized"]
+        elif row["realized"] < 0:
+            bucket["losses"] += 1
+            bucket["gross_loss"] += abs(row["realized"])
+
+    for trade in closed_trades or []:
+        if str(trade.get("status") or "CLOSED").upper() != "CLOSED":
+            continue
+        metadata = _metadata_dict(trade)
+        if str(metadata.get("accounting_excluded") or "false").lower() == "true":
+            continue
+        exit_time = _trade_exit_time(trade)
+        if exit_time is None or exit_time < cutoff:
+            continue
+        strategy = str(trade.get("source_strategy") or trade.get("strategy") or "unknown").strip().lower()
+        side = str(trade.get("position_side") or trade.get("source_signal") or "").strip().lower()
+        if side not in {"long", "short"}:
+            side = normalize_perp_entry_signal(side) or "unknown"
+        regime = str(metadata.get("market_regime") or "unknown").strip().lower()
+        try:
+            realized = float(trade.get("realized_pnl") or 0.0)
+            fees = float(trade.get("fees") or 0.0)
+            funding = float(trade.get("funding") or 0.0)
+            notional = float(trade.get("notional_size") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        row = {
+            "strategy": strategy,
+            "side": side,
+            "regime": regime,
+            "realized": realized,
+            "fees": fees,
+            "funding": funding,
+            "gross_before_fees": realized + fees + funding,
+            "notional": notional,
+            "exit_bucket": _exit_bucket_from_reason(trade.get("exit_reason")),
+        }
+        rows.append(row)
+        _add(strategy_side, f"{strategy}:{side}", row)
+        _add(regime_side, f"{regime}:{side}", row)
+        _add(exit_bucket, row["exit_bucket"], row)
+
+    for group in (strategy_side, regime_side, exit_bucket):
+        for bucket in group.values():
+            bucket["profit_factor"] = _profit_factor(
+                float(bucket["gross_profit"]),
+                float(bucket["gross_loss"]),
+            )
+            bucket["win_rate"] = (
+                float(bucket["wins"]) / float(bucket["closed"])
+                if bucket["closed"]
+                else None
+            )
+            gross = float(bucket["gross_before_fees"])
+            bucket["fee_drag"] = float(bucket["fees"]) / abs(gross) if gross else None
+            bucket["net_edge"] = (
+                float(bucket["realized"]) / float(bucket["notional"])
+                if float(bucket["notional"]) > 0
+                else None
+            )
+            bucket["gross_edge"] = (
+                gross / float(bucket["notional"])
+                if float(bucket["notional"]) > 0
+                else None
+            )
+
+    return rows, strategy_side, regime_side, exit_bucket
+
+
+def build_hyperliquid_adaptive_pnl_control(
+    closed_trades: Iterable[Mapping[str, Any]],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Build a runtime control overlay from recent paper-perp results.
+
+    This is intentionally bounded and reversible: it does not rewrite config.yaml.
+    It returns gate, sizing, and exit-profile adjustments that the orchestrator can
+    apply for the current cycle.
+    """
+    cfg = (hl_cfg or {}).get("adaptive_pnl_control") or {}
+    enabled = cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {"enabled": False, "decisions": [], "entrySizing": {}, "blockedRegimeSides": {}, "exitProfiles": {}}
+
+    hl_cfg = hl_cfg or {}
+    lookback_hours = _safe_float(cfg.get("lookback_hours", 168.0), 168.0)
+    min_reduce_trades = int(_safe_float(cfg.get("min_reduce_trades", 10), 10))
+    min_block_trades = int(_safe_float(cfg.get("min_block_trades", 15), 15))
+    min_scale_trades = int(_safe_float(cfg.get("min_scale_trades", 30), 30))
+    recent_window_hours = _safe_float(cfg.get("recent_window_hours", 6.0), 6.0)
+    min_recent_reduce_trades = int(_safe_float(cfg.get("min_recent_reduce_trades", 3), 3))
+    min_recent_block_trades = int(_safe_float(cfg.get("min_recent_block_trades", 3), 3))
+    recent_release_hold_hours = _safe_float(cfg.get("recent_release_hold_hours", 12.0), 12.0)
+    probation_multiplier = max(0.05, min(1.0, _safe_float(cfg.get("probation_size_multiplier", 0.35), 0.35)))
+    recent_probation_multiplier = max(
+        0.05,
+        min(1.0, _safe_float(cfg.get("recent_probation_size_multiplier", probation_multiplier), probation_multiplier)),
+    )
+    scale_up_multiplier = max(1.0, min(1.5, _safe_float(cfg.get("scale_up_multiplier", 1.25), 1.25)))
+    max_fee_drag_for_scale = _safe_float(cfg.get("max_fee_drag_for_scale", 0.60), 0.60)
+    min_pf_for_scale = _safe_float(cfg.get("min_profit_factor_for_scale", 1.25), 1.25)
+    min_net_edge_for_scale = _safe_float(cfg.get("min_net_edge_for_scale", 0.0015), 0.0015)
+    min_gross_edge_for_scale = _safe_float(cfg.get("min_gross_edge_for_scale", 0.0040), 0.0040)
+
+    rows, strategy_side, regime_side, exit_buckets = _group_closed_paper_trades(
+        closed_trades,
+        now=now,
+        lookback_hours=lookback_hours,
+    )
+    recent_strategy_side: Dict[str, Dict[str, Any]] = {}
+    recent_regime_side: Dict[str, Dict[str, Any]] = {}
+    if recent_window_hours > 0:
+        _, recent_strategy_side, recent_regime_side, _ = _group_closed_paper_trades(
+            closed_trades,
+            now=now,
+            lookback_hours=recent_window_hours,
+        )
+    decisions: List[Dict[str, Any]] = []
+    entry_sizing: Dict[str, float] = {}
+    blocked_regime_sides: Dict[str, List[str]] = {}
+    exit_profiles: Dict[str, Dict[str, Any]] = {}
+
+    def _finite_pf(value: Any) -> float:
+        if value == float("inf"):
+            return 999.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _round_or_none(value: Any, digits: int = 4) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return round(float(value), digits)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _perf_evidence(
+        perf: Mapping[str, Any],
+        *,
+        evidence_lookback_hours: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        pf_raw = perf.get("profit_factor")
+        pf = _finite_pf(pf_raw)
+        return {
+            "lookbackHours": evidence_lookback_hours if evidence_lookback_hours is not None else lookback_hours,
+            "closed": int(perf.get("closed") or 0),
+            "realized": _round_or_none(perf.get("realized")),
+            "grossBeforeFees": _round_or_none(perf.get("gross_before_fees")),
+            "fees": _round_or_none(perf.get("fees")),
+            "feeDragPct": (
+                _round_or_none(float(perf["fee_drag"]) * 100.0, 2)
+                if perf.get("fee_drag") is not None
+                else None
+            ),
+            "profitFactor": None if pf_raw is None else _round_or_none(pf),
+            "winRatePct": (
+                _round_or_none(float(perf["win_rate"]) * 100.0, 2)
+                if perf.get("win_rate") is not None
+                else None
+            ),
+            "netEdgePct": (
+                _round_or_none(float(perf["net_edge"]) * 100.0, 4)
+                if perf.get("net_edge") is not None
+                else None
+            ),
+            "grossEdgePct": (
+                _round_or_none(float(perf["gross_edge"]) * 100.0, 4)
+                if perf.get("gross_edge") is not None
+                else None
+            ),
+        }
+
+    def _entry_decision(
+        *,
+        action: str,
+        decision_type: str,
+        target_type: str,
+        target: str,
+        side: str,
+        multiplier: float,
+        perf: Mapping[str, Any],
+        situation: str,
+        intended_effect: str,
+    ) -> Dict[str, Any]:
+        return {
+            "decisionKey": f"{decision_type}:{target}:{side}",
+            "type": decision_type,
+            "action": action,
+            "targetType": target_type,
+            "target": target,
+            "side": side,
+            "key": f"{target}:{side}",
+            "situation": situation,
+            "configPath": f"runtime.hyperliquid_perps.adaptive_pnl_control.entrySizing.{target}:{side}",
+            "oldValue": 1.0,
+            "newValue": round(float(multiplier), 4),
+            "intendedEffect": intended_effect,
+            "evidence": _perf_evidence(perf),
+        }
+
+    def _block_regime_decision(
+        *,
+        regime: str,
+        side: str,
+        perf: Mapping[str, Any],
+        decision_type: str = "block_regime_side",
+        evidence_lookback_hours: Optional[float] = None,
+        situation: Optional[str] = None,
+        intended_effect: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "decisionKey": f"{decision_type}:{regime}:{side}",
+            "type": decision_type,
+            "action": "block",
+            "targetType": "regime_side",
+            "target": regime,
+            "side": side,
+            "key": f"{regime}:{side}",
+            "situation": situation or (
+                f"{regime} {side} entries show negative gross/net rolling PnL "
+                "after fees."
+            ),
+            "configPath": f"runtime.hyperliquid_perps.blocked_regime_sides.{regime}",
+            "oldValue": sorted(list((hl_cfg.get("blocked_regime_sides") or {}).get(regime) or [])),
+            "newValue": sorted(set(list((hl_cfg.get("blocked_regime_sides") or {}).get(regime) or []) + [side])),
+            "intendedEffect": intended_effect or "Stop opening this weak regime/side until the rolling evidence improves.",
+            "evidence": _perf_evidence(perf, evidence_lookback_hours=evidence_lookback_hours),
+        }
+
+    for key, perf in sorted(strategy_side.items()):
+        strategy, side = key.rsplit(":", 1)
+        closed = int(perf["closed"])
+        realized = float(perf["realized"])
+        gross = float(perf["gross_before_fees"])
+        pf = _finite_pf(perf.get("profit_factor"))
+        fee_drag = perf.get("fee_drag")
+        net_edge = perf.get("net_edge")
+        gross_edge = perf.get("gross_edge")
+        if closed >= min_scale_trades and realized > 0 and pf >= min_pf_for_scale:
+            if (
+                fee_drag is not None
+                and fee_drag <= max_fee_drag_for_scale
+                and net_edge is not None
+                and net_edge >= min_net_edge_for_scale
+                and gross_edge is not None
+                and gross_edge >= min_gross_edge_for_scale
+            ):
+                entry_sizing[key] = scale_up_multiplier
+                decisions.append(_entry_decision(
+                    action="scale_up",
+                    decision_type="scale_up_strategy_side",
+                    target_type="strategy_side",
+                    target=strategy,
+                    side=side,
+                    multiplier=scale_up_multiplier,
+                    perf=perf,
+                    situation=(
+                        f"{strategy} {side} has positive net PnL, profit factor "
+                        f">= {min_pf_for_scale:.2f}, sufficient edge, and acceptable fee drag."
+                    ),
+                    intended_effect="Increase allocation to a fee-adjusted winner while the rolling edge holds.",
+                ))
+                continue
+        if closed >= min_reduce_trades and (realized < 0 or gross < 0 or pf < 1.0):
+            entry_sizing[key] = min(entry_sizing.get(key, 1.0), probation_multiplier)
+            decisions.append(_entry_decision(
+                action="reduce",
+                decision_type="reduce_strategy_side",
+                target_type="strategy_side",
+                target=strategy,
+                side=side,
+                multiplier=probation_multiplier,
+                perf=perf,
+                situation=(
+                    f"{strategy} {side} is underperforming in the rolling window "
+                    "through negative net/gross PnL or profit factor below 1.00."
+                ),
+                intended_effect="Reduce fee exposure and loss velocity while keeping the strategy available for recovery evidence.",
+            ))
+
+    for key, perf in sorted(recent_strategy_side.items()):
+        strategy, side = key.rsplit(":", 1)
+        closed = int(perf["closed"])
+        realized = float(perf["realized"])
+        gross = float(perf["gross_before_fees"])
+        pf = _finite_pf(perf.get("profit_factor"))
+        if closed >= min_recent_reduce_trades and (realized < 0 or gross < 0 or pf < 1.0):
+            entry_sizing[key] = min(entry_sizing.get(key, 1.0), recent_probation_multiplier)
+            decisions.append({
+                **_entry_decision(
+                    action="reduce",
+                    decision_type="reduce_recent_strategy_side",
+                    target_type="strategy_side",
+                    target=strategy,
+                    side=side,
+                    multiplier=recent_probation_multiplier,
+                    perf=perf,
+                    situation=(
+                        f"{strategy} {side} is deteriorating in the last "
+                        f"{recent_window_hours:g}h through negative net/gross PnL or profit factor below 1.00."
+                    ),
+                    intended_effect=(
+                        "React faster to current loss clusters without disabling the strategy; "
+                        "size returns automatically when the recent window improves."
+                    ),
+                ),
+                "evidence": _perf_evidence(perf, evidence_lookback_hours=recent_window_hours),
+            })
+
+    for key, perf in sorted(recent_regime_side.items()):
+        regime, side = key.rsplit(":", 1)
+        closed = int(perf["closed"])
+        realized = float(perf["realized"])
+        gross = float(perf["gross_before_fees"])
+        pf = _finite_pf(perf.get("profit_factor"))
+        if closed >= min_recent_block_trades and (gross < 0 or (realized < 0 and pf < 0.85)):
+            sides = blocked_regime_sides.setdefault(regime, [])
+            if side not in sides:
+                sides.append(side)
+            decisions.append(_block_regime_decision(
+                regime=regime,
+                side=side,
+                perf=perf,
+                decision_type="block_recent_regime_side",
+                evidence_lookback_hours=recent_window_hours,
+                situation=(
+                    f"{regime} {side} entries are deteriorating in the last "
+                    f"{recent_window_hours:g}h through negative gross/net PnL."
+                ),
+                intended_effect=(
+                    "Stop the current loss cluster completely; unblock automatically "
+                    "after the recent evidence clears and the hold window expires."
+                ),
+            ))
+
+    for key, perf in sorted(regime_side.items()):
+        regime, side = key.rsplit(":", 1)
+        closed = int(perf["closed"])
+        realized = float(perf["realized"])
+        gross = float(perf["gross_before_fees"])
+        pf = _finite_pf(perf.get("profit_factor"))
+        fee_drag = perf.get("fee_drag")
+        net_edge = perf.get("net_edge")
+        gross_edge = perf.get("gross_edge")
+        if closed >= min_scale_trades and realized > 0 and pf >= min_pf_for_scale:
+            if (
+                fee_drag is not None
+                and fee_drag <= max_fee_drag_for_scale
+                and net_edge is not None
+                and net_edge >= min_net_edge_for_scale
+                and gross_edge is not None
+                and gross_edge >= min_gross_edge_for_scale
+            ):
+                entry_sizing[key] = max(entry_sizing.get(key, 1.0), scale_up_multiplier)
+                decisions.append(_entry_decision(
+                    action="scale_up",
+                    decision_type="scale_up_regime_side",
+                    target_type="regime_side",
+                    target=regime,
+                    side=side,
+                    multiplier=scale_up_multiplier,
+                    perf=perf,
+                    situation=(
+                        f"{regime} {side} entries have positive fee-adjusted edge "
+                        f"and profit factor >= {min_pf_for_scale:.2f}."
+                    ),
+                    intended_effect="Increase allocation in the regime/side that is currently carrying positive edge.",
+                ))
+                continue
+        if closed >= min_block_trades and (gross < 0 or (realized < 0 and pf < 0.75)):
+            sides = blocked_regime_sides.setdefault(regime, [])
+            if side not in sides:
+                sides.append(side)
+            decisions.append(_block_regime_decision(regime=regime, side=side, perf=perf))
+
+    stop_loss_loss = abs(float((exit_buckets.get("paper_stop_loss") or {}).get("realized") or 0.0))
+    fast_fail_loss = abs(float((exit_buckets.get("paper_stagnant_loser_fast_fail") or {}).get("realized") or 0.0))
+    max_hold_loss = abs(min(0.0, float((exit_buckets.get("max_hold_flat") or {}).get("realized") or 0.0)))
+    trailing_gain = max(0.0, float((exit_buckets.get("trailing_stop") or {}).get("realized") or 0.0))
+    loss_drag = stop_loss_loss + fast_fail_loss + max_hold_loss
+    if len(rows) >= min_reduce_trades and loss_drag > 0 and loss_drag >= max(10.0, trailing_gain * 0.75):
+        exit_profiles["rsi_stoch_reversal_5m"] = {
+            "strategies": ["rsi_stoch_reversal_5m"],
+            "max_holding_minutes": 180,
+            "max_holding_minutes_hard": 240,
+            "stop_loss_pct": 0.9,
+            "stagnant_loser": {
+                "min_age_minutes": 15,
+                "peak_cap_pct": 0.45,
+                "loss_trigger_pct": -0.55,
+                "fast_fail_peak_pct": 0.12,
+                "fast_fail_min_age_minutes": 5,
+                "fast_fail_loss_pct": -0.30,
+            },
+            "trailing_stop": {
+                "step_percentage": 0.0015,
+                "tightened_step_percentage": 0.0010,
+                "tighten_profit_threshold": 0.0045,
+            },
+        }
+        decisions.append({
+            "decisionKey": "tighten_loss_and_trailing_exits:rsi_stoch_reversal_5m",
+            "type": "tighten_loss_and_trailing_exits",
+            "action": "tighten_exits",
+            "targetType": "strategy",
+            "strategy": "rsi_stoch_reversal_5m",
+            "target": "rsi_stoch_reversal_5m",
+            "situation": (
+                "Stop-loss and fast-fail loss drag is dominating trailing-stop gains "
+                "in the rolling paper-perp exit mix."
+            ),
+            "configPath": "runtime.hyperliquid_perps.exit_profiles.rsi_stoch_reversal_5m",
+            "oldValue": {
+                "stop_loss_pct": hl_cfg.get("stop_loss_pct"),
+                "stagnant_loser": deepcopy(hl_cfg.get("stagnant_loser") or {}),
+                "trailing_stop": deepcopy(hl_cfg.get("trailing_stop") or {}),
+            },
+            "newValue": deepcopy(exit_profiles["rsi_stoch_reversal_5m"]),
+            "intendedEffect": "Cut stagnant losers earlier and tighten trailing giveback after profit is available.",
+            "evidence": {
+                "lookbackHours": lookback_hours,
+                "sampleClosed": len(rows),
+                "stopLossLoss": round(stop_loss_loss, 4),
+                "fastFailLoss": round(fast_fail_loss, 4),
+                "maxHoldLoss": round(max_hold_loss, 4),
+                "trailingGain": round(trailing_gain, 4),
+            },
+        })
+
+    return {
+        "enabled": True,
+        "lookbackHours": lookback_hours,
+        "sampleClosed": len(rows),
+        "decisions": decisions,
+        "entrySizing": entry_sizing,
+        "blockedRegimeSides": blocked_regime_sides,
+        "exitProfiles": exit_profiles,
+        "recentReleaseHoldHours": recent_release_hold_hours,
+    }
+
+
+def apply_hyperliquid_adaptive_pnl_control(
+    hl_cfg: Optional[Dict[str, Any]],
+    control: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return a Hyperliquid config copy with adaptive runtime controls merged in."""
+    merged = deepcopy(hl_cfg or {})
+    if not control or not control.get("enabled"):
+        return merged
+
+    blocked = control.get("blockedRegimeSides") or {}
+    if blocked:
+        current = deepcopy(merged.get("blocked_regime_sides") or {})
+        for regime, sides in blocked.items():
+            existing = {
+                str(value or "").strip().lower()
+                for value in (current.get(regime) or [])
+            }
+            for side in sides or []:
+                normalized_side = str(side or "").strip().lower()
+                if normalized_side:
+                    existing.add(normalized_side)
+            current[regime] = sorted(existing)
+        merged["blocked_regime_sides"] = current
+
+    exit_profiles = control.get("exitProfiles") or {}
+    if exit_profiles:
+        current_profiles = deepcopy(merged.get("exit_profiles") or {})
+        for profile_name, profile in exit_profiles.items():
+            base = deepcopy(current_profiles.get(profile_name) or {})
+            for key, value in (profile or {}).items():
+                if isinstance(value, dict) and isinstance(base.get(key), dict):
+                    base[key] = {**base[key], **value}
+                else:
+                    base[key] = deepcopy(value)
+            current_profiles[profile_name] = base
+        merged["exit_profiles"] = current_profiles
+
+    merged["_adaptive_pnl_control"] = {
+        "entrySizing": deepcopy(control.get("entrySizing") or {}),
+        "decisions": deepcopy(control.get("decisions") or []),
+        "sampleClosed": control.get("sampleClosed", 0),
+        "lookbackHours": control.get("lookbackHours"),
+    }
+    return merged
+
+
+def hyperliquid_adaptive_entry_sizing_multiplier(
+    signal: Mapping[str, Any],
+    regime: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Return runtime adaptive size multiplier for a selected strategy/side/regime."""
+    controls = ((hl_cfg or {}).get("_adaptive_pnl_control") or {}).get("entrySizing") or {}
+    if not controls:
+        return 1.0
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = normalize_perp_entry_signal((signal or {}).get("signal"))
+    regime_key = str(regime or "").strip().lower()
+    multipliers = []
+    if strategy and side:
+        multipliers.append(controls.get(f"{strategy}:{side}"))
+    if regime_key and side:
+        multipliers.append(controls.get(f"{regime_key}:{side}"))
+    parsed = []
+    for value in multipliers:
+        if value is None:
+            continue
+        try:
+            parsed.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return 1.0
+    if any(value < 1.0 for value in parsed):
+        return max(0.0, min(1.0, min(parsed)))
+    return max(1.0, min(1.5, max(parsed)))
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -694,7 +2120,7 @@ def hyperliquid_coin_entry_block(
     closed_trades: Iterable[Dict[str, Any]],
     *,
     now: Optional[datetime] = None,
-    realized_block_hours: float = 12.0,
+    realized_block_hours: float = 4.0,
 ) -> Dict[str, Any]:
     """Return dashboard/entry block metadata for the coin, or entryBlocked=False."""
     normalized = pair_to_hyperliquid_coin(coin)
@@ -745,7 +2171,7 @@ def hyperliquid_coin_entry_block(
         if until_dt > now_dt:
             return {
                 "entryBlocked": True,
-                "entryBlockReason": "recent_negative_realized_12h",
+                "entryBlockReason": "recent_negative_realized",
                 "entryBlockUntil": until_dt.isoformat() + "+00:00",
                 "entryBlockMessage": (
                     f"realized loss ${latest_loss_pnl:.2f}; cooldown until {until_dt.isoformat()} UTC"
@@ -760,13 +2186,116 @@ def hyperliquid_coin_entry_block(
     }
 
 
+def hyperliquid_coin_side_entry_block(
+    coin: str,
+    side: str,
+    open_trades: Iterable[Dict[str, Any]],
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    realized_block_hours: float = 4.0,
+) -> Dict[str, Any]:
+    """Return entry block metadata for a single Hyperliquid coin+side."""
+    normalized_coin = pair_to_hyperliquid_coin(coin)
+    normalized_side = str(side or "").strip().lower()
+    if not normalized_coin or normalized_side not in {"long", "short"}:
+        return {
+            "entryBlocked": False,
+            "entryBlockReason": None,
+            "entryBlockUntil": None,
+            "entryBlockMessage": "",
+            "entryBlockSide": normalized_side or None,
+        }
+
+    now_dt = now or datetime.utcnow()
+    block_hours = max(0.0, float(realized_block_hours or 0.0))
+
+    for trade in open_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        if trade_coin != normalized_coin:
+            continue
+        trade_side = str(
+            trade.get("position_side")
+            or position_sides_from_signal(trade.get("source_signal") or "")
+            or ""
+        ).strip().lower()
+        if trade_side != normalized_side:
+            continue
+        try:
+            upnl = float(trade.get("unrealized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            upnl = 0.0
+        if upnl < 0:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "open_unrealized_negative",
+                "entryBlockUntil": None,
+                "entryBlockMessage": (
+                    f"open {normalized_side} paper position is underwater (${upnl:.2f})"
+                ),
+                "entryBlockSide": normalized_side,
+            }
+
+    latest_loss_time: Optional[datetime] = None
+    latest_loss_pnl = 0.0
+    for trade in closed_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        if trade_coin != normalized_coin:
+            continue
+        trade_side = str(
+            trade.get("position_side")
+            or position_sides_from_signal(trade.get("source_signal") or "")
+            or ""
+        ).strip().lower()
+        if trade_side != normalized_side:
+            continue
+        try:
+            rpnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if rpnl >= 0:
+            continue
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_time is None:
+            continue
+        if latest_loss_time is None or exit_time > latest_loss_time:
+            latest_loss_time = exit_time
+            latest_loss_pnl = rpnl
+
+    if latest_loss_time and block_hours > 0:
+        until_dt = latest_loss_time + timedelta(hours=block_hours)
+        if until_dt > now_dt:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "recent_negative_realized",
+                "entryBlockUntil": until_dt.isoformat() + "+00:00",
+                "entryBlockMessage": (
+                    f"{normalized_side} realized loss ${latest_loss_pnl:.2f}; "
+                    f"cooldown until {until_dt.isoformat()} UTC"
+                ),
+                "entryBlockSide": normalized_side,
+            }
+
+    return {
+        "entryBlocked": False,
+        "entryBlockReason": None,
+        "entryBlockUntil": None,
+        "entryBlockMessage": "",
+        "entryBlockSide": normalized_side,
+    }
+
+
 def hyperliquid_strategy_side_entry_block(
     strategy: str,
     side: str,
     closed_trades: Iterable[Dict[str, Any]],
     *,
     now: Optional[datetime] = None,
-    realized_block_hours: float = 12.0,
+    realized_block_hours: float = 4.0,
 ) -> Dict[str, Any]:
     """Block a strategy direction after its latest realized paper loss."""
     normalized_strategy = str(strategy or "").strip().lower()
@@ -829,6 +2358,72 @@ def hyperliquid_strategy_side_entry_block(
         "entryBlockReason": None,
         "entryBlockUntil": None,
         "entryBlockMessage": "",
+    }
+
+
+def hyperliquid_strategy_coin_loss_streak_entry_block(
+    coin: str,
+    strategy: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    consecutive_losses: int = 2,
+    cooldown_hours: float = 12.0,
+) -> Dict[str, Any]:
+    """Block a strategy on a coin after its latest consecutive loss streak."""
+    normalized_coin = pair_to_hyperliquid_coin(coin)
+    normalized_strategy = str(strategy or "").strip().lower()
+    threshold = max(1, int(consecutive_losses or 1))
+    hours = max(0.0, float(cooldown_hours or 0.0))
+    if not normalized_coin or not normalized_strategy or hours <= 0:
+        return {"entryBlocked": False, "entryBlockReason": None, "entryBlockMessage": ""}
+
+    matching = []
+    for trade in closed_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        trade_strategy = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if trade_coin != normalized_coin or trade_strategy != normalized_strategy or exit_time is None:
+            continue
+        try:
+            pnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        matching.append((exit_time, pnl))
+    matching.sort(key=lambda item: item[0], reverse=True)
+
+    streak = 0
+    latest_exit = None
+    for exit_time, pnl in matching:
+        if pnl >= 0:
+            break
+        streak += 1
+        if latest_exit is None:
+            latest_exit = exit_time
+    now_dt = now or datetime.utcnow()
+    if streak >= threshold and latest_exit is not None:
+        until_dt = latest_exit + timedelta(hours=hours)
+        if until_dt > now_dt:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "strategy_coin_consecutive_losses",
+                "entryBlockUntil": until_dt.isoformat() + "+00:00",
+                "entryBlockMessage": (
+                    f"{normalized_strategy} has {streak} consecutive losses on "
+                    f"{normalized_coin}; cooldown until {until_dt.isoformat()} UTC"
+                ),
+                "consecutiveLosses": streak,
+            }
+    return {
+        "entryBlocked": False,
+        "entryBlockReason": None,
+        "entryBlockUntil": None,
+        "entryBlockMessage": "",
+        "consecutiveLosses": streak,
     }
 
 
@@ -1013,14 +2608,37 @@ def perp_entry_atr_metadata(
     return {}
 
 
+def _setup_stop_pct_from_trade(trade: Dict[str, Any]) -> Optional[float]:
+    setup = setup_risk_from_trade_metadata(trade)
+    entry_price = _safe_float(trade.get("entry_price"), 0.0)
+    val = resolve_setup_stop_pct(setup, entry_price)
+    if val <= 0:
+        return None
+    return val
+
+
 def _effective_stop_pct(
     trade: Dict[str, Any],
     cfg: PaperPerpExitConfig,
 ) -> float:
     """Resolve the effective stop loss percentage for this trade.
 
-    Priority: per-coin override > ATR-derived > fixed cfg.stop_loss_pct.
+    Priority: setup metadata stop > per-coin override > ATR-derived > fixed cfg.stop_loss_pct.
     """
+    strategy_key = str(trade.get("source_strategy") or trade.get("strategy") or "").strip().lower()
+    setup_stop = _setup_stop_pct_from_trade(trade)
+    if setup_stop is not None and (
+        cfg.use_setup_stops
+        or strategy_key in {
+            "sma_reclaim_bull_flag",
+            "supply_demand_3step",
+            "dual_sma_daytrade",
+            "arc_daytrade",
+            "ema50_breakout_pullback",
+        }
+    ):
+        return setup_stop
+
     coin = str(trade.get("coin") or "").strip().upper()
     if coin and coin in cfg.per_coin_stop_overrides:
         return float(cfg.per_coin_stop_overrides[coin])
@@ -1227,6 +2845,19 @@ def evaluate_paper_perp_exit(
     ):
         return PaperPerpExitResult("paper_stop_loss", metadata)
 
+    setup = setup_risk_from_trade_metadata(trade)
+    if cfg.breakeven_on_swing_high and side == "long":
+        swing_high = _safe_float(setup.get("breakeven_trigger_swing_high"), 0.0)
+        if (
+            swing_high > entry_price
+            and current_price >= swing_high
+            and not metadata.get("setup_breakeven_armed")
+        ):
+            trigger_px = entry_price * (1.0 + cfg.breakeven_floor_decimal)
+            metadata["trail_stop_trigger"] = trigger_px
+            metadata["setup_breakeven_armed"] = True
+            metadata["profit_protection"] = metadata.get("profit_protection") or "setup_breakeven"
+
     holding_exit, _ = _max_holding_decision(trade, pct, cfg, metadata, now=now)
     if holding_exit:
         return PaperPerpExitResult(holding_exit, metadata)
@@ -1242,6 +2873,25 @@ def evaluate_paper_perp_exit(
     if stagnant_exit:
         return PaperPerpExitResult(stagnant_exit, metadata)
 
+    if cfg.use_setup_targets:
+        target_pct = resolve_setup_target_pct(setup, entry_price)
+        if (
+            cfg.partial_profit_pct > 0
+            and target_pct > 0
+            and not metadata.get("setup_partial_taken")
+            and pct >= target_pct * cfg.partial_profit_pct
+        ):
+            metadata["setup_partial_taken"] = True
+            return PaperPerpExitResult(
+                f"paper_setup_partial_profit@{pct:.2f}%",
+                metadata,
+            )
+        if target_pct > 0 and pct >= target_pct:
+            return PaperPerpExitResult(
+                f"paper_setup_target@{pct:.2f}%",
+                metadata,
+            )
+
     if cfg.overall_take_profit_pct > 0 and pct >= cfg.overall_take_profit_pct:
         return PaperPerpExitResult(
             f"paper_overall_take_profit_{cfg.overall_take_profit_pct:.2f}%@{pct:.2f}%",
@@ -1252,12 +2902,10 @@ def evaluate_paper_perp_exit(
     pp_status = metadata.get("profit_protection")
     trailing_activation_pct = cfg.trailing_activation_decimal * 100.0
     pp_activation_pct = cfg.profit_protection_activation_decimal * 100.0
-    profit_guarantee_pct = cfg.breakeven_floor_decimal * 100.0
 
     if (
         cfg.profit_protection_enabled
         and peak_pct >= pp_activation_pct
-        and peak_pct >= trailing_activation_pct
         and not pp_status
         and not trail_active
     ):
@@ -1276,24 +2924,17 @@ def evaluate_paper_perp_exit(
     ):
         pp_trigger = float(metadata.get("trail_stop_trigger") or 0.0)
         if pp_trigger > 0:
-            # Do not realize sub-floor gross (e.g. 0.22% when floor is 0.35%) — polling
-            # gaps can cross the trigger price without locking the intended minimum.
-            fee_round_trip_pct = cfg.fee_rate_per_side * 2.0 * 100.0
-            min_pp_exit_pct = max(
-                profit_guarantee_pct,
-                fee_round_trip_pct + (cfg.profit_protection_fee_buffer * 100.0),
-            )
-            if pct + 1e-9 < min_pp_exit_pct:
-                pass
-            elif side == "long" and current_price > entry_price and current_price <= pp_trigger:
+            if side == "long" and current_price <= pp_trigger:
                 return PaperPerpExitResult(
                     f"paper_profit_protection_breach@{pct:.2f}%",
                     metadata,
+                    pp_trigger,
                 )
-            elif side == "short" and current_price < entry_price and current_price >= pp_trigger:
+            elif side == "short" and current_price >= pp_trigger:
                 return PaperPerpExitResult(
                     f"paper_profit_protection_breach@{pct:.2f}%",
                     metadata,
+                    pp_trigger,
                 )
 
     if cfg.trailing_enabled:
@@ -1311,11 +2952,13 @@ def evaluate_paper_perp_exit(
                     return PaperPerpExitResult(
                         f"paper_trailing_stop_trigger_${trigger_px:.4f}@{pct:.2f}%",
                         metadata,
+                        trigger_px,
                     )
                 if side == "short" and current_price >= trigger_px:
                     return PaperPerpExitResult(
                         f"paper_trailing_stop_trigger_${trigger_px:.4f}@{pct:.2f}%",
                         metadata,
+                        trigger_px,
                     )
         elif pct >= trailing_activation_pct and extreme > 0:
             if peak_pct >= min_peak_pct_for_trail:
@@ -1400,6 +3043,7 @@ def hyperliquid_regime_direction_gate(
     regime: str,
     confidence: float,
     strength: float,
+    hl_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Block entries that go against the dominant trend direction.
@@ -1411,6 +3055,18 @@ def hyperliquid_regime_direction_gate(
     """
     side = str(signal_side or "").lower()
     regime_key = str(regime or "").lower()
+    blocked_regime_sides = (hl_cfg or {}).get("blocked_regime_sides") or {}
+    configured_blocked_sides = {
+        str(value or "").strip().lower()
+        for value in (blocked_regime_sides.get(regime_key) or [])
+    }
+    if side in configured_blocked_sides:
+        return {
+            "blocked": True,
+            "reason": f"configured_regime_side_block_{regime_key}_{side}",
+            "sizeMultiplier": None,
+        }
+
     blocked_side = _COUNTER_TREND_BLOCKS.get(regime_key)
 
     if blocked_side is None or side != blocked_side:
@@ -1678,6 +3334,28 @@ def hyperliquid_min_edge_gate(
 
     expected = _expected_move_pct_from_signal(signal)
     if expected is None:
+        require_expected_move = edge_cfg.get("require_expected_move", False)
+        strategy_name = str(signal.get("strategy") or "").strip().lower()
+        allow_missing = {
+            str(value or "").strip().lower()
+            for value in (edge_cfg.get("allow_missing_expected_move_strategies") or [])
+        }
+        if strategy_name in allow_missing:
+            return {
+                "blocked": False,
+                "reason": "min_edge_missing_allowed_for_strategy",
+                "expectedMovePct": None,
+                "thresholdPct": threshold_pct,
+            }
+        if require_expected_move is True or str(require_expected_move).lower() in {
+            "1", "true", "yes", "on"
+        }:
+            return {
+                "blocked": True,
+                "reason": "min_edge_blocked_expected_move_missing",
+                "expectedMovePct": None,
+                "thresholdPct": threshold_pct,
+            }
         return {
             "blocked": False,
             "reason": "min_edge_no_data",
@@ -1917,6 +3595,7 @@ def hyperliquid_risk_based_notional(
     hl_cfg: Optional[Dict[str, Any]] = None,
     *,
     size_multiplier: float = 1.0,
+    strategy: str = "",
 ) -> Optional[float]:
     """
     Risk-% position sizing: notional = (equity × risk%) / (stop_distance / 100).
@@ -1929,8 +3608,14 @@ def hyperliquid_risk_based_notional(
     if account_equity <= 0 or stop_distance_pct <= 0:
         return None
     mult = max(0.0, min(1.0, float(size_multiplier or 1.0)))
-    risk_pct = _safe_float(risk_cfg.get("risk_per_trade_pct", 0.0075), 0.0075)
-    max_cap = _safe_float((hl_cfg or {}).get("max_notional_per_trade", 200.0), 200.0)
+    risk_pct = strategy_risk_per_trade_pct(strategy, hl_cfg) if strategy else _safe_float(
+        risk_cfg.get("risk_per_trade_pct", 0.0075),
+        0.0075,
+    )
+    max_cap = strategy_max_notional(strategy, hl_cfg) if strategy else _safe_float(
+        (hl_cfg or {}).get("max_notional_per_trade", 200.0),
+        200.0,
+    )
     risk_usd = account_equity * risk_pct * mult
     notional = risk_usd / (stop_distance_pct / 100.0)
     return min(notional, max_cap * mult)
@@ -2110,3 +3795,33 @@ def is_block_window(
         return False
     windows: List[Dict[str, Any]] = session_cfg.get("block_windows") or []
     return _hour_in_windows(utc_hour, windows)
+
+
+def is_block_window_strategy_exempt(
+    strategy: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return True when a strategy is explicitly exempt from hard session blocks."""
+    session_cfg = ((hl_cfg or {}).get("session_sizing") or {})
+    raw = session_cfg.get("block_window_exempt_strategies") or []
+    exempt = {
+        str(item).strip().lower()
+        for item in raw
+        if str(item).strip()
+    }
+    return str(strategy or "").strip().lower() in exempt
+
+
+def is_caution_window_strategy_exempt(
+    strategy: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return True when a strategy skips session caution sizing haircuts."""
+    session_cfg = ((hl_cfg or {}).get("session_sizing") or {})
+    raw = session_cfg.get("caution_window_exempt_strategies") or []
+    exempt = {
+        str(item).strip().lower()
+        for item in raw
+        if str(item).strip()
+    }
+    return str(strategy or "").strip().lower() in exempt

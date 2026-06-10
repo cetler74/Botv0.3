@@ -6,6 +6,7 @@ Strategy analysis and signal generation
 import asyncio
 import logging
 import time
+from collections import Counter as TallyCounter
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
@@ -23,7 +24,59 @@ from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTEN
 
 # Import market regime detector
 sys.path.append('/app')
+from core.hyperliquid_market import normalize_hyperliquid_coin
 from strategy.market_regime_detector import MarketRegimeDetector, MarketRegime
+
+RSI_STOCH_REVERSAL_STRATEGIES = frozenset(
+    {"rsi_stoch_reversal_5m", "rsi_stoch_reversal_1m"}
+)
+
+
+def _is_rsi_stoch_reversal_strategy(strategy_name: str) -> bool:
+    return str(strategy_name or "").strip().lower() in RSI_STOCH_REVERSAL_STRATEGIES
+
+
+def _rsi_stoch_default_entry_timeframe(strategy_name: str) -> str:
+    return "1m" if str(strategy_name or "").strip().lower().endswith("_1m") else "5m"
+
+
+def _strategy_entry_timeframe(strategy_name: str, strategy_data: Any = None) -> str:
+    default = _rsi_stoch_default_entry_timeframe(strategy_name)
+    cfg = strategy_data or {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict):
+        cfg = cfg.get("config") or {}
+    params = cfg.get("parameters") if isinstance(cfg, dict) else {}
+    if not isinstance(params, dict):
+        params = {}
+    return str(params.get("entry_timeframe") or default).lower()
+
+
+def _strategy_signal_timeframes(strategy_name: str, strategy_data: Any = None) -> List[str]:
+    cfg = strategy_data or {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict):
+        cfg = cfg.get("config") or {}
+    params = cfg.get("parameters") if isinstance(cfg, dict) else {}
+    if not isinstance(params, dict):
+        params = {}
+    ordered: List[str] = []
+
+    def add(tf: Any) -> None:
+        value = str(tf or "").strip().lower()
+        if value and value not in ordered:
+            ordered.append(value)
+
+    for tf in params.get("target_timeframes") or []:
+        add(tf)
+    add(params.get("structure_timeframe"))
+    add(params.get("entry_timeframe"))
+    add(params.get("bias_timeframe"))
+    add(params.get("precision_timeframe"))
+    add(_strategy_entry_timeframe(strategy_name, cfg))
+    confirmation = str(params.get("confirmation_timeframe") or "").strip().lower()
+    add(confirmation)
+    for tf in params.get("context_timeframes") or []:
+        add(tf)
+    return ordered or [_strategy_entry_timeframe(strategy_name, cfg)]
 
 # Custom JSON encoder for numpy types
 class NumpyJSONEncoder(json.JSONEncoder):
@@ -76,7 +129,15 @@ class NumpyJSONEncoder(json.JSONEncoder):
             if np.isnan(obj) or np.isinf(obj):
                 return 0.0
             return obj
-        return super().default(obj)
+            return super().default(obj)
+
+
+def _normalize_hl_coin_path(coin: str) -> str:
+    raw = str(coin or "").replace("/", "")
+    if ":" in raw:
+        dex, base = raw.split(":", 1)
+        return f"{dex.lower()}:{base.upper()}"
+    return raw.upper()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -233,6 +294,26 @@ class StrategyPerformance(BaseModel):
     period: str
 
 DEFAULT_ANALYSIS_TIMEFRAMES = ['1h', '4h', '15m', '5m', '1m', '1d', '1w']
+
+
+def _ohlcv_fetch_limit(timeframe: str) -> int:
+    """Return enough closed candles for the strictest enabled spot setup on a timeframe."""
+    tf = str(timeframe or "").lower()
+    if tf in ("5m", "1m"):
+        # SMA reclaim uses SMA200 on the 5m entry frame and rejects <210 candles.
+        # We drop the currently-building bar after fetch, so request a safe buffer.
+        return 240
+    if tf in ("1h", "15m"):
+        return 240
+    if tf == "1d":
+        # Dual-SMA daytrade needs a closed SMA200 bias frame plus slope buffer.
+        return 260
+    if tf == "1w":
+        # Optional Dual-SMA context frame; enough for weekly squeeze checks.
+        return 220
+    if tf == "4h":
+        return 150
+    return 110
 
 class AnalysisRequest(BaseModel):
     # PnL-FIX v4: Default timeframes updated to the union of all strategies'
@@ -457,8 +538,16 @@ def _record_pair_strategy_snapshot(
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
                 "rsi_stoch_reversal_5m",
             }:
+                standalone_like = True
+            else:
+                standalone_like = _is_rsi_stoch_reversal_strategy(name)
+            if standalone_like:
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 if isinstance(indicators, dict):
                     reason = (
@@ -509,17 +598,17 @@ def _record_pair_strategy_snapshot(
                 checklist_buy = bool(indicators.get("checklist_buy", False))
                 if not checklist_buy and isinstance(indicators, dict):
                     failed_checks = []
-                    if indicators.get("rsi_reclaimed_30") is False:
-                        failed_checks.append("rsi_reclaim_30")
-                    if indicators.get("price_above_ema20") is False:
+                    if indicators.get("rsi_trigger_ok") is False:
+                        failed_checks.append("rsi_trigger")
+                    if indicators.get("price_above_ema20") is False and indicators.get("require_price_above_ema20"):
                         failed_checks.append("price_above_ema20")
                     if indicators.get("macro_trend_ok") is False:
                         failed_checks.append("ema50_above_ema200")
                     if indicators.get("volume_ok") is False:
                         failed_checks.append("volume_spike")
-                    if indicators.get("support_bounce") is False:
+                    if indicators.get("support_bounce") is False and indicators.get("require_support_proximity"):
                         failed_checks.append("support_bounce")
-                    if indicators.get("bullish_divergence") is False:
+                    if indicators.get("bullish_divergence") is False and indicators.get("require_bullish_divergence"):
                         failed_checks.append("bullish_divergence")
                     if failed_checks:
                         exec_rsi = indicators.get("exec_rsi_15m")
@@ -530,6 +619,32 @@ def _record_pair_strategy_snapshot(
                             + (
                                 f" (rsi15={float(exec_rsi):.2f}, rsi1h={float(trend_rsi):.2f})"
                                 if exec_rsi is not None and trend_rsi is not None
+                                else ""
+                            )
+                        )
+            if name == "rsi_oversold_override":
+                indicators = ((sr.get("state") or {}).get("indicators") or {})
+                if isinstance(indicators, dict):
+                    failed = []
+                    if indicators.get("oversold_now") is False:
+                        failed.append("not_oversold")
+                    if indicators.get("rsi_reclaim_ok") is False:
+                        failed.append("no_reclaim")
+                    if indicators.get("price_above_ema") is False:
+                        failed.append("below_ema20")
+                    if indicators.get("trend_macd_ok") is False:
+                        failed.append("trend_macd_bearish")
+                    if indicators.get("trend_rsi_ok") is False:
+                        failed.append("trend_rsi_weak")
+                    if failed:
+                        rsi = indicators.get("rsi_15m")
+                        threshold = indicators.get("rsi_buy_threshold")
+                        reason = (
+                            "HOLD - RSI override: "
+                            + ", ".join(failed)
+                            + (
+                                f" (rsi15={float(rsi):.2f}, threshold={float(threshold):.2f})"
+                                if rsi is not None and threshold is not None
                                 else ""
                             )
                         )
@@ -578,8 +693,16 @@ def _record_pair_strategy_snapshot(
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
                 "rsi_stoch_reversal_5m",
             }:
+                standalone_like = True
+            else:
+                standalone_like = _is_rsi_stoch_reversal_strategy(name)
+            if standalone_like:
                 indicators = ((sr.get("state") or {}).get("indicators") or {})
                 if isinstance(indicators, dict):
                     reason = (
@@ -646,6 +769,7 @@ def _record_pair_strategy_snapshot(
                         "sma_reclaim_bull_flag",
                         "rsi_stoch_reversal_5m",
                     }
+                    or _is_rsi_stoch_reversal_strategy(name)
                     else None
                 ),
             }
@@ -757,6 +881,103 @@ class StrategyManager:
                 "Failed to persist macd analysis log for %s on %s: %s",
                 pair,
                 exchange_name,
+                e,
+            )
+
+    async def _persist_supply_demand_analysis_log(
+        self,
+        venue: str,
+        symbol: str,
+        strategy_result: Dict[str, Any],
+    ) -> None:
+        from strategy.playbooks.supply_demand_audit import persist_supply_demand_audit
+
+        try:
+            await persist_supply_demand_audit(
+                database_service_url,
+                venue,
+                symbol,
+                strategy_result,
+                source="strategy-service-spot",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist supply/demand audit for %s on %s: %s",
+                symbol,
+
+                venue,
+                e,
+            )
+
+    async def _persist_dual_sma_analysis_log(
+        self,
+        venue: str,
+        symbol: str,
+        strategy_result: Dict[str, Any],
+    ) -> None:
+        from strategy.playbooks.dual_sma_audit import persist_dual_sma_audit
+
+        try:
+            await persist_dual_sma_audit(
+                database_service_url,
+                venue,
+                symbol,
+                strategy_result,
+                source="strategy-service-spot",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist dual-SMA audit for %s on %s: %s",
+                symbol,
+                venue,
+                e,
+            )
+
+    async def _persist_arc_analysis_log(
+        self,
+        venue: str,
+        symbol: str,
+        strategy_result: Dict[str, Any],
+    ) -> None:
+        from strategy.playbooks.arc_audit import persist_arc_audit
+
+        try:
+            await persist_arc_audit(
+                database_service_url,
+                venue,
+                symbol,
+                strategy_result,
+                source="strategy-service-spot",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist ARC audit for %s on %s: %s",
+                symbol,
+                venue,
+                e,
+            )
+
+    async def _persist_ema50_breakout_pullback_analysis_log(
+        self,
+        venue: str,
+        symbol: str,
+        strategy_result: Dict[str, Any],
+    ) -> None:
+        from strategy.playbooks.ema50_breakout_pullback_audit import persist_ema50_breakout_pullback_audit
+
+        try:
+            await persist_ema50_breakout_pullback_audit(
+                database_service_url,
+                venue,
+                symbol,
+                strategy_result,
+                source="strategy-service-spot",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist EMA50 breakout-pullback audit for %s on %s: %s",
+                symbol,
+                venue,
                 e,
             )
 
@@ -898,6 +1119,26 @@ class StrategyManager:
                 'module': 'rsi_stoch_reversal_5m_strategy',
                 'class': 'RsiStochReversal5mStrategy',
             },
+            'rsi_stoch_reversal_1m': {
+                'module': 'rsi_stoch_reversal_1m_strategy',
+                'class': 'RsiStochReversal1mStrategy',
+            },
+            'supply_demand_3step': {
+                'module': 'supply_demand_3step_strategy',
+                'class': 'SupplyDemand3StepStrategy',
+            },
+            'dual_sma_daytrade': {
+                'module': 'dual_sma_daytrade_strategy',
+                'class': 'DualSmaDaytradeStrategy',
+            },
+            'arc_daytrade': {
+                'module': 'arc_daytrade_strategy',
+                'class': 'ArcDaytradeStrategy',
+            },
+            'ema50_breakout_pullback': {
+                'module': 'ema50_breakout_pullback_strategy',
+                'class': 'Ema50BreakoutPullbackStrategy',
+            },
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
@@ -949,7 +1190,7 @@ class StrategyManager:
                 continue
                 
     async def analyze_pair(self, exchange_name: str, pair: str,
-                          timeframes: List[str] = ['1h', '4h', '15m'],
+                          timeframes: Optional[List[str]] = None,
                           strategy_allowlist: Optional[List[str]] = None) -> Dict[str, Any]:  # PnL-FIX v4 / v6
         """Analyze a trading pair using market regime-based strategy selection.
 
@@ -963,6 +1204,7 @@ class StrategyManager:
                 across concurrent analyses.
         """
         try:
+            timeframes = list(timeframes or DEFAULT_ANALYSIS_TIMEFRAMES)
             # Get market data for all timeframes
             market_data = await self._get_market_data_for_strategy(
                 exchange_name, pair, timeframes
@@ -1042,7 +1284,12 @@ class StrategyManager:
                     "vwap_bounce_scalping",
                     "small_size_momentum_scalp",
                     "sma_reclaim_bull_flag",
+                    "supply_demand_3step",
+                    "dual_sma_daytrade",
+                    "arc_daytrade",
+                    "ema50_breakout_pullback",
                     "rsi_stoch_reversal_5m",
+                    "rsi_stoch_reversal_1m",
                 ):
                     if (
                         standalone_name in strategies
@@ -1136,25 +1383,24 @@ class StrategyManager:
                         strategy_instance.state = SimpleNamespace()
                         strategy_instance.state.market_regime = market_regime.value
                     
-                    # Generate signal — rsi_stoch uses 5m closed bar only (not multi-TF bundle).
+                    # Generate signal using the configured entry and confirmation bars.
                     signal_market_data = market_data
-                    if strategy_name == "rsi_stoch_reversal_5m":
-                        entry_tf = str(
-                            (strategy_data.get("config") or {})
-                            .get("parameters", {})
-                            .get("entry_timeframe", "5m")
-                            or "5m"
-                        ).lower()
-                        ohlcv_5m = market_data.get(entry_tf)
-                        if ohlcv_5m is None or len(ohlcv_5m) < 30:
+                    if _is_rsi_stoch_reversal_strategy(strategy_name):
+                        required_tfs = _strategy_signal_timeframes(strategy_name, strategy_data)
+                        missing_tfs = [
+                            tf for tf in required_tfs
+                            if market_data.get(tf) is None or len(market_data.get(tf)) < 30
+                        ]
+                        if missing_tfs:
                             logger.warning(
-                                "[rsi_stoch_reversal_5m] Missing %s data for %s on %s, skipping",
-                                entry_tf,
+                                "[%s] Missing %s data for %s on %s, skipping",
+                                strategy_name,
+                                ",".join(missing_tfs),
                                 pair,
                                 exchange_name,
                             )
                             continue
-                        signal_market_data = {entry_tf: ohlcv_5m}
+                        signal_market_data = {tf: market_data[tf] for tf in required_tfs}
                     logger.info(f"🎯 [SIGNAL GENERATION] {strategy_name} generating signal for {pair} on {exchange_name}")
                     signal, confidence, strength = await strategy_instance.generate_signal(
                         signal_market_data,
@@ -1203,7 +1449,23 @@ class StrategyManager:
                         await self._persist_macd_analysis_log(
                             exchange_name, pair, analysis_results['strategies'][strategy_name]
                         )
-                    
+                    if strategy_name == "supply_demand_3step":
+                        await self._persist_supply_demand_analysis_log(
+                            exchange_name, pair, analysis_results['strategies'][strategy_name]
+                        )
+                    if strategy_name == "dual_sma_daytrade":
+                        await self._persist_dual_sma_analysis_log(
+                            exchange_name, pair, analysis_results['strategies'][strategy_name]
+                        )
+                    if strategy_name == "arc_daytrade":
+                        await self._persist_arc_analysis_log(
+                            exchange_name, pair, analysis_results['strategies'][strategy_name]
+                        )
+                    if strategy_name == "ema50_breakout_pullback":
+                        await self._persist_ema50_breakout_pullback_analysis_log(
+                            exchange_name, pair, analysis_results['strategies'][strategy_name]
+                        )
+
                     # Log the final result
                     signal_emoji = "🟢" if signal == "buy" else "🔴" if signal == "sell" else "⚪"
                     logger.info(f"📈 [STRATEGY RESULT] {strategy_name}: {signal_emoji} {signal.upper()} | "
@@ -1458,7 +1720,7 @@ class StrategyManager:
                         'is_primary': False,
                     })
                     continue
-                if strategy_name == "rsi_stoch_reversal_5m":
+                if _is_rsi_stoch_reversal_strategy(strategy_name):
                     valid_signals.append({
                         'strategy': strategy_name,
                         'signal': signal,
@@ -1705,10 +1967,11 @@ class StrategyManager:
                 logger.warning(f"  ❌ Parameter {param_name} not found in {strategy_name}")
             
     async def _get_market_data_for_strategy(self, exchange_name: str, symbol: str,
-                                           timeframes: List[str] = ['1h', '4h', '15m']) -> Dict[str, pd.DataFrame]:  # PnL-FIX v4
+                                           timeframes: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:  # PnL-FIX v4
         """Get market data for strategy analysis"""
         try:
             market_data = {}
+            timeframes = list(timeframes or DEFAULT_ANALYSIS_TIMEFRAMES)
             # Hard freshness gate: do not analyze on stale OHLCV snapshots.
             # If exchange data lags too much, we skip that timeframe and fail-safe to no entry.
             tf_seconds_map = {
@@ -1722,17 +1985,9 @@ class StrategyManager:
                 max_retries = 3
                 response: Optional[httpx.Response] = None
 
-                # Per-timeframe candle limits.
-                # We drop the in-progress (unclosed) last candle below, so the
-                # effective usable count is (limit - 1). RSI checklist uses
-                # EMA200 and requires >205 candles, therefore 1h/15m must fetch
-                # materially more than 110.
-                if timeframe in ("4h", "1d"):
-                    ohlcv_limit = 150
-                elif timeframe in ("1h", "15m"):
-                    ohlcv_limit = 240
-                else:
-                    ohlcv_limit = 110
+                # Per-timeframe candle limits. We drop the in-progress last
+                # candle below, so strict SMA200 setups need a buffer above 210.
+                ohlcv_limit = _ohlcv_fetch_limit(timeframe)
 
                 for retry in range(max_retries):
                     try:
@@ -2132,12 +2387,17 @@ async def _fast_signal_enabled() -> bool:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(f"{config_service_url}/api/v1/config/strategies-hyperliquid")
             if resp.status_code == 200:
-                hl_cfg = (resp.json() or {}).get("rsi_stoch_reversal_5m") or {}
+                hl_cfg = resp.json() or {}
         params = dict(spot_cfg.get("parameters") or {})
-        params_hl = dict(hl_cfg.get("parameters") or {})
-        if params.get("fast_signal_enabled") is False or params_hl.get("fast_signal_enabled") is False:
-            return False
-        return bool(spot_cfg.get("enabled")) or bool(hl_cfg.get("enabled"))
+        spot_on = bool(spot_cfg.get("enabled")) and params.get("fast_signal_enabled") is not False
+        hl_on = False
+        for strategy_name in RSI_STOCH_REVERSAL_STRATEGIES:
+            cfg = (hl_cfg or {}).get(strategy_name) or {}
+            cfg_params = dict(cfg.get("parameters") or {})
+            if bool(cfg.get("enabled")) and cfg_params.get("fast_signal_enabled") is not False:
+                hl_on = True
+                break
+        return spot_on or hl_on
     except Exception:
         return False
 
@@ -2150,11 +2410,11 @@ async def _fetch_hl_coins_for_fast_signal() -> List[str]:
                 pairs = resp.json().get("pairs") or []
                 coins = []
                 for p in pairs:
-                    raw = str(p or "").upper()
+                    raw = str(p or "").strip()
                     if "/" in raw:
-                        coins.append(raw.split("/", 1)[0])
+                        coins.append(normalize_hyperliquid_coin(raw.split("/", 1)[0]))
                     else:
-                        coins.append(raw.replace("USD-PERP", "").replace("USDC", "").replace("USD", ""))
+                        coins.append(normalize_hyperliquid_coin(raw.replace("USD-PERP", "").replace("USDC", "").replace("USD", "")))
                 return [c for c in coins if c]
     except Exception as exc:
         logger.debug("[FastSignal] HL pairs fetch failed: %s", exc)
@@ -2162,16 +2422,17 @@ async def _fetch_hl_coins_for_fast_signal() -> List[str]:
 
 
 async def rsi_stoch_reversal_5m_fast_loop() -> None:
-    """Publish rsi_stoch_reversal_5m signals to Redis every 30s."""
+    """Publish RSI/Stoch reversal fast signals to Redis every 30s."""
     from strategy.fast_signal_cache import publish_fast_signal
 
-    def _hl_rsi_params() -> tuple:
+    def _hl_rsi_params(strategy_name: str) -> tuple:
         if hyperliquid_strategy_manager:
             cfg = (
-                hyperliquid_strategy_manager.strategies.get("rsi_stoch_reversal_5m")
+                hyperliquid_strategy_manager.strategies.get(strategy_name)
                 or {}
             )
-            params = cfg.get("parameters") or {}
+            cfg_block = cfg.get("config") if isinstance(cfg.get("config"), dict) else cfg
+            params = (cfg_block or {}).get("parameters") or {}
             return params, bool(params.get("allow_short", False))
         return {}, False
 
@@ -2181,7 +2442,7 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
         return params, bool(params.get("allow_short", False))
 
     global fast_signal_redis_client
-    logger.info("[FastSignal] Starting rsi_stoch_reversal_5m fast publisher loop")
+    logger.info("[FastSignal] Starting RSI/Stoch reversal fast publisher loop")
     interval = 30.0
     while True:
         try:
@@ -2195,43 +2456,47 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
 
             spot_cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
             spot_enabled = bool(spot_cfg.get("enabled"))
-            hl_enabled = False
+            hl_enabled: Dict[str, Any] = {}
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     resp = await client.get(
                         f"{config_service_url}/api/v1/config/strategies-hyperliquid"
                     )
                     if resp.status_code == 200:
-                        hl_enabled = bool(
-                            (resp.json() or {}).get("rsi_stoch_reversal_5m", {}).get("enabled")
-                        )
+                        hl_enabled = resp.json() or {}
             except Exception:
                 pass
 
             if hl_enabled and hyperliquid_strategy_manager:
                 for coin in await _fetch_hl_coins_for_fast_signal():
-                    results = await hyperliquid_strategy_manager.analyze_coin(
-                        coin,
-                        ["5m"],
-                        strategy_allowlist=["rsi_stoch_reversal_5m"],
-                    )
-                    strat = (results.get("strategies") or {}).get("rsi_stoch_reversal_5m") or {}
-                    sig = str(strat.get("signal") or "hold").lower()
-                    conf = float(strat.get("confidence") or 0)
-                    strength = float(strat.get("strength") or 0)
-                    indicators = ((strat.get("state") or {}).get("indicators") or {})
-                    hl_params, hl_allow_short = _hl_rsi_params()
-                    await publish_fast_signal(
-                        fast_signal_redis_client,
-                        "hyperliquid",
-                        coin,
-                        sig,
-                        conf,
-                        strength,
-                        indicators if isinstance(indicators, dict) else {},
-                        allow_short=hl_allow_short,
-                        params=hl_params,
-                    )
+                    for strategy_name in sorted(RSI_STOCH_REVERSAL_STRATEGIES):
+                        cfg = (hl_enabled or {}).get(strategy_name) or {}
+                        cfg_params = dict(cfg.get("parameters") or {})
+                        if not bool(cfg.get("enabled")) or cfg_params.get("fast_signal_enabled") is False:
+                            continue
+                        results = await hyperliquid_strategy_manager.analyze_coin(
+                            coin,
+                            _strategy_signal_timeframes(strategy_name, cfg),
+                            strategy_allowlist=[strategy_name],
+                        )
+                        strat = (results.get("strategies") or {}).get(strategy_name) or {}
+                        sig = str(strat.get("signal") or "hold").lower()
+                        conf = float(strat.get("confidence") or 0)
+                        strength = float(strat.get("strength") or 0)
+                        indicators = ((strat.get("state") or {}).get("indicators") or {})
+                        hl_params, hl_allow_short = _hl_rsi_params(strategy_name)
+                        await publish_fast_signal(
+                            fast_signal_redis_client,
+                            "hyperliquid",
+                            coin,
+                            sig,
+                            conf,
+                            strength,
+                            indicators if isinstance(indicators, dict) else {},
+                            allow_short=hl_allow_short,
+                            params=hl_params,
+                            strategy_key=strategy_name,
+                        )
 
             if spot_enabled and strategy_manager:
                 exchanges = ["binance", "bybit", "cryptocom"]
@@ -2246,7 +2511,7 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
                                 strategy_allowlist=["rsi_stoch_reversal_5m"],
                             )
                             strat = (result.get("strategies") or {}).get(
-                                "rsi_stoch_reversal_5m"
+                    "rsi_stoch_reversal_5m"
                             ) or {}
                             sig = str(strat.get("signal") or "hold").lower()
                             conf = float(strat.get("confidence") or 0)
@@ -2544,13 +2809,21 @@ async def get_hyperliquid_signals(coin: str):
     """Analyze Hyperliquid perp coin with HL-native strategy forks."""
     if not hyperliquid_strategy_manager:
         raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
-    symbol = str(coin or "").upper().replace("/", "")
+    symbol = _normalize_hl_coin_path(coin)
     cache_key = f"hl_{symbol}_{int(datetime.utcnow().timestamp() / 300)}"
     if cache_key in hl_signal_cache:
         return hl_signal_cache[cache_key]
     results = await hyperliquid_strategy_manager.analyze_coin(symbol)
     if not results:
         raise HTTPException(status_code=404, detail=f"No HL signals for {symbol}")
+    try:
+        from core.cycle_analysis_snapshot import build_hl_cycle_analysis
+
+        preview = build_hl_cycle_analysis(results)
+        results = dict(results)
+        results["cycleAnalysisPreview"] = preview
+    except Exception:
+        pass
     hl_signal_cache[cache_key] = results
     return results
 
@@ -2559,7 +2832,7 @@ async def get_hyperliquid_signals(coin: str):
 async def analyze_hyperliquid_coin(coin: str, request: AnalysisRequest):
     if not hyperliquid_strategy_manager:
         raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
-    symbol = str(coin or "").upper().replace("/", "")
+    symbol = _normalize_hl_coin_path(coin)
     results = await hyperliquid_strategy_manager.analyze_coin(
         symbol,
         request.timeframes or ["1h", "4h", "15m", "5m"],
@@ -2581,7 +2854,7 @@ class HyperliquidExitAdviceRequest(BaseModel):
 async def hyperliquid_exit_advice(coin: str, body: HyperliquidExitAdviceRequest):
     if not hyperliquid_strategy_manager:
         raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
-    symbol = str(coin or "").upper().replace("/", "")
+    symbol = _normalize_hl_coin_path(coin)
     market_data = await hyperliquid_strategy_manager._get_market_data(
         symbol, ["1h", "15m"]
     )
@@ -2602,14 +2875,18 @@ async def hyperliquid_exit_advice(coin: str, body: HyperliquidExitAdviceRequest)
 async def get_hyperliquid_strategy_signal(coin: str, strategy_name: str):
     if not hyperliquid_strategy_manager:
         raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
-    symbol = str(coin or "").upper().replace("/", "")
-    bucket = FAST_SIGNAL_CACHE_SECONDS if strategy_name == "rsi_stoch_reversal_5m" else 300
+    symbol = _normalize_hl_coin_path(coin)
+    bucket = FAST_SIGNAL_CACHE_SECONDS if _is_rsi_stoch_reversal_strategy(strategy_name) else 300
     cache_key = f"hl_{symbol}_{strategy_name}_{int(datetime.utcnow().timestamp() / bucket)}"
     if cache_key in hl_signal_cache:
         return hl_signal_cache[cache_key]
+    signal_tfs = _strategy_signal_timeframes(
+        strategy_name,
+        (hyperliquid_strategy_manager.strategies or {}).get(strategy_name),
+    )
     results = await hyperliquid_strategy_manager.analyze_coin(
         symbol,
-        ["5m"] if strategy_name == "rsi_stoch_reversal_5m" else None,
+        signal_tfs if _is_rsi_stoch_reversal_strategy(strategy_name) else None,
         strategy_allowlist=[strategy_name],
     )
     strat = (results.get("strategies") or {}).get(strategy_name)
@@ -2631,11 +2908,15 @@ async def get_spot_strategy_signal(exchange: str, pair: str, strategy_name: str)
             formatted_pair = f"{pair[:-4]}/USDC"
         elif len(pair) >= 6 and pair.endswith("USD"):
             formatted_pair = f"{pair[:-3]}/USD"
-    bucket = FAST_SIGNAL_CACHE_SECONDS if strategy_name == "rsi_stoch_reversal_5m" else 300
+    bucket = FAST_SIGNAL_CACHE_SECONDS if _is_rsi_stoch_reversal_strategy(strategy_name) else 300
     cache_key = f"{exchange}_{formatted_pair}_{strategy_name}_{int(datetime.utcnow().timestamp() / bucket)}"
     if cache_key in signal_cache:
         return signal_cache[cache_key]
-    tfs = ["5m"] if strategy_name == "rsi_stoch_reversal_5m" else DEFAULT_ANALYSIS_TIMEFRAMES
+    tfs = (
+        _strategy_signal_timeframes(strategy_name, (strategies or {}).get(strategy_name))
+        if _is_rsi_stoch_reversal_strategy(strategy_name)
+        else DEFAULT_ANALYSIS_TIMEFRAMES
+    )
     analysis_results = await strategy_manager.analyze_pair(
         exchange,
         formatted_pair,
@@ -2918,6 +3199,133 @@ async def get_pair_snapshots():
         "strategy_cumulative_runs": dict(
             sorted(strategy_cumulative_runs.items(), key=lambda x: x[0])
         ),
+    }
+
+
+@app.get("/api/v1/spot/no-entry-summary")
+async def get_spot_no_entry_summary(max_age_minutes: int = 120):
+    """Compact explanation of why recent SPOT analyses did not produce entries."""
+    now = datetime.utcnow()
+    max_age = max(1, min(int(max_age_minutes or 120), 24 * 60))
+    cutoff = now - timedelta(minutes=max_age)
+    exchanges = ("binance", "bybit", "cryptocom")
+
+    exchange_rows: Dict[str, Dict[str, Any]] = {}
+    total_pairs = 0
+    fresh_pairs = 0
+    actionable = []
+    stale_pairs = []
+    global_regimes: TallyCounter = TallyCounter()
+    global_consensus: TallyCounter = TallyCounter()
+    global_strategy_outcomes: TallyCounter = TallyCounter()
+    global_reasons: TallyCounter = TallyCounter()
+
+    for exchange in exchanges:
+        pairs = pair_last_snapshots.get(exchange, {}) or {}
+        seen_pairs = set()
+        regimes: TallyCounter = TallyCounter()
+        consensus: TallyCounter = TallyCounter()
+        strategy_outcomes: TallyCounter = TallyCounter()
+        reasons: TallyCounter = TallyCounter()
+        pair_count = 0
+        fresh_count = 0
+
+        for pair, snap in pairs.items():
+            # Skip alias duplicates such as SOLUSDC when SOL/USDC is present.
+            canonical = str(pair or "")
+            if "/" not in canonical:
+                continue
+            if canonical in seen_pairs:
+                continue
+            seen_pairs.add(canonical)
+            pair_count += 1
+            total_pairs += 1
+
+            ts = None
+            try:
+                ts = datetime.fromisoformat(str(snap.get("timestamp") or "").replace("Z", "+00:00"))
+                if ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)
+            except Exception:
+                ts = None
+            is_fresh = ts is not None and ts >= cutoff
+            if not is_fresh:
+                stale_pairs.append({"exchange": exchange, "pair": canonical, "timestamp": snap.get("timestamp")})
+                continue
+            fresh_count += 1
+            fresh_pairs += 1
+
+            regime = str(snap.get("market_regime") or snap.get("stable_regime") or "unknown")
+            regimes[regime] += 1
+            global_regimes[regime] += 1
+
+            c_signal = str(((snap.get("consensus") or {}).get("signal") or "unknown")).lower()
+            consensus[c_signal] += 1
+            global_consensus[c_signal] += 1
+
+            if c_signal == "buy":
+                actionable.append(
+                    {
+                        "exchange": exchange,
+                        "pair": canonical,
+                        "consensus": snap.get("consensus"),
+                        "summary": snap.get("summary"),
+                    }
+                )
+
+            for strat in snap.get("strategies") or []:
+                strategy = str(strat.get("strategy") or "unknown")
+                outcome = str(strat.get("outcome") or strat.get("signal") or "unknown")
+                key = f"{strategy}:{outcome}"
+                strategy_outcomes[key] += 1
+                global_strategy_outcomes[key] += 1
+                if outcome in {"hold", "weak_buy", "weak_sell"}:
+                    reason = str(strat.get("reason") or "no_reason")
+                    reason_key = f"{strategy}: {reason}"
+                    reasons[reason_key] += 1
+                    global_reasons[reason_key] += 1
+
+        exchange_rows[exchange] = {
+            "pairs_seen": pair_count,
+            "fresh_pairs": fresh_count,
+            "regimes": dict(regimes.most_common()),
+            "consensus": dict(consensus.most_common()),
+            "strategy_outcomes": dict(strategy_outcomes.most_common(20)),
+            "top_hold_reasons": [
+                {"reason": reason, "count": count}
+                for reason, count in reasons.most_common(10)
+            ],
+        }
+
+    if actionable:
+        headline = f"{len(actionable)} fresh SPOT pair snapshots currently show consensus BUY."
+    elif fresh_pairs == 0:
+        headline = "No fresh SPOT snapshots are available, so no-entry cause cannot be proven from runtime state."
+    else:
+        top_reason = global_reasons.most_common(1)
+        reason_txt = top_reason[0][0] if top_reason else "all fresh consensus signals are HOLD"
+        headline = f"No fresh SPOT consensus BUY. Dominant blocker: {reason_txt}."
+
+    return {
+        "timestamp": now.isoformat() + "Z",
+        "lookback_minutes": max_age,
+        "headline": headline,
+        "totals": {
+            "pairs_seen": total_pairs,
+            "fresh_pairs": fresh_pairs,
+            "stale_pairs": len(stale_pairs),
+            "actionable_buy_pairs": len(actionable),
+        },
+        "regimes": dict(global_regimes.most_common()),
+        "consensus": dict(global_consensus.most_common()),
+        "strategy_outcomes": dict(global_strategy_outcomes.most_common(30)),
+        "top_hold_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in global_reasons.most_common(15)
+        ],
+        "actionable": actionable[:20],
+        "stale_pairs": stale_pairs[:20],
+        "exchanges": exchange_rows,
     }
 
 

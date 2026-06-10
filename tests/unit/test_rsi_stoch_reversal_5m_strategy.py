@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from strategy.playbooks.rsi_stoch_reversal_5m_engine import EngineResult
+from strategy.rsi_stoch_reversal_1m_strategy import RsiStochReversal1mStrategy
 from strategy.rsi_stoch_reversal_5m_strategy import RsiStochReversal5mStrategy
 
 
@@ -88,5 +89,37 @@ async def test_spot_wrapper_never_emits_sell():
         sig, conf, strength = await strat.generate_signal(
             {"5m": pd.DataFrame()}, pair="BTC/USDC"
         )
+    assert sig == "hold"
+    assert conf == 0.0
+
+
+@pytest.mark.asyncio
+async def test_spot_1m_wrapper_defaults_to_1m_and_never_allows_short():
+    strat = RsiStochReversal1mStrategy(
+        config={"parameters": {}},
+        exchange=None,
+        database=None,
+    )
+    await strat.initialize("BTC/USDC")
+    captured = {}
+
+    def _capture_eval(market_data, params, **kwargs):
+        captured["entry_timeframe"] = params.entry_timeframe
+        captured["allow_short"] = kwargs.get("allow_short")
+        captured["keys"] = list(market_data.keys()) if isinstance(market_data, dict) else None
+        return EngineResult(signal="sell", confidence=0.72, strength=0.70, indicators={})
+
+    with patch(
+        "strategy.rsi_stoch_reversal_5m_strategy.evaluate_rsi_stoch_reversal_5m",
+        side_effect=_capture_eval,
+    ):
+        strat.log_condition_outcome = AsyncMock()
+        sig, conf, strength = await strat.generate_signal(
+            {"1m": pd.DataFrame(), "5m": pd.DataFrame()}, pair="BTC/USDC"
+        )
+
+    assert captured["entry_timeframe"] == "1m"
+    assert captured["allow_short"] is False
+    assert captured["keys"] == ["1m", "5m"]
     assert sig == "hold"
     assert conf == 0.0

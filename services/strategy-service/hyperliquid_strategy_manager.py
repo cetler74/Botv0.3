@@ -56,7 +56,12 @@ class HyperliquidExchangeAdapter:
         self.exchange_service_url = exchange_service_url.rstrip("/")
 
     async def get_ohlcv(self, exchange_name: str, symbol: str, timeframe: str, limit: int = 100):
-        coin = str(symbol).upper().replace("/", "")
+        raw = str(symbol or "").replace("/", "")
+        if ":" in raw:
+            dex, base = raw.split(":", 1)
+            coin = f"{dex.lower()}:{base.upper()}"
+        else:
+            coin = raw.upper()
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
                 f"{self.exchange_service_url}/api/v1/market/ohlcv/hyperliquid/{coin}",
@@ -165,6 +170,10 @@ class HyperliquidStrategyManager:
             for tf in params.get("target_timeframes") or []:
                 add(tf)
             add(params.get("entry_timeframe"))
+            add(params.get("structure_timeframe"))
+            add(params.get("bias_timeframe"))
+            add(params.get("confirmation_timeframe"))
+            add(params.get("precision_timeframe"))
             add(params.get("execution_timeframe"))
             for tf in params.get("context_timeframes") or []:
                 add(tf)
@@ -174,7 +183,7 @@ class HyperliquidStrategyManager:
     async def _get_market_data(self, coin: str, timeframes: List[str]) -> Dict[str, pd.DataFrame]:
         adapter = HyperliquidExchangeAdapter(self.exchange_service_url)
         market_data: Dict[str, pd.DataFrame] = {}
-        tf_limits = {"1d": 260, "4h": 150, "1h": 240, "15m": 240, "5m": 260, "1m": 240}
+        tf_limits = {"1d": 260, "1w": 220, "4h": 150, "1h": 240, "15m": 240, "5m": 260, "1m": 240}
         for tf in timeframes:
             limit = tf_limits.get(tf, 120)
             try:
@@ -192,7 +201,12 @@ class HyperliquidStrategyManager:
         *,
         strategy_allowlist: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        symbol = str(coin or "").upper()
+        raw_symbol = str(coin or "")
+        if ":" in raw_symbol:
+            dex, base = raw_symbol.split(":", 1)
+            symbol = f"{dex.lower()}:{base.upper()}"
+        else:
+            symbol = raw_symbol.upper()
         tfs = self._resolve_timeframes(timeframes, strategy_allowlist)
         market_data = await self._get_market_data(symbol, tfs)
         if not market_data:
@@ -237,10 +251,38 @@ class HyperliquidStrategyManager:
                     exchange_adapter=adapter,
                 )
                 signal = normalize_perp_entry_signal(signal)
+                if signal == "short" and not bool(getattr(instance, "allow_short", True)):
+                    logger.info(
+                        "[HLStrategy] %s on %s HOLD: short side disabled by config",
+                        strategy_name,
+                        symbol,
+                    )
+                    signal, confidence, strength = "hold", 0.0, 0.0
+                elif signal == "long" and not bool(getattr(instance, "allow_long", True)):
+                    logger.info(
+                        "[HLStrategy] %s on %s HOLD: long side disabled by config",
+                        strategy_name,
+                        symbol,
+                    )
+                    signal, confidence, strength = "hold", 0.0, 0.0
                 if isinstance(confidence, float) and (np.isnan(confidence) or np.isinf(confidence)):
                     confidence = 0.0
                 if isinstance(strength, float) and (np.isnan(strength) or np.isinf(strength)):
                     strength = 0.0
+                indicators = dict(getattr(instance.state, "indicators", {}) or {})
+                logger.info(
+                    "[HLStrategyEval] %s %s tf=%s signal=%s conf=%.3f strength=%.3f reason=%s",
+                    strategy_name,
+                    symbol,
+                    indicators.get("entry_timeframe") or "",
+                    signal,
+                    float(confidence),
+                    float(strength),
+                    indicators.get("entry_reason")
+                    or indicators.get("skip_reason")
+                    or indicators.get("invalidation_reason")
+                    or "",
+                )
                 results["strategies"][strategy_name] = {
                     "signal": signal,
                     "confidence": float(confidence),
@@ -249,10 +291,92 @@ class HyperliquidStrategyManager:
                     "timestamp": datetime.utcnow().isoformat(),
                     "state": {
                         "market_regime": market_regime.value,
-                        "indicators": dict(getattr(instance.state, "indicators", {}) or {}),
+                        "indicators": indicators,
                         "entry_reason": getattr(instance.state, "entry_reason", ""),
                     },
                 }
+                if strategy_name == "supply_demand_3step":
+                    from strategy.playbooks.supply_demand_audit import persist_supply_demand_audit
+
+                    try:
+                        import os
+
+                        db_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+                        await persist_supply_demand_audit(
+                            db_url,
+                            "hyperliquid",
+                            symbol,
+                            results["strategies"][strategy_name],
+                            source="strategy-service-hl",
+                        )
+                    except Exception as exc:
+                        logger.debug("[HLStrategy] supply/demand audit persist failed: %s", exc)
+                if strategy_name == "dual_sma_daytrade":
+                    from strategy.playbooks.dual_sma_audit import persist_dual_sma_audit
+
+                    try:
+                        import os
+
+                        db_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+                        await persist_dual_sma_audit(
+                            db_url,
+                            "hyperliquid",
+                            symbol,
+                            results["strategies"][strategy_name],
+                            source="strategy-service-hl",
+                        )
+                    except Exception as exc:
+                        logger.debug("[HLStrategy] dual-SMA audit persist failed: %s", exc)
+                if strategy_name == "arc_daytrade":
+                    from strategy.playbooks.arc_audit import persist_arc_audit
+
+                    try:
+                        import os
+
+                        db_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+                        await persist_arc_audit(
+                            db_url,
+                            "hyperliquid",
+                            symbol,
+                            results["strategies"][strategy_name],
+                            source="strategy-service-hl",
+                        )
+                    except Exception as exc:
+                        logger.debug("[HLStrategy] ARC audit persist failed: %s", exc)
+                if strategy_name == "ema50_breakout_pullback":
+                    from strategy.playbooks.ema50_breakout_pullback_audit import (
+                        persist_ema50_breakout_pullback_audit,
+                    )
+
+                    try:
+                        import os
+
+                        db_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+                        await persist_ema50_breakout_pullback_audit(
+                            db_url,
+                            "hyperliquid",
+                            symbol,
+                            results["strategies"][strategy_name],
+                            source="strategy-service-hl",
+                        )
+                    except Exception as exc:
+                        logger.debug("[HLStrategy] EMA50 BP audit persist failed: %s", exc)
+                if strategy_name == "orb_5m_scalp":
+                    from strategy.playbooks.orb_5m_scalp_audit import persist_orb_5m_scalp_audit
+
+                    try:
+                        import os
+
+                        db_url = os.getenv("DATABASE_SERVICE_URL", "http://database-service:8002")
+                        await persist_orb_5m_scalp_audit(
+                            db_url,
+                            "hyperliquid",
+                            symbol,
+                            results["strategies"][strategy_name],
+                            source="strategy-service-hl",
+                        )
+                    except Exception as exc:
+                        logger.debug("[HLStrategy] ORB 5m scalp audit persist failed: %s", exc)
             except Exception as exc:
                 logger.error("[HLStrategy] %s on %s: %s", strategy_name, symbol, exc)
                 results["strategies"][strategy_name] = {"error": str(exc)}

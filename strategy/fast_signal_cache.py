@@ -13,15 +13,25 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 STRATEGY_KEY = "rsi_stoch_reversal_5m"
-FAST_SIGNAL_PREFIX = f"trading:fast_signal:{STRATEGY_KEY}"
 DEFAULT_TTL_SECONDS = 45
 HOLD_TTL_SECONDS = 15
 
 
-def redis_key(venue: str, symbol: str) -> str:
+def _normalize_hyperliquid_symbol(symbol: str) -> str:
+    s = str(symbol or "").strip().replace("/", "")
+    if not s:
+        return ""
+    if ":" in s:
+        dex, base = s.split(":", 1)
+        return f"{dex.strip().lower()}:{base.strip().upper()}"
+    return s.upper()
+
+
+def redis_key(venue: str, symbol: str, strategy_key: str = STRATEGY_KEY) -> str:
     v = str(venue or "").strip().lower()
-    s = str(symbol or "").strip().upper().replace("/", "")
-    return f"{FAST_SIGNAL_PREFIX}:{v}:{s}"
+    s = _normalize_hyperliquid_symbol(symbol) if v == "hyperliquid" else str(symbol or "").strip().upper().replace("/", "")
+    strat = str(strategy_key or STRATEGY_KEY).strip().lower()
+    return f"trading:fast_signal:{strat}:{v}:{s}"
 
 
 def _normalize_payload(
@@ -29,6 +39,8 @@ def _normalize_payload(
     confidence: float,
     strength: float,
     indicators: Optional[Dict[str, Any]] = None,
+    *,
+    strategy_key: str = STRATEGY_KEY,
 ) -> Dict[str, str]:
     ind = indicators or {}
     return {
@@ -42,7 +54,7 @@ def _normalize_payload(
         "entry_reason": str(ind.get("entry_reason") or ind.get("skip_reason") or ""),
         "bar_close_time": str(ind.get("bar_close_time") or ""),
         "analyzed_at": datetime.now(timezone.utc).isoformat(),
-        "strategy": STRATEGY_KEY,
+        "strategy": str(strategy_key or STRATEGY_KEY).strip().lower(),
         "indicators_json": json.dumps(ind, default=str),
     }
 
@@ -109,26 +121,33 @@ def validate_rsi_stoch_actionable(
     stoch_os = float(p.stoch_oversold)
     stoch_ob = float(p.stoch_overbought)
     rsi_os = float(p.rsi_oversold)
+    rsi_ob = float(p.rsi_overbought)
 
     if side == "long":
-        if not (rsi < rsi_os and k < stoch_os and d < stoch_os and k > d):
+        if not (rsi < rsi_os and k < stoch_os and d < stoch_os and k >= d):
             return False, "long_rules_failed"
         return True, "long_ok"
 
     if side == "short":
         if not allow_short:
             return False, "short_not_allowed"
-        if not (k > stoch_ob and d > stoch_ob and d > k):
+        if not (rsi > rsi_ob and k > stoch_ob and d > stoch_ob and d >= k):
             return False, "short_rules_failed"
         return True, "short_ok"
 
     return False, "unknown_side"
 
 
-async def clear_fast_signal(redis_client: Any, venue: str, symbol: str) -> bool:
+async def clear_fast_signal(
+    redis_client: Any,
+    venue: str,
+    symbol: str,
+    *,
+    strategy_key: str = STRATEGY_KEY,
+) -> bool:
     if redis_client is None:
         return False
-    key = redis_key(venue, symbol)
+    key = redis_key(venue, symbol, strategy_key=strategy_key)
     try:
         await redis_client.delete(key)
         return True
@@ -149,15 +168,22 @@ async def publish_fast_signal(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     allow_short: bool = False,
     params: Optional[Any] = None,
+    strategy_key: str = STRATEGY_KEY,
 ) -> bool:
     if redis_client is None:
         return False
-    key = redis_key(venue, symbol)
+    key = redis_key(venue, symbol, strategy_key=strategy_key)
     sig_lc = str(signal or "hold").lower()
     if sig_lc in {"hold", ""}:
         return True
 
-    payload = _normalize_payload(signal, confidence, strength, indicators)
+    payload = _normalize_payload(
+        signal,
+        confidence,
+        strength,
+        indicators,
+        strategy_key=strategy_key,
+    )
     try:
         await redis_client.hset(key, mapping=payload)
         await redis_client.expire(key, max(15, int(ttl_seconds)))
@@ -180,10 +206,12 @@ async def read_fast_signal(
     redis_client: Any,
     venue: str,
     symbol: str,
+    *,
+    strategy_key: str = STRATEGY_KEY,
 ) -> Optional[Dict[str, Any]]:
     if redis_client is None:
         return None
-    key = redis_key(venue, symbol)
+    key = redis_key(venue, symbol, strategy_key=strategy_key)
     try:
         raw = await redis_client.hgetall(key)
         if not raw:
@@ -279,7 +307,7 @@ def signals_data_from_fast_perp_payload(
     strategy_name = mirrored["strategy"]
     ind = (mirrored.get("details") or {}).get("state", {}).get("indicators") or {}
     return {
-        "coin": str(coin).upper(),
+        "coin": _normalize_hyperliquid_symbol(coin),
         "market_regime": str(
             ind.get("market_regime") or fast_payload.get("market_regime") or ""
         ).lower(),

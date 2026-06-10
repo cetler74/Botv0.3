@@ -26,6 +26,9 @@ docker compose build "${BAKED_SERVICES[@]}"
 echo "[apply_config] recreating those containers..."
 docker compose up -d --no-deps "${BAKED_SERVICES[@]}"
 
+echo "[apply_config] syncing config.yaml into shared config_data volume..."
+docker compose cp config/config.yaml config-service:/app/config/config.yaml
+
 echo "[apply_config] waiting for config-service to become healthy..."
 for _ in $(seq 1 30); do
   if docker compose exec -T config-service curl -sf http://localhost:8001/health >/dev/null 2>&1; then
@@ -61,6 +64,33 @@ keys = [
 ]
 for k in keys:
     print(f"  {k}: {m.get(k)}")
+'
+
+echo "[apply_config] verifying adaptive_pnl_control from live config-service..."
+docker compose exec -T config-service sh -lc \
+  'curl -sf http://localhost:8001/api/v1/config/trading' \
+  | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+a = d.get("hyperliquid_perps", {}).get("adaptive_pnl_control", {})
+keys = [
+    "enabled",
+    "lookback_hours",
+    "fetch_limit",
+    "min_reduce_trades",
+    "min_block_trades",
+    "min_scale_trades",
+    "probation_size_multiplier",
+    "scale_up_multiplier",
+    "min_profit_factor_for_scale",
+    "min_net_edge_for_scale",
+    "min_gross_edge_for_scale",
+    "max_fee_drag_for_scale",
+]
+for k in keys:
+    print(f"  {k}: {a.get(k)}")
+if a.get("enabled") is not True:
+    raise SystemExit("adaptive_pnl_control.enabled is not true in live config-service")
 '
 
 echo "[apply_config] done. Tail the strategy log to confirm new values are applied:"

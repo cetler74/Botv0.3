@@ -13,9 +13,15 @@ if ORCH not in sys.path:
 
 from hyperliquid_perps import (  # noqa: E402
     PaperPerpExitConfig,
+    adaptive_blocked_regime_side_exit_reason,
+    apply_hyperliquid_adaptive_pnl_control,
+    build_hyperliquid_adaptive_pnl_control,
     calculate_perp_pnl,
+    disabled_strategy_side_exit_reason,
     evaluate_paper_perp_exit,
     hyperliquid_coin_entry_block,
+    hyperliquid_coin_side_entry_block,
+    hyperliquid_adaptive_entry_sizing_multiplier,
     hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
@@ -23,8 +29,10 @@ from hyperliquid_perps import (  # noqa: E402
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    hyperliquid_strategy_coin_loss_streak_entry_block,
     hyperliquid_trend_chase_gate,
     is_block_window,
+    is_block_window_strategy_exempt,
     is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
@@ -34,8 +42,19 @@ from hyperliquid_perps import (  # noqa: E402
     pnl_percentage,
     position_sides_from_signal,
     select_mirrored_signal,
+    setup_risk_metadata_from_signal,
     sma_reclaim_bull_flag_specialist_gate,
+    supply_demand_3step_specialist_gate,
+    dual_sma_daytrade_specialist_gate,
+    specialist_entry_gate,
+    strategy_max_notional,
+    strategy_min_size_multiplier,
+    strategy_risk_per_trade_pct,
+    hyperliquid_risk_based_notional,
     should_close_paper_perp,
+    encode_setup_risk_entry_reason,
+    parse_setup_risk_from_entry_reason,
+    setup_risk_from_trade_metadata,
 )
 
 
@@ -75,6 +94,52 @@ def test_position_sides_from_signal():
     assert position_sides_from_signal("buy") == "long"
     assert position_sides_from_signal("sell") == "short"
     assert position_sides_from_signal("hold") is None
+
+
+def test_disabled_strategy_side_exit_reason_closes_legacy_disabled_short():
+    cfg = {
+        "strategies_hyperliquid": {
+            "vwma_hull": {
+                "enabled": True,
+                "parameters": {"allow_long": True, "allow_short": False},
+            }
+        }
+    }
+
+    assert disabled_strategy_side_exit_reason(
+        {"source_strategy": "vwma_hull", "position_side": "short"}, cfg
+    ) == "paper_disabled_side_vwma_hull_short"
+    assert disabled_strategy_side_exit_reason(
+        {"source_strategy": "vwma_hull", "position_side": "long"}, cfg
+    ) is None
+
+
+def test_adaptive_blocked_regime_side_exit_reason_closes_matching_open_position():
+    trade = {
+        "source_strategy": "rsi_stoch_reversal_5m",
+        "position_side": "short",
+        "metadata": {"market_regime": "reversal_zone"},
+    }
+    cfg = {
+        "_adaptive_pnl_control": {
+            "decisions": [
+                {
+                    "type": "block_recent_regime_side",
+                    "action": "block",
+                    "targetType": "regime_side",
+                    "target": "reversal_zone",
+                    "side": "short",
+                }
+            ]
+        }
+    }
+
+    assert adaptive_blocked_regime_side_exit_reason(
+        trade, cfg
+    ) == "paper_block_recent_regime_side_reversal_zone_short"
+    assert adaptive_blocked_regime_side_exit_reason(
+        {**trade, "position_side": "long"}, cfg
+    ) is None
 
 
 def test_hyperliquid_perps_use_centralized_exit_rules():
@@ -141,7 +206,7 @@ def test_select_mirrored_signal_does_not_dilute_standalone_entry_confidence():
     assert selected["consensus_agreement"] == pytest.approx(7.14)
 
 
-def test_select_mirrored_signal_uses_best_individual_when_consensus_hold():
+def test_select_mirrored_signal_does_not_use_generic_individual_when_consensus_hold():
     payload = {
         "consensus": {"signal": "hold", "confidence": 0.2, "agreement": 40},
         "strategies": {
@@ -150,8 +215,28 @@ def test_select_mirrored_signal_uses_best_individual_when_consensus_hold():
         },
     }
     selected = select_mirrored_signal(payload)
+    assert selected is None
+
+
+def test_select_mirrored_signal_prioritizes_rsi_stoch_standalone_before_consensus():
+    payload = {
+        "consensus": {"signal": "long", "confidence": 0.8, "agreement": 70},
+        "strategies": {
+            "macd_momentum": {"signal": "long", "confidence": 0.8, "strength": 0.7},
+            "rsi_stoch_reversal_5m": {
+                "signal": "short",
+                "confidence": 0.72,
+                "strength": 0.7,
+            },
+        },
+    }
+
+    selected = select_mirrored_signal(payload)
+
     assert selected["signal"] == "short"
-    assert selected["strategy"] == "strong_short"
+    assert selected["strategy"] == "rsi_stoch_reversal_5m"
+    assert selected["standalone_priority"] is True
+    assert selected["consensus_agreement"] == pytest.approx(70)
 
 
 def test_paper_perp_position_size_multiplier_moderate_profile():
@@ -211,7 +296,7 @@ def test_sma_reclaim_bull_flag_specialist_gate_bypasses_consensus_when_setup_pas
                 "min_strength": 0.70,
                 "min_reward_risk": 1.8,
                 "max_stop_pct": 0.03,
-                "size_multiplier": 0.35,
+                "size_multiplier": 1.0,
             }
         }
     }
@@ -221,7 +306,7 @@ def test_sma_reclaim_bull_flag_specialist_gate_bypasses_consensus_when_setup_pas
     assert gate["isSpecialist"] is True
     assert gate["allowed"] is True
     assert gate["bypassConsensus"] is True
-    assert gate["sizeMultiplier"] == pytest.approx(0.35)
+    assert gate["sizeMultiplier"] == pytest.approx(1.0)
 
 
 def test_sma_reclaim_bull_flag_specialist_gate_requires_own_risk_metadata():
@@ -249,6 +334,180 @@ def test_sma_reclaim_bull_flag_specialist_gate_requires_own_risk_metadata():
     assert gate["bypassConsensus"] is False
     assert "rr_1.20_lt_1.80" in gate["reason"]
     assert "stop_pct_0.0450_gt_0.0300" in gate["reason"]
+
+
+def test_setup_risk_metadata_from_signal_extracts_stop_and_target():
+    signal = {
+        "strategy": "sma_reclaim_bull_flag",
+        "details": {
+            "state": {
+                "indicators": {
+                    "setup": "sma_reclaim_bull_flag",
+                    "entry_price": 100.0,
+                    "stop_hint": 98.0,
+                    "target_hint": 104.0,
+                    "stop_pct": 0.02,
+                    "reward_risk": 2.0,
+                    "breakeven_trigger_swing_high": 101.5,
+                }
+            }
+        },
+    }
+    meta = setup_risk_metadata_from_signal(signal)
+    assert meta["stop_pct"] == pytest.approx(2.0)
+    assert meta["target_pct"] == pytest.approx(4.0)
+
+
+def test_setup_risk_metadata_prefers_hints_over_decimal_target_pct():
+    """EMA50-style engines publish decimal target_pct; exits must use hint geometry."""
+    signal = {
+        "strategy": "ema50_breakout_pullback",
+        "details": {
+            "state": {
+                "indicators": {
+                    "setup": "ema50_breakout_pullback",
+                    "entry_price": 392.24,
+                    "stop_hint": 398.12,
+                    "target_hint": 368.58,
+                    "stop_pct": 0.015,
+                    "target_pct": 0.0603,
+                    "reward_risk": 2.0,
+                }
+            }
+        },
+    }
+    meta = setup_risk_metadata_from_signal(signal)
+    assert meta["stop_pct"] == pytest.approx(1.5, rel=0.01)
+    assert meta["target_pct"] == pytest.approx(6.03, rel=0.01)
+
+
+def test_paper_perp_exit_ema50_short_waits_for_real_setup_target():
+    cfg = PaperPerpExitConfig(
+        use_setup_stops=True,
+        use_setup_targets=True,
+        fixed_stop_loss_enabled=True,
+        stop_loss_pct=1.5,
+        max_holding_minutes=2880,
+    )
+    trade = {
+        "entry_price": 392.24,
+        "position_side": "short",
+        "source_strategy": "ema50_breakout_pullback",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "setup_risk": {
+                "entry_price": 392.24,
+                "stop_hint": 398.12,
+                "target_hint": 368.58,
+                "stop_pct": 0.015,
+                "target_pct": 0.0603,
+            }
+        },
+    }
+    # +0.06% favorable move for a short — must NOT hit a 6% target.
+    tiny_win = evaluate_paper_perp_exit(trade, 392.00, cfg)
+    assert tiny_win.exit_reason is None
+    # ~6.1% favorable move should trigger the real 2R target.
+    full_target = evaluate_paper_perp_exit(trade, 368.50, cfg)
+    assert full_target.exit_reason == "paper_setup_target@6.05%"
+
+
+def test_strategy_priority_sizing_overrides():
+    hl_cfg = {
+        "risk_based_sizing": {"enabled": True, "risk_per_trade_pct": 0.0075},
+        "strategy_risk_overrides": {"sma_reclaim_bull_flag": {"risk_per_trade_pct": 0.012}},
+        "strategy_notional_overrides": {"sma_reclaim_bull_flag": {"max_notional_per_trade": 300.0}},
+        "max_notional_per_trade": 200.0,
+    }
+    assert strategy_risk_per_trade_pct("sma_reclaim_bull_flag", hl_cfg) == pytest.approx(0.012)
+    assert strategy_risk_per_trade_pct("rsi_stoch_reversal_5m", hl_cfg) == pytest.approx(0.0075)
+    assert strategy_max_notional("sma_reclaim_bull_flag", hl_cfg) == pytest.approx(300.0)
+    assert strategy_max_notional("rsi_stoch_reversal_5m", hl_cfg) == pytest.approx(200.0)
+    trading_cfg = {
+        "strategy_sizing_tiers": {
+            "ordered": ["sma_reclaim_bull_flag"],
+            "multipliers": {"sma_reclaim_bull_flag": 1.0},
+            "sma_reclaim_bull_flag_min_multiplier": 1.0,
+        },
+        "adaptive_position_sizing": {
+            "strategy_min_multipliers": {"sma_reclaim_bull_flag": 0.85},
+        },
+    }
+    assert strategy_min_size_multiplier("sma_reclaim_bull_flag", trading_cfg) == pytest.approx(1.0)
+    sma_notional = hyperliquid_risk_based_notional(
+        10000.0,
+        2.0,
+        hl_cfg,
+        size_multiplier=1.0,
+        strategy="sma_reclaim_bull_flag",
+    )
+    rsi_notional = hyperliquid_risk_based_notional(
+        10000.0,
+        2.0,
+        hl_cfg,
+        size_multiplier=1.0,
+        strategy="rsi_stoch_reversal_5m",
+    )
+    assert sma_notional > rsi_notional
+
+
+def test_paper_perp_exit_uses_setup_stop_and_target():
+    cfg = PaperPerpExitConfig(
+        use_setup_stops=True,
+        use_setup_targets=True,
+        fixed_stop_loss_enabled=True,
+        stop_loss_pct=1.5,
+        max_holding_minutes=240,
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "source_strategy": "sma_reclaim_bull_flag",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "setup_risk": {
+                "stop_pct": 1.0,
+                "target_pct": 3.0,
+                "entry_price": 100.0,
+            }
+        },
+    }
+    stop_result = evaluate_paper_perp_exit(trade, 98.9, cfg)
+    assert stop_result.exit_reason == "paper_stop_loss"
+    target_result = evaluate_paper_perp_exit(trade, 103.1, cfg)
+    assert target_result.exit_reason == "paper_setup_target@3.10%"
+
+
+def test_setup_risk_entry_reason_roundtrip():
+    setup = {"stop_pct": 2.0, "target_hint": 105.0}
+    encoded = encode_setup_risk_entry_reason("Queue-based signal", setup)
+    parsed = parse_setup_risk_from_entry_reason(encoded)
+    assert parsed["stop_pct"] == 2.0
+    trade = {"entry_reason": encoded, "metadata": {}}
+    assert setup_risk_from_trade_metadata(trade)["stop_pct"] == 2.0
+
+
+def test_paper_perp_exit_profile_applies_to_sma_reclaim_bull_flag():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "exit_profiles": {
+                "sma_reclaim_bull_flag": {
+                    "strategies": ["sma_reclaim_bull_flag"],
+                    "use_setup_stops": True,
+                    "use_setup_targets": True,
+                    "breakeven_on_swing_high": True,
+                    "partial_profit_pct": 0.5,
+                    "max_holding_minutes": 240,
+                }
+            }
+        },
+        {},
+        strategy_name="sma_reclaim_bull_flag",
+    )
+    assert cfg.use_setup_stops is True
+    assert cfg.use_setup_targets is True
+    assert cfg.breakeven_on_swing_high is True
+    assert cfg.partial_profit_pct == pytest.approx(0.5)
 
 
 def test_hyperliquid_standalone_gate_allows_heterogeneous_strategy_without_global_consensus():
@@ -410,6 +669,223 @@ def test_paper_perp_position_size_multiplier_can_be_disabled():
     ) == pytest.approx(1.0)
 
 
+# ---------------------------------------------------------------------------
+# Adaptive paper-perp PnL control
+# ---------------------------------------------------------------------------
+
+
+def _adaptive_cfg(**overrides):
+    cfg = {
+        "enabled": True,
+        "lookback_hours": 168,
+        "min_reduce_trades": 3,
+        "min_block_trades": 3,
+        "min_scale_trades": 3,
+        "min_recent_block_trades": 3,
+        "recent_release_hold_hours": 12,
+        "probation_size_multiplier": 0.35,
+        "scale_up_multiplier": 1.25,
+        "min_profit_factor_for_scale": 1.25,
+        "min_net_edge_for_scale": 0.0015,
+        "min_gross_edge_for_scale": 0.0040,
+        "max_fee_drag_for_scale": 0.60,
+    }
+    cfg.update(overrides)
+    return {"adaptive_pnl_control": cfg}
+
+
+def _adaptive_trade(
+    *,
+    strategy="rsi_stoch_reversal_1m",
+    side="long",
+    regime="reversal_zone",
+    pnl=-1.0,
+    fees=0.1,
+    funding=0.0,
+    notional=100.0,
+    exit_reason="paper_stop_loss",
+    hours_ago=1,
+):
+    return {
+        "status": "CLOSED",
+        "source_strategy": strategy,
+        "position_side": side,
+        "realized_pnl": pnl,
+        "fees": fees,
+        "funding": funding,
+        "notional_size": notional,
+        "exit_reason": exit_reason,
+        "exit_time": (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat() + "Z",
+        "metadata": {"market_regime": regime},
+    }
+
+
+def test_adaptive_pnl_control_reduces_bad_strategy_side_and_releases_when_improved():
+    bad_trades = [
+        _adaptive_trade(strategy="rsi_stoch_reversal_1m", side="long", pnl=-1.0, fees=0.1)
+        for _ in range(3)
+    ]
+    control = build_hyperliquid_adaptive_pnl_control(bad_trades, _adaptive_cfg())
+
+    assert control["entrySizing"]["rsi_stoch_reversal_1m:long"] == pytest.approx(0.35)
+    decision = control["decisions"][0]
+    assert decision["type"] == "reduce_strategy_side"
+    assert decision["configPath"].endswith("entrySizing.rsi_stoch_reversal_1m:long")
+    assert "underperforming" in decision["situation"]
+
+    improved_trades = [
+        _adaptive_trade(strategy="rsi_stoch_reversal_1m", side="long", pnl=1.0, fees=0.05, notional=100.0)
+        for _ in range(3)
+    ]
+    improved = build_hyperliquid_adaptive_pnl_control(improved_trades, _adaptive_cfg())
+
+    assert improved["entrySizing"]["rsi_stoch_reversal_1m:long"] == pytest.approx(1.25)
+    assert all(d["type"] != "reduce_strategy_side" for d in improved["decisions"])
+
+
+def test_adaptive_pnl_control_blocks_bad_regime_side_and_unblocks_when_improved():
+    bad_trades = [
+        _adaptive_trade(strategy="vwma_hull", side="short", regime="high_volatility", pnl=-1.0, fees=0.1)
+        for _ in range(3)
+    ]
+    control = build_hyperliquid_adaptive_pnl_control(bad_trades, _adaptive_cfg())
+
+    assert control["blockedRegimeSides"]["high_volatility"] == ["short"]
+    assert any(d["type"] == "block_regime_side" for d in control["decisions"])
+
+    improved_trades = [
+        _adaptive_trade(strategy="vwma_hull", side="short", regime="high_volatility", pnl=1.0, fees=0.05, notional=100.0)
+        for _ in range(3)
+    ]
+    improved = build_hyperliquid_adaptive_pnl_control(improved_trades, _adaptive_cfg())
+
+    assert improved["blockedRegimeSides"] == {}
+    assert all(d["type"] != "block_regime_side" for d in improved["decisions"])
+
+
+def test_adaptive_pnl_control_scales_up_fee_adjusted_winner():
+    trades = [
+        _adaptive_trade(strategy="rsi_stoch_reversal_5m", side="long", regime="high_volatility", pnl=1.0, fees=0.05, notional=100.0)
+        for _ in range(3)
+    ]
+    control = build_hyperliquid_adaptive_pnl_control(trades, _adaptive_cfg())
+
+    assert control["entrySizing"]["rsi_stoch_reversal_5m:long"] == pytest.approx(1.25)
+    assert control["entrySizing"]["high_volatility:long"] == pytest.approx(1.25)
+    applied = apply_hyperliquid_adaptive_pnl_control(_adaptive_cfg(), control)
+    multiplier = hyperliquid_adaptive_entry_sizing_multiplier(
+        {"strategy": "rsi_stoch_reversal_5m", "signal": "long"},
+        "high_volatility",
+        applied,
+    )
+    assert multiplier == pytest.approx(1.25)
+
+
+def test_adaptive_pnl_control_tightens_exits_when_loss_drag_dominates():
+    trades = [
+        _adaptive_trade(strategy="rsi_stoch_reversal_5m", pnl=-4.0, exit_reason="paper_stop_loss")
+        for _ in range(2)
+    ] + [
+        _adaptive_trade(strategy="rsi_stoch_reversal_5m", pnl=-3.0, exit_reason="paper_stagnant_loser_fast_fail")
+        for _ in range(2)
+    ] + [
+        _adaptive_trade(strategy="rsi_stoch_reversal_5m", pnl=1.0, exit_reason="trailing_stop")
+        for _ in range(2)
+    ]
+    cfg = _adaptive_cfg(min_reduce_trades=3)
+    control = build_hyperliquid_adaptive_pnl_control(trades, cfg)
+
+    profile = control["exitProfiles"]["rsi_stoch_reversal_5m"]
+    assert profile["stop_loss_pct"] == pytest.approx(0.9)
+    assert profile["max_holding_minutes"] == 180
+    assert profile["max_holding_minutes_hard"] == 240
+    assert profile["trailing_stop"]["step_percentage"] == pytest.approx(0.0015)
+    assert any(d["type"] == "tighten_loss_and_trailing_exits" for d in control["decisions"])
+
+    applied = apply_hyperliquid_adaptive_pnl_control(cfg, control)
+    applied_profile = applied["exit_profiles"]["rsi_stoch_reversal_5m"]
+    assert applied_profile["stagnant_loser"]["fast_fail_loss_pct"] == pytest.approx(-0.30)
+    assert applied_profile["max_holding_minutes"] == 180
+
+
+def test_adaptive_pnl_control_reduces_recent_deterioration_before_long_window_turns_negative():
+    trades = [
+        _adaptive_trade(
+            strategy="rsi_stoch_reversal_5m",
+            side="long",
+            pnl=1.0,
+            fees=0.05,
+            notional=100.0,
+            hours_ago=24,
+        )
+        for _ in range(8)
+    ] + [
+        _adaptive_trade(
+            strategy="rsi_stoch_reversal_5m",
+            side="long",
+            pnl=-0.9,
+            fees=0.1,
+            notional=100.0,
+            hours_ago=1,
+        )
+        for _ in range(3)
+    ]
+    cfg = _adaptive_cfg(
+        min_reduce_trades=10,
+        min_scale_trades=30,
+        recent_window_hours=6,
+        min_recent_reduce_trades=3,
+        recent_probation_size_multiplier=0.35,
+    )
+
+    control = build_hyperliquid_adaptive_pnl_control(trades, cfg)
+
+    assert control["entrySizing"]["rsi_stoch_reversal_5m:long"] == pytest.approx(0.35)
+    assert control["recentReleaseHoldHours"] == pytest.approx(12)
+    decision = next(d for d in control["decisions"] if d["type"] == "reduce_recent_strategy_side")
+    assert decision["evidence"]["lookbackHours"] == 6
+    assert "last 6h" in decision["situation"]
+
+
+def test_adaptive_pnl_control_blocks_recent_bad_regime_side_before_long_window_turns_negative():
+    trades = [
+        _adaptive_trade(
+            strategy="rsi_stoch_reversal_5m",
+            side="short",
+            regime="reversal_zone",
+            pnl=1.0,
+            fees=0.05,
+            notional=100.0,
+            hours_ago=24,
+        )
+        for _ in range(12)
+    ] + [
+        _adaptive_trade(
+            strategy="rsi_stoch_reversal_5m",
+            side="short",
+            regime="reversal_zone",
+            pnl=-1.2,
+            fees=0.12,
+            notional=100.0,
+            hours_ago=1,
+        )
+        for _ in range(3)
+    ]
+    cfg = _adaptive_cfg(
+        min_block_trades=30,
+        recent_window_hours=6,
+        min_recent_block_trades=3,
+    )
+
+    control = build_hyperliquid_adaptive_pnl_control(trades, cfg)
+
+    assert control["blockedRegimeSides"]["reversal_zone"] == ["short"]
+    decision = next(d for d in control["decisions"] if d["type"] == "block_recent_regime_side")
+    assert decision["decisionKey"] == "block_recent_regime_side:reversal_zone:short"
+    assert decision["evidence"]["lookbackHours"] == 6
+    assert "last 6h" in decision["situation"]
+
+
 def test_hyperliquid_strategy_side_entry_block_after_recent_loss():
     now = datetime(2026, 5, 25, 12, 0, 0)
     closed = [
@@ -458,6 +934,79 @@ def test_hyperliquid_strategy_side_entry_block_after_recent_loss():
         realized_block_hours=12,
     )
     assert other_strategy["entryBlocked"] is False
+
+
+def test_hyperliquid_strategy_coin_loss_streak_blocks_only_matching_strategy_coin():
+    now = datetime(2026, 6, 5, 12, 0, 0)
+    closed = [
+        {
+            "coin": "WLD",
+            "source_strategy": "rsi_stoch_reversal_1m",
+            "realized_pnl": -0.5,
+            "exit_time": "2026-06-05T10:00:00+00:00",
+        },
+        {
+            "coin": "WLD",
+            "source_strategy": "rsi_stoch_reversal_1m",
+            "realized_pnl": -0.4,
+            "exit_time": "2026-06-05T09:00:00+00:00",
+        },
+    ]
+    block = hyperliquid_strategy_coin_loss_streak_entry_block(
+        "WLD", "rsi_stoch_reversal_1m", closed, now=now
+    )
+    assert block["entryBlocked"] is True
+    assert block["consecutiveLosses"] == 2
+    assert hyperliquid_strategy_coin_loss_streak_entry_block(
+        "ETH", "rsi_stoch_reversal_1m", closed, now=now
+    )["entryBlocked"] is False
+
+
+def test_paper_perp_exit_profile_applies_to_rsi_stoch_1m():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "stop_loss_pct": 1.5,
+            "max_holding_minutes": 240,
+            "max_holding_minutes_hard": 360,
+            "exit_profiles": {
+                "rsi_1m": {
+                    "strategies": ["rsi_stoch_reversal_1m"],
+                    "stop_loss_pct": 0.9,
+                    "max_holding_minutes": 30,
+                    "max_holding_minutes_hard": 45,
+                    "stagnant_loser": {"min_age_minutes": 8},
+                }
+            },
+        },
+        {"stop_loss_percentage": 0.015},
+        strategy_name="rsi_stoch_reversal_1m",
+    )
+    assert cfg.stop_loss_pct == pytest.approx(0.9)
+    assert cfg.max_holding_minutes == 30
+    assert cfg.max_holding_minutes_hard == 45
+    assert cfg.stagnant_loser["min_age_minutes"] == 8
+
+
+def test_paper_perp_exit_profile_disables_stagnant_loser_for_arc_daytrade():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "stagnant_loser_enabled": True,
+            "exit_profiles": {
+                "arc_daytrade": {
+                    "strategies": ["arc_daytrade"],
+                    "use_setup_stops": True,
+                    "use_setup_targets": False,
+                    "max_holding_minutes": 180,
+                    "stagnant_loser_enabled": False,
+                }
+            },
+        },
+        {"stagnant_loser": {"min_age_minutes": 30}},
+        strategy_name="arc_daytrade",
+    )
+    assert cfg.use_setup_stops is True
+    assert cfg.use_setup_targets is False
+    assert cfg.stagnant_loser_enabled is False
 
 
 def test_should_close_paper_perp():
@@ -641,7 +1190,7 @@ def test_hyperliquid_coin_entry_block_recent_negative_realized():
     )
 
     assert block["entryBlocked"] is True
-    assert block["entryBlockReason"] == "recent_negative_realized_12h"
+    assert block["entryBlockReason"] == "recent_negative_realized"
     assert block["entryBlockUntil"]
 
 
@@ -653,6 +1202,160 @@ def test_hyperliquid_coin_entry_block_expired_negative_realized_allows_entry():
         [{"coin": "WLD", "realized_pnl": -1.0, "exit_time": (now - timedelta(hours=13)).isoformat()}],
         now=now,
         realized_block_hours=12,
+    )
+
+    assert block["entryBlocked"] is False
+
+
+def test_hyperliquid_coin_side_entry_block_open_negative_long_only_blocks_long():
+    block_long = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "long",
+        [{"coin": "WLD", "position_side": "long", "unrealized_pnl": -0.01}],
+        [],
+        now=datetime(2026, 5, 24, 12, 0, 0),
+    )
+    block_short = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "short",
+        [{"coin": "WLD", "position_side": "long", "unrealized_pnl": -0.01}],
+        [],
+        now=datetime(2026, 5, 24, 12, 0, 0),
+    )
+
+    assert block_long["entryBlocked"] is True
+    assert block_long["entryBlockReason"] == "open_unrealized_negative"
+    assert block_long["entryBlockSide"] == "long"
+    assert block_short["entryBlocked"] is False
+
+
+def test_hyperliquid_coin_side_entry_block_open_negative_short_only_blocks_short():
+    block_long = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "long",
+        [{"coin": "WLD", "position_side": "short", "unrealized_pnl": -0.01}],
+        [],
+        now=datetime(2026, 5, 24, 12, 0, 0),
+    )
+    block_short = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "short",
+        [{"coin": "WLD", "position_side": "short", "unrealized_pnl": -0.01}],
+        [],
+        now=datetime(2026, 5, 24, 12, 0, 0),
+    )
+
+    assert block_long["entryBlocked"] is False
+    assert block_short["entryBlocked"] is True
+    assert block_short["entryBlockReason"] == "open_unrealized_negative"
+    assert block_short["entryBlockSide"] == "short"
+
+
+def test_hyperliquid_coin_side_entry_block_recent_long_loss_allows_short():
+    now = datetime(2026, 5, 24, 12, 0, 0)
+    closed = [
+        {
+            "coin": "WLD",
+            "position_side": "long",
+            "realized_pnl": -1.0,
+            "exit_time": (now - timedelta(hours=2)).isoformat(),
+        }
+    ]
+
+    block_long = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "long",
+        [],
+        closed,
+        now=now,
+        realized_block_hours=4,
+    )
+    block_short = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "short",
+        [],
+        closed,
+        now=now,
+        realized_block_hours=4,
+    )
+
+    assert block_long["entryBlocked"] is True
+    assert block_long["entryBlockReason"] == "recent_negative_realized"
+    assert block_long["entryBlockSide"] == "long"
+    assert block_short["entryBlocked"] is False
+
+
+def test_hyperliquid_coin_side_entry_block_recent_short_loss_allows_long():
+    now = datetime(2026, 5, 24, 12, 0, 0)
+    closed = [
+        {
+            "coin": "WLD",
+            "position_side": "short",
+            "realized_pnl": -1.0,
+            "exit_time": (now - timedelta(hours=2)).isoformat(),
+        }
+    ]
+
+    block_long = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "long",
+        [],
+        closed,
+        now=now,
+        realized_block_hours=4,
+    )
+    block_short = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "short",
+        [],
+        closed,
+        now=now,
+        realized_block_hours=4,
+    )
+
+    assert block_long["entryBlocked"] is False
+    assert block_short["entryBlocked"] is True
+    assert block_short["entryBlockReason"] == "recent_negative_realized"
+    assert block_short["entryBlockSide"] == "short"
+
+
+def test_hyperliquid_coin_side_entry_block_expires_after_four_hours():
+    now = datetime(2026, 5, 24, 12, 0, 0)
+    block = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "long",
+        [],
+        [
+            {
+                "coin": "WLD",
+                "position_side": "long",
+                "realized_pnl": -1.0,
+                "exit_time": (now - timedelta(hours=5)).isoformat(),
+            }
+        ],
+        now=now,
+        realized_block_hours=4,
+    )
+
+    assert block["entryBlocked"] is False
+
+
+def test_hyperliquid_coin_side_entry_block_positive_pnl_does_not_block():
+    now = datetime(2026, 5, 24, 12, 0, 0)
+    block = hyperliquid_coin_side_entry_block(
+        "WLD",
+        "long",
+        [{"coin": "WLD", "position_side": "long", "unrealized_pnl": 0.01}],
+        [
+            {
+                "coin": "WLD",
+                "position_side": "long",
+                "realized_pnl": 1.0,
+                "exit_time": (now - timedelta(hours=1)).isoformat(),
+            }
+        ],
+        now=now,
+        realized_block_hours=4,
     )
 
     assert block["entryBlocked"] is False
@@ -715,23 +1418,37 @@ def test_spot_trailing_short_exits_on_bounce():
 
 
 # ---------------------------------------------------------------------------
-# Change 2: Wider trailing stop defaults
+# Change 2: Fee-aware profit protection / trailing defaults
 # ---------------------------------------------------------------------------
 
 
-def test_default_exit_config_uses_widened_trailing_params():
+def test_default_exit_config_uses_fee_floor_trailing_params():
     cfg = PaperPerpExitConfig()
-    assert cfg.trailing_activation_decimal == pytest.approx(0.0075)
-    assert cfg.trailing_step_decimal == pytest.approx(0.0050)
-    assert cfg.tightened_step_decimal == pytest.approx(0.0030)
-    assert cfg.tighten_profit_threshold_decimal == pytest.approx(0.0150)
-    assert cfg.breakeven_floor_decimal == pytest.approx(0.0050)
-    assert cfg.min_trigger_distance_decimal == pytest.approx(0.0050)
-    assert cfg.profit_protection_activation_decimal == pytest.approx(0.0050)
+    assert cfg.profit_protection_activation_decimal == pytest.approx(0.0035)
+    assert cfg.trailing_activation_decimal == pytest.approx(0.0050)
+    assert cfg.trailing_step_decimal == pytest.approx(0.0020)
+    assert cfg.tightened_step_decimal == pytest.approx(0.0015)
+    assert cfg.tighten_profit_threshold_decimal == pytest.approx(0.0050)
+    assert cfg.breakeven_floor_decimal == pytest.approx(0.0035)
+    assert cfg.min_trigger_distance_decimal == pytest.approx(0.0035)
 
 
-def test_widened_trailing_does_not_arm_at_half_percent():
-    """With activation at 0.75%, a +0.50% move should NOT activate the trail."""
+def test_default_trailing_does_not_arm_below_half_percent():
+    """With activation at 0.50%, a +0.49% move should NOT activate the trail."""
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": (datetime.utcnow() - timedelta(minutes=5)).isoformat(),
+        "metadata": {},
+    }
+    cfg = PaperPerpExitConfig()
+    result = evaluate_paper_perp_exit(trade, 100.49, cfg)
+    assert result.exit_reason is None
+    assert result.metadata.get("trail_stop") != "active"
+
+
+def test_default_trailing_arms_at_half_percent():
+    """With activation at 0.50%, a +0.50% move should activate the trail."""
     trade = {
         "entry_price": 100.0,
         "position_side": "long",
@@ -741,21 +1458,62 @@ def test_widened_trailing_does_not_arm_at_half_percent():
     cfg = PaperPerpExitConfig()
     result = evaluate_paper_perp_exit(trade, 100.50, cfg)
     assert result.exit_reason is None
-    assert result.metadata.get("trail_stop") != "active"
+    assert result.metadata.get("trail_stop") == "active"
 
 
-def test_widened_trailing_arms_at_one_percent():
-    """With activation at 0.75%, a +1.0% move should activate the trail."""
+def test_active_trailing_long_fills_at_trigger_when_price_gaps_through():
+    """Paper trailing protection must not realize worse than its armed trigger."""
+    cfg = PaperPerpExitConfig()
+    entry_price = 107.90
+    size = 120.0 / entry_price
+    trigger_price = 108.327265
+    trade = {
+        "entry_price": entry_price,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "fees": perp_side_fee(120.0, cfg.fee_rate_per_side),
+        "metadata": {
+            "highest_price": 108.49,
+            "trail_stop": "active",
+            "trail_stop_trigger": trigger_price,
+            "profit_protection": "trailing",
+        },
+    }
+
+    result = evaluate_paper_perp_exit(trade, 108.00, cfg)
+    assert result.exit_reason is not None
+    assert "paper_trailing_stop_trigger" in result.exit_reason
+    assert result.exit_price == pytest.approx(trigger_price)
+
+    exit_fee = perp_side_fee(result.exit_price * size, cfg.fee_rate_per_side)
+    realized = calculate_perp_pnl(
+        "long",
+        entry_price,
+        result.exit_price,
+        size,
+        trade["fees"] + exit_fee,
+    )
+    assert realized > 0
+
+
+def test_profit_protection_breach_fills_at_floor_when_price_gaps_through():
+    cfg = PaperPerpExitConfig()
+    floor_px = 100.0 * (1.0 + cfg.breakeven_floor_decimal)
     trade = {
         "entry_price": 100.0,
         "position_side": "long",
-        "entry_time": (datetime.utcnow() - timedelta(minutes=5)).isoformat(),
-        "metadata": {},
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "highest_price": 100.6,
+            "profit_protection": "profit_guaranteed",
+            "trail_stop_trigger": floor_px,
+        },
     }
-    cfg = PaperPerpExitConfig()
-    result = evaluate_paper_perp_exit(trade, 101.0, cfg)
-    assert result.exit_reason is None
-    assert result.metadata.get("trail_stop") == "active"
+
+    result = evaluate_paper_perp_exit(trade, 100.10, cfg)
+    assert result.exit_reason is not None
+    assert "profit_protection_breach" in result.exit_reason
+    assert result.exit_price == pytest.approx(floor_px)
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +1542,19 @@ def test_regime_direction_gate_allows_any_in_sideways():
     for side in ("long", "short"):
         gate = hyperliquid_regime_direction_gate(side, "sideways", 0.50, 0.50)
         assert gate["blocked"] is False
+
+
+def test_regime_direction_gate_honors_configured_regime_side_block():
+    gate = hyperliquid_regime_direction_gate(
+        "long",
+        "reversal_zone",
+        0.90,
+        0.90,
+        {"blocked_regime_sides": {"reversal_zone": ["long"]}},
+    )
+
+    assert gate["blocked"] is True
+    assert gate["reason"] == "configured_regime_side_block_reversal_zone_long"
 
 
 def test_regime_direction_gate_high_conviction_override():
@@ -1024,6 +1795,15 @@ def test_phase4_block_windows_off_by_flag():
 def test_phase4_block_windows_off_when_session_sizing_disabled():
     cfg = _phase4_session_cfg(enabled=False)
     assert is_block_window(13, cfg) is False
+
+
+def test_phase4_block_window_strategy_exemption_is_explicit():
+    cfg = _phase4_session_cfg(
+        block_window_exempt_strategies=["rsi_stoch_reversal_5m"]
+    )
+    assert is_block_window(13, cfg) is True
+    assert is_block_window_strategy_exempt("rsi_stoch_reversal_5m", cfg) is True
+    assert is_block_window_strategy_exempt("vwma_hull", cfg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1309,6 +2089,33 @@ def test_perp_trailing_override_prefers_hyperliquid_perps_section():
     assert cfg.profit_protection_activation_decimal == pytest.approx(0.0075)
 
 
+def test_paper_perp_exit_config_accepts_strategy_name_overrides():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.001,
+            "profit_protection_fee_buffer": 0.0015,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0075,
+                "breakeven_floor_percentage": 0.0035,
+                "min_trigger_distance_percentage": 0.0035,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0075},
+        },
+        {
+            "rsi_stoch_reversal_5m_risk": {
+                "profit_activation_threshold": 0.0035,
+                "trailing_activation_threshold": 0.0050,
+            },
+        },
+        strategy_name="rsi_stoch_reversal_5m",
+    )
+
+    assert cfg.profit_protection_activation_decimal == pytest.approx(0.0035)
+    assert cfg.trailing_activation_decimal == pytest.approx(0.0050)
+
+
 def test_stagnant_loser_fast_fail_long():
     now = datetime(2026, 5, 28, 12, 0, 0)
     cfg = PaperPerpExitConfig(
@@ -1383,8 +2190,9 @@ def test_stagnant_loser_disabled_skips_exit():
     assert result.exit_reason is None
 
 
-def test_profit_protection_loss_guard_skips_breach_below_entry_long():
+def test_profit_protection_breach_fills_floor_below_entry_long():
     cfg = _spot_like_exit_cfg()
+    trigger = 100.35
     trade = {
         "entry_price": 100.0,
         "position_side": "long",
@@ -1392,16 +2200,19 @@ def test_profit_protection_loss_guard_skips_breach_below_entry_long():
         "metadata": {
             "highest_price": 100.5,
             "profit_protection": "profit_guaranteed",
-            "trail_stop_trigger": 100.35,
+            "trail_stop_trigger": trigger,
         },
     }
     result = evaluate_paper_perp_exit(trade, 99.8, cfg)
-    assert result.exit_reason is None
+    assert result.exit_reason is not None
+    assert "profit_protection_breach" in result.exit_reason
+    assert result.exit_price == pytest.approx(trigger)
 
 
-def test_profit_protection_skips_breach_below_floor_short():
-    """ENA-like: armed PP must not exit at 0.22% when floor is 0.35%."""
+def test_profit_protection_breach_fills_floor_short():
+    """ENA-like: armed PP exits at the floor even if polling observes a worse price."""
     cfg = _spot_like_exit_cfg()
+    trigger = 0.087331 * (1.0 - cfg.breakeven_floor_decimal)
     trade = {
         "entry_price": 0.087331,
         "position_side": "short",
@@ -1409,14 +2220,16 @@ def test_profit_protection_skips_breach_below_floor_short():
         "metadata": {
             "lowest_price": 0.087025,
             "profit_protection": "profit_guaranteed",
-            "trail_stop_trigger": 0.087331 * (1.0 - cfg.breakeven_floor_decimal),
+            "trail_stop_trigger": trigger,
         },
     }
     result = evaluate_paper_perp_exit(trade, 0.087135, cfg)
-    assert result.exit_reason is None
+    assert result.exit_reason is not None
+    assert "profit_protection_breach" in result.exit_reason
+    assert result.exit_price == pytest.approx(trigger)
 
 
-def test_profit_protection_does_not_arm_before_trailing_activation():
+def test_profit_protection_arms_before_trailing_activation():
     cfg = paper_perp_exit_config_from_yaml(
         {
             "use_spot_exit_rules": True,
@@ -1438,7 +2251,49 @@ def test_profit_protection_does_not_arm_before_trailing_activation():
     }
     # Peak ~0.40% — above PP threshold but below trailing activation (0.75%).
     result = evaluate_paper_perp_exit(trade, 99.60, cfg)
-    assert result.metadata.get("profit_protection") is None
+    assert result.metadata.get("profit_protection") == "profit_guaranteed"
+    assert result.metadata.get("trail_stop") != "active"
+    assert float(result.metadata.get("trail_stop_trigger") or 0) == pytest.approx(
+        100.0 * (1.0 - cfg.breakeven_floor_decimal)
+    )
+
+
+def test_wld_long_profit_protection_arms_at_configured_threshold_before_trail():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.001,
+            "profit_protection_fee_buffer": 0.0015,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0050,
+                "step_percentage": 0.0020,
+                "tightened_step_percentage": 0.0015,
+                "dynamic_tightening_enabled": True,
+                "tighten_profit_threshold": 0.0050,
+                "breakeven_floor_percentage": 0.0035,
+                "min_trigger_distance_percentage": 0.0035,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0035},
+        },
+        {},
+    )
+    trade = {
+        "coin": "WLD",
+        "entry_price": 0.49179,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {},
+    }
+
+    result = evaluate_paper_perp_exit(trade, 0.49381, cfg)
+
+    assert result.exit_reason is None
+    assert result.metadata.get("profit_protection") == "profit_guaranteed"
+    assert result.metadata.get("trail_stop") != "active"
+    assert result.metadata.get("trail_stop_trigger") == pytest.approx(
+        0.49179 * (1.0 + cfg.breakeven_floor_decimal)
+    )
 
 
 def test_profit_protection_breach_exits_at_floor_short():
@@ -1463,8 +2318,9 @@ def test_config_yaml_carries_perp_trailing_and_stagnant_flags():
     config_path = Path(ROOT) / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
     hl = cfg["trading"]["hyperliquid_perps"]
-    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0075)
-    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0075)
+    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0035)
+    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0050)
+    assert hl["trailing_stop"]["breakeven_floor_percentage"] == pytest.approx(0.0035)
     assert hl["stagnant_loser_enabled"] is True
     assert hl["structural_exits"]["enabled"] is True
     assert "vwma_hull" in hl["structural_exits"]["strategies"]
@@ -1605,6 +2461,28 @@ def test_min_edge_gate_passes_when_no_data():
     result = hyperliquid_min_edge_gate({"signal": "long"}, cfg)
     assert result["blocked"] is False
     assert result["reason"] == "min_edge_no_data"
+
+
+def test_min_edge_gate_blocks_missing_expected_move_when_required():
+    cfg = _edge_cfg(require_expected_move=True)
+    result = hyperliquid_min_edge_gate({"signal": "long"}, cfg)
+
+    assert result["blocked"] is True
+    assert result["reason"] == "min_edge_blocked_expected_move_missing"
+
+
+def test_min_edge_gate_can_allow_missing_expected_move_for_named_strategy():
+    cfg = _edge_cfg(
+        require_expected_move=True,
+        allow_missing_expected_move_strategies=["rsi_stoch_reversal_1m"],
+    )
+    result = hyperliquid_min_edge_gate(
+        {"signal": "long", "strategy": "rsi_stoch_reversal_1m"},
+        cfg,
+    )
+
+    assert result["blocked"] is False
+    assert result["reason"] == "min_edge_missing_allowed_for_strategy"
 
 
 def test_min_edge_gate_uses_direct_expected_move():
@@ -1783,3 +2661,113 @@ def test_pnl_tier_empty_strategy_name():
     )
     assert result["tier"] == "normal"
     assert result["reason"] == "strategy_unknown"
+
+
+def test_dual_sma_specialist_gate_passes_valid_long():
+    signal = {
+        "strategy": "dual_sma_daytrade",
+        "signal": "long",
+        "confidence": 0.76,
+        "strength": 0.70,
+        "details": {
+            "indicators": {
+                "setup": "dual_sma_daytrade",
+                "daily_pass": True,
+                "confirm_15m_pass": True,
+                "entry_5m_pass": True,
+                "reward_risk": 2.1,
+            }
+        },
+    }
+    gate = dual_sma_daytrade_specialist_gate(signal, {"specialist_strategy_gates": {"dual_sma_daytrade": {"bypass_consensus": True}}})
+    assert gate["isSpecialist"] is True
+    assert gate["allowed"] is True
+    assert gate["bypassConsensus"] is True
+
+
+def test_supply_demand_specialist_gate_passes_valid_short():
+    signal = {
+        "strategy": "supply_demand_3step",
+        "signal": "short",
+        "confidence": 0.76,
+        "strength": 0.70,
+        "details": {
+            "indicators": {
+                "setup": "supply_demand_3step",
+                "step1_pass": True,
+                "step2_pass": True,
+                "step3_pass": True,
+                "reward_risk": 2.8,
+            }
+        },
+    }
+    gate = supply_demand_3step_specialist_gate(
+        signal,
+        {"specialist_strategy_gates": {"supply_demand_3step": {"bypass_consensus": True}}},
+    )
+    assert gate["isSpecialist"] is True
+    assert gate["allowed"] is True
+    assert gate["bypassConsensus"] is True
+
+
+def test_supply_demand_specialist_gate_blocks_missing_step2():
+    signal = {
+        "strategy": "supply_demand_3step",
+        "signal": "long",
+        "confidence": 0.76,
+        "strength": 0.70,
+        "details": {
+            "indicators": {
+                "setup": "supply_demand_3step",
+                "step1_pass": True,
+                "step2_pass": False,
+                "step3_pass": True,
+                "reward_risk": 3.0,
+            }
+        },
+    }
+    gate = supply_demand_3step_specialist_gate(signal, {})
+    assert gate["allowed"] is False
+    assert "step2_fail" in gate["reason"]
+
+
+def test_dual_sma_specialist_gate_blocks_low_rr():
+    signal = {
+        "strategy": "dual_sma_daytrade",
+        "signal": "long",
+        "confidence": 0.76,
+        "strength": 0.70,
+        "details": {
+            "indicators": {
+                "setup": "dual_sma_daytrade",
+                "daily_pass": True,
+                "confirm_15m_pass": True,
+                "entry_5m_pass": True,
+                "reward_risk": 1.0,
+            }
+        },
+    }
+    gate = dual_sma_daytrade_specialist_gate(signal, {})
+    assert gate["allowed"] is False
+    assert "rr_" in gate["reason"]
+
+
+def test_specialist_entry_gate_selects_dual_sma():
+    signal = {
+        "strategy": "dual_sma_daytrade",
+        "signal": "long",
+        "confidence": 0.76,
+        "strength": 0.70,
+        "details": {
+            "indicators": {
+                "setup": "dual_sma_daytrade",
+                "daily_pass": True,
+                "confirm_15m_pass": True,
+                "entry_5m_pass": True,
+                "reward_risk": 2.0,
+            }
+        },
+    }
+    gate = specialist_entry_gate(signal, {"specialist_strategy_gates": {"dual_sma_daytrade": {}}})
+    assert gate["isSpecialist"] is True
+    assert gate["allowed"] is True

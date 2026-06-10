@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spot Trading Intelligence</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260604" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260608-section-collapse">
+</head>
+<body>
+    <header class="pi-topbar">
+        <div class="pi-brand">
+            <div class="pi-brand-mark pi-brand-spot"><i class="fas fa-coins"></i></div>
+            <div>
+                <h1>Spot Trading Intelligence</h1>
+                <p>Multi-exchange spot trading</p>
+            </div>
+        </div>
+        <div class="pi-topbar-center">
+            <span class="pi-live"><span></span>Live</span>
+            <span class="pi-pill pi-pill-spot" id="spot-mode-pill">Spot: Long only</span>
+            <span class="pi-pill" id="spot-engine-pill">Trading: ...</span>
+            <span class="pi-pill" id="spot-orchestrator-pill">Orchestrator: ...</span>
+            <button type="button" class="pi-theme-toggle" id="theme-toggle" title="Theme: System">
+                <i class="fas fa-circle-half-stroke"></i><span>System</span>
+            </button>
+        </div>
+    </header>
+
+    <main class="pi-shell">
+        <section class="pi-hero pi-hero-spot">
+            <div class="pi-hero-main">
+                <div class="pi-hero-head">
+                    <p class="pi-eyebrow">Spot portfolio</p>
+                    <a href="/portfolio-dashboard" class="pi-hero-nav-link pi-hero-nav-link-perp" title="Open perpetual trading dashboard">
+                        <i class="fas fa-water" aria-hidden="true"></i>
+                        <span>Perpetual trading</span>
+                    </a>
+                </div>
+                <div class="pi-portfolio-value" id="hero-equity">$0.00</div>
+                <div class="pi-portfolio-sub">
+                    <span id="hero-available">Available: $0.00</span>
+                    <span id="trading-status">Status: loading</span>
+                    <span id="updated-at">Updating...</span>
+                </div>
+                <div class="pi-cycle-strip" aria-label="Spot cycle health">
+                    <span class="pi-pill" id="spot-entry-cycle">Entry last run: N/A</span>
+                    <span class="pi-pill" id="spot-exit-cycle">Exit last run: N/A</span>
+                </div>
+            </div>
+            <div class="pi-kpi-grid">
+                <article class="pi-kpi">
+                    <span>Invested</span>
+                    <strong id="hero-invested">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open trades</span>
+                    <strong id="spot-open-trades">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open winners</span>
+                    <strong id="spot-open-profit">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open losers</span>
+                    <strong id="spot-open-loss">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Daily realized</span>
+                    <strong id="spot-daily-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Total realized</span>
+                    <strong id="spot-realized-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Unrealized</span>
+                    <strong id="spot-unrealized-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Win rate</span>
+                    <strong id="spot-win-rate">0.0%</strong>
+                </article>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-spot-panel pi-pnl-report" id="spot-pnl-report-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Last 24 hours</p>
+                    <h2>Spot PnL analysis</h2>
+                </div>
+                <span class="pi-muted" id="spot-pnl-report-window">—</span>
+            </div>
+            <div class="pi-kpi-grid pi-pnl-kpi-grid">
+                <article class="pi-kpi">
+                    <span>Closed</span>
+                    <strong id="spot-pnl-closed">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open</span>
+                    <strong id="spot-pnl-open">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Net realized</span>
+                    <strong id="spot-pnl-realized">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Gross before fees</span>
+                    <strong id="spot-pnl-gross-before-fees">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Fees</span>
+                    <strong id="spot-pnl-fees">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Fee drag</span>
+                    <strong id="spot-pnl-fee-drag">n/a</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Funding</span>
+                    <strong id="spot-pnl-funding">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Win rate</span>
+                    <strong id="spot-pnl-win-rate">0.0%</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg win</span>
+                    <strong id="spot-pnl-avg-win">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg loss</span>
+                    <strong id="spot-pnl-avg-loss">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Profit factor</span>
+                    <strong id="spot-pnl-pf">n/a</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg win hold</span>
+                    <strong id="spot-pnl-win-hold">0 min</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Avg loss hold</span>
+                    <strong id="spot-pnl-loss-hold">0 min</strong>
+                </article>
+            </div>
+            <div class="pi-filter-bar pi-pnl-tabs" role="tablist" aria-label="Spot PnL breakdown">
+                <button type="button" class="pi-filter-btn active" data-spot-pnl-tab="strategy">Strategy</button>
+                <button type="button" class="pi-filter-btn" data-spot-pnl-tab="exchange">Exchange</button>
+                <button type="button" class="pi-filter-btn" data-spot-pnl-tab="exitBucket">Exit</button>
+                <button type="button" class="pi-filter-btn" data-spot-pnl-tab="utcHour">UTC hour</button>
+                <button type="button" class="pi-filter-btn" data-spot-pnl-tab="pair">Pair</button>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-pnl-breakdown-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Label</th>
+                            <th>Closed</th>
+                            <th>Open</th>
+                            <th>PnL</th>
+                            <th>Avg</th>
+                            <th>WR%</th>
+                            <th>PF</th>
+                        </tr>
+                    </thead>
+                    <tbody id="spot-pnl-breakdown-body">
+                        <tr><td colspan="7" class="pi-empty">Loading 24h spot breakdown...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-pnl-pagination">
+                <p id="pnl-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="pnl-page-size">
+                        Rows
+                        <select id="pnl-page-size" class="pi-select" aria-label="Spot PnL rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="pnl-prev" aria-label="Previous spot PnL page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="pnl-next" aria-label="Next spot PnL page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-spot-panel" id="spot-supply-demand-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Supply / Demand 3-Step</p>
+                    <h2>Step pass rates (24h)</h2>
+                </div>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi"><span class="pi-kpi-label">Step 1</span><strong id="spot-sd-step1">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Step 2</span><strong id="spot-sd-step2">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Step 3</span><strong id="spot-sd-step3">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Evals</span><strong id="spot-sd-evals">0</strong></div>
+            </div>
+            <p class="pi-adaptive-note" id="spot-sd-summary">No supply/demand evaluations yet.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Exchange</th>
+                            <th>Symbol</th>
+                            <th>Trend</th>
+                            <th>Signal</th>
+                            <th>R:R</th>
+                            <th>Steps</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="spot-sd-audit-body">
+                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-sd-audit-pagination">
+                <p id="sd-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="sd-page-size">
+                        Rows
+                        <select id="sd-page-size" class="pi-select" aria-label="Spot supply/demand audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="sd-prev" aria-label="Previous spot supply/demand page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="sd-next" aria-label="Next spot supply/demand page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-spot-panel" id="spot-arc-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">ARC daytrade</p>
+                    <h2>Area · Range · Candle (24h)</h2>
+                </div>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi"><span class="pi-kpi-label">Area</span><strong id="spot-arc-area">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Range</span><strong id="spot-arc-range">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Candle</span><strong id="spot-arc-candle">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Evals</span><strong id="spot-arc-evals">0</strong></div>
+            </div>
+            <p class="pi-adaptive-note" id="spot-arc-summary">No ARC evaluations yet.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Exchange</th>
+                            <th>Symbol</th>
+                            <th>Zone</th>
+                            <th>Signal</th>
+                            <th>Move %</th>
+                            <th>R:R</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="spot-arc-audit-body">
+                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-spot-panel" id="spot-dual-sma-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Dual-SMA daytrade</p>
+                    <h2>Gate pass rates (24h)</h2>
+                </div>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi"><span class="pi-kpi-label">Daily</span><strong id="spot-dsma-daily">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">15m</span><strong id="spot-dsma-15m">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">5m</span><strong id="spot-dsma-5m">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Evals</span><strong id="spot-dsma-evals">0</strong></div>
+            </div>
+            <p class="pi-adaptive-note" id="spot-dsma-summary">No dual-SMA evaluations yet.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Exchange</th>
+                            <th>Symbol</th>
+                            <th>Daily bias</th>
+                            <th>15m trend</th>
+                            <th>5m signal</th>
+                            <th>Ext %</th>
+                            <th>R:R</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="spot-dsma-audit-body">
+                        <tr><td colspan="8" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-dsma-audit-pagination">
+                <p id="dsma-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="dsma-page-size">
+                        Rows
+                        <select id="dsma-page-size" class="pi-select" aria-label="Spot dual-SMA audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="dsma-prev" aria-label="Previous spot dual-SMA page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="dsma-next" aria-label="Next spot dual-SMA page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-spot-panel" id="spot-ema50-bp-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">EMA50 breakout pullback · spot exchanges only</p>
+                    <h2>Gate pass rates (24h)</h2>
+                </div>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <div class="pi-kpi"><span class="pi-kpi-label">Breakout</span><strong id="spot-ebp-breakout">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Pullback</span><strong id="spot-ebp-pullback">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Trigger</span><strong id="spot-ebp-trigger">0%</strong></div>
+                <div class="pi-kpi"><span class="pi-kpi-label">Evals</span><strong id="spot-ebp-evals">0</strong></div>
+            </div>
+            <p class="pi-adaptive-note" id="spot-ebp-summary">No EMA50 breakout-pullback evaluations yet.</p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Exchange</th>
+                            <th>Symbol</th>
+                            <th>State</th>
+                            <th>Direction</th>
+                            <th>Signal</th>
+                            <th>R:R</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="spot-ebp-audit-body">
+                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-ebp-audit-pagination">
+                <p id="ebp-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="ebp-page-size">
+                        Rows
+                        <select id="ebp-page-size" class="pi-select" aria-label="Spot EMA50 audit rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="ebp-prev" aria-label="Previous spot EMA50 page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="ebp-next" aria-label="Next spot EMA50 page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-spot-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Per exchange</p>
+                    <h2>Exchange analysis</h2>
+                </div>
+                <span class="pi-muted" id="exchange-analysis-meta">Loading...</span>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-spot-exchange-table pi-horizontal-table">
+                    <thead id="spot-exchange-head"></thead>
+                    <tbody id="spot-exchange-body">
+                        <tr><td colspan="11" class="pi-empty">Loading exchange analysis...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-exchange-pagination">
+                <p id="exchanges-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="exchanges-page-size">
+                        Rows
+                        <select id="exchanges-page-size" class="pi-select" aria-label="Exchange rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="exchanges-prev" aria-label="Previous exchange page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="exchanges-next" aria-label="Next exchange page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-positions pi-spot-watchlist">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Spot pair universe</p>
+                    <h2>Pairs under analysis</h2>
+                </div>
+                <div class="pi-head-actions">
+                    <label class="pi-toggle">
+                        <input type="checkbox" id="pairs-active-only" />
+                        Open &amp; recently traded only
+                    </label>
+                    <span id="pair-count" class="pi-muted">0 pairs</span>
+                </div>
+            </div>
+            <div class="pi-table-tools pi-watchlist-toolbar">
+                <label class="pi-field-label" for="pair-exchange-filter">
+                    Exchange
+                    <select id="pair-exchange-filter" class="pi-select" aria-label="Filter pairs by exchange">
+                        <option value="all">All exchanges</option>
+                        <option value="binance">Binance</option>
+                        <option value="bybit">Bybit</option>
+                        <option value="cryptocom">Crypto.com</option>
+                    </select>
+                </label>
+                <label class="pi-field-label" for="pair-status-filter">
+                    Status
+                    <select id="pair-status-filter" class="pi-select" aria-label="Filter pairs by status">
+                        <option value="all">All statuses</option>
+                        <option value="open">Open position</option>
+                        <option value="under_analysis">Under analysis</option>
+                    </select>
+                </label>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-spot-pairs-table pi-horizontal-table">
+                    <thead id="spot-pairs-head"></thead>
+                    <tbody id="spot-pairs-body">
+                        <tr><td colspan="11" class="pi-empty">Loading spot pairs...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-pairs-pagination">
+                <p id="pairs-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="pairs-page-size">
+                        Rows
+                        <select id="pairs-page-size" class="pi-select" aria-label="Pair rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="pairs-prev" aria-label="Previous pair page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="pairs-next" aria-label="Next pair page">Next</button>
+                </div>
+            </div>
+            <p class="pi-perp-subline pi-rules-hint">Spot mode is long-only with no leverage. Crypto.com uses USD quote pairs; Binance and Bybit use USDC quote pairs.</p>
+        </section>
+
+        <section class="pi-panel pi-spot-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Spot trades</p>
+                    <h2>Active &amp; closed positions</h2>
+                </div>
+                <span class="pi-muted" id="spot-trades-meta">Loading...</span>
+            </div>
+            <div class="pi-filter-bar" role="group" aria-label="Trade status filter">
+                <button type="button" class="pi-filter-btn active" data-trade-filter="open">Open</button>
+                <button type="button" class="pi-filter-btn" data-trade-filter="closed">Closed</button>
+                <button type="button" class="pi-filter-btn" data-trade-filter="all">All</button>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-spot-trades-table pi-horizontal-table">
+                    <thead id="spot-trades-head"></thead>
+                    <tbody id="spot-trades-body">
+                        <tr><td colspan="17" class="pi-empty">Loading spot trades...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pi-watchlist-pagination" id="spot-trades-pagination">
+                <p id="trades-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
+                <div class="pi-pagination-actions">
+                    <label class="pi-field-label" for="trades-page-size">
+                        Rows
+                        <select id="trades-page-size" class="pi-select" aria-label="Trade rows per page">
+                            <option value="10" selected>10</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
+                    <button type="button" class="pi-page-btn" id="trades-prev" aria-label="Previous trade page">Prev</button>
+                    <button type="button" class="pi-page-btn" id="trades-next" aria-label="Next trade page">Next</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="pi-system-strip" id="system-strip">
+            <span>System health loading...</span>
+        </section>
+    </main>
+
+    <script src="/static/js/portfolio-panel-collapse.js?v=20260608-section-collapse"></script>
+    <script src="/static/js/spot-dashboard.js?v=20260608-spot-exit-columns"></script>
+</body>
+</html>

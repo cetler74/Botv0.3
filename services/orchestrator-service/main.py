@@ -22,12 +22,14 @@ CHANGELOG:
 import asyncio
 import json
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Union
-from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional, Set, Tuple, Union
+from datetime import datetime, timedelta, timezone
 import signal
 import sys
 import os
 import httpx
+import re
+from pathlib import Path
 
 # Version tracking
 ORCHESTRATOR_VERSION = "2.4.0"
@@ -55,6 +57,7 @@ from core.pair_filters import (
 from redis_order_manager import RedisOrderManager
 from redis_realtime_order_manager import redis_realtime_manager
 from core.database_manager import DatabaseManager
+from core.cycle_analysis_snapshot import HlCoinCycleRecorder
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +75,49 @@ def _http_response_log_snippet(response: httpx.Response, max_len: int = 400) -> 
         return (response.text or "")[:max_len].replace("\n", " ")
 
 
+def _hyperliquid_realized_loss_block_hours(cfg: Dict[str, Any]) -> float:
+    """Return the HL token-level realized-loss block window."""
+    raw = (cfg or {}).get("block_after_negative_realized_hours")
+    if raw is None:
+        return 4.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def _hyperliquid_strategy_side_realized_loss_block_hours(cfg: Dict[str, Any]) -> float:
+    """Return the broad HL strategy+side cooldown; explicit 0 disables it."""
+    raw = (cfg or {}).get("strategy_side_block_after_negative_realized_hours")
+    if raw is None:
+        raw = (cfg or {}).get("block_after_strategy_side_negative_realized_hours")
+    if raw is None:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _hyperliquid_strategy_coin_loss_streak_cfg(
+    cfg: Dict[str, Any], strategy: str
+) -> Dict[str, Any]:
+    root = cfg.get("strategy_coin_loss_streak_cooldowns") or {}
+    value = root.get(str(strategy or "").strip().lower()) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _extract_trigger_price_from_exit_reason(exit_reason: str) -> float:
+    """Best-effort parser for trigger metadata embedded in legacy exit reasons."""
+    match = re.search(r"_trigger([0-9]+(?:\.[0-9]+)?)", str(exit_reason or ""))
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # Import new trailing stop system (local modules)
 try:
     from activation_trigger_system import ActivationTriggerSystem
@@ -86,14 +132,22 @@ from pair_loss_policy import (
     infer_trade_notional_usd,
     is_macd_momentum_strategy,
     loss_cooldown_key,
+    loss_scaled_cooldown_hours,
     qualifies_for_hard_loss_cooldown,
 )
+from adaptive_pnl_audit import merge_persisted_adaptive_history
 from hyperliquid_perps import (
+    adaptive_blocked_regime_side_exit_reason,
+    apply_hyperliquid_adaptive_pnl_control,
+    build_hyperliquid_adaptive_pnl_control,
     calculate_perp_pnl,
+    disabled_strategy_side_exit_reason,
     evaluate_paper_perp_exit,
     filter_allowed_coin,
     find_mirror_spot_pair,
     hyperliquid_coin_entry_block,
+    hyperliquid_coin_side_entry_block,
+    hyperliquid_adaptive_entry_sizing_multiplier,
     hyperliquid_daily_loss_halt,
     hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
@@ -103,9 +157,12 @@ from hyperliquid_perps import (
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
+    hyperliquid_strategy_coin_loss_streak_entry_block,
     hyperliquid_trend_chase_gate,
     is_block_window,
+    is_block_window_strategy_exempt,
     is_caution_window,
+    is_caution_window_strategy_exempt,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
     perp_entry_atr_metadata as _perp_entry_atr_metadata,
@@ -114,16 +171,34 @@ from hyperliquid_perps import (
     pnl_percentage,
     position_sides_from_signal,
     select_mirrored_signal,
+    selected_mirrored_signal_metadata,
+    setup_risk_metadata_from_signal,
+    resolve_setup_target_pct,
+    resolve_setup_stop_pct,
     signal_position_size_multiplier,
     sma_reclaim_bull_flag_specialist_gate,
+    specialist_entry_gate,
     stop_distance_pct_from_signal,
+    strategy_max_notional,
+    strategy_min_notional,
+    strategy_min_size_multiplier,
+    setup_risk_from_trade_metadata,
 )
 from hyperliquid_pair_selector import select_top_hyperliquid_perps
 from hyperliquid_balance import fetch_hyperliquid_wallet_balance
+from spot_exit_config import (
+    is_stagnant_loser_disabled_for_strategy,
+    spot_strategy_exit_rules_from_trading_config,
+)
 
 
 # Create custom registry to avoid conflicts
 custom_registry = CollectorRegistry()
+
+SPOT_RSI_STOCH_REVERSAL_STRATEGIES = {
+    "rsi_stoch_reversal_5m",
+    "rsi_stoch_reversal_1m",
+}
 
 # Prometheus Metrics
 trades_total = Counter('orchestrator_trades_total', 'Total number of trades', ['exchange', 'pair', 'side', 'status'], registry=custom_registry)
@@ -553,6 +628,8 @@ class TradingStatus(BaseModel):
     uptime: timedelta
     # Wall-clock seconds for the last completed exit+entry+maintenance loop (not the sleep gap)
     last_loop_duration_seconds: Optional[float] = None
+    cycles: Dict[str, Any] = Field(default_factory=dict)
+    cycle_health: Dict[str, Any] = Field(default_factory=dict)
 
 class TradingCycle(BaseModel):
     cycle_id: str
@@ -670,6 +747,25 @@ class TradingOrchestrator:
         self._hyperliquid_pair_selection_updated_at: Optional[datetime] = None
         self._hyperliquid_pair_selector_signature: Optional[str] = None
         self._hyperliquid_blocked_signal_diagnostic_at: Dict[str, datetime] = {}
+        self._last_hyperliquid_entry_scan_coins: List[str] = []
+        self._hyperliquid_adaptive_pnl_control: Dict[str, Any] = {
+            "enabled": False,
+            "decisions": [],
+            "entrySizing": {},
+            "blockedRegimeSides": {},
+            "exitProfiles": {},
+            "sampleClosed": 0,
+            "lastEvaluatedAt": None,
+            "status": "not_evaluated",
+        }
+        self._hyperliquid_adaptive_pnl_audit_path = Path(
+            os.getenv(
+                "HL_ADAPTIVE_PNL_AUDIT_PATH",
+                "data/hyperliquid_adaptive_pnl_audit.json",
+            )
+        )
+        # Runtime cache only. Durable adaptive audit records live in Postgres.
+        self._hyperliquid_adaptive_pnl_history: List[Dict[str, Any]] = []
         self.balances = {}
         self.start_time = None
         self.exiting_trades = set()  # Track trades currently being exited to prevent duplicates
@@ -710,11 +806,20 @@ class TradingOrchestrator:
         self._loop_exit_cycle_first: bool = True
         # Wall time reserved for entry + maintenance after exit's timebox (exit_cycle_first).
         self._loop_entry_reserve_seconds: float = 90.0
+        self._loop_perp_cycle_max_seconds: float = 45.0
+        self._loop_spot_entry_pair_timeout_seconds: float = 35.0
+        self.cycle_telemetry: Dict[str, Dict[str, Any]] = {
+            "spot_exit": self._empty_cycle_phase("spot_exit"),
+            "spot_entry": self._empty_cycle_phase("spot_entry"),
+            "perp_exit_update": self._empty_cycle_phase("perp_exit_update"),
+            "perp_entry": self._empty_cycle_phase("perp_entry"),
+        }
         
         # Initialize strategy manager and database manager
         self.database_manager = None
         self.strategy_manager = None
         self._config = None
+        self._config_loaded_at: Optional[str] = None
         self.config_manager = None  # Will be initialized in initialize() method
         
         
@@ -730,6 +835,96 @@ class TradingOrchestrator:
         # Initialize new trailing stop system
         self.trailing_stop_system = None
         self.use_new_trailing_system = TRAILING_STOP_SYSTEM_AVAILABLE  # Feature flag
+
+    def _empty_cycle_phase(self, phase: str) -> Dict[str, Any]:
+        return {
+            "phase": phase,
+            "cycle_count": 0,
+            "status": "never_run",
+            "started_at": None,
+            "completed_at": None,
+            "duration_seconds": None,
+            "processed_count": None,
+            "message": None,
+            "last_error": None,
+        }
+
+    def _mark_cycle_phase_started(self, phase: str) -> None:
+        self.cycle_telemetry[phase] = {
+            **self._empty_cycle_phase(phase),
+            "cycle_count": self.cycle_count,
+            "status": "running",
+            "started_at": datetime.utcnow(),
+        }
+
+    def _finish_cycle_phase(
+        self,
+        phase: str,
+        status: str = "completed",
+        processed_count: Optional[int] = None,
+        message: Optional[str] = None,
+        error: Optional[Exception] = None,
+    ) -> None:
+        phase_state = self.cycle_telemetry.get(phase) or self._empty_cycle_phase(phase)
+        started_at = phase_state.get("started_at")
+        completed_at = datetime.utcnow()
+        duration_seconds = None
+        if isinstance(started_at, datetime):
+            duration_seconds = round((completed_at - started_at).total_seconds(), 3)
+        self.cycle_telemetry[phase] = {
+            **phase_state,
+            "cycle_count": self.cycle_count,
+            "status": status,
+            "completed_at": completed_at,
+            "duration_seconds": duration_seconds,
+            "processed_count": processed_count,
+            "message": message,
+            "last_error": str(error) if error else None,
+        }
+
+    def _cycle_phase_snapshot(self) -> Dict[str, Any]:
+        def serialize_phase_time(value: Any) -> Any:
+            if not isinstance(value, datetime):
+                return value
+            suffix = "" if value.tzinfo else "Z"
+            return f"{value.isoformat()}{suffix}"
+
+        return {
+            phase: {
+                **data,
+                "started_at": serialize_phase_time(data.get("started_at")),
+                "completed_at": serialize_phase_time(data.get("completed_at")),
+            }
+            for phase, data in self.cycle_telemetry.items()
+        }
+
+    def _cycle_health_snapshot(self) -> Dict[str, Any]:
+        phases = self._cycle_phase_snapshot()
+        current_cycle = self.cycle_count
+        running = bool(self.running)
+        required = ["spot_exit", "spot_entry", "perp_exit_update", "perp_entry"]
+        details: Dict[str, Dict[str, Any]] = {}
+        healthy = True
+        for phase in required:
+            data = phases.get(phase, {})
+            phase_cycle = int(data.get("cycle_count") or 0)
+            status = str(data.get("status") or "never_run")
+            ran_this_cycle = current_cycle > 0 and phase_cycle == current_cycle
+            phase_ok = (not running) or (ran_this_cycle and status in {"completed", "skipped"})
+            if not phase_ok:
+                healthy = False
+            details[phase] = {
+                "ok": phase_ok,
+                "ran_this_cycle": ran_this_cycle,
+                "status": status,
+                "cycle_count": phase_cycle,
+            }
+        return {
+            "ok": healthy,
+            "current_cycle": current_cycle,
+            "running": running,
+            "details": details,
+        }
 
     def _classify_feed_quality(self, price_source: str, down_sources: set, degraded_sources: set) -> str:
         src = str(price_source or "").lower()
@@ -858,6 +1053,24 @@ class TradingOrchestrator:
                 e,
             )
 
+    def _hl_cycle_recorder(self, coin: str) -> HlCoinCycleRecorder:
+        redis_client = getattr(self.redis_order_manager, "redis_client", None)
+        return HlCoinCycleRecorder(
+            coin=coin,
+            cycle_count=int(self.cycle_count or 0),
+            redis_client=redis_client,
+        )
+
+    @staticmethod
+    def _hl_selected_gate_message(mirrored: Optional[Dict[str, Any]]) -> str:
+        if not mirrored:
+            return "No actionable signal"
+        return (
+            f"{mirrored.get('strategy') or 'unknown'} "
+            f"{str(mirrored.get('signal') or 'hold').upper()} "
+            f"{float(mirrored.get('confidence') or 0.0):.2f}"
+        )
+
     @staticmethod
     def _float_config(value: Any, default: float) -> float:
         """Parse numeric config while preserving intentional zero values."""
@@ -949,6 +1162,12 @@ class TradingOrchestrator:
             logger.warning("[AdaptiveSizing] Failed to compute pair multiplier for %s %s: %s", exchange_name, pair, e)
             return 1.0
 
+    def _apply_strategy_size_floor(self, strategy_name: str, multiplier: float, cfg: Dict[str, Any]) -> float:
+        floor = strategy_min_size_multiplier(strategy_name, cfg)
+        if floor is not None:
+            return max(multiplier, floor)
+        return multiplier
+
     async def _long_entry_regime_allowed(self, stable_regime: str) -> bool:
         """Consensus-path SPOT-long regime allowlist (trading.long_entry_allowed_regimes)."""
         cfg = await self._get_config_value("trading.long_entry_allowed_regimes", {})
@@ -1024,6 +1243,18 @@ class TradingOrchestrator:
             if not isinstance(cfg, dict) or not cfg.get("enabled", False):
                 return True, "disabled"
 
+            exempt = {
+                str(x).strip()
+                for x in (cfg.get("probation_exempt_strategies") or [])
+                if str(x).strip()
+            }
+            if strategy_name in exempt:
+                logger.info(
+                    "[StrategyExpectancyGuard] Allow %s: probation_exempt_fresh_sample",
+                    strategy_name,
+                )
+                return True, "probation_exempt_fresh_sample"
+
             cache_seconds = float(cfg.get("cache_seconds", 300) or 300)
             cached = self._strategy_expectancy_cache.get(strategy_name)
             now = datetime.utcnow()
@@ -1033,6 +1264,12 @@ class TradingOrchestrator:
             lookback_days = float(cfg.get("lookback_days", 7) or 7)
             min_closed_trades = int(cfg.get("min_closed_trades", 5) or 5)
             min_total_pnl = float(cfg.get("min_total_pnl_usd", 0.0) or 0.0)
+            per_strategy_min_total = cfg.get("strategy_min_total_pnl_usd") or {}
+            if isinstance(per_strategy_min_total, dict) and strategy_name in per_strategy_min_total:
+                try:
+                    min_total_pnl = float(per_strategy_min_total.get(strategy_name))
+                except (TypeError, ValueError):
+                    pass
             allow_unproven = {
                 str(x).strip()
                 for x in (cfg.get("allow_unproven_strategies") or [])
@@ -1116,6 +1353,13 @@ class TradingOrchestrator:
         if blocked is not None:
             blocked_set = {str(r).strip().lower() for r in blocked if str(r).strip()}
             if blocked_set and regime_lc in blocked_set:
+                reclaim_bypass = {
+                    str(r).strip().lower()
+                    for r in (params.get("blocked_regime_reclaim_bypass") or [])
+                    if str(r).strip()
+                }
+                if strategy_name in SPOT_RSI_STOCH_REVERSAL_STRATEGIES and regime_lc in reclaim_bypass:
+                    return True
                 return False
         return True
 
@@ -1528,6 +1772,12 @@ class TradingOrchestrator:
                 "supertrend",
                 "swing_hull_rsi_ema",
                 "rsi_stoch_reversal_5m",
+                "rsi_stoch_reversal_1m",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
             }
             consensus_strategies = {
                 name: data
@@ -1556,7 +1806,12 @@ class TradingOrchestrator:
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
                 "rsi_stoch_reversal_5m",
+                "rsi_stoch_reversal_1m",
             )
             for strat_name in standalone_buy_strategies:
                 strat_raw = strategies.get(strat_name, {}) or {}
@@ -2728,28 +2983,34 @@ class TradingOrchestrator:
         self._loop_max_cycle_duration = max(15.0, min(raw_max, 600.0))
         self._loop_exit_cycle_first = bool(tc.get("exit_cycle_first", True))
         raw_reserve = float(tc.get("entry_loop_reserve_seconds", 90) or 90)
-        # Cap reserve so exit always has at least ~25s of wall before its deadline.
-        max_reserve_for_exit = max(25.0, self._loop_max_cycle_duration - 25.0)
-        self._loop_entry_reserve_seconds = max(30.0, min(raw_reserve, max_reserve_for_exit))
+        # Cap reserve so exit always has wall time before its deadline while still
+        # allowing a true 60s max loop for responsive trade-shift detection.
+        min_exit_headroom = 25.0
+        max_reserve_for_exit = max(15.0, self._loop_max_cycle_duration - min_exit_headroom)
+        self._loop_entry_reserve_seconds = max(15.0, min(raw_reserve, max_reserve_for_exit))
+        raw_perp_cap = float(tc.get("perp_cycle_max_seconds", 45) or 45)
+        self._loop_perp_cycle_max_seconds = max(10.0, min(raw_perp_cap, max(10.0, self._loop_max_cycle_duration - 15.0)))
+        raw_pair_timeout = float(tc.get("spot_entry_pair_timeout_seconds", 35) or 35)
+        self._loop_spot_entry_pair_timeout_seconds = max(8.0, min(raw_pair_timeout, 90.0))
         # Exit runs in [0, max_wall - reserve]; entry+maintenance use full max_wall deadline.
         if self._loop_exit_cycle_first:
             min_loop_wall = max(
-                120.0,
-                self._loop_cycle_interval * 2.0 + 60.0,
-                self._loop_entry_reserve_seconds + 40.0,
+                45.0,
+                self._loop_entry_reserve_seconds + min_exit_headroom,
             )
             if self._loop_max_cycle_duration < min_loop_wall:
                 logger.warning(
                     "[TradingLoop] max_cycle_duration=%.0fs is too low with exit_cycle_first=true "
-                    "(need >=%.0fs = entry_loop_reserve %.0fs + ~40s exit headroom). Raising.",
+                    "(need >=%.0fs = entry_loop_reserve %.0fs + ~%.0fs exit headroom). Raising.",
                     self._loop_max_cycle_duration,
                     min_loop_wall,
                     self._loop_entry_reserve_seconds,
+                    min_exit_headroom,
                 )
                 self._loop_max_cycle_duration = min(min_loop_wall, 600.0)
-                max_reserve_for_exit = max(25.0, self._loop_max_cycle_duration - 25.0)
+                max_reserve_for_exit = max(15.0, self._loop_max_cycle_duration - min_exit_headroom)
                 self._loop_entry_reserve_seconds = max(
-                    30.0, min(self._loop_entry_reserve_seconds, max_reserve_for_exit)
+                    15.0, min(self._loop_entry_reserve_seconds, max_reserve_for_exit)
                 )
             
     async def start_trading(self) -> bool:
@@ -3007,13 +3268,27 @@ class TradingOrchestrator:
                 strategies_response = await client.get(f"{config_service_url}/api/v1/config/strategies")
                 strategies_response.raise_for_status()
                 strategies_config = strategies_response.json()
+
+                full_config = {}
+                try:
+                    full_config_response = await client.get(f"{config_service_url}/api/v1/config/all")
+                    full_config_response.raise_for_status()
+                    full_config = full_config_response.json() or {}
+                except Exception as exc:
+                    logger.warning(
+                        "Full configuration hydrate skipped; Hyperliquid strategy-side "
+                        "guards may use entry-only config: %s",
+                        exc,
+                    )
                 
                 # Combine all configurations
                 self._config = {
                     'trading': trading_config,
                     'database': database_config,
-                    'strategies': strategies_config
+                    'strategies': strategies_config,
+                    'strategies_hyperliquid': full_config.get('strategies_hyperliquid', {}),
                 }
+                self._config_loaded_at = datetime.utcnow().isoformat() + "Z"
                 
                 logger.info(
                     f"Configuration loaded successfully: trailing_stop activation_threshold="
@@ -3233,6 +3508,7 @@ class TradingOrchestrator:
                             f"🔄 Starting trading cycle {self.cycle_count} "
                             f"(exit timebox {exit_deadline - loop_start:.0f}s, "
                             f"entry+maintenance reserve {self._loop_entry_reserve_seconds:.0f}s, "
+                            f"perp cap {self._loop_perp_cycle_max_seconds:.0f}s, "
                             f"full wall {max_wall:.0f}s, spacing {cycle_interval:.0f}s)"
                         )
                     else:
@@ -3241,23 +3517,45 @@ class TradingOrchestrator:
                             f"(wall budget {max_wall:.0f}s until {cycle_interval:.0f}s spacing)"
                         )
 
-                    logger.info(f"📊 Running Hyperliquid paper-perps cycle {self.cycle_count}...")
-                    await self._run_hyperliquid_perps_cycle(deadline=full_deadline)
-                    logger.info(f"✅ Hyperliquid paper-perps cycle {self.cycle_count} completed")
-                    
-                    # Run exit cycle first if configured (timeboxed so entry always gets wall time)
+                    # Spot exits and entries run before HL perps so wall budget is not consumed
+                    # by the full perp universe scan before standalone spot signals execute.
                     if exit_cycle_first:
                         logger.info(f"📤 Running exit cycle {self.cycle_count}...")
                         await self._run_exit_cycle(deadline=exit_deadline)
                         logger.info(f"✅ Exit cycle {self.cycle_count} completed")
-                        
-                    # New trailing stop system runs continuously after startup
-                    # No additional cycle calls needed - system is event-driven
-                        
-                    # Run entry cycle
-                    logger.info(f"📥 Running entry cycle {self.cycle_count}...")
-                    await self._run_entry_cycle(deadline=full_deadline)
-                    logger.info(f"✅ Entry cycle {self.cycle_count} completed")
+
+                    spot_entry_deadline = max(
+                        loop_start + 5.0,
+                        full_deadline - self._loop_perp_cycle_max_seconds,
+                    )
+                    logger.info(
+                        f"📥 Running entry cycle {self.cycle_count} "
+                        f"(spot deadline in {spot_entry_deadline - time.monotonic():.0f}s; "
+                        f"perp reserve {self._loop_perp_cycle_max_seconds:.0f}s)..."
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._run_entry_cycle(deadline=spot_entry_deadline),
+                            timeout=max(1.0, spot_entry_deadline - time.monotonic()),
+                        )
+                        logger.info(f"✅ Entry cycle {self.cycle_count} completed")
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "⏱️ Spot entry cycle timed out before perp reserve; continuing to perps"
+                        )
+                        self._finish_cycle_phase(
+                            "spot_entry",
+                            status="skipped",
+                            message=(
+                                "Timed out at spot-entry budget; reserved time used for perps"
+                            ),
+                        )
+
+                    hl_start = time.monotonic()
+                    perp_deadline = min(full_deadline, hl_start + self._loop_perp_cycle_max_seconds)
+                    logger.info(f"📊 Running Hyperliquid paper-perps cycle {self.cycle_count}...")
+                    await self._run_hyperliquid_perps_cycle(deadline=perp_deadline)
+                    logger.info(f"✅ Hyperliquid paper-perps cycle {self.cycle_count} completed")
                     
                     # Run maintenance tasks
                     logger.info(f"🔧 Running maintenance tasks for cycle {self.cycle_count}...")
@@ -3382,6 +3680,7 @@ class TradingOrchestrator:
         Prices are prefetched in parallel (Redis mirror + ``ticker-live`` HTTP).
         """
         cycle_start_time = time.time()
+        self._mark_cycle_phase_started("spot_exit")
         try:
             logger.info("📤 Starting exit cycle...")
             
@@ -3395,6 +3694,13 @@ class TradingOrchestrator:
             
             if len(open_trades) == 0:
                 logger.info("📤 Exit cycle: No open trades to process")
+                self._finish_cycle_phase(
+                    "spot_exit",
+                    status="completed",
+                    processed_count=0,
+                    message="No open trades to process",
+                )
+                cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
                 return
 
             # Load trading config ONCE per exit cycle (was incorrectly fetched inside every
@@ -3476,6 +3782,12 @@ class TradingOrchestrator:
                     len(valid_trades),
                 )
                 cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+                self._finish_cycle_phase(
+                    "spot_exit",
+                    status="skipped",
+                    processed_count=0,
+                    message=f"Deadline reached before exit checks; {len(valid_trades)} trades pending next loop",
+                )
                 return
 
             sem = asyncio.Semaphore(exit_conc)
@@ -3501,6 +3813,12 @@ class TradingOrchestrator:
                         len(valid_trades),
                     )
                     cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+                    self._finish_cycle_phase(
+                        "spot_exit",
+                        status="skipped",
+                        processed_count=0,
+                        message=f"No time left for exit checks; {len(valid_trades)} trades deferred",
+                    )
                     return
                 try:
                     results = await asyncio.wait_for(
@@ -3514,6 +3832,12 @@ class TradingOrchestrator:
                         len(valid_trades),
                     )
                     cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+                    self._finish_cycle_phase(
+                        "spot_exit",
+                        status="skipped",
+                        processed_count=0,
+                        message=f"Exit timebox hit; {len(valid_trades)} trades will run next loop",
+                    )
                     return
             else:
                 results = await gather_coro
@@ -3532,6 +3856,12 @@ class TradingOrchestrator:
             
             # Record cycle duration
             cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+            self._finish_cycle_phase(
+                "spot_exit",
+                status="completed",
+                processed_count=processed_count,
+                message=f"{processed_count} trades checked, {skipped_count} skipped",
+            )
                 
         except Exception as e:
             logger.error(f"Error in exit cycle: {str(e)}")
@@ -3540,6 +3870,7 @@ class TradingOrchestrator:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             # Record cycle duration even on error
             cycle_duration.labels(cycle_type='exit').observe(time.time() - cycle_start_time)
+            self._finish_cycle_phase("spot_exit", status="error", error=e)
             
     async def _check_trade_exit(
         self,
@@ -3622,7 +3953,25 @@ class TradingOrchestrator:
             # Convert stop_loss_percentage to negative percentage (e.g., 0.035 -> -3.5)
             config_stop_loss_pct = trading_config.get('stop_loss_percentage', 0.02)
             default_stop_loss = -(config_stop_loss_pct * 100)
-            trailing_stop_config = trading_config.get('trailing_stop', {})
+            trade_strategy_l = str(trade.get("strategy") or "").lower()
+            trailing_stop_config = dict(trading_config.get('trailing_stop', {}) or {})
+            profit_protection_config = dict(trading_config.get('profit_protection', {}) or {})
+            spot_exit_rules = spot_strategy_exit_rules_from_trading_config(
+                trading_config, trade_strategy_l
+            )
+            if spot_exit_rules.profile_name:
+                trailing_stop_config = spot_exit_rules.trailing_stop
+                profit_protection_config = spot_exit_rules.profit_protection
+                logger.info(
+                    "[Trade %s] [SpotExitProfile] profile=%s trail_act=%.2f%% "
+                    "pp_act=%.2f%% floor=%.2f%% step=%.2f%%",
+                    trade_id,
+                    spot_exit_rules.profile_name,
+                    float(trailing_stop_config.get("activation_threshold", 0) or 0) * 100.0,
+                    float(profit_protection_config.get("activation_threshold", 0) or 0) * 100.0,
+                    float(trailing_stop_config.get("breakeven_floor_percentage", 0) or 0) * 100.0,
+                    float(trailing_stop_config.get("step_percentage", 0) or 0) * 100.0,
+                )
             trade_regime = str(trade.get("stable_regime") or trade.get("market_regime") or "unknown")
             regime_cfg = trading_config.get("regime_policies", {}) or {}
             regime_defaults = regime_cfg.get("defaults", {}) or {}
@@ -3657,7 +4006,6 @@ class TradingOrchestrator:
                 breakeven_floor_decimal = 0.0
             # PnL-FIX v11+ — profit-protection arms when peak >= activation_threshold
             # (config trading.profit_protection.activation_threshold, decimal e.g. 0.005 = +0.5%).
-            profit_protection_config = trading_config.get('profit_protection', {}) or {}
             pp_activation_decimal = float(
                 profit_protection_config.get('activation_threshold', 0.005) or 0.005
             )
@@ -3671,11 +4019,13 @@ class TradingOrchestrator:
                     or "rsi_gate=false" in entry_reason_lc
                 )
             )
-            is_rsi_stoch_5m_trade = (
-                str(trade.get("strategy") or "").lower() == "rsi_stoch_reversal_5m"
-            )
-            if is_rsi_stoch_5m_trade:
-                rsi_stoch_risk = trading_config.get("rsi_stoch_reversal_5m_risk", {}) or {}
+            is_rsi_stoch_trade = trade_strategy_l in SPOT_RSI_STOCH_REVERSAL_STRATEGIES
+            if is_rsi_stoch_trade:
+                rsi_stoch_risk = (
+                    trading_config.get(f"{trade_strategy_l}_risk", {})
+                    or trading_config.get("rsi_stoch_reversal_5m_risk", {})
+                    or {}
+                )
                 pp_activation_decimal = float(
                     rsi_stoch_risk.get("profit_activation_threshold", pp_activation_decimal)
                     or pp_activation_decimal
@@ -3686,9 +4036,10 @@ class TradingOrchestrator:
                 )
                 trailing_trigger_pct = trailing_trigger_decimal * 100
                 logger.warning(
-                    "[Trade %s] [RsiStoch5mRisk] Using 0.5%% activation profile: "
+                    "[Trade %s] [RsiStochRisk] Using %s activation profile: "
                     "pp=%.3f%% trail=%.3f%%",
                     trade_id,
+                    trade_strategy_l,
                     pp_activation_decimal * 100.0,
                     trailing_trigger_pct,
                 )
@@ -3790,6 +4141,17 @@ class TradingOrchestrator:
             
             # Always use the configured stop loss percentage, not the trailing stop trigger price
             current_stop_loss = default_stop_loss  # This is already the correct negative percentage (e.g., -0.8%)
+            setup_risk = setup_risk_from_trade_metadata(trade)
+            if trade_strategy_l in {
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
+            } and setup_risk:
+                stop_val = resolve_setup_stop_pct(setup_risk, entry_price)
+                if stop_val > 0:
+                    current_stop_loss = -abs(stop_val)
             logger.info(f"[Trade {trade_id}] [ExitCheck] Using stop loss: {current_stop_loss}%")
 
             # Calculate PnL and update trade data
@@ -4488,6 +4850,56 @@ class TradingOrchestrator:
                         logger.warning(f"[Trade {trade_id}] [LegacyTrailingStop] Invalid trigger price: {trade.get('trail_stop_trigger')}")
 
             # Stop loss check (percentage-based)
+            if not should_exit and trade_strategy_l in {
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "ema50_breakout_pullback",
+            } and setup_risk:
+                min_setup_target_pct = float(
+                    (trading_config or {}).get("min_setup_target_pct", 0.0) or 0.0
+                )
+                target_pct_val = resolve_setup_target_pct(
+                    setup_risk,
+                    entry_price,
+                    min_target_pct=min_setup_target_pct,
+                )
+                if target_pct_val > 0:
+                    partial_pct = target_pct_val * 0.5
+                    if (
+                        pnl_percentage >= partial_pct
+                        and str(trade.get("profit_protection") or "") != "setup_partial"
+                        and pnl_percentage < target_pct_val
+                    ):
+                        await self._update_trade_data(
+                            trade_id,
+                            {"profit_protection": "setup_partial"},
+                        )
+                        trade["profit_protection"] = "setup_partial"
+                    if pnl_percentage >= target_pct_val and risk_exit_allowed_by_feed:
+                        should_exit = True
+                        exit_trigger_price = current_price
+                        exit_reason = f"{trade_strategy_l}_setup_target@{pnl_percentage:.2f}%"
+                if (
+                    not should_exit
+                    and str(trade.get("profit_protection") or "") != "setup_breakeven"
+                ):
+                    try:
+                        swing_high = float(setup_risk.get("breakeven_trigger_swing_high") or 0)
+                        if swing_high > entry_price and current_price >= swing_high:
+                            be_px = entry_price * (1.0 + breakeven_floor_decimal)
+                            await self._update_trade_data(
+                                trade_id,
+                                {
+                                    "trail_stop_trigger": be_px,
+                                    "profit_protection": "setup_breakeven",
+                                },
+                            )
+                            trade["trail_stop_trigger"] = be_px
+                            trade["profit_protection"] = "setup_breakeven"
+                    except (TypeError, ValueError):
+                        pass
+
             logger.info(f"[Trade {trade_id}] [StopLoss] Checking exit - PnL: {pnl_percentage:.2f}%, Stop Level: {current_stop_loss:.2f}% (source={current_price_source})")
             if not should_exit and pnl_percentage <= current_stop_loss and risk_exit_allowed_by_feed:
                 should_exit = True
@@ -4616,8 +5028,13 @@ class TradingOrchestrator:
             # already meaningfully underwater (≤ -0.8%), force an exit
             # now while the book is still orderly. Better -1% realized
             # than -5% slippage when the SL finally trips.
+            stagnant_loser_cfg = trading_config.get("stagnant_loser", {}) or {}
+            stagnant_disabled = is_stagnant_loser_disabled_for_strategy(
+                trading_config, trade_strategy_l
+            )
             if (
                 not should_exit
+                and not stagnant_disabled
                 and risk_exit_allowed_by_feed
                 and entry_price > 0
                 and highest_price > 0
@@ -4625,13 +5042,14 @@ class TradingOrchestrator:
                 try:
                     stagnant_cfg = (
                         resolved_exit_policy.get("stagnant_loser")
-                        or trading_config.get("stagnant_loser", {})
+                        or stagnant_loser_cfg
                         or {}
                     )
                     min_age_minutes = float(stagnant_cfg.get("min_age_minutes", 30.0) or 30.0)
                     base_peak_cap_pct = float(stagnant_cfg.get("peak_cap_pct", 0.3) or 0.3)
-                    pp_cfg = trading_config.get("profit_protection", {}) or {}
-                    pp_act_dec = float(pp_cfg.get("activation_threshold", 0.006) or 0.006)
+                    pp_act_dec = float(
+                        profit_protection_config.get("activation_threshold", 0.006) or 0.006
+                    )
                     if pp_act_dec > 0:
                         activation_peak_cap = (pp_act_dec * 100.0) * 0.92
                         base_peak_cap_pct = min(base_peak_cap_pct, activation_peak_cap)
@@ -4741,18 +5159,31 @@ class TradingOrchestrator:
         ``max_cycle_duration`` (crypto-responsive cadence).
         """
         cycle_start_time = time.time()
+        self._mark_cycle_phase_started("spot_entry")
         try:
             logger.info("📥 Starting entry cycle...")
 
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Entry cycle skipped: trading-loop wall budget already exhausted")
                 cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+                self._finish_cycle_phase(
+                    "spot_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Trading-loop wall budget already exhausted",
+                )
                 return
             
             # Check available balance
             if not await self._check_available_balance():
                 logger.info("📥 Entry cycle: Insufficient balance for new trades")
                 cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+                self._finish_cycle_phase(
+                    "spot_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Insufficient balance for new trades",
+                )
                 return
             # Trading knobs: single config fetch (was 3× identical HTTP calls per entry cycle)
             max_trades_per_exchange = 20
@@ -4781,6 +5212,12 @@ class TradingOrchestrator:
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Entry cycle stopped after config fetch: wall budget exhausted")
                 cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+                self._finish_cycle_phase(
+                    "spot_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Wall budget exhausted after config fetch",
+                )
                 return
 
             # Get all open trades once
@@ -4796,12 +5233,46 @@ class TradingOrchestrator:
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Entry cycle stopped after open-trades fetch: wall budget exhausted")
                 cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+                self._finish_cycle_phase(
+                    "spot_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Wall budget exhausted after open-trades fetch",
+                )
                 return
 
             # Strict loss-block refresh: build hard entry cooldowns from recent losing closes.
             await self._refresh_hard_loss_cooldown_map()
             # Cross-exchange blacklist for pairs with recent negative realized closes.
             await self._refresh_recent_negative_realized_blacklist_map()
+
+            from entry_pair_priority import fetch_priority_entry_pairs
+
+            trading_cfg = (self._config or {}).get("trading") if isinstance(self._config, dict) else {}
+            priority_cfg = (trading_cfg or {}).get("spot_entry_pair_priority") or {}
+            priority_by_exchange: Dict[str, Set[str]] = {}
+            if priority_cfg.get("enabled", True):
+                for exchange_name in self.pair_selections:
+                    try:
+                        priority_by_exchange[exchange_name] = await fetch_priority_entry_pairs(
+                            database_service_url,
+                            exchange_name,
+                            priority_cfg,
+                        )
+                        if priority_by_exchange[exchange_name]:
+                            logger.info(
+                                "[EntryCycle] %s: %d priority pair(s) from recent standalone BUY audits: %s",
+                                exchange_name,
+                                len(priority_by_exchange[exchange_name]),
+                                sorted(priority_by_exchange[exchange_name])[:8],
+                            )
+                    except Exception as pri_exc:
+                        logger.debug(
+                            "[EntryCycle] priority pair fetch skipped for %s: %s",
+                            exchange_name,
+                            pri_exc,
+                        )
+                        priority_by_exchange[exchange_name] = set()
             
             # Check exchanges in parallel so one slow/failing exchange cannot block others
             exchange_tasks = [
@@ -4812,6 +5283,7 @@ class TradingOrchestrator:
                     max_trades_per_exchange,
                     min_balance_threshold,
                     deadline=deadline,
+                    priority_pairs=priority_by_exchange.get(exchange_name) or set(),
                 )
                 for exchange_name, pairs in self.pair_selections.items()
             ]
@@ -4820,6 +5292,12 @@ class TradingOrchestrator:
             
             # Record successful cycle completion
             cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+            self._finish_cycle_phase(
+                "spot_entry",
+                status="completed",
+                processed_count=len(exchange_tasks),
+                message=f"{len(exchange_tasks)} exchanges scanned",
+            )
             
         except Exception as e:
             logger.error(f"Error in entry cycle: {str(e)}")
@@ -4828,6 +5306,7 @@ class TradingOrchestrator:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             # Record cycle duration even on error
             cycle_duration.labels(cycle_type='entry').observe(time.time() - cycle_start_time)
+            self._finish_cycle_phase("spot_entry", status="error", error=e)
 
     async def _refresh_hard_loss_cooldown_map(self) -> None:
         """Rebuild strict pair-entry cooldowns from recent closed losing trades."""
@@ -4838,20 +5317,37 @@ class TradingOrchestrator:
                 )
                 or 0.0
             )
-            cooldown_hours = float(
+            loss_scaled_cfg = await self._get_config_value(
+                "trading.pair_rotation.loss_scaled_cooldown", {}
+            )
+            if not isinstance(loss_scaled_cfg, dict):
+                loss_scaled_cfg = {}
+            legacy_hours = float(
                 await self._get_config_value(
                     "trading.pair_rotation.temp_blacklist_cooldown_hours", 12
                 )
                 or 12
             )
+            if not loss_scaled_cfg.get("enabled", True):
+                loss_scaled_cfg = {
+                    "enabled": False,
+                    "base_hours": legacy_hours,
+                    "max_hours": legacy_hours,
+                }
             scan_limit = int(
                 await self._get_config_value(
                     "trading.pair_rotation.scan_recent_closed_limit", 2000
                 )
                 or 2000
             )
+            raw_blacklist_all_strategies = await self._get_config_value(
+                "trading.pair_rotation.blacklist_all_strategies", True
+            )
+            blacklist_all_strategies = (
+                raw_blacklist_all_strategies is True
+                or str(raw_blacklist_all_strategies).lower() in ("1", "true", "yes")
+            )
             now = datetime.utcnow()
-            cooldown_delta = timedelta(hours=cooldown_hours)
 
             async with httpx.AsyncClient(timeout=45.0) as client:
                 ex_resp = await client.get(f"{config_service_url}/api/v1/config/exchanges/list")
@@ -4915,7 +5411,12 @@ class TradingOrchestrator:
                         realized_pnl_pct = (realized_pnl / notional) * 100.0
                         if not qualifies_for_hard_loss_cooldown(realized_pnl_pct, hard_loss_thr):
                             continue
-                        until = exit_time + cooldown_delta
+                        cooldown_hours = loss_scaled_cooldown_hours(
+                            realized_pnl_pct, loss_scaled_cfg
+                        )
+                        if cooldown_hours <= 0:
+                            continue
+                        until = exit_time + timedelta(hours=cooldown_hours)
                         if until <= now:
                             continue
                         key = loss_cooldown_key(exchange_name, pair)
@@ -4934,9 +5435,12 @@ class TradingOrchestrator:
         max_trades_per_exchange: int,
         min_balance_threshold: float,
         deadline: Optional[float] = None,
+        priority_pairs: Optional[Set[str]] = None,
     ) -> None:
         """Run entry checks for a single exchange, isolated from others."""
         try:
+            from entry_pair_priority import order_pairs_by_priority
+
             exchange_balance = self.balances.get(exchange_name, {}).get('available', 0)
             if exchange_balance < min_balance_threshold:
                 logger.info(
@@ -4969,11 +5473,20 @@ class TradingOrchestrator:
                 f"Processing entry cycle for this exchange."
             )
 
+            scan_pairs = order_pairs_by_priority(pairs, priority_pairs or set())
+            if priority_pairs and scan_pairs != pairs:
+                logger.info(
+                    "[EntryCycle] %s: reordered %d pairs (%d priority first)",
+                    exchange_name,
+                    len(scan_pairs),
+                    sum(1 for p in scan_pairs if p in priority_pairs),
+                )
+
             # Guard each pair check so one long timeout (e.g., external signal API) doesn't
             # hold up the rest of this exchange's queue. Under a global loop deadline, cap per-pair
             # wait so we can scan more pairs within max_cycle_duration.
-            pair_timeout_base = 70.0
-            for pair in pairs:
+            pair_timeout_base = self._loop_spot_entry_pair_timeout_seconds
+            for pair in scan_pairs:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -5011,51 +5524,584 @@ class TradingOrchestrator:
             cfg = {}
         return cfg
 
-    async def _fetch_hyperliquid_mids(self) -> Dict[str, float]:
-        """Fetch live Hyperliquid perp mids. Read-only, no wallet/order side effects."""
+    def _load_hyperliquid_adaptive_pnl_history(self) -> List[Dict[str, Any]]:
+        path = self._hyperliquid_adaptive_pnl_audit_path
+        try:
+            if not path.exists():
+                return []
+            payload = json.loads(path.read_text())
+            records = payload.get("records") if isinstance(payload, dict) else payload
+            return records if isinstance(records, list) else []
+        except Exception as exc:
+            logger.warning("[HyperliquidAdaptive] Failed to load audit history: %s", exc)
+            return []
+
+    def _save_hyperliquid_adaptive_pnl_history(self) -> None:
+        path = self._hyperliquid_adaptive_pnl_audit_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            records = self._hyperliquid_adaptive_pnl_history[-500:]
+            payload = {
+                "updatedAt": datetime.utcnow().isoformat() + "Z",
+                "records": records,
+            }
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+            tmp_path.replace(path)
+            self._hyperliquid_adaptive_pnl_history = records
+        except Exception as exc:
+            logger.warning("[HyperliquidAdaptive] Failed to save audit history: %s", exc)
+
+    @staticmethod
+    def _adaptive_trade_metadata(trade: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = (trade or {}).get("metadata") or {}
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _adaptive_parse_time(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None) if value.tzinfo else value
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except Exception:
+            return None
+
+    def _adaptive_decision_matches_trade(
+        self,
+        decision: Dict[str, Any],
+        trade: Dict[str, Any],
+    ) -> bool:
+        if str((trade or {}).get("status") or "CLOSED").upper() != "CLOSED":
+            return False
+        metadata = self._adaptive_trade_metadata(trade)
+        if str(metadata.get("accounting_excluded") or "false").lower() == "true":
+            return False
+        target_type = str(decision.get("targetType") or "").lower()
+        target = str(decision.get("target") or decision.get("strategy") or "").strip().lower()
+        side = str(decision.get("side") or "").strip().lower()
+        trade_side = str(trade.get("position_side") or trade.get("source_signal") or "").strip().lower()
+        if side and trade_side != side:
+            return False
+        if target_type == "strategy_side" or target_type == "strategy":
+            return str(trade.get("source_strategy") or trade.get("strategy") or "").strip().lower() == target
+        if target_type == "regime_side":
+            return str(metadata.get("market_regime") or "unknown").strip().lower() == target
+        return False
+
+    def _adaptive_outcome_since_live(
+        self,
+        decision: Dict[str, Any],
+        closed_trades: List[Dict[str, Any]],
+        live_since: str,
+    ) -> Dict[str, Any]:
+        live_since_dt = self._adaptive_parse_time(live_since) or datetime.utcnow()
+        wins = 0
+        losses = 0
+        realized = 0.0
+        fees = 0.0
+        funding = 0.0
+        gross_profit = 0.0
+        gross_loss = 0.0
+        closed = 0
+        for trade in closed_trades or []:
+            exit_time = self._adaptive_parse_time(
+                trade.get("exit_time") or trade.get("updated_at")
+            )
+            if exit_time is None or exit_time < live_since_dt:
+                continue
+            if not self._adaptive_decision_matches_trade(decision, trade):
+                continue
+            try:
+                pnl = float(trade.get("realized_pnl") or 0.0)
+                fee = float(trade.get("fees") or 0.0)
+                fund = float(trade.get("funding") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            closed += 1
+            realized += pnl
+            fees += fee
+            funding += fund
+            if pnl > 0:
+                wins += 1
+                gross_profit += pnl
+            elif pnl < 0:
+                losses += 1
+                gross_loss += abs(pnl)
+        gross_before_fees = realized + fees + funding
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else float("inf") if gross_profit > 0 else None
+        )
+        return {
+            "closed": closed,
+            "realized": round(realized, 4),
+            "grossBeforeFees": round(gross_before_fees, 4),
+            "fees": round(fees, 4),
+            "funding": round(funding, 4),
+            "winRatePct": round((wins / closed) * 100.0, 2) if closed else None,
+            "profitFactor": (
+                round(float(profit_factor), 4)
+                if profit_factor is not None and profit_factor != float("inf")
+                else "inf" if profit_factor == float("inf") else None
+            ),
+            "status": "no_closed_trades_since_change" if closed == 0 else "measured",
+        }
+
+    def _sync_hyperliquid_adaptive_pnl_audit(
+        self,
+        control: Dict[str, Any],
+        closed_trades: List[Dict[str, Any]],
+        *,
+        now_iso: str,
+        release_missing: bool = True,
+        apply_status: str = "applied_live",
+        applied_to_cycle: Optional[int] = None,
+        reload_required: bool = False,
+    ) -> Dict[str, Any]:
+        decisions = control.get("decisions") or []
+        history = self._hyperliquid_adaptive_pnl_history
+        try:
+            recent_release_hold_hours = max(0.0, float(control.get("recentReleaseHoldHours") or 0.0))
+        except (TypeError, ValueError):
+            recent_release_hold_hours = 0.0
+
+        def _parse_control_time(value: Any) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                return parsed
+            except Exception:
+                return None
+
+        now_dt = _parse_control_time(now_iso) or datetime.utcnow()
+
+        def _recent_decision_still_in_hold(record: Dict[str, Any]) -> bool:
+            if recent_release_hold_hours <= 0:
+                return False
+            decision_type = str(record.get("decisionType") or record.get("type") or "")
+            if decision_type not in {"reduce_recent_strategy_side", "block_recent_regime_side"}:
+                return False
+            live_dt = _parse_control_time(record.get("liveSince") or record.get("firstSeenAt"))
+            if live_dt is None:
+                return False
+            age_hours = (now_dt - live_dt).total_seconds() / 3600.0
+            return age_hours < recent_release_hold_hours
+
+        def _held_regime_side(record: Dict[str, Any]) -> tuple[str, str]:
+            if str(record.get("targetType") or "").strip().lower() != "regime_side":
+                return "", ""
+            regime = str(record.get("target") or "").strip().lower()
+            side = str(record.get("side") or "").strip().lower()
+            return regime, side
+
+        def _entry_sizing_key(record: Dict[str, Any]) -> str:
+            explicit = str(record.get("key") or "").strip()
+            if explicit:
+                return explicit
+            target = str(record.get("target") or record.get("strategy") or "").strip()
+            side = str(record.get("side") or "").strip().lower()
+            return f"{target}:{side}" if target and side else ""
+
+        active_by_key: Dict[str, Dict[str, Any]] = {}
+        for record in history:
+            if str(record.get("status") or "").lower() == "active":
+                key = str(record.get("decisionKey") or "")
+                if key:
+                    active_by_key[key] = record
+
+        current_keys = set()
+        active_records: List[Dict[str, Any]] = []
+        for decision in decisions:
+            key = str(decision.get("decisionKey") or decision.get("key") or decision.get("type") or "")
+            if not key:
+                continue
+            current_keys.add(key)
+            existing = active_by_key.get(key)
+            live_since = str((existing or {}).get("liveSince") or now_iso)
+            record = {
+                **decision,
+                "decisionKey": key,
+                "status": "active",
+                "liveSince": live_since,
+                "firstSeenAt": str((existing or {}).get("firstSeenAt") or now_iso),
+                "lastSeenAt": now_iso,
+                "applyStatus": apply_status,
+                "appliedAt": now_iso if apply_status == "applied_live" else None,
+                "appliedToCycle": applied_to_cycle,
+                "reloadRequired": reload_required,
+                "reloadVerifiedAt": now_iso if apply_status == "applied_live" else None,
+                "currentOutcome": self._adaptive_outcome_since_live(
+                    decision,
+                    closed_trades,
+                    live_since,
+                ),
+            }
+            if existing is None:
+                history.append(record)
+            else:
+                existing.clear()
+                existing.update(record)
+            active_records.append(record)
+
+        if release_missing:
+            for key, record in list(active_by_key.items()):
+                if key in current_keys:
+                    continue
+                if _recent_decision_still_in_hold(record):
+                    live_since = str(record.get("liveSince") or now_iso)
+                    held_record = {
+                        **record,
+                        "status": "active",
+                        "lastSeenAt": now_iso,
+                        "applyStatus": apply_status,
+                        "appliedAt": now_iso if apply_status == "applied_live" else record.get("appliedAt"),
+                        "appliedToCycle": applied_to_cycle,
+                        "reloadRequired": reload_required,
+                        "reloadVerifiedAt": now_iso if apply_status == "applied_live" else record.get("reloadVerifiedAt"),
+                        "currentOutcome": self._adaptive_outcome_since_live(
+                            record,
+                            closed_trades,
+                            live_since,
+                        ),
+                    }
+                    record.clear()
+                    record.update(held_record)
+                    current_keys.add(key)
+                    active_records.append(record)
+                    sizing_key = _entry_sizing_key(record)
+                    if sizing_key:
+                        entry_sizing = control.setdefault("entrySizing", {})
+                        entry_sizing[sizing_key] = float(record.get("newValue") or 1.0)
+                    regime, side = _held_regime_side(record)
+                    if regime and side:
+                        blocked = control.setdefault("blockedRegimeSides", {})
+                        sides = blocked.setdefault(regime, [])
+                        if side not in sides:
+                            sides.append(side)
+                    continue
+                record["status"] = "released"
+                record["releasedAt"] = now_iso
+                record["lastSeenAt"] = now_iso
+                record["releaseReason"] = (
+                    "Rolling paper-PnL evidence no longer triggers this adaptive overlay; "
+                    "the runtime value reverted to the base configuration."
+                )
+                record["currentOutcome"] = self._adaptive_outcome_since_live(
+                    record,
+                    closed_trades,
+                    str(record.get("liveSince") or now_iso),
+                )
+
+        self._hyperliquid_adaptive_pnl_history = history
+        control["decisions"] = active_records
+        control["history"] = list(reversed(self._hyperliquid_adaptive_pnl_history[-100:]))
+        control["historyCount"] = len(self._hyperliquid_adaptive_pnl_history)
+        control["activeDecisionKeys"] = sorted(current_keys)
+        return merge_persisted_adaptive_history(control, [])
+
+    async def _persist_hyperliquid_adaptive_pnl_audit(self, control: Dict[str, Any]) -> None:
+        """Best-effort durable sync of adaptive decisions into database-service."""
+        records = control.get("history") or control.get("decisions") or []
+        active_decision_keys = control.get("activeDecisionKeys")
+        if active_decision_keys is None:
+            active_decision_keys = sorted(
+                str(record.get("decisionKey") or "").strip()
+                for record in (control.get("decisions") or [])
+                if str(record.get("decisionKey") or "").strip()
+            )
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(
-                    "https://api.hyperliquid.xyz/info",
-                    json={"type": "allMids"},
+                    f"{database_service_url}/api/v1/perps/adaptive-pnl-decisions/sync",
+                    json={
+                        "records": records,
+                        "active_decision_keys": active_decision_keys,
+                        "release_missing_active": True,
+                        "source": "orchestrator",
+                        "synced_at": datetime.utcnow().isoformat() + "Z",
+                    },
                 )
-                response.raise_for_status()
-                data = response.json() or {}
-            mids: Dict[str, float] = {}
-            if isinstance(data, dict):
-                for coin, raw_price in data.items():
-                    try:
-                        price = float(raw_price)
-                    except (TypeError, ValueError):
-                        continue
-                    if price > 0:
-                        mids[str(coin).upper()] = price
-            return mids
-        except Exception as e:
-            logger.warning("[HyperliquidPaper] Could not fetch live mids: %s", e)
-            return {}
+            if response.status_code >= 400:
+                logger.warning(
+                    "[HyperliquidAdaptive] DB audit sync failed: %s %s",
+                    response.status_code,
+                    _http_response_log_snippet(response),
+                )
+        except Exception as exc:
+            logger.warning("[HyperliquidAdaptive] DB audit sync skipped: %s", exc)
+
+    async def _fetch_hyperliquid_adaptive_pnl_history(
+        self,
+        *,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read durable adaptive decision history from database-service."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{database_service_url}/api/v1/perps/adaptive-pnl-decisions",
+                    params={"limit": max(1, min(500, int(limit)))},
+                )
+            if response.status_code >= 400:
+                logger.warning(
+                    "[HyperliquidAdaptive] DB audit history fetch failed: %s %s",
+                    response.status_code,
+                    _http_response_log_snippet(response),
+                )
+                return []
+            payload = response.json() or {}
+            records = payload.get("records") or []
+            return records if isinstance(records, list) else []
+        except Exception as exc:
+            logger.warning("[HyperliquidAdaptive] DB audit history unavailable: %s", exc)
+            return []
+
+    async def _hyperliquid_adaptive_control_with_persisted_history(self) -> Dict[str, Any]:
+        """Return current adaptive control with Postgres history as the authoritative timeline."""
+        control = getattr(self, "_hyperliquid_adaptive_pnl_control", {}) or {}
+        records = await self._fetch_hyperliquid_adaptive_pnl_history(limit=100)
+        return merge_persisted_adaptive_history(control, records)
+
+    async def _hyperliquid_adaptive_runtime_cfg(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        apply_status: str = "applied_live",
+    ) -> Dict[str, Any]:
+        """Build and apply the rolling paper-PnL control overlay for this cycle."""
+        control_cfg = (cfg or {}).get("adaptive_pnl_control") or {}
+        enabled = control_cfg.get("enabled", False)
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+            control = {
+                "enabled": False,
+                "decisions": [],
+                "entrySizing": {},
+                "blockedRegimeSides": {},
+                "exitProfiles": {},
+                "sampleClosed": 0,
+                "lastEvaluatedAt": now_iso,
+                "status": "disabled",
+            }
+            self._hyperliquid_adaptive_pnl_control = self._sync_hyperliquid_adaptive_pnl_audit(
+                control,
+                [],
+                now_iso=now_iso,
+                apply_status=apply_status,
+                applied_to_cycle=getattr(self, "cycle_count", None),
+            )
+            await self._persist_hyperliquid_adaptive_pnl_audit(self._hyperliquid_adaptive_pnl_control)
+            return cfg
+
+        fetch_limit = int(float(control_cfg.get("fetch_limit", 500) or 500))
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={"status": "CLOSED", "limit": max(50, min(2000, fetch_limit))},
+                )
+            closed_trades = (
+                (response.json() or {}).get("trades", [])
+                if response.status_code == 200
+                else []
+            )
+            control = build_hyperliquid_adaptive_pnl_control(
+                closed_trades,
+                cfg,
+                now=datetime.utcnow(),
+            )
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            control["lastEvaluatedAt"] = now_iso
+            control["status"] = "active" if control.get("enabled") else "disabled"
+            control = self._sync_hyperliquid_adaptive_pnl_audit(
+                control,
+                closed_trades,
+                now_iso=now_iso,
+                apply_status=apply_status,
+                applied_to_cycle=getattr(self, "cycle_count", None),
+            )
+            await self._persist_hyperliquid_adaptive_pnl_audit(control)
+            self._hyperliquid_adaptive_pnl_control = control
+            if control.get("decisions"):
+                logger.info(
+                    "[HyperliquidAdaptive] Applied %d runtime decisions on %d closed trades: %s",
+                    len(control.get("decisions") or []),
+                    int(control.get("sampleClosed") or 0),
+                    "; ".join(
+                        f"{d.get('type')}:{d.get('key') or d.get('strategy')}"
+                        for d in (control.get("decisions") or [])[:8]
+                    ),
+                )
+            return apply_hyperliquid_adaptive_pnl_control(cfg, control)
+        except Exception as exc:
+            logger.warning("[HyperliquidAdaptive] Evaluation skipped: %s", exc)
+            self._hyperliquid_adaptive_pnl_control = merge_persisted_adaptive_history({
+                "enabled": True,
+                "decisions": [],
+                "entrySizing": {},
+                "blockedRegimeSides": {},
+                "exitProfiles": {},
+                "sampleClosed": 0,
+                "lastEvaluatedAt": datetime.utcnow().isoformat() + "Z",
+                "status": "error",
+                "error": str(exc),
+            }, self._hyperliquid_adaptive_pnl_history)
+            return cfg
+
+    def _hyperliquid_tradfi_dexes(self) -> List[str]:
+        cfg = self._hyperliquid_perps_cfg()
+        tradfi = ((cfg.get("pair_selector") or {}).get("tradfi") or {})
+        enabled = tradfi.get("enabled", True)
+        if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+            return []
+        return [
+            str(dex).strip().lower()
+            for dex in (tradfi.get("dexes") or ["xyz"])
+            if str(dex).strip()
+        ]
+
+    async def _fetch_hyperliquid_mids(self) -> Dict[str, float]:
+        """Fetch live Hyperliquid perp mids. Read-only, no wallet/order side effects."""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    requests = [{"type": "allMids"}]
+                    requests.extend(
+                        {"type": "allMids", "dex": dex}
+                        for dex in self._hyperliquid_tradfi_dexes()
+                    )
+                    payloads = []
+                    for req in requests:
+                        response = await client.post(
+                            "https://api.hyperliquid.xyz/info",
+                            json=req,
+                        )
+                        response.raise_for_status()
+                        payloads.append(response.json() or {})
+                mids: Dict[str, float] = {}
+                for data in payloads:
+                    if isinstance(data, dict):
+                        for coin, raw_price in data.items():
+                            try:
+                                price = float(raw_price)
+                            except (TypeError, ValueError):
+                                continue
+                            if price > 0:
+                                mids[pair_to_hyperliquid_coin(str(coin))] = price
+                return mids
+            except httpx.HTTPStatusError as e:
+                status_code = e.response.status_code if e.response else None
+                if status_code == 429 and attempt < max_attempts:
+                    delay = min(2.0, 0.5 * attempt)
+                    logger.warning(
+                        "[HyperliquidPaper] Hyperliquid mids rate-limited; "
+                        "retrying in %.1fs (%d/%d)",
+                        delay,
+                        attempt,
+                        max_attempts,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning("[HyperliquidPaper] Could not fetch live mids: %s", e)
+                return {}
+            except Exception as e:
+                logger.warning("[HyperliquidPaper] Could not fetch live mids: %s", e)
+                return {}
+        return {}
 
     async def _run_hyperliquid_perps_cycle(self, deadline: Optional[float] = None) -> None:
         """Hyperliquid perp paper mirror or live rsi_stoch execution."""
         cfg = self._hyperliquid_perps_cfg()
         if not bool(cfg.get("enabled", False)):
+            self._mark_cycle_phase_started("perp_exit_update")
+            self._finish_cycle_phase(
+                "perp_exit_update",
+                status="skipped",
+                processed_count=0,
+                message="Hyperliquid perps disabled",
+            )
+            self._mark_cycle_phase_started("perp_entry")
+            self._finish_cycle_phase(
+                "perp_entry",
+                status="skipped",
+                processed_count=0,
+                message="Hyperliquid perps disabled",
+            )
             return
         mode = str(cfg.get("mode", "paper")).lower()
 
-        await self._refresh_hyperliquid_pair_selections(cfg)
-        await self._refresh_hyperliquid_balance(cfg)
+        try:
+            await self._refresh_hyperliquid_pair_selections(cfg)
+            await self._refresh_hyperliquid_balance(cfg)
+        except Exception as e:
+            self._mark_cycle_phase_started("perp_exit_update")
+            self._finish_cycle_phase("perp_exit_update", status="error", error=e)
+            self._mark_cycle_phase_started("perp_entry")
+            self._finish_cycle_phase("perp_entry", status="error", error=e)
+            raise
 
         mids = await self._fetch_hyperliquid_mids()
         if not mids:
+            self._mark_cycle_phase_started("perp_exit_update")
+            self._finish_cycle_phase(
+                "perp_exit_update",
+                status="skipped",
+                processed_count=0,
+                message="No Hyperliquid mids available",
+            )
+            self._mark_cycle_phase_started("perp_entry")
+            self._finish_cycle_phase(
+                "perp_entry",
+                status="skipped",
+                processed_count=0,
+                message="No Hyperliquid mids available",
+            )
             return
 
         if mode == "live":
+            self._mark_cycle_phase_started("perp_exit_update")
+            self._finish_cycle_phase(
+                "perp_exit_update",
+                status="skipped",
+                processed_count=0,
+                message="Live mode does not run paper position updates",
+            )
             if bool(cfg.get("live_kill_switch", False)):
                 logger.warning("[HyperliquidLive] live_kill_switch active — no new entries")
+                self._mark_cycle_phase_started("perp_entry")
+                self._finish_cycle_phase(
+                    "perp_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Live kill switch active",
+                )
                 return
             if not bool(cfg.get("allow_live_orders", False)):
                 logger.error(
                     "[HyperliquidLive] mode=live but allow_live_orders=false — blocked"
+                )
+                self._mark_cycle_phase_started("perp_entry")
+                self._finish_cycle_phase(
+                    "perp_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Live orders disabled",
                 )
                 return
             from hyperliquid_live_orders import is_live_trading_configured
@@ -5064,29 +6110,107 @@ class TradingOrchestrator:
                 logger.error(
                     "[HyperliquidLive] mode=live but HYPERLIQUID_PRIVATE_KEY unset"
                 )
+                self._mark_cycle_phase_started("perp_entry")
+                self._finish_cycle_phase(
+                    "perp_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Live trading key not configured",
+                )
                 return
             if deadline is not None and time.monotonic() >= deadline:
+                self._mark_cycle_phase_started("perp_entry")
+                self._finish_cycle_phase(
+                    "perp_entry",
+                    status="skipped",
+                    processed_count=0,
+                    message="Trading-loop wall budget already exhausted",
+                )
                 return
-            await self._run_hyperliquid_strategy_entries(
-                mids, cfg, deadline=deadline, execution_mode="live"
-            )
+            self._mark_cycle_phase_started("perp_entry")
+            try:
+                await self._run_hyperliquid_strategy_entries(
+                    mids, cfg, deadline=deadline, execution_mode="live"
+                )
+                self._finish_cycle_phase(
+                    "perp_entry",
+                    status="completed",
+                    processed_count=len(
+                        self._last_hyperliquid_entry_scan_coins
+                        or self.hyperliquid_pair_selections
+                        or []
+                    ),
+                    message="Live Hyperliquid entries scanned",
+                )
+            except Exception as e:
+                self._finish_cycle_phase("perp_entry", status="error", error=e)
+                raise
             return
 
         if mode != "paper":
             logger.debug(
                 "[HyperliquidPaper] mode=%s — only paper/live supported", mode
             )
+            self._mark_cycle_phase_started("perp_exit_update")
+            self._finish_cycle_phase(
+                "perp_exit_update",
+                status="skipped",
+                processed_count=0,
+                message=f"Unsupported Hyperliquid mode: {mode}",
+            )
+            self._mark_cycle_phase_started("perp_entry")
+            self._finish_cycle_phase(
+                "perp_entry",
+                status="skipped",
+                processed_count=0,
+                message=f"Unsupported Hyperliquid mode: {mode}",
+            )
             return
 
-        await self._update_hyperliquid_paper_positions(mids, cfg)
+        cfg = await self._hyperliquid_adaptive_runtime_cfg(cfg)
+
+        self._mark_cycle_phase_started("perp_exit_update")
+        try:
+            await self._update_hyperliquid_paper_positions(mids, cfg)
+            self._finish_cycle_phase(
+                "perp_exit_update",
+                status="completed",
+                processed_count=len(mids),
+                message="Paper positions updated and exits evaluated",
+            )
+        except Exception as e:
+            self._finish_cycle_phase("perp_exit_update", status="error", error=e)
+            raise
         if deadline is not None and time.monotonic() >= deadline:
+            self._mark_cycle_phase_started("perp_entry")
+            self._finish_cycle_phase(
+                "perp_entry",
+                status="skipped",
+                processed_count=0,
+                message="Trading-loop wall budget exhausted after perps exit/update",
+            )
             return
-        await self._run_hyperliquid_strategy_entries(
-            mids, cfg, deadline=deadline, execution_mode="paper"
-        )
+        self._mark_cycle_phase_started("perp_entry")
+        try:
+            await self._run_hyperliquid_strategy_entries(
+                mids, cfg, deadline=deadline, execution_mode="paper"
+            )
+            self._finish_cycle_phase(
+                "perp_entry",
+                status="completed",
+                processed_count=len(
+                    self._last_hyperliquid_entry_scan_coins
+                    or self.hyperliquid_pair_selections
+                    or []
+                ),
+                message="Paper Hyperliquid entries scanned",
+            )
+        except Exception as e:
+            self._finish_cycle_phase("perp_entry", status="error", error=e)
+            raise
 
     async def _hyperliquid_runtime_blocked_coins(self, cfg: Dict[str, Any]) -> List[str]:
-        """Coins blocked by current paper-position or recent realized-loss gates."""
+        """Coins where both long and short entries are currently blocked."""
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
@@ -5113,15 +6237,15 @@ class TradingOrchestrator:
             }
             blocked: List[str] = []
             for coin in sorted(c for c in coins if c):
-                block = hyperliquid_coin_entry_block(
-                    coin,
-                    open_trades,
-                    closed_trades,
-                    realized_block_hours=float(
-                        cfg.get("block_after_negative_realized_hours", 12) or 12
-                    ),
+                long_block = hyperliquid_coin_side_entry_block(
+                    coin, "long", open_trades, closed_trades,
+                    realized_block_hours=_hyperliquid_realized_loss_block_hours(cfg),
                 )
-                if block.get("entryBlocked"):
+                short_block = hyperliquid_coin_side_entry_block(
+                    coin, "short", open_trades, closed_trades,
+                    realized_block_hours=_hyperliquid_realized_loss_block_hours(cfg),
+                )
+                if long_block.get("entryBlocked") and short_block.get("entryBlocked"):
                     blocked.append(coin)
             return blocked
         except Exception as e:
@@ -5186,7 +6310,7 @@ class TradingOrchestrator:
                 )
                 open_keys = {
                     (
-                        str(t.get("coin") or "").upper(),
+                        pair_to_hyperliquid_coin(str(t.get("coin") or "")),
                         str(t.get("position_side") or "").lower(),
                     )
                     for t in (open_trades or [])
@@ -5197,9 +6321,7 @@ class TradingOrchestrator:
                         coin,
                         open_trades,
                         closed_trades,
-                        realized_block_hours=float(
-                            cfg.get("block_after_negative_realized_hours", 12) or 12
-                        ),
+                        realized_block_hours=_hyperliquid_realized_loss_block_hours(cfg),
                     )
                     if not block.get("entryBlocked"):
                         self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
@@ -5261,7 +6383,7 @@ class TradingOrchestrator:
                         if conf < required_conf:
                             signal_gate_reason = f"confidence_{conf:.2f}_lt_{required_conf:.2f}"
                         else:
-                            specialist_gate = sma_reclaim_bull_flag_specialist_gate(
+                            specialist_gate = specialist_entry_gate(
                                 mirrored,
                                 cfg,
                             )
@@ -5290,9 +6412,7 @@ class TradingOrchestrator:
                                         mirrored.get("strategy") or "unknown",
                                         side,
                                         closed_trades,
-                                        realized_block_hours=float(
-                                            cfg.get("block_after_negative_realized_hours", 12) or 12
-                                        ),
+                                        realized_block_hours=_hyperliquid_strategy_side_realized_loss_block_hours(cfg),
                                     )
 
                     would_open_without_coin_block = (
@@ -5435,6 +6555,142 @@ class TradingOrchestrator:
                 )
             logger.warning("[HyperliquidPaper] HL pair selector failed: %s", e)
 
+    @staticmethod
+    def _merge_hyperliquid_coins(*coin_lists: List[str]) -> List[str]:
+        merged: List[str] = []
+        seen: Set[str] = set()
+        for coins in coin_lists:
+            for raw in coins or []:
+                coin = pair_to_hyperliquid_coin(str(raw or ""))
+                if not coin or coin in seen:
+                    continue
+                seen.add(coin)
+                merged.append(coin)
+        return merged
+
+    @staticmethod
+    def _row_bool(row: Dict[str, Any], key: str) -> bool:
+        value = row.get(key)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "pass", "passed"}
+
+    def _setup_audit_row_is_actionable(self, strategy: str, row: Dict[str, Any]) -> bool:
+        strategy = str(strategy or "").strip().lower()
+        if strategy == "orb_5m_scalp":
+            state = str(row.get("setup_state") or "").strip().lower()
+            if state == "waiting_retest" and self._row_bool(row, "breakout_valid"):
+                return True
+            signal_value = str(row.get("signal") or "").strip().lower()
+            if state == "signal" and signal_value in {"buy", "sell", "long", "short"}:
+                return self._row_bool(row, "breakout_valid") and self._row_bool(row, "retest_valid")
+            return False
+        signal_value = str(
+            row.get("signal") or row.get("entry_signal_5m") or ""
+        ).strip().lower()
+        if signal_value not in {"buy", "sell", "long", "short"}:
+            return False
+        if strategy == "supply_demand_3step":
+            return all(
+                self._row_bool(row, key)
+                for key in ("step1_pass", "step2_pass", "step3_pass")
+            )
+        if strategy == "dual_sma_daytrade":
+            return all(
+                self._row_bool(row, key)
+                for key in ("daily_pass", "confirm_15m_pass", "entry_5m_pass")
+            )
+        if strategy == "arc_daytrade":
+            return all(
+                self._row_bool(row, key)
+                for key in ("area_pass", "range_pass", "candle_pass")
+            )
+        if strategy == "ema50_breakout_pullback":
+            return self._row_bool(row, "trigger_pass")
+        return False
+
+    async def _hyperliquid_fresh_setup_candidate_coins(
+        self, cfg: Dict[str, Any]
+    ) -> List[str]:
+        """Fresh audit-triggered setup candidates that should receive a full entry scan."""
+        scan_cfg = cfg.get("setup_audit_candidate_scan") or {}
+        if scan_cfg.get("enabled", True) is False:
+            return []
+        hours = int(scan_cfg.get("hours", 24) or 24)
+        limit = int(scan_cfg.get("limit_per_strategy", 120) or 120)
+        max_candidates = int(scan_cfg.get("max_candidates", 30) or 30)
+        endpoints = {
+            "supply_demand_3step": "/api/v1/analytics/supply-demand-analysis-logs",
+            "dual_sma_daytrade": "/api/v1/analytics/dual-sma-analysis-logs",
+            "arc_daytrade": "/api/v1/analytics/arc-analysis-logs",
+            "ema50_breakout_pullback": "/api/v1/analytics/ema50-breakout-pullback-analysis-logs",
+            "orb_5m_scalp": "/api/v1/analytics/orb-5m-scalp-analysis-logs",
+        }
+        candidates: List[str] = []
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                for strategy_name, path in endpoints.items():
+                    resp = await client.get(
+                        f"{database_service_url}{path}",
+                        params={
+                            "venue": "hyperliquid",
+                            "hours": max(1, min(hours, 720)),
+                            "limit": max(1, min(limit, 5000)),
+                        },
+                    )
+                    if resp.status_code != 200:
+                        logger.debug(
+                            "[HyperliquidPaper] Setup audit candidate fetch failed %s: HTTP %s",
+                            strategy_name,
+                            resp.status_code,
+                        )
+                        continue
+                    rows = (resp.json() or {}).get("rows") or []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        if not self._setup_audit_row_is_actionable(strategy_name, row):
+                            continue
+                        coin = pair_to_hyperliquid_coin(str(row.get("symbol") or ""))
+                        if coin:
+                            candidates.append(coin)
+                        if len(self._merge_hyperliquid_coins(candidates)) >= max_candidates:
+                            break
+                    if len(self._merge_hyperliquid_coins(candidates)) >= max_candidates:
+                        break
+        except Exception as exc:
+            logger.warning(
+                "[HyperliquidPaper] Setup audit candidate scan skipped: %s", exc
+            )
+            return []
+        result = self._merge_hyperliquid_coins(candidates)[:max_candidates]
+        if result:
+            logger.info(
+                "[HyperliquidPaper] Adding setup-audit candidates to entry scan: %s",
+                result,
+            )
+        return result
+
+    async def _finish_hyperliquid_global_skip(
+        self,
+        coins: List[str],
+        *,
+        primary_reason: str,
+        message: str,
+    ) -> None:
+        for raw in coins or []:
+            coin = pair_to_hyperliquid_coin(str(raw or ""))
+            if not coin:
+                continue
+            try:
+                await self._hl_cycle_recorder(coin).finish(
+                    outcome="skipped",
+                    primary_reason=primary_reason,
+                    message=message,
+                )
+            except Exception:
+                pass
+
     async def _refresh_hyperliquid_balance(self, cfg: Dict[str, Any]) -> None:
         """Sync Hyperliquid venue balance: paper-derived or live clearinghouse wallet."""
         try:
@@ -5531,7 +6787,7 @@ class TradingOrchestrator:
                     return
                 open_trades = (open_resp.json() or {}).get("trades", []) or []
                 for trade in open_trades:
-                    coin = str(trade.get("coin") or "").upper()
+                    coin = pair_to_hyperliquid_coin(str(trade.get("coin") or ""))
                     current_price = mids.get(coin)
                     if not current_price:
                         continue
@@ -5540,8 +6796,14 @@ class TradingOrchestrator:
                     side = str(trade.get("position_side") or "long").lower()
                     fees = float(trade.get("fees") or 0.0) + float(trade.get("funding") or 0.0)
                     unrealized = calculate_perp_pnl(side, entry_price, current_price, size, fees)
-                    exit_reason = None
-                    if use_strategy_exits and trade.get("source_strategy"):
+                    exit_reason = disabled_strategy_side_exit_reason(
+                        trade, self._config or {}
+                    )
+                    if not exit_reason:
+                        exit_reason = adaptive_blocked_regime_side_exit_reason(
+                            trade, cfg
+                        )
+                    if not exit_reason and use_strategy_exits and trade.get("source_strategy"):
                         try:
                             advice_resp = await client.post(
                                 f"{strategy_service_url}/api/v1/hyperliquid/{coin}/exit-advice",
@@ -5595,15 +6857,19 @@ class TradingOrchestrator:
                         "metadata": exit_eval.metadata,
                     }
                     if exit_reason:
-                        exit_notional = current_price * size
+                        execution_price = current_price
+                        if exit_eval.exit_reason and exit_reason == exit_eval.exit_reason:
+                            execution_price = float(exit_eval.exit_price or current_price)
+                        exit_notional = execution_price * size
                         total_fees = fees + perp_side_fee(exit_notional, fee_rate)
                         realized = calculate_perp_pnl(
-                            side, entry_price, current_price, size, total_fees
+                            side, entry_price, execution_price, size, total_fees
                         )
                         payload.update(
                             {
                                 "status": "CLOSED",
-                                "exit_price": current_price,
+                                "current_price": execution_price,
+                                "exit_price": execution_price,
                                 "exit_time": datetime.utcnow().isoformat() + "+00:00",
                                 "realized_pnl": realized,
                                 "fees": total_fees,
@@ -5659,7 +6925,15 @@ class TradingOrchestrator:
             if not mirror_exchanges:
                 mirror_exchanges = list(self.pair_selections.keys())
 
-            hl_coins = list(self.hyperliquid_pair_selections or [])
+            selector_coins = list(self.hyperliquid_pair_selections or [])
+            setup_candidate_coins = []
+            if signal_source == "hyperliquid_strategies" and not coin_filter:
+                setup_candidate_coins = await self._hyperliquid_fresh_setup_candidate_coins(cfg)
+            hl_coins = self._merge_hyperliquid_coins(
+                setup_candidate_coins,
+                selector_coins,
+            )
+            self._last_hyperliquid_entry_scan_coins = list(hl_coins)
             if not hl_coins:
                 logger.warning(
                     "[HyperliquidPaper] No HL selector output; skipping entry cycle"
@@ -5689,10 +6963,20 @@ class TradingOrchestrator:
                     else []
                 )
                 open_keys = {
-                    (str(t.get("coin") or "").upper(), str(t.get("position_side") or "").lower())
+                    (
+                        pair_to_hyperliquid_coin(str(t.get("coin") or "")),
+                        str(t.get("position_side") or "").lower(),
+                    )
                     for t in (open_trades or [])
                 }
                 if len(open_trades or []) >= max_open:
+                    await self._finish_hyperliquid_global_skip(
+                        hl_coins,
+                        primary_reason="max_open_positions",
+                        message=(
+                            f"Max open positions reached: {len(open_trades or [])}/{max_open}"
+                        ),
+                    )
                     return
 
                 account_equity = float(cfg.get("starting_balance_usd", 5000.0) or 5000.0)
@@ -5706,7 +6990,26 @@ class TradingOrchestrator:
                         float(daily_halt.get("limitUsd") or 0.0),
                         float(daily_halt.get("maxDailyLossPct") or 0.0) * 100.0,
                     )
+                    await self._finish_hyperliquid_global_skip(
+                        hl_coins,
+                        primary_reason="daily_loss_halt",
+                        message=(
+                            f"Daily loss halt active: pnl=${float(daily_halt.get('dailyPnl') or 0.0):.2f}, "
+                            f"limit=${float(daily_halt.get('limitUsd') or 0.0):.2f}"
+                        ),
+                    )
                     return
+
+                trading_cfg: Dict[str, Any] = {}
+                try:
+                    trading_resp = await client.get(f"{config_service_url}/api/v1/config/trading")
+                    if trading_resp.status_code == 200:
+                        trading_cfg = trading_resp.json() or {}
+                except Exception as trading_cfg_err:
+                    logger.warning(
+                        "[HyperliquidPaper] Could not load trading config for sizing tiers: %s",
+                        trading_cfg_err,
+                    )
 
                 opened = 0
                 for coin in hl_coins:
@@ -5715,32 +7018,33 @@ class TradingOrchestrator:
                     if len(open_trades or []) + opened >= max_open:
                         return
 
-                    coin = str(coin).upper()
-                    if coin_filter and coin not in {str(c).upper() for c in coin_filter}:
+                    coin = pair_to_hyperliquid_coin(str(coin))
+                    recorder = self._hl_cycle_recorder(coin)
+                    if coin_filter and coin not in {
+                        pair_to_hyperliquid_coin(str(c)) for c in coin_filter
+                    }:
+                        await recorder.finish(
+                            outcome="not_scanned",
+                            primary_reason="coin_filter",
+                            message=(
+                                "Not scanned in this fast-entry pass; only coins with fresh "
+                                "fast trigger payloads were evaluated. Wait for the full "
+                                "perp scan or check strategy audit eligibility."
+                            ),
+                        )
                         continue
                     price = mids.get(coin)
                     if not price:
+                        await recorder.finish(
+                            outcome="not_scanned",
+                            primary_reason="no_price",
+                            message="No Hyperliquid mid price available",
+                        )
                         continue
 
                     exchange_name = "hyperliquid"
                     pair = f"{coin}/USD-PERP"
                     signals_data: Dict[str, Any] = {}
-                    block = hyperliquid_coin_entry_block(
-                        coin,
-                        open_trades,
-                        closed_trades,
-                        realized_block_hours=float(
-                            cfg.get("block_after_negative_realized_hours", 12) or 12
-                        ),
-                    )
-                    if block.get("entryBlocked"):
-                        logger.warning(
-                            "[HyperliquidPaper] Blocked PAPER entry %s: %s (%s)",
-                            coin,
-                            block.get("entryBlockReason"),
-                            block.get("entryBlockMessage"),
-                        )
-                        continue
                     mirrored: Optional[Dict[str, Any]] = None
                     signals_data: Dict[str, Any] = {}
                     fast_payload = (fast_signal_by_coin or {}).get(coin)
@@ -5752,10 +7056,18 @@ class TradingOrchestrator:
 
                         mirrored = mirrored_perp_signal_from_fast_payload(fast_payload)
                         if not mirrored:
+                            fast_signals = signals_data_from_fast_perp_payload(fast_payload, coin)
+                            recorder.set_signals(fast_signals)
+                            await recorder.finish(
+                                outcome="no_actionable_signal",
+                                primary_reason="fast_signal_invalid",
+                                message="Fast signal payload could not be mirrored",
+                            )
                             continue
                         signals_data = signals_data_from_fast_perp_payload(
                             fast_payload, coin
                         )
+                        recorder.set_signals(signals_data)
                         logger.info(
                             "[HyperliquidPaper] Fast-signal entry path %s %s "
                             "strategy=%s conf=%.2f",
@@ -5779,6 +7091,11 @@ class TradingOrchestrator:
                                         "[HyperliquidPaper] No mirror spot pair for HL coin %s",
                                         coin,
                                     )
+                                    await recorder.finish(
+                                        outcome="not_scanned",
+                                        primary_reason="no_mirror_pair",
+                                        message="No mirror spot pair configured",
+                                    )
                                     continue
                                 exchange_name = spot_ex
                                 pair = spot_pair
@@ -5788,6 +7105,11 @@ class TradingOrchestrator:
                                 )
                             signals_resp = await client.get(signals_url, timeout=90.0)
                             if signals_resp.status_code != 200:
+                                await recorder.finish(
+                                    outcome="not_scanned",
+                                    primary_reason="signal_fetch_failed",
+                                    message=f"Strategy service HTTP {signals_resp.status_code}",
+                                )
                                 continue
                             signals_data = signals_resp.json()
                         except Exception as e:
@@ -5796,12 +7118,30 @@ class TradingOrchestrator:
                                 coin,
                                 e,
                             )
+                            await recorder.finish(
+                                outcome="not_scanned",
+                                primary_reason="signal_fetch_error",
+                                message=str(e)[:200],
+                            )
                             continue
 
+                    recorder.set_signals(signals_data)
                     if mirrored is None:
                         mirrored = select_mirrored_signal(signals_data)
+                    recorder.set_mirrored(mirrored)
                     if not mirrored:
+                        await recorder.finish(
+                            outcome="no_actionable_signal",
+                            primary_reason="no_actionable_signal",
+                            message="No long/short candidate from enabled strategies",
+                        )
                         continue
+
+                    recorder.add_gate(
+                        "signal_selected",
+                        True,
+                        self._hl_selected_gate_message(mirrored),
+                    )
 
                     entry_path = "cycle_slow"
                     src_strat = str(mirrored.get("strategy") or "")
@@ -5820,10 +7160,46 @@ class TradingOrchestrator:
                                 coin,
                                 src_strat,
                             )
+                            await recorder.finish(
+                                outcome="skipped",
+                                primary_reason="live_allowlist",
+                                message=f"Strategy {src_strat} not on live allowlist",
+                            )
                             continue
 
                     side = position_sides_from_signal(mirrored.get("signal"))
                     if side not in {"long", "short"}:
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="invalid_side",
+                            message="Selected signal is not long/short",
+                        )
+                        continue
+                    side_block = hyperliquid_coin_side_entry_block(
+                        coin,
+                        side,
+                        open_trades,
+                        closed_trades,
+                        realized_block_hours=_hyperliquid_realized_loss_block_hours(cfg),
+                    )
+                    if side_block.get("entryBlocked"):
+                        logger.warning(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s (%s)",
+                            side,
+                            coin,
+                            side_block.get("entryBlockReason"),
+                            side_block.get("entryBlockMessage"),
+                        )
+                        recorder.add_gate(
+                            "coin_side_block",
+                            False,
+                            str(side_block.get("entryBlockMessage") or side_block.get("entryBlockReason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="blocked_pre_signal",
+                            primary_reason=str(side_block.get("entryBlockReason") or "coin_side_block"),
+                            message=str(side_block.get("entryBlockMessage") or ""),
+                        )
                         continue
                     conf = float(mirrored.get("confidence") or 0.0)
                     if side == "long" and conf < min_long_conf:
@@ -5836,6 +7212,16 @@ class TradingOrchestrator:
                             float(mirrored.get("consensus_confidence") or 0.0),
                             float(mirrored.get("consensus_agreement") or 0.0),
                         )
+                        recorder.add_gate(
+                            "confidence",
+                            False,
+                            f"long conf {conf:.2f} < {min_long_conf:.2f}",
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="confidence",
+                            message=f"long confidence {conf:.2f} below {min_long_conf:.2f}",
+                        )
                         continue
                     if side == "short" and conf < min_short_conf:
                         logger.info(
@@ -5847,7 +7233,22 @@ class TradingOrchestrator:
                             float(mirrored.get("consensus_confidence") or 0.0),
                             float(mirrored.get("consensus_agreement") or 0.0),
                         )
+                        recorder.add_gate(
+                            "confidence",
+                            False,
+                            f"short conf {conf:.2f} < {min_short_conf:.2f}",
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="confidence",
+                            message=f"short confidence {conf:.2f} below {min_short_conf:.2f}",
+                        )
                         continue
+                    recorder.add_gate(
+                        "confidence",
+                        True,
+                        f"{side} conf {conf:.2f} meets threshold",
+                    )
 
                     market_regime = str(
                         (signals_data.get("market_regime") or "")
@@ -5855,6 +7256,7 @@ class TradingOrchestrator:
                     regime_gate = hyperliquid_regime_direction_gate(
                         side, market_regime, conf,
                         float(mirrored.get("strength") or 0.0),
+                        cfg,
                     )
                     if regime_gate.get("blocked"):
                         logger.info(
@@ -5863,7 +7265,18 @@ class TradingOrchestrator:
                             regime_gate.get("reason"),
                             market_regime, conf,
                         )
+                        recorder.add_gate(
+                            "regime_gate",
+                            False,
+                            str(regime_gate.get("reason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="regime_gate",
+                            message=str(regime_gate.get("reason") or ""),
+                        )
                         continue
+                    recorder.add_gate("regime_gate", True, f"regime={market_regime or 'unknown'}")
 
                     chase_gate = hyperliquid_trend_chase_gate(
                         mirrored, market_regime,
@@ -5873,8 +7286,19 @@ class TradingOrchestrator:
                             "[HyperliquidPaper] Blocked PAPER %s %s: %s",
                             side, coin, chase_gate.get("reason"),
                         )
+                        recorder.add_gate(
+                            "trend_chase_gate",
+                            False,
+                            str(chase_gate.get("reason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="trend_chase_gate",
+                            message=str(chase_gate.get("reason") or ""),
+                        )
                         continue
                     chase_size_mult = chase_gate.get("sizeMultiplier")
+                    recorder.add_gate("trend_chase_gate", True, "trend-chase gate clear")
 
                     edge_gate = hyperliquid_min_edge_gate(mirrored, cfg)
                     if edge_gate.get("blocked"):
@@ -5882,7 +7306,42 @@ class TradingOrchestrator:
                             "[HyperliquidPaper] Blocked PAPER %s %s: %s",
                             side, coin, edge_gate.get("reason"),
                         )
+                        recorder.add_gate(
+                            "edge_gate",
+                            False,
+                            str(edge_gate.get("reason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="edge_gate",
+                            message=str(edge_gate.get("reason") or ""),
+                        )
                         continue
+                    recorder.add_gate("edge_gate", True, "expected move covers fees")
+
+                    streak_cfg = _hyperliquid_strategy_coin_loss_streak_cfg(
+                        cfg, mirrored.get("strategy") or ""
+                    )
+                    streak_block = hyperliquid_strategy_coin_loss_streak_entry_block(
+                        coin,
+                        mirrored.get("strategy") or "",
+                        closed_trades,
+                        consecutive_losses=int(streak_cfg.get("consecutive_losses", 2) or 2),
+                        cooldown_hours=float(streak_cfg.get("cooldown_hours", 0) or 0),
+                    )
+                    if streak_block.get("entryBlocked"):
+                        recorder.add_gate(
+                            "strategy_coin_loss_streak",
+                            False,
+                            str(streak_block.get("entryBlockMessage") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="strategy_coin_loss_streak",
+                            message=str(streak_block.get("entryBlockMessage") or ""),
+                        )
+                        continue
+                    recorder.add_gate("strategy_coin_loss_streak", True, "loss streak clear")
 
                     cooldown_minutes = int(
                         cfg.get("perp_reentry_cooldown_minutes", 30) or 30
@@ -5897,7 +7356,18 @@ class TradingOrchestrator:
                             side, coin,
                             cooldown_check.get("reason"),
                         )
+                        recorder.add_gate(
+                            "reentry_cooldown",
+                            False,
+                            str(cooldown_check.get("reason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="reentry_cooldown",
+                            message=str(cooldown_check.get("reason") or ""),
+                        )
                         continue
+                    recorder.add_gate("reentry_cooldown", True, "cooldown clear")
 
                     perf_logging = (cfg.get("strategy_performance_logging") or {})
                     perf_enabled = perf_logging.get("enabled", True)
@@ -5936,7 +7406,7 @@ class TradingOrchestrator:
                         )
                     consensus_agreement = float(mirrored.get("consensus_agreement") or 0.0)
                     consensus_confidence = float(mirrored.get("consensus_confidence") or 0.0)
-                    specialist_gate = sma_reclaim_bull_flag_specialist_gate(mirrored, cfg)
+                    specialist_gate = specialist_entry_gate(mirrored, cfg)
                     standalone_gate = (
                         {"isStandalone": False, "allowed": False, "bypassConsensus": False, "sizeMultiplier": None}
                         if specialist_gate.get("isSpecialist")
@@ -5952,6 +7422,16 @@ class TradingOrchestrator:
                             conf,
                             float(mirrored.get("strength") or 0.0),
                         )
+                        recorder.add_gate(
+                            "specialist_gate",
+                            False,
+                            str(specialist_gate.get("reason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="specialist_gate",
+                            message=str(specialist_gate.get("reason") or ""),
+                        )
                         continue
                     if standalone_gate.get("isStandalone") and not standalone_gate.get("allowed"):
                         logger.info(
@@ -5963,6 +7443,16 @@ class TradingOrchestrator:
                             standalone_gate.get("reason"),
                             conf,
                             float(mirrored.get("strength") or 0.0),
+                        )
+                        recorder.add_gate(
+                            "standalone_gate",
+                            False,
+                            str(standalone_gate.get("reason") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="standalone_gate",
+                            message=str(standalone_gate.get("reason") or ""),
                         )
                         continue
                     bypass_consensus = bool(
@@ -5980,6 +7470,16 @@ class TradingOrchestrator:
                             consensus_confidence,
                             conf,
                         )
+                        recorder.add_gate(
+                            "consensus_agreement",
+                            False,
+                            f"agreement {consensus_agreement:.1f}% < {min_agreement:.1f}%",
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="consensus_agreement",
+                            message=f"agreement {consensus_agreement:.1f}% below {min_agreement:.1f}%",
+                        )
                         continue
                     if bypass_consensus:
                         logger.info(
@@ -5996,9 +7496,7 @@ class TradingOrchestrator:
                         mirrored.get("strategy") or "unknown",
                         side,
                         closed_trades,
-                        realized_block_hours=float(
-                            cfg.get("block_after_negative_realized_hours", 12) or 12
-                        ),
+                        realized_block_hours=_hyperliquid_strategy_side_realized_loss_block_hours(cfg),
                     )
                     if strategy_side_block.get("entryBlocked"):
                         logger.warning(
@@ -6008,8 +7506,24 @@ class TradingOrchestrator:
                             mirrored.get("strategy") or "unknown",
                             strategy_side_block.get("entryBlockMessage"),
                         )
+                        recorder.add_gate(
+                            "strategy_side_block",
+                            False,
+                            str(strategy_side_block.get("entryBlockMessage") or ""),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="strategy_side_block",
+                            message=str(strategy_side_block.get("entryBlockMessage") or ""),
+                        )
                         continue
                     if (coin, side) in open_keys:
+                        recorder.add_gate("position_open", False, f"{side} already open")
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="position_already_open",
+                            message=f"Open {side} position already exists",
+                        )
                         continue
 
                     size_multiplier = (
@@ -6071,13 +7585,48 @@ class TradingOrchestrator:
                         )
                     utc_hour = datetime.utcnow().hour
                     if is_block_window(utc_hour, cfg):
-                        logger.info(
-                            "[HyperliquidPaper] Blocked PAPER %s %s: "
-                            "session_block_window (UTC %d:00)",
-                            side, coin, utc_hour,
-                        )
-                        continue
+                        strategy_name = str(mirrored.get("strategy") or "unknown")
+                        if is_block_window_strategy_exempt(strategy_name, cfg):
+                            logger.warning(
+                                "[HyperliquidPaper] %s %s bypassed "
+                                "session_block_window (UTC %d:00): strategy=%s",
+                                side,
+                                coin,
+                                utc_hour,
+                                strategy_name,
+                            )
+                        else:
+                            logger.info(
+                                "[HyperliquidPaper] Blocked PAPER %s %s: "
+                                "strategy=%s session_block_window (UTC %d:00)",
+                                side,
+                                coin,
+                                strategy_name,
+                                utc_hour,
+                            )
+                            recorder.add_gate(
+                                "session_block_window",
+                                False,
+                                f"UTC hour {utc_hour}:00 blocked",
+                            )
+                            await recorder.finish(
+                                outcome="skipped",
+                                primary_reason="session_block_window",
+                                message=f"Session block window UTC {utc_hour}:00",
+                            )
+                            continue
                     caution, caution_mult = is_caution_window(utc_hour, cfg)
+                    perp_strategy_for_caution = str(mirrored.get("strategy") or "")
+                    if caution and is_caution_window_strategy_exempt(perp_strategy_for_caution, cfg):
+                        logger.info(
+                            "[HyperliquidPaper] %s %s bypassed session caution "
+                            "(UTC %d:00): strategy=%s",
+                            side,
+                            coin,
+                            utc_hour,
+                            perp_strategy_for_caution,
+                        )
+                        caution = False
                     if caution:
                         size_multiplier *= caution_mult
                         logger.info(
@@ -6106,15 +7655,50 @@ class TradingOrchestrator:
                             "[HyperliquidPaper] %s %s strategy size hint: mult=%.2f",
                             side, coin, signal_size_mult,
                         )
-                    size_multiplier = max(0.0, min(1.0, size_multiplier))
-                    scaled_max_margin = max_margin * size_multiplier
-                    scaled_max_notional = max_notional * size_multiplier
+                    adaptive_size_mult = hyperliquid_adaptive_entry_sizing_multiplier(
+                        mirrored,
+                        market_regime,
+                        cfg,
+                    )
+                    if adaptive_size_mult != 1.0:
+                        size_multiplier *= adaptive_size_mult
+                        logger.info(
+                            "[HyperliquidAdaptive] %s %s strategy=%s regime=%s "
+                            "runtime sizing *= %.2f",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            market_regime or "unknown",
+                            adaptive_size_mult,
+                        )
+                    adaptive_cfg = (cfg.get("adaptive_pnl_control") or {})
+                    max_size_multiplier = 1.0
+                    if adaptive_cfg.get("enabled", False) is not False:
+                        max_size_multiplier = max(
+                            1.0,
+                            min(
+                                1.5,
+                                float(adaptive_cfg.get("scale_up_multiplier", 1.25) or 1.25),
+                            ),
+                        )
+                    size_multiplier = max(0.0, min(max_size_multiplier, size_multiplier))
+                    perp_strategy_name = str(mirrored.get("strategy") or "")
+                    tier_floor = strategy_min_size_multiplier(perp_strategy_name, trading_cfg)
+                    if tier_floor is not None:
+                        size_multiplier = max(size_multiplier, tier_floor)
+                    strategy_notional_cap = strategy_max_notional(perp_strategy_name, cfg)
+                    strategy_margin_cap = strategy_notional_cap / max(leverage, 1e-9)
+                    effective_max_notional = max(max_notional, strategy_notional_cap)
+                    effective_max_margin = max(max_margin, strategy_margin_cap)
+                    scaled_max_margin = effective_max_margin * size_multiplier
+                    scaled_max_notional = effective_max_notional * size_multiplier
                     stop_dist_pct = stop_distance_pct_from_signal(mirrored, cfg)
                     risk_notional = hyperliquid_risk_based_notional(
                         account_equity,
                         stop_dist_pct,
                         cfg,
                         size_multiplier=size_multiplier,
+                        strategy=perp_strategy_name,
                     )
                     if risk_notional is not None and risk_notional > 0:
                         notional = min(risk_notional, scaled_max_notional)
@@ -6123,10 +7707,64 @@ class TradingOrchestrator:
                     else:
                         margin_used = min(scaled_max_margin, scaled_max_notional / leverage)
                         notional = min(scaled_max_notional, margin_used * leverage)
+                    min_notional = strategy_min_notional(perp_strategy_name, cfg)
+                    if min_notional > 0 and notional < min_notional:
+                        min_margin = min_notional / max(leverage, 1e-9)
+                        can_floor_to_min = (
+                            available_balance is not None
+                            and min_margin <= available_balance
+                            and min_notional <= effective_max_notional
+                        )
+                        if can_floor_to_min:
+                            logger.info(
+                                "[HyperliquidPaper] Raising %s %s notional %.2f -> min_notional %.2f",
+                                side,
+                                coin,
+                                notional,
+                                min_notional,
+                            )
+                            recorder.add_gate(
+                                "min_notional",
+                                True,
+                                (
+                                    f"notional {notional:.2f} raised to configured "
+                                    f"min {min_notional:.2f}"
+                                ),
+                            )
+                            notional = min_notional
+                            margin_used = min_margin
+                        else:
+                            logger.info(
+                                "[HyperliquidPaper] Blocked PAPER %s %s: notional %.2f < min_notional %.2f",
+                                side,
+                                coin,
+                                notional,
+                                min_notional,
+                            )
+                            recorder.add_gate(
+                                "min_notional",
+                                False,
+                                f"notional {notional:.2f} < min {min_notional:.2f}",
+                            )
+                            await recorder.finish(
+                                outcome="skipped",
+                                primary_reason="min_notional",
+                                message=(
+                                    f"Blocked by min notional: computed ${notional:.2f} "
+                                    f"after strategy/PnL sizing, below required ${min_notional:.2f}"
+                                ),
+                            )
+                            continue
                     if available_balance is None:
                         logger.warning(
                             "[HyperliquidPaper] Blocking %s entry because HL available balance is unavailable",
                             coin,
+                        )
+                        recorder.add_gate("available_balance", False, "balance unavailable")
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="available_balance_unavailable",
+                            message="Hyperliquid available balance unavailable",
                         )
                         continue
                     if margin_used > available_balance:
@@ -6136,12 +7774,33 @@ class TradingOrchestrator:
                             margin_used,
                             coin,
                         )
+                        recorder.add_gate(
+                            "available_balance",
+                            False,
+                            f"need margin {margin_used:.2f}, have {available_balance:.2f}",
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="insufficient_balance",
+                            message=f"Insufficient balance for margin {margin_used:.2f}",
+                        )
                         continue
                     size = notional / price
                     if size <= 0:
+                        recorder.add_gate("position_size", False, "computed size <= 0")
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="invalid_size",
+                            message="Computed position size is zero",
+                        )
                         continue
                     entry_fee = perp_side_fee(notional, fee_rate)
                     trade_id = str(uuid.uuid4())
+                    service_recommended = (signals_data or {}).get("recommended")
+                    if not isinstance(service_recommended, dict):
+                        service_recommended = {}
+                    setup_risk = setup_risk_metadata_from_signal(mirrored)
+                    hl_selected = selected_mirrored_signal_metadata(mirrored)
                     payload = {
                         "trade_id": trade_id,
                         "venue": "hyperliquid",
@@ -6180,11 +7839,24 @@ class TradingOrchestrator:
                             "risk_based_notional": risk_notional,
                             "stable_regime": (signals_data or {}).get("stable_regime"),
                             "market_regime": (signals_data or {}).get("market_regime"),
-                            "hl_recommended": (signals_data or {}).get("recommended"),
+                            "hl_selected": hl_selected,
+                            "setup_risk": setup_risk or hl_selected.get("setup_risk") or {},
+                            "hl_recommended": service_recommended,
+                            "hl_recommended_matches_selected": (
+                                str(service_recommended.get("strategy") or "")
+                                == str(mirrored.get("strategy") or "")
+                                and position_sides_from_signal(
+                                    service_recommended.get("signal") or ""
+                                )
+                                == side
+                            ),
                             **_perp_entry_atr_metadata(mirrored, price),
                         },
                     }
-                    if str(payload["source_strategy"]) == "rsi_stoch_reversal_5m":
+                    if str(payload["source_strategy"]) in {
+                        "rsi_stoch_reversal_5m",
+                        "rsi_stoch_reversal_1m",
+                    }:
                         payload["metadata"].update(
                             self._rsi_stoch_audit_metadata(
                                 mirrored,
@@ -6212,12 +7884,28 @@ class TradingOrchestrator:
                             available_balance = max(
                                 0.0, available_balance - margin_used
                             )
+                            recorder.add_gate("entry_execution", True, "live order opened")
+                            await recorder.finish(
+                                outcome="entered",
+                                primary_reason="entered",
+                                message=f"Opened live {side} via {payload['source_strategy']}",
+                            )
                         else:
                             logger.warning(
                                 "[HyperliquidLive] Entry failed %s %s: %s",
                                 side,
                                 coin,
                                 live_result.get("error"),
+                            )
+                            recorder.add_gate(
+                                "entry_execution",
+                                False,
+                                str(live_result.get("error") or "live entry failed"),
+                            )
+                            await recorder.finish(
+                                outcome="skipped",
+                                primary_reason="entry_execution_failed",
+                                message=str(live_result.get("error") or "live entry failed"),
                             )
                         continue
 
@@ -6241,6 +7929,12 @@ class TradingOrchestrator:
                             leverage,
                             size_multiplier,
                         )
+                        recorder.add_gate("entry_execution", True, "paper trade opened")
+                        await recorder.finish(
+                            outcome="entered",
+                            primary_reason="entered",
+                            message=f"Opened paper {side} via {payload['source_strategy']}",
+                        )
                     else:
                         logger.warning(
                             "[HyperliquidPaper] DB create failed for %s %s: %s %s",
@@ -6248,6 +7942,16 @@ class TradingOrchestrator:
                             coin,
                             create_resp.status_code,
                             _http_response_log_snippet(create_resp),
+                        )
+                        recorder.add_gate(
+                            "entry_execution",
+                            False,
+                            f"DB create HTTP {create_resp.status_code}",
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="entry_execution_failed",
+                            message=f"Paper trade DB create failed ({create_resp.status_code})",
                         )
         except Exception as e:
             logger.warning("[HyperliquidPaper] Signal mirror skipped: %s", e)
@@ -6602,8 +8306,25 @@ class TradingOrchestrator:
             if not enabled:
                 self._recent_negative_realized_blacklist_until = {}
                 return
-            window_hours = float(
-                await self._get_config_value("trading.block_pair_after_negative_realized_hours", 12) or 12
+            loss_scaled_cfg = await self._get_config_value(
+                "trading.pair_rotation.loss_scaled_cooldown", {}
+            )
+            if not isinstance(loss_scaled_cfg, dict):
+                loss_scaled_cfg = {}
+            legacy_hours = float(
+                await self._get_config_value(
+                    "trading.block_pair_after_negative_realized_hours", 12
+                )
+                or 12
+            )
+            if not loss_scaled_cfg.get("enabled", True):
+                loss_scaled_cfg = {
+                    "enabled": False,
+                    "base_hours": legacy_hours,
+                    "max_hours": legacy_hours,
+                }
+            scan_hours = float(
+                loss_scaled_cfg.get("max_hours", legacy_hours) or legacy_hours
             )
             min_realized_pct = self._float_config(
                 await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.0),
@@ -6613,7 +8334,7 @@ class TradingOrchestrator:
                 await self._get_config_value("trading.pair_rotation.scan_recent_closed_limit", 2000) or 2000
             )
             now = datetime.utcnow()
-            cutoff = now - timedelta(hours=window_hours)
+            cutoff = now - timedelta(hours=scan_hours)
             rows: List[Dict[str, Any]] = []
             async with httpx.AsyncClient(timeout=45.0) as client:
                 for st_filter in ("CLOSED", "FAILED"):
@@ -6671,7 +8392,12 @@ class TradingOrchestrator:
             for key, (exit_time, realized_pnl_pct, pair_name) in latest_by_cluster.items():
                 if realized_pnl_pct >= min_realized_pct:
                     continue
-                until = exit_time + timedelta(hours=window_hours)
+                cooldown_hours = loss_scaled_cooldown_hours(
+                    realized_pnl_pct, loss_scaled_cfg
+                )
+                if cooldown_hours <= 0:
+                    continue
+                until = exit_time + timedelta(hours=cooldown_hours)
                 if until > now:
                     new_map[key] = until
             self._recent_negative_realized_blacklist_until = new_map
@@ -6689,17 +8415,36 @@ class TradingOrchestrator:
             enabled = not (raw_enabled is False or str(raw_enabled).lower() in ("0", "false", "no"))
             if not enabled:
                 return
-            window_hours = float(
-                await self._get_config_value("trading.block_pair_after_negative_realized_hours", 12) or 12
+            loss_scaled_cfg = await self._get_config_value(
+                "trading.pair_rotation.loss_scaled_cooldown", {}
             )
+            if not isinstance(loss_scaled_cfg, dict):
+                loss_scaled_cfg = {}
+            legacy_hours = float(
+                await self._get_config_value(
+                    "trading.block_pair_after_negative_realized_hours", 12
+                )
+                or 12
+            )
+            if not loss_scaled_cfg.get("enabled", True):
+                loss_scaled_cfg = {
+                    "enabled": False,
+                    "base_hours": legacy_hours,
+                    "max_hours": legacy_hours,
+                }
             min_realized_pct = self._float_config(
                 await self._get_config_value("trading.block_pair_after_realized_pnl_below_pct", 0.0),
                 0.0,
             )
             if realized_pnl_pct is not None and float(realized_pnl_pct) >= min_realized_pct:
                 return
+            cooldown_hours = loss_scaled_cooldown_hours(
+                float(realized_pnl_pct or 0.0), loss_scaled_cfg
+            )
+            if cooldown_hours <= 0:
+                return
             key = self._entry_cluster_key(pair)
-            until = datetime.utcnow() + timedelta(hours=window_hours)
+            until = datetime.utcnow() + timedelta(hours=cooldown_hours)
             prev = self._recent_negative_realized_blacklist_until.get(key)
             if prev is None or until > prev:
                 self._recent_negative_realized_blacklist_until[key] = until
@@ -6707,7 +8452,7 @@ class TradingOrchestrator:
                     "🚫 [RECENT REALIZED GUARD] Added %s to %.1fh blacklist "
                     "(realized_pnl_pct=%s%%, threshold<%.2f%%, until %s)",
                     pair,
-                    window_hours,
+                    cooldown_hours,
                     "n/a" if realized_pnl_pct is None else f"{float(realized_pnl_pct):.2f}",
                     min_realized_pct,
                     until.isoformat(),
@@ -6842,7 +8587,7 @@ class TradingOrchestrator:
             fast_payload_from_hl_strategy_signal,
         )
 
-        coin_u = str(coin or "").upper()
+        coin_u = pair_to_hyperliquid_coin(str(coin or ""))
         try:
             async with httpx.AsyncClient(timeout=90.0) as client:
                 resp = await client.get(
@@ -6956,7 +8701,7 @@ class TradingOrchestrator:
                 from strategy.fast_signal_cache import normalize_perp_side
 
                 for coin in self.hyperliquid_pair_selections or []:
-                    coin_u = str(coin).upper()
+                    coin_u = pair_to_hyperliquid_coin(str(coin))
                     payload = await read_fast_signal(
                         redis_client, "hyperliquid", coin_u
                     )
@@ -7203,7 +8948,7 @@ class TradingOrchestrator:
             return False
         if a == b:
             return True
-        return a.replace("/", "").upper() == b.replace("/", "").upper()
+        return pair_to_hyperliquid_coin(a) == pair_to_hyperliquid_coin(b)
 
     @staticmethod
     def _entry_cluster_key(pair: Optional[str]) -> str:
@@ -7800,6 +9545,12 @@ class TradingOrchestrator:
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
                 "rsi_stoch_reversal_5m",
+                "rsi_stoch_reversal_1m",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
             }
             consensus_strategies = {
                 name: data
@@ -7867,16 +9618,34 @@ class TradingOrchestrator:
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
             )
+            setup_standalone_names = (
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+            )
             intraday_buy_overrides = {
                 name: (strategies.get(name, {}) or {})
                 for name in intraday_standalone_names
                 if str((strategies.get(name, {}) or {}).get("signal", "hold")).lower() == "buy"
             }
-            rsi_stoch_strategy_data = strategies.get("rsi_stoch_reversal_5m", {}) or {}
-            rsi_stoch_is_buy_override = (
-                str(rsi_stoch_strategy_data.get("signal", "hold")).lower() == "buy"
+            setup_buy_overrides = {
+                name: (strategies.get(name, {}) or {})
+                for name in setup_standalone_names
+                if str((strategies.get(name, {}) or {}).get("signal", "hold")).lower() == "buy"
+            }
+            rsi_stoch_buy_overrides = {
+                name: (strategies.get(name, {}) or {})
+                for name in SPOT_RSI_STOCH_REVERSAL_STRATEGIES
+                if str((strategies.get(name, {}) or {}).get("signal", "hold")).lower() == "buy"
+            }
+            rsi_stoch_is_buy_override = bool(rsi_stoch_buy_overrides)
+            standalone_buy_overrides = (
+                bool(intraday_buy_overrides)
+                or bool(setup_buy_overrides)
+                or rsi_stoch_is_buy_override
             )
-            standalone_buy_overrides = bool(intraday_buy_overrides) or rsi_stoch_is_buy_override
             if macd_is_buy_override:
                 logger.warning(
                     "[MACDOverride] %s %s: forcing BUY execution from macd_momentum "
@@ -7963,12 +9732,26 @@ class TradingOrchestrator:
                     c_conf,
                     c_agreement,
                 )
-            if rsi_stoch_is_buy_override:
+            for setup_name, setup_data in setup_buy_overrides.items():
                 logger.warning(
-                    "[RsiStochReversalStandalone] %s %s: BUY from rsi_stoch_reversal_5m "
+                    "[SetupStandalone] %s %s: BUY from %s (independent of consensus; "
+                    "conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
+                    exchange_name,
+                    pair,
+                    setup_name,
+                    float(setup_data.get("confidence", 0) or 0),
+                    float(setup_data.get("strength", 0) or 0),
+                    c_signal,
+                    c_conf,
+                    c_agreement,
+                )
+            for rsi_stoch_name, rsi_stoch_strategy_data in sorted(rsi_stoch_buy_overrides.items()):
+                logger.warning(
+                    "[RsiStochReversalStandalone] %s %s: BUY from %s "
                     "(independent of consensus; conf=%.2f str=%.2f consensus=%s %.2f/%.1f%%)",
                     exchange_name,
                     pair,
+                    rsi_stoch_name,
                     float(rsi_stoch_strategy_data.get("confidence", 0) or 0),
                     float(rsi_stoch_strategy_data.get("strength", 0) or 0),
                     c_signal,
@@ -8091,6 +9874,19 @@ class TradingOrchestrator:
                 best_conf = float(swing_hull_strategy_data.get("confidence", 0) or 0)
                 best_strength = float(swing_hull_strategy_data.get("strength", 0) or 0)
                 best_strategy = "swing_hull_rsi_ema"
+            if setup_buy_overrides:
+                setup_ranked = sorted(
+                    (
+                        (
+                            float(data.get("confidence", 0) or 0),
+                            float(data.get("strength", 0) or 0),
+                            name,
+                        )
+                        for name, data in setup_buy_overrides.items()
+                    ),
+                    reverse=True,
+                )
+                best_conf, best_strength, best_strategy = setup_ranked[0]
             if intraday_buy_overrides:
                 intraday_ranked = sorted(
                     (
@@ -8103,12 +9899,24 @@ class TradingOrchestrator:
                     ),
                     reverse=True,
                 )
-                best_conf, best_strength, best_strategy = intraday_ranked[0]
-            if rsi_stoch_is_buy_override:
-                rsi_conf = float(rsi_stoch_strategy_data.get("confidence", 0) or 0)
-                rsi_str = float(rsi_stoch_strategy_data.get("strength", 0) or 0)
+                i_conf, i_str, i_name = intraday_ranked[0]
+                if not setup_buy_overrides or (i_conf, i_str) >= (best_conf, best_strength):
+                    best_conf, best_strength, best_strategy = i_conf, i_str, i_name
+            if rsi_stoch_buy_overrides:
+                rsi_ranked = sorted(
+                    (
+                        (
+                            float(data.get("confidence", 0) or 0),
+                            float(data.get("strength", 0) or 0),
+                            name,
+                        )
+                        for name, data in rsi_stoch_buy_overrides.items()
+                    ),
+                    reverse=True,
+                )
+                rsi_conf, rsi_str, rsi_name = rsi_ranked[0]
                 if not intraday_buy_overrides or (rsi_conf, rsi_str) >= (best_conf, best_strength):
-                    best_conf, best_strength, best_strategy = rsi_conf, rsi_str, "rsi_stoch_reversal_5m"
+                    best_conf, best_strength, best_strategy = rsi_conf, rsi_str, rsi_name
 
             is_standalone_entry = (
                 macd_is_buy_override
@@ -8269,6 +10077,7 @@ class TradingOrchestrator:
                     )
                 ),
                 'resolved_policy': resolved_policy,
+                'strategy_data': strategies.get(best_strategy, {}),
             })
             self._record_regime_entry_decision(exchange_name, stable_regime, "accepted", "entry_approved")
                 
@@ -8542,6 +10351,8 @@ class TradingOrchestrator:
                 "breakout_retest_long",
                 "vwap_bounce_scalping",
                 "small_size_momentum_scalp",
+                "rsi_stoch_reversal_5m",
+                "rsi_stoch_reversal_1m",
             }
             strategy_name = str(signal.get("strategy") or "")
             stable_regime = str(signal.get("stable_regime") or "unknown")
@@ -8671,17 +10482,66 @@ class TradingOrchestrator:
             # STRATEGY-SPECIFIC POSITION SIZING
             strategy_name = signal.get('strategy', 'default')
             position_percentage, max_position_usd = await self._get_strategy_position_config(strategy_name)
+            min_order_size_usd = await self._get_min_order_size_for_exchange(exchange_name)
+            max_position_usd = max(float(max_position_usd or 0.0), float(min_order_size_usd or 0.0))
 
-            position_value_usdc = min(
-                available_balance * position_percentage,
-                max_position_usd
-            )
+            setup_risk = setup_risk_metadata_from_signal(signal)
+            stop_pct = float(setup_risk.get("stop_pct") or 0.0)
+            if stop_pct > 0 and stop_pct < 0.1:
+                stop_pct *= 100.0
+            if strategy_name in {
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
+            } and stop_pct > 0:
+                max_risk_pct = 0.012
+                try:
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        strat_resp = await client.get(f"{config_service_url}/api/v1/config/strategies")
+                        if strat_resp.status_code == 200:
+                            strat_cfg = (strat_resp.json() or {}).get("sma_reclaim_bull_flag") or {}
+                            max_risk_pct = float(
+                                (strat_cfg.get("parameters") or {}).get("max_risk_per_trade_pct", max_risk_pct)
+                                or max_risk_pct
+                            )
+                except Exception:
+                    pass
+                risk_usd = available_balance * max_risk_pct
+                position_value_usdc = min(
+                    risk_usd / (stop_pct / 100.0),
+                    max_position_usd,
+                )
+                logger.info(
+                    "[Redis Queue] SMA reclaim risk-based size: stop_pct=%.3f risk_usd=%.2f value=$%.2f",
+                    stop_pct,
+                    risk_usd,
+                    position_value_usdc,
+                )
+            else:
+                position_value_usdc = min(
+                    available_balance * position_percentage,
+                    max_position_usd
+                )
             # Adaptive size haircut for pairs with consecutive recent losses.
             pair_loss_mult = await self._get_pair_loss_size_multiplier(
                 exchange_name,
                 pair,
                 signal.get("resolved_policy"),
             )
+            try:
+                trading_cfg = await self._get_config_value("trading", {}) or {}
+                if isinstance(trading_cfg, dict):
+                    floored_mult = self._apply_strategy_size_floor(
+                        strategy_name,
+                        pair_loss_mult,
+                        trading_cfg,
+                    )
+                    if floored_mult > pair_loss_mult:
+                        pair_loss_mult = floored_mult
+            except Exception:
+                pass
             if pair_loss_mult < 1.0:
                 original_value = position_value_usdc
                 position_value_usdc *= pair_loss_mult
@@ -8689,7 +10549,6 @@ class TradingOrchestrator:
                     "[AdaptiveSizing] %s %s position reduced: $%.2f -> $%.2f (mult=%.2f)",
                     exchange_name, pair, original_value, position_value_usdc, pair_loss_mult
                 )
-
             # PnL-FIX v5 — Diversification budget cap.
             # Evidence: an API3/USD trade was sized at ≈$2,333 on $9k available,
             # because confluence's `position_size_percentage: 0.25` ignored the
@@ -9940,7 +11799,15 @@ class TradingOrchestrator:
             realized_pnl = (exit_price - entry_price) * filled_amount - exit_fees - float(trade.get('fees', 0))
             notional = entry_price * filled_amount if entry_price > 0 and filled_amount > 0 else 0.0
             realized_pnl_pct = (realized_pnl / notional) * 100.0 if notional > 0 else 0.0
-            trigger_price = float(trade.get("trigger_price") or entry_price)
+            trigger_price = float(trade.get("trigger_price") or 0.0)
+            if trigger_price <= 0 and bool(exit_reason):
+                if (
+                    exit_reason.startswith('trailing_stop')
+                    or exit_reason.startswith('profit_protection_breach')
+                ):
+                    trigger_price = float(trade.get("trail_stop_trigger") or 0.0)
+                if trigger_price <= 0:
+                    trigger_price = _extract_trigger_price_from_exit_reason(exit_reason)
             slippage_bps = 0.0
             if trigger_price > 0:
                 slippage_bps = ((exit_price - trigger_price) / trigger_price) * 10000.0
@@ -10572,7 +12439,8 @@ class TradingOrchestrator:
                 return None
 
         tf = str(params.get("structural_exit_timeframe") or "1h")
-        pair = f"{str(coin).upper()}/USDC"
+        hl_coin = pair_to_hyperliquid_coin(str(coin))
+        pair = hl_coin if ":" in hl_coin else f"{hl_coin}/USDC"
         df = await self._fetch_ohlcv_dataframe_for_structural(
             "hyperliquid", pair, timeframe=tf, limit=160
         )
@@ -13498,7 +15366,43 @@ async def get_trading_status():
         last_loop_duration_seconds=getattr(
             orchestrator, "last_loop_duration_seconds", None
         ),
+        cycles=orchestrator._cycle_phase_snapshot(),
+        cycle_health=orchestrator._cycle_health_snapshot(),
     )
+
+
+@app.get("/api/v1/perps/adaptive-pnl-control")
+async def get_hyperliquid_adaptive_pnl_control():
+    """Current rolling paper-PnL control decisions applied to Hyperliquid paper perps."""
+    state = await orchestrator._hyperliquid_adaptive_control_with_persisted_history()
+    hl_cfg = orchestrator._hyperliquid_perps_cfg() or {}
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "control": state,
+        "mode": str(hl_cfg.get("mode", "paper")),
+        "configLoadedAt": getattr(orchestrator, "_config_loaded_at", None),
+        "adaptiveConfig": hl_cfg.get("adaptive_pnl_control") or {},
+        "note": (
+            "Runtime overlay is rebuilt from the rolling paper-PnL window each cycle; "
+            "blocks/reductions disappear automatically when current evidence improves."
+        ),
+    }
+
+
+@app.post("/api/v1/perps/adaptive-pnl-control/reevaluate")
+async def post_hyperliquid_adaptive_pnl_control_reevaluate():
+    """Force a rolling paper-PnL adaptive control reevaluation from current config."""
+    cfg = orchestrator._hyperliquid_perps_cfg()
+    await orchestrator._hyperliquid_adaptive_runtime_cfg(cfg, apply_status="pending_cycle")
+    state = await orchestrator._hyperliquid_adaptive_control_with_persisted_history()
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "control": state,
+        "mode": str((orchestrator._hyperliquid_perps_cfg() or {}).get("mode", "paper")),
+        "configLoadedAt": getattr(orchestrator, "_config_loaded_at", None),
+        "adaptiveConfig": (orchestrator._hyperliquid_perps_cfg() or {}).get("adaptive_pnl_control") or {},
+        "message": "Adaptive PnL control reevaluated from current rolling paper-trade evidence; changes are pending until the next trading cycle applies the runtime overlay.",
+    }
 
 
 @app.post("/api/v1/trading/pairs/entry-blocks")

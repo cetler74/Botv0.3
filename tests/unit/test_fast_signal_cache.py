@@ -16,6 +16,11 @@ def test_redis_key_format():
     assert redis_key("binance", "BTCUSDC") == (
         "trading:fast_signal:rsi_stoch_reversal_5m:binance:BTCUSDC"
     )
+    assert redis_key(
+        "hyperliquid",
+        "BTC",
+        strategy_key="rsi_stoch_reversal_1m",
+    ) == "trading:fast_signal:rsi_stoch_reversal_1m:hyperliquid:BTC"
 
 
 def test_signal_age_seconds_parses_iso():

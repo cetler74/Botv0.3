@@ -10,12 +10,13 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 from datetime import datetime
 import json
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 import uvicorn
 import copy
 from dotenv import load_dotenv
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +36,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+config_registry = CollectorRegistry()
+config_loaded_metric = Gauge(
+    "config_service_config_loaded",
+    "Whether config-service currently has configuration loaded",
+    registry=config_registry,
 )
 
 # Load .env if present
@@ -313,6 +321,12 @@ async def liveness_check():
     """Liveness check endpoint"""
     return {"status": "alive"}
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrape endpoint."""
+    config_loaded_metric.set(1 if config_data else 0)
+    return Response(generate_latest(config_registry), media_type=CONTENT_TYPE_LATEST)
+
 @app.get("/api/v1/config/database")
 async def get_database_config():
     """Get database configuration"""
@@ -391,6 +405,9 @@ async def get_trading_config():
         "exit_cycle_first",
         "max_cycle_duration",
         "entry_loop_reserve_seconds",
+        "perp_cycle_max_seconds",
+        "spot_entry_pair_timeout_seconds",
+        "spot_entry_pair_priority",
         "exit_check_concurrency",
         "exit_price_prefetch_concurrency",
     ):
@@ -574,6 +591,7 @@ async def get_hyperliquid_perps_settings():
         "allow_live_orders": bool(hl.get("allow_live_orders", False)),
         "default_leverage": float(hl.get("default_leverage", 2.0)),
         "max_margin_per_trade": float(hl.get("max_margin_per_trade", 100.0)),
+        "min_notional_per_trade": float(hl.get("min_notional_per_trade", 0.0)),
         "max_notional_per_trade": float(hl.get("max_notional_per_trade", 200.0)),
         "max_open_positions": int(hl.get("max_open_positions", 5)),
         "fixed_stop_loss_enabled": bool(hl.get("fixed_stop_loss_enabled", True)),
@@ -583,7 +601,7 @@ async def get_hyperliquid_perps_settings():
         "max_holding_minutes": int(hl.get("max_holding_minutes", 240)),
         "profit_protection_fee_buffer": float(hl.get("profit_protection_fee_buffer", 0.0015)),
         "block_after_negative_realized_hours": float(
-            hl.get("block_after_negative_realized_hours", 12)
+            hl.get("block_after_negative_realized_hours", 4)
         ),
         "strategy_performance_logging": hl.get("strategy_performance_logging") or {},
         "position_sizing": hl.get("position_sizing") or {},

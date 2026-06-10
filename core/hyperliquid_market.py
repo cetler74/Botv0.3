@@ -51,9 +51,14 @@ INTERVAL_MS: Dict[str, int] = {
 
 def normalize_hyperliquid_coin(symbol: str) -> str:
     """BTC, BTCUSD, BTC/USDC -> BTC."""
-    raw = str(symbol or "").upper().strip()
+    raw = str(symbol or "").strip()
     if "/" in raw:
         return raw.split("/", 1)[0]
+    if ":" in raw:
+        dex, base = raw.split(":", 1)
+        raw = f"{dex.lower()}:{base.upper()}"
+    else:
+        raw = raw.upper()
     for suffix in ("USDC", "USDT", "USD", "-PERP"):
         if raw.endswith(suffix):
             return raw[: -len(suffix)]
