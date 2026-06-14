@@ -4,6 +4,7 @@ Strategy analysis and signal generation
 """
 
 import asyncio
+import copy
 import logging
 import time
 from collections import Counter as TallyCounter
@@ -34,6 +35,17 @@ RSI_STOCH_REVERSAL_STRATEGIES = frozenset(
 
 def _is_rsi_stoch_reversal_strategy(strategy_name: str) -> bool:
     return str(strategy_name or "").strip().lower() in RSI_STOCH_REVERSAL_STRATEGIES
+
+
+def _uses_fast_signal_cache(strategy_name: str) -> bool:
+    from strategy.fast_signal_cache import DAYTRADE_FAST_STRATEGIES, ORB_STRATEGY_KEY
+
+    key = str(strategy_name or "").strip().lower()
+    return (
+        key in RSI_STOCH_REVERSAL_STRATEGIES
+        or key in DAYTRADE_FAST_STRATEGIES
+        or key == ORB_STRATEGY_KEY
+    )
 
 
 def _rsi_stoch_default_entry_timeframe(strategy_name: str) -> str:
@@ -352,6 +364,13 @@ strategy_cumulative_runs: Dict[str, int] = {}
 # Align with orchestrator default entry bar (see trading.min_confidence_threshold in config)
 SNAPSHOT_ENTRY_CONFIDENCE = 0.3
 FAST_SIGNAL_CACHE_SECONDS = 30
+# Shared short-TTL OHLCV cache. Prevents the per-strategy / fast-signal-loop
+# fan-out from re-fetching the SAME (exchange, symbol, timeframe, limit) candles
+# from the un-cached, rate-limited exchange-service many times within one cycle.
+# TTL is kept just under the 30s fast-signal interval so each loop still refreshes
+# once, but the dozens of concurrent strategy calls in a burst share one fetch.
+OHLCV_CACHE_TTL_SECONDS = float(os.getenv("STRATEGY_OHLCV_CACHE_TTL_SECONDS", "25"))
+_ohlcv_df_cache: "Dict[str, Tuple[float, Any]]" = {}
 strategy_manager = None
 fast_signal_redis_client = None
 hyperliquid_strategy_manager = None
@@ -1141,6 +1160,7 @@ class StrategyManager:
             },
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
+        self._strategy_mapping = strategy_mapping
         
         for strategy_name, strategy_config in strategies_config.items():
             if not strategy_config.get('enabled', False):
@@ -1149,29 +1169,10 @@ class StrategyManager:
             try:
                 # Import strategy module
                 if strategy_name in strategy_mapping:
-                    mapping = strategy_mapping[strategy_name]
-                    module_name = mapping['module']
-                    class_name = mapping['class']
-                    
-                    # Import the strategy module with correct path
-                    module = importlib.import_module(f"strategy.{module_name}")
-                    strategy_class = getattr(module, class_name)
-                    
-                    # Create strategy instance with a generic exchange adapter (will be replaced per analysis)
-                    strategy_instance = strategy_class(
-                        config=strategy_config,
-                        exchange=None,  # Will be set per analysis with exchange-specific adapter
-                        database=None,   # Can be None for now
-                        redis_client=None  # Can be None for now
+                    strategy_instance = self._create_strategy_instance(
+                        strategy_name,
+                        strategy_config,
                     )
-                    
-                    # Enable detailed logging mode for condition logger even without Redis
-                    if hasattr(strategy_instance, '_condition_logger'):
-                        strategy_instance._condition_logger.detailed_mode = True
-                        logger.info(f"Enabled detailed condition logging for {strategy_name}")
-                    
-                    # Set exchange_name attribute for proper logging
-                    strategy_instance.exchange_name = None  # Will be set per analysis
                     
                     self.strategies[strategy_name] = {
                         'instance': strategy_instance,
@@ -1188,6 +1189,25 @@ class StrategyManager:
             except Exception as e:
                 logger.error(f"Failed to initialize strategy {strategy_name}: {e}")
                 continue
+
+    def _create_strategy_instance(self, strategy_name: str, strategy_config: Dict[str, Any]) -> Any:
+        """Create an isolated strategy instance for one analysis task."""
+        mapping = getattr(self, "_strategy_mapping", {}).get(strategy_name)
+        if not mapping:
+            raise ValueError(f"Strategy {strategy_name} is not mapped")
+
+        module = importlib.import_module(f"strategy.{mapping['module']}")
+        strategy_class = getattr(module, mapping["class"])
+        strategy_instance = strategy_class(
+            config=copy.deepcopy(strategy_config),
+            exchange=None,
+            database=None,
+            redis_client=None,
+        )
+        if hasattr(strategy_instance, "_condition_logger"):
+            strategy_instance._condition_logger.detailed_mode = True
+        strategy_instance.exchange_name = None
+        return strategy_instance
                 
     async def analyze_pair(self, exchange_name: str, pair: str,
                           timeframes: Optional[List[str]] = None,
@@ -1326,19 +1346,35 @@ class StrategyManager:
                 'consensus': {}
             }
             
-            # STEP 2: Run analysis only for applicable strategies
+            # STEP 2: Run analysis only for applicable strategies, in parallel.
             pair_specific_entry = await self._load_pair_specific_config_entry(pair, exchange_name)
             allowlist_set = set(strategy_allowlist) if strategy_allowlist else None
-            strategies_analyzed = 0
-            for strategy_name in applicable_strategies:
+            aggregate_cfg = self.config.get("strategy_manager") if isinstance(self.config.get("strategy_manager"), dict) else {}
+            max_parallel_strategies = int(
+                os.getenv(
+                    "STRATEGY_AGGREGATE_CONCURRENCY",
+                    str(aggregate_cfg.get("max_concurrent_analyses", 6) or 6),
+                )
+            )
+            max_parallel_strategies = max(1, min(max_parallel_strategies, 12))
+            per_strategy_timeout = float(
+                os.getenv(
+                    "STRATEGY_AGGREGATE_STRATEGY_TIMEOUT_SECONDS",
+                    str(aggregate_cfg.get("analysis_timeout", 8) or 8),
+                )
+            )
+            per_strategy_timeout = max(2.0, min(per_strategy_timeout, 12.0))
+            strategy_sem = asyncio.Semaphore(max_parallel_strategies)
+
+            async def _analyze_strategy(strategy_name: str) -> Tuple[str, Dict[str, Any], bool]:
                 if strategy_name not in strategies:
                     logger.warning(f"Strategy {strategy_name} not available, skipping")
-                    continue
+                    return strategy_name, {}, False
 
                 strategy_data = strategies[strategy_name]
                 if not strategy_data['enabled']:
                     logger.info(f"Strategy {strategy_name} disabled, skipping")
-                    continue
+                    return strategy_name, {}, False
 
                 # PnL-FIX v6: per-call allowlist replaces the old global toggle
                 # in analyze_pair_internal which mutated strategies[name]['enabled'].
@@ -1346,135 +1382,106 @@ class StrategyManager:
                     logger.debug(
                         f"Strategy {strategy_name} not in per-call allowlist, skipping"
                     )
-                    continue
-                    
+                    return strategy_name, {}, False
+
+                _analysis_start = time.time()
                 try:
-                    _analysis_start = time.time()
-                    logger.info(f"🔍 [STRATEGY ANALYSIS] {strategy_name} analyzing {pair} on {exchange_name} (regime: {market_regime.value})")
-                    strategy_instance = strategy_data['instance']
-                    
-                    # Create exchange-specific adapter for this analysis
-                    exchange_specific_adapter = ExchangeAdapter(exchange_service_url, exchange_name)
-                    
-                    # Set exchange and exchange name for proper logging and functionality
-                    strategy_instance.exchange = exchange_specific_adapter
-                    strategy_instance.exchange_name = exchange_name
-                    
-                    # Initialize strategy for this pair with detailed logging
-                    logger.info(f"🔧 [STRATEGY INIT] Initializing {strategy_name} for {pair}")
-                    await strategy_instance.initialize(pair)
-                    
-                    # Apply pair-specific configuration overrides (entry loaded once per pair analysis)
-                    self._apply_pair_strategy_overrides(
-                        strategy_instance, strategy_name, pair, pair_specific_entry
-                    )
-                    
-                    # Update strategy with market data (use primary timeframe)
-                    if primary_timeframe in market_data:
-                        logger.info(f"📊 [STRATEGY DATA] Updating {strategy_name} with {primary_timeframe} data ({len(market_data[primary_timeframe])} candles)")
-                        await strategy_instance.update(market_data[primary_timeframe])
-                    
-                    # CRITICAL FIX: Set market regime in strategy state
-                    if hasattr(strategy_instance, 'state') and strategy_instance.state:
-                        strategy_instance.state.market_regime = market_regime.value
-                    elif hasattr(strategy_instance, 'state'):
-                        # Initialize state with market regime if state exists but is empty
-                        from types import SimpleNamespace
-                        strategy_instance.state = SimpleNamespace()
-                        strategy_instance.state.market_regime = market_regime.value
-                    
-                    # Generate signal using the configured entry and confirmation bars.
-                    signal_market_data = market_data
-                    if _is_rsi_stoch_reversal_strategy(strategy_name):
-                        required_tfs = _strategy_signal_timeframes(strategy_name, strategy_data)
-                        missing_tfs = [
-                            tf for tf in required_tfs
-                            if market_data.get(tf) is None or len(market_data.get(tf)) < 30
-                        ]
-                        if missing_tfs:
-                            logger.warning(
-                                "[%s] Missing %s data for %s on %s, skipping",
-                                strategy_name,
-                                ",".join(missing_tfs),
-                                pair,
-                                exchange_name,
+                    async with strategy_sem:
+                        logger.info(f"🔍 [STRATEGY ANALYSIS] {strategy_name} analyzing {pair} on {exchange_name} (regime: {market_regime.value})")
+                        strategy_instance = self._create_strategy_instance(
+                            strategy_name,
+                            strategy_data["config"],
+                        )
+                        exchange_specific_adapter = ExchangeAdapter(exchange_service_url, exchange_name)
+                        strategy_instance.exchange = exchange_specific_adapter
+                        strategy_instance.exchange_name = exchange_name
+
+                        async def _run() -> Tuple[str, float, float, Dict[str, Any], Any]:
+                            logger.info(f"🔧 [STRATEGY INIT] Initializing {strategy_name} for {pair}")
+                            await strategy_instance.initialize(pair)
+                            self._apply_pair_strategy_overrides(
+                                strategy_instance, strategy_name, pair, pair_specific_entry
                             )
-                            continue
-                        signal_market_data = {tf: market_data[tf] for tf in required_tfs}
-                    logger.info(f"🎯 [SIGNAL GENERATION] {strategy_name} generating signal for {pair} on {exchange_name}")
-                    signal, confidence, strength = await strategy_instance.generate_signal(
-                        signal_market_data,
-                        pair=pair,
-                        timeframe=primary_timeframe,
-                        exchange_adapter=exchange_specific_adapter,
-                    )
-                    
-                    # CRITICAL: Sanitize confidence and strength values to prevent JSON serialization errors
+                            if primary_timeframe in market_data:
+                                logger.info(f"📊 [STRATEGY DATA] Updating {strategy_name} with {primary_timeframe} data ({len(market_data[primary_timeframe])} candles)")
+                                await strategy_instance.update(market_data[primary_timeframe])
+                            if hasattr(strategy_instance, 'state') and strategy_instance.state:
+                                strategy_instance.state.market_regime = market_regime.value
+                            elif hasattr(strategy_instance, 'state'):
+                                from types import SimpleNamespace
+                                strategy_instance.state = SimpleNamespace()
+                                strategy_instance.state.market_regime = market_regime.value
+
+                            signal_market_data = market_data
+                            if _is_rsi_stoch_reversal_strategy(strategy_name):
+                                required_tfs = _strategy_signal_timeframes(strategy_name, strategy_data)
+                                missing_tfs = [
+                                    tf for tf in required_tfs
+                                    if market_data.get(tf) is None or len(market_data.get(tf)) < 30
+                                ]
+                                if missing_tfs:
+                                    raise ValueError(
+                                        f"Missing {','.join(missing_tfs)} data for {strategy_name}"
+                                    )
+                                signal_market_data = {tf: market_data[tf] for tf in required_tfs}
+                            logger.info(f"🎯 [SIGNAL GENERATION] {strategy_name} generating signal for {pair} on {exchange_name}")
+                            signal, confidence, strength = await strategy_instance.generate_signal(
+                                signal_market_data,
+                                pair=pair,
+                                timeframe=primary_timeframe,
+                                exchange_adapter=exchange_specific_adapter,
+                            )
+                            clean_state = self._clean_strategy_state_for_serialization(strategy_instance)
+                            return signal, confidence, strength, clean_state, strategy_instance
+
+                        signal, confidence, strength, clean_state, strategy_instance = await asyncio.wait_for(
+                            _run(),
+                            timeout=per_strategy_timeout,
+                        )
+
                     try:
-                        # Check for NaN or infinity in confidence
                         if isinstance(confidence, (int, float)):
                             if np.isnan(confidence) or np.isinf(confidence):
                                 logger.warning(f"🔧 [SANITIZE] Invalid confidence value {confidence} from {strategy_name}, setting to 0.0")
                                 confidence = 0.0
                         else:
                             confidence = 0.0
-                            
-                        # Check for NaN or infinity in strength  
                         if isinstance(strength, (int, float)):
                             if np.isnan(strength) or np.isinf(strength):
                                 logger.warning(f"🔧 [SANITIZE] Invalid strength value {strength} from {strategy_name}, setting to 0.0")
                                 strength = 0.0
                         else:
                             strength = 0.0
-                            
                     except Exception as sanitize_error:
                         logger.error(f"❌ [SANITIZE] Error sanitizing values from {strategy_name}: {sanitize_error}")
                         confidence = 0.0
                         strength = 0.0
-                    
-                    # Store results with detailed logging
-                    # Clean strategy state to ensure JSON serialization
-                    clean_state = self._clean_strategy_state_for_serialization(strategy_instance)
-                    
-                    analysis_results['strategies'][strategy_name] = {
+
+                    strategy_result = {
                         'signal': signal,
-                        'confidence': float(confidence),  # Ensure it's a regular Python float
-                        'strength': float(strength),      # Ensure it's a regular Python float
+                        'confidence': float(confidence),
+                        'strength': float(strength),
                         'market_regime': clean_state['market_regime'],
                         'timestamp': datetime.utcnow().isoformat(),
                         'selected_for_regime': market_regime.value,
                         'state': clean_state
                     }
                     if strategy_name == "macd_momentum":
-                        await self._persist_macd_analysis_log(
-                            exchange_name, pair, analysis_results['strategies'][strategy_name]
-                        )
+                        await self._persist_macd_analysis_log(exchange_name, pair, strategy_result)
                     if strategy_name == "supply_demand_3step":
-                        await self._persist_supply_demand_analysis_log(
-                            exchange_name, pair, analysis_results['strategies'][strategy_name]
-                        )
+                        await self._persist_supply_demand_analysis_log(exchange_name, pair, strategy_result)
                     if strategy_name == "dual_sma_daytrade":
-                        await self._persist_dual_sma_analysis_log(
-                            exchange_name, pair, analysis_results['strategies'][strategy_name]
-                        )
+                        await self._persist_dual_sma_analysis_log(exchange_name, pair, strategy_result)
                     if strategy_name == "arc_daytrade":
-                        await self._persist_arc_analysis_log(
-                            exchange_name, pair, analysis_results['strategies'][strategy_name]
-                        )
+                        await self._persist_arc_analysis_log(exchange_name, pair, strategy_result)
                     if strategy_name == "ema50_breakout_pullback":
-                        await self._persist_ema50_breakout_pullback_analysis_log(
-                            exchange_name, pair, analysis_results['strategies'][strategy_name]
-                        )
+                        await self._persist_ema50_breakout_pullback_analysis_log(exchange_name, pair, strategy_result)
 
-                    # Log the final result
                     signal_emoji = "🟢" if signal == "buy" else "🔴" if signal == "sell" else "⚪"
                     logger.info(f"📈 [STRATEGY RESULT] {strategy_name}: {signal_emoji} {signal.upper()} | "
                               f"Confidence: {confidence:.2f} | Strength: {strength:.2f} | "
                               f"Regime: {getattr(strategy_instance.state, 'market_regime', 'unknown')}")
-                    
-                    # Update last analysis time
                     strategy_data['last_analysis'] = datetime.utcnow()
-                    strategies_analyzed += 1
                     _bump_strategy_cumulative_run(strategy_name)
                     strategy_analyses.labels(
                         strategy=strategy_name, exchange=exchange_name, pair=pair, result="ok"
@@ -1482,18 +1489,33 @@ class StrategyManager:
                     analysis_duration.labels(strategy=strategy_name).observe(time.time() - _analysis_start)
                     if signal in ("buy", "sell", "long", "short"):
                         signals_generated.labels(strategy=strategy_name, signal_type=str(signal).lower()).inc()
-                    
+                    return strategy_name, strategy_result, True
                 except Exception as e:
                     strategy_analyses.labels(
                         strategy=strategy_name, exchange=exchange_name, pair=pair, result="error"
                     ).inc()
                     analysis_duration.labels(strategy=strategy_name).observe(time.time() - _analysis_start)
                     logger.error(f"Error analyzing {pair} with {strategy_name}: {e}")
-                    analysis_results['strategies'][strategy_name] = {
+                    return strategy_name, {
                         'error': str(e),
                         'timestamp': datetime.utcnow().isoformat(),
                         'selected_for_regime': market_regime.value
-                    }
+                    }, False
+
+            strategy_results = await asyncio.gather(
+                *(_analyze_strategy(strategy_name) for strategy_name in applicable_strategies),
+                return_exceptions=True,
+            )
+            strategies_analyzed = 0
+            for item in strategy_results:
+                if isinstance(item, Exception):
+                    logger.error("Strategy aggregate worker failed for %s on %s: %s", pair, exchange_name, item)
+                    continue
+                strategy_name, strategy_result, analyzed = item
+                if strategy_result:
+                    analysis_results['strategies'][strategy_name] = strategy_result
+                if analyzed:
+                    strategies_analyzed += 1
                     
             # Calculate consensus with detailed logging
             logger.info(f"🤝 [CONSENSUS] Calculating consensus from {strategies_analyzed} regime-selected strategies "
@@ -1547,9 +1569,12 @@ class StrategyManager:
                        f"Confidence: {consensus['confidence']:.2f} | Agreement: {consensus['agreement']:.2f} | "
                        f"Participating: {consensus['participating_strategies']} | Regime: {market_regime.value}")
             
-            # Cache results
-            cache_key = f"{exchange_name}_{pair}_{int(datetime.utcnow().timestamp() / 300)}"  # 5-minute cache
-            signal_cache[cache_key] = analysis_results
+            # Cache full aggregate results only. Per-strategy allowlist calls are
+            # cached by their caller with a strategy-specific key; storing them
+            # here would poison the aggregate /signals/{exchange}/{pair} cache.
+            if allowlist_set is None:
+                cache_key = f"{exchange_name}_{pair}_{int(datetime.utcnow().timestamp() / 300)}"  # 5-minute cache
+                signal_cache[cache_key] = analysis_results
 
             _record_pair_strategy_snapshot(exchange_name, pair, analysis_results)
             strategy_pair_runs.labels(exchange=exchange_name, pair=pair, result='ok').inc()
@@ -1989,6 +2014,14 @@ class StrategyManager:
                 # candle below, so strict SMA200 setups need a buffer above 210.
                 ohlcv_limit = _ohlcv_fetch_limit(timeframe)
 
+                # Shared short-TTL cache: collapse redundant concurrent fetches of
+                # the same candles across strategies / the fast-signal loop.
+                cache_key = f"{exchange_name}_{symbol}_{timeframe}_{ohlcv_limit}"
+                cached_entry = _ohlcv_df_cache.get(cache_key)
+                if cached_entry is not None and (time.time() - cached_entry[0]) < OHLCV_CACHE_TTL_SECONDS:
+                    market_data[timeframe] = cached_entry[1]
+                    continue
+
                 for retry in range(max_retries):
                     try:
                         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2114,6 +2147,7 @@ class StrategyManager:
                                     continue
 
                             market_data[timeframe] = df
+                            _ohlcv_df_cache[cache_key] = (time.time(), df)
                             logger.info(f"✅ [DATA FETCH] Got {len(df)} {timeframe} candles for {symbol} on {exchange_name}")
                             
                         except Exception as timestamp_error:
@@ -2381,6 +2415,8 @@ async def _fetch_pairs_for_exchange(client: httpx.AsyncClient, exchange: str) ->
 
 
 async def _fast_signal_enabled() -> bool:
+    from strategy.fast_signal_cache import DAYTRADE_FAST_STRATEGIES
+
     try:
         spot_cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
         hl_cfg = {}
@@ -2391,7 +2427,11 @@ async def _fast_signal_enabled() -> bool:
         params = dict(spot_cfg.get("parameters") or {})
         spot_on = bool(spot_cfg.get("enabled")) and params.get("fast_signal_enabled") is not False
         hl_on = False
-        for strategy_name in RSI_STOCH_REVERSAL_STRATEGIES:
+        for strategy_name in (
+            *RSI_STOCH_REVERSAL_STRATEGIES,
+            "orb_5m_scalp",
+            *DAYTRADE_FAST_STRATEGIES,
+        ):
             cfg = (hl_cfg or {}).get(strategy_name) or {}
             cfg_params = dict(cfg.get("parameters") or {})
             if bool(cfg.get("enabled")) and cfg_params.get("fast_signal_enabled") is not False:
@@ -2532,6 +2572,201 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
                             )
         except Exception as exc:
             logger.error("[FastSignal] loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def daytrade_fast_signal_loop() -> None:
+    """Publish daytrade standalone fast signals (EMA50/ARC/Dual-SMA/Supply-Demand) to Redis."""
+    from strategy.fast_signal_cache import (
+        DAYTRADE_FAST_STRATEGIES,
+        DAYTRADE_FAST_TTL_SECONDS,
+        publish_fast_signal,
+    )
+
+    global fast_signal_redis_client
+    logger.info("[FastSignal] Starting daytrade fast publisher loop")
+    interval = 30.0
+    publish_concurrency = 6
+    while True:
+        try:
+            spot_cfg_all = strategies or {}
+            hl_cfg_all: Dict[str, Any] = {}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{config_service_url}/api/v1/config/strategies-hyperliquid"
+                )
+                if resp.status_code == 200:
+                    hl_cfg_all = resp.json() or {}
+
+            enabled_hl = []
+            enabled_spot = []
+            for strategy_name in sorted(DAYTRADE_FAST_STRATEGIES):
+                hl_cfg = (hl_cfg_all or {}).get(strategy_name) or {}
+                hl_params = dict(hl_cfg.get("parameters") or {})
+                if bool(hl_cfg.get("enabled")) and hl_params.get("fast_signal_enabled") is not False:
+                    enabled_hl.append((strategy_name, hl_cfg))
+                spot_cfg = (spot_cfg_all or {}).get(strategy_name) or {}
+                spot_params = dict(spot_cfg.get("parameters") or {})
+                if bool(spot_cfg.get("enabled")) and spot_params.get("fast_signal_enabled") is not False:
+                    enabled_spot.append((strategy_name, spot_cfg))
+
+            if not enabled_hl and not enabled_spot:
+                await asyncio.sleep(interval)
+                continue
+
+            if fast_signal_redis_client is None:
+                from strategy.fast_signal_cache import create_redis_client
+
+                fast_signal_redis_client = await create_redis_client()
+
+            sem = asyncio.Semaphore(publish_concurrency)
+
+            async def publish_hl(strategy_name: str, cfg: Dict[str, Any], coin: str) -> None:
+                if not hyperliquid_strategy_manager:
+                    return
+                async with sem:
+                    results = await hyperliquid_strategy_manager.analyze_coin(
+                        coin,
+                        _strategy_signal_timeframes(strategy_name, cfg),
+                        strategy_allowlist=[strategy_name],
+                    )
+                    strat = (results.get("strategies") or {}).get(strategy_name) or {}
+                    sig = str(strat.get("signal") or "hold").lower()
+                    conf = float(strat.get("confidence") or 0)
+                    strength = float(strat.get("strength") or 0)
+                    indicators = ((strat.get("state") or {}).get("indicators") or {})
+                    await publish_fast_signal(
+                        fast_signal_redis_client,
+                        "hyperliquid",
+                        coin,
+                        sig,
+                        conf,
+                        strength,
+                        indicators if isinstance(indicators, dict) else {},
+                        ttl_seconds=DAYTRADE_FAST_TTL_SECONDS,
+                        strategy_key=strategy_name,
+                    )
+
+            async def publish_spot(
+                strategy_name: str, cfg: Dict[str, Any], exchange: str, pair: str
+            ) -> None:
+                if not strategy_manager:
+                    return
+                async with sem:
+                    results = await strategy_manager.analyze_pair(
+                        exchange,
+                        pair,
+                        _strategy_signal_timeframes(strategy_name, cfg),
+                        strategy_allowlist=[strategy_name],
+                    )
+                    strat = (results.get("strategies") or {}).get(strategy_name) or {}
+                    sig = str(strat.get("signal") or "hold").lower()
+                    conf = float(strat.get("confidence") or 0)
+                    strength = float(strat.get("strength") or 0)
+                    indicators = ((strat.get("state") or {}).get("indicators") or {})
+                    sym = pair.replace("/", "")
+                    await publish_fast_signal(
+                        fast_signal_redis_client,
+                        exchange,
+                        sym,
+                        sig,
+                        conf,
+                        strength,
+                        indicators if isinstance(indicators, dict) else {},
+                        ttl_seconds=DAYTRADE_FAST_TTL_SECONDS,
+                        strategy_key=strategy_name,
+                    )
+
+            if enabled_hl:
+                coins = await _fetch_hl_coins_for_fast_signal()
+                await asyncio.gather(
+                    *(
+                        publish_hl(strategy_name, cfg, coin)
+                        for strategy_name, cfg in enabled_hl
+                        for coin in coins
+                    ),
+                    return_exceptions=True,
+                )
+
+            if enabled_spot:
+                exchanges = ["binance", "bybit", "cryptocom"]
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    for exchange in exchanges:
+                        pairs = await _fetch_pairs_for_exchange(client, exchange)
+                        await asyncio.gather(
+                            *(
+                                publish_spot(strategy_name, cfg, exchange, pair)
+                                for strategy_name, cfg in enabled_spot
+                                for pair in pairs
+                            ),
+                            return_exceptions=True,
+                        )
+        except Exception as exc:
+            logger.error("[FastSignal] daytrade loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def orb_5m_scalp_fast_loop() -> None:
+    """Publish ORB 5m scalp fast signals to Redis every 30s."""
+    from strategy.fast_signal_cache import (
+        ORB_FAST_TTL_SECONDS,
+        ORB_STRATEGY_KEY,
+        publish_fast_signal,
+    )
+
+    global fast_signal_redis_client
+    strategy_name = ORB_STRATEGY_KEY
+    logger.info("[FastSignal] Starting ORB 5m scalp fast publisher loop")
+    interval = 30.0
+    while True:
+        try:
+            hl_cfg: Dict[str, Any] = {}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{config_service_url}/api/v1/config/strategies-hyperliquid"
+                )
+                if resp.status_code == 200:
+                    hl_cfg = resp.json() or {}
+            cfg = (hl_cfg or {}).get(strategy_name) or {}
+            params = dict(cfg.get("parameters") or {})
+            if not bool(cfg.get("enabled")) or params.get("fast_signal_enabled") is False:
+                await asyncio.sleep(interval)
+                continue
+            interval = float(params.get("fast_signal_interval_seconds", 30) or 30)
+
+            if fast_signal_redis_client is None:
+                from strategy.fast_signal_cache import create_redis_client
+
+                fast_signal_redis_client = await create_redis_client()
+
+            if not hyperliquid_strategy_manager:
+                await asyncio.sleep(interval)
+                continue
+
+            for coin in await _fetch_hl_coins_for_fast_signal():
+                results = await hyperliquid_strategy_manager.analyze_coin(
+                    coin,
+                    _strategy_signal_timeframes(strategy_name, cfg),
+                    strategy_allowlist=[strategy_name],
+                )
+                strat = (results.get("strategies") or {}).get(strategy_name) or {}
+                sig = str(strat.get("signal") or "hold").lower()
+                conf = float(strat.get("confidence") or 0)
+                strength = float(strat.get("strength") or 0)
+                indicators = ((strat.get("state") or {}).get("indicators") or {})
+                await publish_fast_signal(
+                    fast_signal_redis_client,
+                    "hyperliquid",
+                    coin,
+                    sig,
+                    conf,
+                    strength,
+                    indicators if isinstance(indicators, dict) else {},
+                    ttl_seconds=ORB_FAST_TTL_SECONDS,
+                    strategy_key=strategy_name,
+                )
+        except Exception as exc:
+            logger.error("[FastSignal] ORB loop error: %s", exc)
         await asyncio.sleep(interval)
 
 
@@ -2873,13 +3108,28 @@ async def hyperliquid_exit_advice(coin: str, body: HyperliquidExitAdviceRequest)
 
 @app.get("/api/v1/signals/hyperliquid/{coin}/{strategy_name}")
 async def get_hyperliquid_strategy_signal(coin: str, strategy_name: str):
+    global hyperliquid_strategy_manager
     if not hyperliquid_strategy_manager:
         raise HTTPException(status_code=503, detail="Hyperliquid strategy manager not initialized")
     symbol = _normalize_hl_coin_path(coin)
-    bucket = FAST_SIGNAL_CACHE_SECONDS if _is_rsi_stoch_reversal_strategy(strategy_name) else 300
+    bucket = FAST_SIGNAL_CACHE_SECONDS if _uses_fast_signal_cache(strategy_name) else 300
     cache_key = f"hl_{symbol}_{strategy_name}_{int(datetime.utcnow().timestamp() / bucket)}"
     if cache_key in hl_signal_cache:
         return hl_signal_cache[cache_key]
+    if strategy_name not in (hyperliquid_strategy_manager.strategies or {}):
+        try:
+            hl_config = await get_hyperliquid_config_from_service()
+            if isinstance(hl_config, dict) and hl_config:
+                hyperliquid_strategy_manager.config = hl_config
+                hyperliquid_strategy_manager._initialize_strategies()
+        except Exception as exc:
+            logger.warning(
+                "[HLStrategy] Could not refresh HL strategy config for %s: %s",
+                strategy_name,
+                exc,
+            )
+    if strategy_name not in (hyperliquid_strategy_manager.strategies or {}):
+        raise HTTPException(status_code=404, detail=f"Strategy {strategy_name} not found")
     signal_tfs = _strategy_signal_timeframes(
         strategy_name,
         (hyperliquid_strategy_manager.strategies or {}).get(strategy_name),
@@ -2891,7 +3141,21 @@ async def get_hyperliquid_strategy_signal(coin: str, strategy_name: str):
     )
     strat = (results.get("strategies") or {}).get(strategy_name)
     if not strat:
-        raise HTTPException(status_code=404, detail=f"Strategy {strategy_name} not found")
+        if strategy_name in (hyperliquid_strategy_manager.strategies or {}):
+            strat = {
+                "signal": "hold",
+                "confidence": 0.0,
+                "strength": 0.0,
+                "market_regime": (results or {}).get("market_regime", "unknown"),
+                "timestamp": datetime.utcnow().isoformat(),
+                "state": {
+                    "market_regime": (results or {}).get("market_regime", "unknown"),
+                    "indicators": {"skip_reason": "analysis_unavailable"},
+                    "entry_reason": "",
+                },
+            }
+        else:
+            raise HTTPException(status_code=404, detail=f"Strategy {strategy_name} not found")
     payload = {"coin": symbol, "strategy": strategy_name, **strat}
     hl_signal_cache[cache_key] = payload
     return payload
@@ -2908,7 +3172,7 @@ async def get_spot_strategy_signal(exchange: str, pair: str, strategy_name: str)
             formatted_pair = f"{pair[:-4]}/USDC"
         elif len(pair) >= 6 and pair.endswith("USD"):
             formatted_pair = f"{pair[:-3]}/USD"
-    bucket = FAST_SIGNAL_CACHE_SECONDS if _is_rsi_stoch_reversal_strategy(strategy_name) else 300
+    bucket = FAST_SIGNAL_CACHE_SECONDS if _uses_fast_signal_cache(strategy_name) else 300
     cache_key = f"{exchange}_{formatted_pair}_{strategy_name}_{int(datetime.utcnow().timestamp() / bucket)}"
     if cache_key in signal_cache:
         return signal_cache[cache_key]
@@ -3341,6 +3605,8 @@ async def startup_event():
     # Start continuous strategy analysis in background
     asyncio.create_task(continuous_strategy_analysis())
     asyncio.create_task(rsi_stoch_reversal_5m_fast_loop())
+    asyncio.create_task(orb_5m_scalp_fast_loop())
+    asyncio.create_task(daytrade_fast_signal_loop())
 
     logger.info("Strategy Service started successfully")
 
