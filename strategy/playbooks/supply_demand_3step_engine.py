@@ -243,6 +243,18 @@ def evaluate_supply_demand_3step(
     rr = reward / risk
     stop_pct = risk / entry_price
     target_pct = reward / entry_price
+    signal_confidence = (
+        float(params.buy_confidence)
+        if side == "buy"
+        else float(params.sell_confidence)
+    )
+    # Fee-aware execution gates consume percentage points (1.25 == 1.25%).
+    # Publish the setup's own conservative expectancy instead of forcing the
+    # orchestrator to guess when a complete stop/target geometry is available.
+    expected_move_pct = max(
+        0.0,
+        (target_pct - stop_pct * (1.0 - signal_confidence)) * 100.0,
+    )
     swing_pct = _trend_swing_pct(structure, entry_price)
     close_px = float(zone_df["close"].astype(float).iloc[-1])
     close_above_low_pct = 0.0
@@ -258,6 +270,7 @@ def evaluate_supply_demand_3step(
             "target_hint": target,
             "stop_pct": stop_pct,
             "target_pct": target_pct,
+            "expected_move_pct": expected_move_pct,
             "reward_risk": rr,
             "trend_swing_pct": swing_pct,
             "close_above_swing_low_pct": close_above_low_pct,

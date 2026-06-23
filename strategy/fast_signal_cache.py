@@ -13,8 +13,23 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 STRATEGY_KEY = "rsi_stoch_reversal_5m"
+ORB_STRATEGY_KEY = "orb_5m_scalp"
+RSI_STOCH_REVERSAL_STRATEGIES = frozenset(
+    {"rsi_stoch_reversal_5m", "rsi_stoch_reversal_1m"}
+)
+DAYTRADE_FAST_STRATEGIES = frozenset(
+    {
+        "ema50_breakout_pullback",
+        "arc_daytrade",
+        "dual_sma_daytrade",
+        "supply_demand_3step",
+    }
+)
 DEFAULT_TTL_SECONDS = 45
+ORB_FAST_TTL_SECONDS = 960
+DAYTRADE_FAST_TTL_SECONDS = 45
 HOLD_TTL_SECONDS = 15
+RSI_STOCH_BAR_MAX_AGE_SECONDS = 360
 
 
 def _normalize_hyperliquid_symbol(symbol: str) -> str:
@@ -77,7 +92,7 @@ def validate_rsi_stoch_actionable(
     *,
     allow_short: bool = False,
     params: Optional[Any] = None,
-    max_bar_age_seconds: float = 360.0,
+    max_bar_age_seconds: float = RSI_STOCH_BAR_MAX_AGE_SECONDS,
 ) -> Tuple[bool, str]:
     """
     Confirm payload indicators satisfy rsi_stoch entry rules (not just signal side).
@@ -136,6 +151,111 @@ def validate_rsi_stoch_actionable(
         return True, "short_ok"
 
     return False, "unknown_side"
+
+
+def validate_generic_fast_actionable(
+    payload: Dict[str, Any],
+    *,
+    allow_short: bool = False,
+    min_confidence: float = 0.0,
+    min_strength: float = 0.0,
+    max_signal_age_seconds: float = 60.0,
+    require_entry_reason: bool = True,
+) -> Tuple[bool, str]:
+    """Confirm a generic fast payload still has an actionable entry snapshot."""
+    sig = str(payload.get("signal") or "").lower()
+    if sig == "buy":
+        side = "long"
+    elif sig == "sell":
+        side = "short"
+    else:
+        side = normalize_perp_side(sig)
+    if not side:
+        return False, "not_actionable_signal"
+
+    ind = payload.get("indicators") or {}
+    if not isinstance(ind, dict):
+        return False, "missing_indicators"
+
+    skip = str(ind.get("skip_reason") or "").strip().lower()
+    if skip:
+        return False, f"skip_reason:{skip}"
+
+    if require_entry_reason and not str(ind.get("entry_reason") or "").strip():
+        return False, "missing_entry_reason"
+
+    try:
+        conf = float(payload.get("confidence") or 0)
+        strength = float(payload.get("strength") or 0)
+    except (TypeError, ValueError):
+        return False, "invalid_confidence_or_strength"
+
+    if conf < float(min_confidence):
+        return False, f"confidence_{conf:.2f}_lt_{min_confidence:.2f}"
+    if strength < float(min_strength):
+        return False, f"strength_{strength:.2f}_lt_{min_strength:.2f}"
+
+    if side == "short" and not allow_short:
+        return False, "short_not_allowed"
+
+    age = signal_age_seconds(payload)
+    if age is not None and age > max_signal_age_seconds:
+        return False, f"stale_fast_signal age={age:.0f}s"
+
+    return True, f"{side}_ok"
+
+
+def validate_orb_actionable(
+    payload: Dict[str, Any],
+    *,
+    allow_short: bool = True,
+    min_reward_risk: float = 2.0,
+    max_signal_age_seconds: float = 960.0,
+) -> Tuple[bool, str]:
+    """Confirm ORB fast payload still has a valid breakout+retest entry."""
+    sig = str(payload.get("signal") or "").lower()
+    side = normalize_perp_side(sig)
+    if not side:
+        return False, "not_actionable_signal"
+
+    ind = payload.get("indicators") or {}
+    if not isinstance(ind, dict):
+        return False, "missing_indicators"
+
+    skip = str(ind.get("skip_reason") or "").strip().lower()
+    if skip in {"session_entry_taken", "regime_blocked"} or skip.startswith("regime_blocked:"):
+        return False, f"skip_reason:{skip or 'blocked'}"
+
+    session_state = str(ind.get("session_state") or "").strip().lower()
+    if session_state != "signal":
+        return False, f"session_state_{session_state or 'unknown'}"
+
+    if not ind.get("breakout_valid") or not ind.get("retest_valid"):
+        return False, "breakout_or_retest_invalid"
+
+    direction = str(ind.get("direction") or "").strip().lower()
+    if direction and direction != side:
+        return False, f"direction_mismatch_{direction}_vs_{side}"
+
+    entry_reason = str(ind.get("entry_reason") or "").strip()
+    if not entry_reason:
+        return False, "missing_entry_reason"
+
+    try:
+        rr = float(ind.get("reward_risk") or 0)
+    except (TypeError, ValueError):
+        rr = 0.0
+    if rr < float(min_reward_risk):
+        return False, f"reward_risk_{rr:.2f}_lt_{min_reward_risk:.2f}"
+
+    if side == "short" and not allow_short:
+        return False, "short_not_allowed"
+
+    age = signal_age_seconds(payload)
+    if age is not None and age > max_signal_age_seconds:
+        return False, f"stale_fast_signal age={age:.0f}s"
+
+    return True, f"{side}_ok"
 
 
 async def clear_fast_signal(
@@ -239,15 +359,21 @@ async def read_fast_signal(
         return None
 
 
-def merge_rsi_stoch_spot_buy_into_signals(
+def merge_fast_spot_signal_into_signals(
     signals_data: Dict[str, Any],
     fast_payload: Dict[str, Any],
+    *,
+    strategy_key: Optional[str] = None,
 ) -> bool:
     """
     Overlay a Redis fast-lane BUY into strategy-service snapshot so spot
-    standalone entry sees rsi_stoch_reversal_5m without waiting on full consensus.
+    standalone entry sees the strategy without waiting on full consensus.
     """
-    if str(fast_payload.get("signal", "")).lower() != "buy":
+    sig = str(fast_payload.get("signal", "")).lower()
+    if sig not in {"buy", "long"}:
+        return False
+    strat_name = str(strategy_key or fast_payload.get("strategy") or STRATEGY_KEY).strip().lower()
+    if not strat_name:
         return False
     ind = fast_payload.get("indicators") or {}
     if not isinstance(ind, dict):
@@ -255,7 +381,7 @@ def merge_rsi_stoch_spot_buy_into_signals(
     strategies = signals_data.setdefault("strategies", {})
     if not isinstance(strategies, dict):
         return False
-    strategies[STRATEGY_KEY] = {
+    strategies[strat_name] = {
         "signal": "buy",
         "confidence": float(fast_payload.get("confidence") or 0),
         "strength": float(fast_payload.get("strength") or 0),
@@ -264,6 +390,76 @@ def merge_rsi_stoch_spot_buy_into_signals(
         "state": {"indicators": ind},
     }
     return True
+
+
+def spot_signals_data_from_fast_payload(
+    fast_payload: Dict[str, Any],
+    exchange: str,
+    pair: str,
+    *,
+    strategy_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a minimal spot signal envelope from a validated Redis fast payload."""
+    strat_name = str(strategy_key or fast_payload.get("strategy") or STRATEGY_KEY).strip().lower()
+    ind = fast_payload.get("indicators") or {}
+    if not isinstance(ind, dict):
+        ind = {}
+    sig = str(fast_payload.get("signal") or "").strip().lower()
+    if sig == "long":
+        sig = "buy"
+    elif sig == "short":
+        sig = "sell"
+    conf = float(fast_payload.get("confidence") or 0)
+    strength = float(fast_payload.get("strength") or 0)
+    analyzed_at = fast_payload.get("analyzed_at") or datetime.now(timezone.utc).isoformat()
+    regime = str(
+        ind.get("stable_regime")
+        or ind.get("market_regime")
+        or fast_payload.get("stable_regime")
+        or fast_payload.get("market_regime")
+        or "unknown"
+    ).lower()
+    strategy_data = {
+        "signal": sig,
+        "confidence": conf,
+        "strength": strength,
+        "market_regime": regime,
+        "timestamp": analyzed_at,
+        "state": {"indicators": ind},
+    }
+    return {
+        "exchange": str(exchange or "").lower(),
+        "pair": str(pair or ""),
+        "timestamp": analyzed_at,
+        "market_regime": regime,
+        "stable_regime": regime,
+        "consensus": {
+            "signal": "hold",
+            "confidence": 0.0,
+            "agreement": 0.0,
+            "stable_regime": regime,
+            "primary_override": False,
+            "sell_veto_max": 0.0,
+        },
+        "strategies": {strat_name: strategy_data},
+        "fast_signal": {
+            "source": "redis",
+            "strategy": strat_name,
+            "analyzed_at": analyzed_at,
+        },
+    }
+
+
+def merge_rsi_stoch_spot_buy_into_signals(
+    signals_data: Dict[str, Any],
+    fast_payload: Dict[str, Any],
+) -> bool:
+    """Backward-compatible RSI/Stoch spot fast-lane merge."""
+    return merge_fast_spot_signal_into_signals(
+        signals_data,
+        fast_payload,
+        strategy_key=STRATEGY_KEY,
+    )
 
 
 def mirrored_perp_signal_from_fast_payload(

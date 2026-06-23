@@ -7,6 +7,7 @@ import pytest
 
 from core.cycle_analysis_snapshot import (
     SNAPSHOT_ENTRY_CONFIDENCE,
+    HlCoinCycleRecorder,
     build_entry_decision,
     build_hl_best_signal,
     build_hl_cycle_analysis,
@@ -194,3 +195,34 @@ async def test_write_and_read_hl_cycle_snapshots():
     assert "WLD" in out
     assert out["WLD"]["regime"] == "sideways"
     assert "ETH" not in out
+
+
+@pytest.mark.asyncio
+async def test_cycle_recorder_runs_finish_callback_with_terminal_gate_trace():
+    redis = AsyncMock()
+    redis.set = AsyncMock(return_value=True)
+    callback = AsyncMock()
+    recorder = HlCoinCycleRecorder(coin="BTC", cycle_count=7, redis_client=redis)
+    recorder.add_gate("confidence", True, "passed")
+    recorder.add_gate("edge_gate", False, "expected move too small")
+    recorder.set_finish_callback(callback)
+
+    await recorder.finish(
+        outcome="skipped",
+        primary_reason="edge_gate",
+        message="expected move too small",
+    )
+
+    callback.assert_awaited_once_with(
+        "skipped",
+        "edge_gate",
+        "expected move too small",
+        [
+            {"step": "confidence", "passed": True, "message": "passed"},
+            {
+                "step": "edge_gate",
+                "passed": False,
+                "message": "expected move too small",
+            },
+        ],
+    )

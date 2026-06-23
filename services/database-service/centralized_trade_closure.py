@@ -253,12 +253,9 @@ class TradeClosureService:
     ) -> Dict[str, Any]:
         """Calculate realized PnL and related metrics.
 
-        PnL-FIX v9 — In simulation mode the round-trip fee is normalized to
-        `simulation.fee_rate_per_side * 2 * entry_notional` on every exchange,
-        regardless of what (often inconsistent) entry/exit fees the exchange-specific
-        simulator stamped on the trade. This guarantees the cash ledger and
-        realized_pnl reconcile, and makes per-exchange paper P&L directly
-        comparable.
+        PnL-FIX v9 — In simulation mode the round-trip fee is normalized from
+        configured maker-style simulation rates instead of exchange-specific fee
+        stamps, which can be one-sided or charged in non-USD assets.
         """
         entry_price = float(trade['entry_price'])
         position_size = float(trade['position_size'])
@@ -267,6 +264,7 @@ class TradeClosureService:
 
         sim_mode = False
         sim_fee_rate = 0.0005
+        sim_fee_rate_by_exchange: Dict[str, float] = {}
         try:
             import os
             cfg_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
@@ -277,16 +275,26 @@ class TradeClosureService:
                 if sim_mode:
                     s = await client.get(f"{cfg_url}/api/v1/config/simulation")
                     if s.status_code == 200:
-                        sim_fee_rate = float(
-                            (s.json() or {}).get("fee_rate_per_side", 0.0005)
-                        )
+                        sim_cfg = s.json() or {}
+                        sim_fee_rate = float(sim_cfg.get("fee_rate_per_side", 0.0005))
+                        sim_fee_rate_by_exchange = {
+                            str(exchange).lower(): float(rate)
+                            for exchange, rate in (
+                                sim_cfg.get("fee_rate_per_side_by_exchange") or {}
+                            ).items()
+                        }
         except Exception as e:
             logger.debug("simulation fee-rate fetch failed: %s", e)
 
         if sim_mode:
             entry_notional = entry_price * position_size
             exit_notional = exit_price * position_size
-            total_fees = (entry_notional + exit_notional) * sim_fee_rate
+            exchange_key = str(trade.get("exchange") or "").lower()
+            fee_rate = sim_fee_rate_by_exchange.get(
+                exchange_key,
+                sim_fee_rate_by_exchange.get("default", sim_fee_rate),
+            )
+            total_fees = (entry_notional + exit_notional) * fee_rate
         else:
             existing_fees = float(trade.get('fees', 0))
             total_fees = existing_fees + (fees or 0)

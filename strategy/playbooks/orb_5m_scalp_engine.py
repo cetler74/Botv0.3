@@ -30,6 +30,7 @@ class EngineParams:
     block_weekends: bool = False
     target_reward_risk: float = 2.0
     min_candles: int = 80
+    entry_grace_bars: int = 3
     allow_long: bool = True
     allow_short: bool = True
     buy_confidence: float = 0.74
@@ -197,6 +198,7 @@ def evaluate_orb_5m_scalp(
         or_close_time=params.or_close_time,
         entry_watch_end=params.entry_watch_end,
         target_reward_risk=params.target_reward_risk,
+        entry_grace_bars=params.entry_grace_bars,
         now=now,
     )
 

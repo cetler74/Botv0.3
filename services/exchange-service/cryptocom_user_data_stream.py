@@ -103,15 +103,12 @@ class CryptocomUserDataStreamManager:
             if not success:
                 logger.error("❌ Failed to establish Crypto.com WebSocket connection")
                 return False
-            
-            # Authenticate and subscribe
-            auth_success = await self._authenticate()
-            if not auth_success:
-                await self.connection_manager.disconnect()
-                return False
-            
-            subscribe_success = await self._subscribe_to_channels()
-            if not subscribe_success:
+
+            # The connection callback performs authentication/subscription for
+            # both initial connect and reconnect. Do not send the same auth and
+            # subscription frames twice during startup.
+            if not self.subscribed_channels:
+                logger.error("❌ Crypto.com connected without channel subscriptions")
                 await self.connection_manager.disconnect()
                 return False
             
@@ -232,7 +229,7 @@ class CryptocomUserDataStreamManager:
                 
             except Exception as e:
                 logger.error(f"❌ Connection attempt {attempt + 1} failed: {e}")
-                await self.error_handler.handle_error("network", str(e), "medium")
+                await self.error_handler.handle_error(e, "connection")
                 
                 if attempt < max_attempts - 1:
                     delay = base_delay * (2 ** attempt)  # Exponential backoff
@@ -329,7 +326,7 @@ class CryptocomUserDataStreamManager:
                 
             except Exception as e:
                 logger.error(f"❌ Error in message processing loop: {e}")
-                await self.error_handler.handle_error("system", str(e), "medium")
+                await self.error_handler.handle_error(e, "message_processing_loop")
                 
                 # Continue processing unless critical error
                 if not self.is_running:
@@ -338,12 +335,21 @@ class CryptocomUserDataStreamManager:
     async def _process_message(self, message: str):
         """Process incoming WebSocket message"""
         try:
-            data = json.loads(message)
+            if isinstance(message, (dict, list)):
+                data = message
+            else:
+                data = json.loads(message)
+            if not isinstance(data, dict):
+                logger.debug("Ignoring non-object Crypto.com WebSocket message: %s", data)
+                return
             
             # Handle different message types
             method = data.get("method")
             
-            if method == "subscription":
+            if method in {"public/heartbeat", "public/respond-heartbeat"}:
+                # Connection manager already acknowledges server heartbeats.
+                logger.debug("Crypto.com heartbeat processed")
+            elif method == "subscription":
                 await self._handle_subscription_message(data)
             elif method == "heartbeat":
                 await self._handle_heartbeat_response(data)
@@ -356,11 +362,11 @@ class CryptocomUserDataStreamManager:
             
         except json.JSONDecodeError as e:
             logger.error(f"❌ Failed to parse message: {e}")
-            await self.error_handler.handle_error("data_format", str(e), "low")
+            await self.error_handler.handle_error(e, "data_format")
         except Exception as e:
             logger.error(f"❌ Error processing message: {e}")
             self.metrics["processing_errors"] += 1
-            await self.error_handler.handle_error("system", str(e), "medium")
+            await self.error_handler.handle_error(e, "message_processing")
     
     async def _handle_subscription_message(self, data: Dict[str, Any]):
         """Handle subscription event messages"""
@@ -385,7 +391,7 @@ class CryptocomUserDataStreamManager:
                 
         except Exception as e:
             logger.error(f"❌ Error handling subscription message: {e}")
-            await self.error_handler.handle_error("system", str(e), "medium")
+            await self.error_handler.handle_error(e, "subscription_message")
     
     async def _process_order_event(self, event_data: Dict[str, Any]):
         """Process order status update events"""
@@ -401,7 +407,7 @@ class CryptocomUserDataStreamManager:
                     
         except Exception as e:
             logger.error(f"❌ Error processing order event: {e}")
-            await self.error_handler.handle_error("system", str(e), "medium")
+            await self.error_handler.handle_error(e, "order_event")
     
     async def _process_trade_event(self, event_data: Dict[str, Any]):
         """Process trade execution events"""
@@ -417,7 +423,7 @@ class CryptocomUserDataStreamManager:
                     
         except Exception as e:
             logger.error(f"❌ Error processing trade event: {e}")
-            await self.error_handler.handle_error("system", str(e), "medium")
+            await self.error_handler.handle_error(e, "trade_event")
     
     async def _process_balance_event(self, event_data: Dict[str, Any]):
         """Process balance update events"""
@@ -433,7 +439,7 @@ class CryptocomUserDataStreamManager:
                     
         except Exception as e:
             logger.error(f"❌ Error processing balance event: {e}")
-            await self.error_handler.handle_error("system", str(e), "medium")
+            await self.error_handler.handle_error(e, "balance_event")
     
     async def _heartbeat_loop(self):
         """Send periodic heartbeat messages"""
@@ -461,7 +467,7 @@ class CryptocomUserDataStreamManager:
             except Exception as e:
                 logger.error(f"❌ Heartbeat error: {e}")
                 self.metrics["heartbeat_failures"] += 1
-                await self.error_handler.handle_error("network", str(e), "medium")
+                await self.error_handler.handle_error(e, "heartbeat")
                 break
     
     async def _handle_heartbeat_response(self, data: Dict[str, Any]):
@@ -474,7 +480,7 @@ class CryptocomUserDataStreamManager:
         code = data.get("code")
         message = data.get("message", "")
         
-        if code == 0:
+        if code == 0 or str(message).lower() == "already authorized":
             logger.debug(f"✅ Request {request_id} successful")
         else:
             logger.warning(f"⚠️ Request {request_id} failed: {message}")

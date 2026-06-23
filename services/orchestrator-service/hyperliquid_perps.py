@@ -61,16 +61,16 @@ DEFAULT_STANDALONE_STRATEGY_GATES = {
     "dual_sma_daytrade": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
     "arc_daytrade": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
     "ema50_breakout_pullback": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
+    "orb_5m_scalp": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
 }
 
 
 PRIORITY_STANDALONE_ENTRY_STRATEGIES = (
-    "rsi_stoch_reversal_5m",
-    "rsi_stoch_reversal_1m",
     "supply_demand_3step",
     "dual_sma_daytrade",
     "arc_daytrade",
     "ema50_breakout_pullback",
+    "orb_5m_scalp",
 )
 
 
@@ -88,6 +88,29 @@ def pair_to_hyperliquid_coin(pair: str) -> str:
         if raw.endswith(suffix):
             return raw[: -len(suffix)]
     return raw
+
+
+def merge_active_trades_with_paper_perps(
+    active_trades: Iterable[Mapping[str, Any]],
+    paper_perp_open_trades: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return active spot/in-memory rows plus DB-backed Hyperliquid paper perps."""
+    rows: List[Dict[str, Any]] = [
+        dict(row) for row in (active_trades or []) if isinstance(row, Mapping)
+    ]
+    for raw in paper_perp_open_trades or []:
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        coin = pair_to_hyperliquid_coin(str(row.get("coin") or row.get("pair") or ""))
+        row.setdefault("exchange", "hyperliquid")
+        if coin:
+            row.setdefault("coin", coin)
+            row.setdefault("pair", f"{coin}/USD-PERP")
+        row.setdefault("asset_class", "perp")
+        row.setdefault("source", "hyperliquid_paper_perp")
+        rows.append(row)
+    return rows
 
 
 def position_sides_from_signal(signal: str) -> Optional[str]:
@@ -159,6 +182,27 @@ def adaptive_blocked_regime_side_exit_reason(
     return None
 
 
+def portfolio_control_exit_reason(
+    trade: Mapping[str, Any],
+    root_config: Mapping[str, Any],
+    hl_cfg: Mapping[str, Any],
+) -> Optional[str]:
+    """Apply executable-portfolio exits without contaminating shadow outcomes."""
+    metadata = trade.get("metadata") or {}
+    if isinstance(metadata, Mapping):
+        shadow_raw = metadata.get("shadow_trade")
+        if shadow_raw is True or str(shadow_raw or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return None
+    return disabled_strategy_side_exit_reason(trade, root_config) or (
+        adaptive_blocked_regime_side_exit_reason(trade, hl_cfg)
+    )
+
+
 def perp_side_fee(notional: float, fee_rate_per_side: float) -> float:
     """Taker-style fee for one fill (entry or exit) on notional USD."""
     if notional <= 0 or fee_rate_per_side <= 0:
@@ -192,7 +236,135 @@ def pnl_percentage(position_side: str, entry_price: float, current_price: float)
     return ((current_price - entry_price) / entry_price) * 100.0
 
 
-def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def promoted_cohort_selection_boost(
+    candidate: Dict[str, Any],
+    *,
+    coin: str,
+    market_regime: str,
+    promoted_cohorts: Optional[Iterable[Mapping[str, Any]]],
+    hl_cfg: Optional[Dict[str, Any]],
+) -> float:
+    """Additive cross-strategy score boost when live signal matches a promoted cohort."""
+    promotion_cfg = (hl_cfg or {}).get("shadow_cohort_promotion") or {}
+    try:
+        boost = float(promotion_cfg.get("selection_boost", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        boost = 0.0
+    if boost <= 0 or not promoted_cohorts:
+        return 0.0
+    strategy = str(candidate.get("strategy") or "").strip().lower()
+    side = position_sides_from_signal(candidate.get("signal"))
+    regime = str(market_regime or "").strip().lower()
+    coin_key = pair_to_hyperliquid_coin(str(coin or ""))
+    for cohort in promoted_cohorts:
+        cohort_coin = pair_to_hyperliquid_coin(str(cohort.get("coin") or ""))
+        if cohort_coin.lower() != coin_key.lower():
+            continue
+        if str(cohort.get("strategy") or "").strip().lower() != strategy:
+            continue
+        if str(cohort.get("side") or "").strip().lower() != side:
+            continue
+        cohort_regime = str(cohort.get("regime") or "").strip().lower()
+        if cohort_regime and cohort_regime != regime:
+            continue
+        return boost
+    return 0.0
+
+
+def _is_executable_perp_trade(trade: Mapping[str, Any]) -> bool:
+    meta = trade.get("metadata") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    shadow_raw = meta.get("shadow_trade")
+    if shadow_raw is True or str(shadow_raw).lower() in {"1", "true", "yes"}:
+        return False
+    if str(meta.get("accounting_excluded") or "").lower() in {"1", "true", "yes"}:
+        return False
+    return str(trade.get("status") or "").upper() == "CLOSED"
+
+
+def executable_size_requalification_passes(
+    strategy: str,
+    side: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
+    """Gate size boosts until executable paper stats meet the requalification bar."""
+    cfg = ((hl_cfg or {}).get("executable_size_requalification") or {})
+    enabled = cfg.get("enabled", True)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return True, "requal_disabled"
+
+    normalized_strategy = str(strategy or "").strip().lower()
+    normalized_side = str(side or "").strip().lower()
+    if not normalized_strategy or normalized_side not in {"long", "short"}:
+        return False, "requal_missing_strategy_side"
+
+    try:
+        min_closed = max(1, int(cfg.get("min_closed_trades", 30) or 30))
+        min_span_days = max(1.0, float(cfg.get("min_span_days", 14) or 14))
+        min_profit_factor = float(cfg.get("min_profit_factor", 1.25) or 1.25)
+        min_realized = float(cfg.get("min_realized_pnl_usd", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False, "requal_invalid_config"
+
+    rows: List[Dict[str, Any]] = []
+    for trade in closed_trades or []:
+        if not _is_executable_perp_trade(trade):
+            continue
+        trade_strategy = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        trade_side = str(
+            trade.get("position_side") or trade.get("source_signal") or ""
+        ).strip().lower()
+        if trade_side not in {"long", "short"}:
+            trade_side = normalize_perp_entry_signal(trade_side) or trade_side
+        if trade_strategy != normalized_strategy or trade_side != normalized_side:
+            continue
+        exit_dt = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_dt is None:
+            continue
+        try:
+            pnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        rows.append({"pnl": pnl, "exit_time": exit_dt})
+
+    if len(rows) < min_closed:
+        return False, f"requal_closed_{len(rows)}_lt_{min_closed}"
+
+    exit_times = [row["exit_time"] for row in rows if row.get("exit_time") is not None]
+    if not exit_times:
+        return False, "requal_missing_exit_times"
+    span_days = (max(exit_times) - min(exit_times)).total_seconds() / 86400.0
+    if span_days < min_span_days:
+        return False, f"requal_span_{span_days:.1f}d_lt_{min_span_days:.1f}d"
+
+    realized = sum(row["pnl"] for row in rows)
+    gross_profit = sum(row["pnl"] for row in rows if row["pnl"] > 0)
+    gross_loss = abs(sum(row["pnl"] for row in rows if row["pnl"] < 0))
+    if realized < min_realized:
+        return False, f"requal_pnl_{realized:.2f}_lt_{min_realized:.2f}"
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
+    if profit_factor < min_profit_factor:
+        return False, f"requal_pf_{profit_factor:.2f}_lt_{min_profit_factor:.2f}"
+    return True, "requal_pass"
+
+
+def select_mirrored_signal(
+    signals_data: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    coin: Optional[str] = None,
+    market_regime: Optional[str] = None,
+    promoted_cohorts: Optional[Iterable[Mapping[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Pick the best actionable long/short entry intent from a strategy-service payload.
 
@@ -207,13 +379,30 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
     if not isinstance(strategies, dict):
         strategies = {}
 
-    def best_strategy_for(side: str) -> Dict[str, Any]:
+    def best_strategy_for(
+        side: str,
+        *,
+        require_runtime_eligibility: bool = False,
+    ) -> Dict[str, Any]:
         candidates = []
         for name, data in strategies.items():
             if not isinstance(data, dict):
                 continue
             if normalize_perp_entry_signal(data.get("signal", "")) != side:
                 continue
+            if require_runtime_eligibility and hl_cfg is not None:
+                candidate = {
+                    "strategy": str(name),
+                    "signal": side,
+                    "confidence": float(data.get("confidence", 0) or 0),
+                    "strength": float(data.get("strength", 0) or 0),
+                    "details": data,
+                }
+                if hyperliquid_min_edge_gate(candidate, hl_cfg).get("blocked"):
+                    continue
+                specialist_gate = specialist_entry_gate(candidate, hl_cfg)
+                if specialist_gate.get("isSpecialist") and not specialist_gate.get("allowed"):
+                    continue
             candidates.append(
                 (
                     float(data.get("confidence", 0) or 0),
@@ -239,6 +428,7 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
 
     consensus = signals_data.get("consensus") or {}
 
+    standalone_candidates: List[Dict[str, Any]] = []
     for strategy_name in PRIORITY_STANDALONE_ENTRY_STRATEGIES:
         data = strategies.get(strategy_name) or {}
         if not isinstance(data, dict):
@@ -254,7 +444,7 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
             or strength < float(defaults.get("min_strength", 0) or 0)
         ):
             continue
-        selected = {
+        selected: Dict[str, Any] = {
             "strategy": strategy_name,
             "signal": side,
             "confidence": conf,
@@ -264,16 +454,77 @@ def select_mirrored_signal(signals_data: Dict[str, Any]) -> Optional[Dict[str, A
             "details": data,
             "standalone_priority": True,
         }
+        # Do not let a fixed strategy-list order monopolize execution. Rank every
+        # complete standalone setup by signal quality, and when runtime config is
+        # available discard candidates that are certain to fail the downstream
+        # edge/specialist gates. All gates still run again before an order opens.
+        if hl_cfg is not None:
+            edge_gate = hyperliquid_min_edge_gate(selected, hl_cfg)
+            if edge_gate.get("blocked"):
+                continue
+            specialist_gate = specialist_entry_gate(selected, hl_cfg)
+            if specialist_gate.get("isSpecialist") and not specialist_gate.get("allowed"):
+                continue
+        expected_move = _expected_move_pct_from_signal(selected)
+        expected_quality = min(max(float(expected_move or 0.0), 0.0), 2.0) / 2.0
+        # Per-strategy edge bias so cross_strategy_selection favours the playbooks
+        # the shadow book proves have edge instead of just the loudest signal.
+        # See trading.hyperliquid_perps.cross_strategy_selection_bias.
+        selection_bias = 0.0
+        if hl_cfg is not None:
+            raw_bias = hl_cfg.get("cross_strategy_selection_bias")
+            if isinstance(raw_bias, dict):
+                try:
+                    selection_bias = float(raw_bias.get(strategy_name, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    selection_bias = 0.0
+        if selection_bias:
+            selected["selection_bias"] = selection_bias
+        promo_boost = promoted_cohort_selection_boost(
+            selected,
+            coin=str(coin or ""),
+            market_regime=str(
+                market_regime or signals_data.get("market_regime") or ""
+            ),
+            promoted_cohorts=promoted_cohorts,
+            hl_cfg=hl_cfg,
+        )
+        if promo_boost:
+            selected["promoted_cohort_boost"] = promo_boost
+        selected["selection_score"] = round(
+            conf * 0.50
+            + strength * 0.30
+            + expected_quality * 0.20
+            + selection_bias
+            + promo_boost,
+            6,
+        )
+        if expected_move is not None:
+            selected["expected_move_pct"] = expected_move
         opposite = strongest_opposite_for(side)
         if opposite:
             selected["opposite_strategy"] = opposite.get("strategy")
             selected["opposite_confidence"] = float(opposite.get("confidence", 0) or 0)
             selected["opposite_strength"] = float(opposite.get("strength", 0) or 0)
-        return selected
+        standalone_candidates.append(selected)
+
+    if standalone_candidates:
+        return max(
+            standalone_candidates,
+            key=lambda item: (
+                float(item.get("selection_score") or 0.0),
+                float(item.get("expected_move_pct") or 0.0),
+                float(item.get("confidence") or 0.0),
+                float(item.get("strength") or 0.0),
+                str(item.get("strategy") or ""),
+            ),
+        )
 
     c_signal = normalize_perp_entry_signal(consensus.get("signal", ""))
     if c_signal in {"long", "short"}:
-        best = best_strategy_for(c_signal)
+        best = best_strategy_for(c_signal, require_runtime_eligibility=True)
+        if not best:
+            return None
         consensus_confidence = float(consensus.get("confidence", 0) or 0)
         best_confidence = float(best.get("confidence", 0) or 0)
         selected = {
@@ -636,6 +887,21 @@ class PaperPerpExitConfig:
     partial_profit_pct: float = 0.0
     partial_profit_sma_extension_pct: float = 0.05
 
+    dollar_loss_cap_enabled: bool = False
+    dollar_loss_soft_pct: float = 0.0
+    dollar_loss_hard_pct: float = 0.0
+    dollar_loss_hard_pct_by_strategy: Dict[str, float] = field(default_factory=dict)
+    dollar_loss_cap_default_usd: float = 0.0
+    dollar_loss_cap_by_strategy: Dict[str, float] = field(default_factory=dict)
+    dollar_loss_recovery_soft_usd: float = 0.0
+    dollar_loss_recovery_minutes: float = 0.0
+    dollar_loss_suppress_percentage_stop: bool = True
+
+    time_decay_exit_enabled: bool = False
+    time_decay_min_age_minutes: float = 0.0
+    time_decay_max_loss_usd: float = 0.0
+    time_decay_min_age_by_strategy: Dict[str, float] = field(default_factory=dict)
+
 
 @dataclass
 class PaperPerpExitResult:
@@ -791,6 +1057,35 @@ def paper_perp_exit_config_from_yaml(
     else:
         stagnant_enabled = bool(stagnant_enabled)
 
+    dollar_cap_cfg = hl_cfg.get("dollar_loss_cap") or {}
+    if not isinstance(dollar_cap_cfg, dict):
+        dollar_cap_cfg = {}
+    raw_strategy_caps = dollar_cap_cfg.get("strategy_max_loss_usd") or {}
+    dollar_cap_by_strategy: Dict[str, float] = {}
+    if isinstance(raw_strategy_caps, dict):
+        for strategy, value in raw_strategy_caps.items():
+            cap = _safe_float(value, 0.0)
+            if cap > 0:
+                dollar_cap_by_strategy[str(strategy or "").strip().lower()] = cap
+    raw_strategy_pct_caps = dollar_cap_cfg.get("strategy_hard_loss_pct") or {}
+    dollar_hard_pct_by_strategy: Dict[str, float] = {}
+    if isinstance(raw_strategy_pct_caps, dict):
+        for strategy, value in raw_strategy_pct_caps.items():
+            cap = _safe_float(value, 0.0)
+            if cap > 0:
+                dollar_hard_pct_by_strategy[str(strategy or "").strip().lower()] = cap
+
+    time_decay_cfg = hl_cfg.get("time_decay_exit") or {}
+    if not isinstance(time_decay_cfg, dict):
+        time_decay_cfg = {}
+    raw_time_decay_ages = time_decay_cfg.get("strategy_min_age_minutes") or {}
+    time_decay_min_age_by_strategy: Dict[str, float] = {}
+    if isinstance(raw_time_decay_ages, dict):
+        for strategy, value in raw_time_decay_ages.items():
+            minutes = _safe_float(value, 0.0)
+            if minutes > 0:
+                time_decay_min_age_by_strategy[str(strategy or "").strip().lower()] = minutes
+
     return PaperPerpExitConfig(
         use_spot_exit_rules=use_spot,
         fixed_stop_loss_enabled=bool(hl_cfg.get("fixed_stop_loss_enabled", True)),
@@ -827,6 +1122,42 @@ def paper_perp_exit_config_from_yaml(
             hl_cfg.get("partial_profit_sma_extension_pct", 0.05),
             0.05,
         ),
+        dollar_loss_cap_enabled=bool(dollar_cap_cfg.get("enabled", False)),
+        dollar_loss_cap_default_usd=_safe_float(
+            dollar_cap_cfg.get("default_max_loss_usd", 0.0),
+            0.0,
+        ),
+        dollar_loss_soft_pct=_safe_float(
+            dollar_cap_cfg.get("soft_loss_pct", 0.0),
+            0.0,
+        ),
+        dollar_loss_hard_pct=_safe_float(
+            dollar_cap_cfg.get("hard_loss_pct", 0.0),
+            0.0,
+        ),
+        dollar_loss_hard_pct_by_strategy=dollar_hard_pct_by_strategy,
+        dollar_loss_cap_by_strategy=dollar_cap_by_strategy,
+        dollar_loss_recovery_soft_usd=_safe_float(
+            dollar_cap_cfg.get("soft_loss_usd", 0.0),
+            0.0,
+        ),
+        dollar_loss_recovery_minutes=_safe_float(
+            dollar_cap_cfg.get("max_recovery_minutes", 0.0),
+            0.0,
+        ),
+        dollar_loss_suppress_percentage_stop=bool(
+            dollar_cap_cfg.get("suppress_percentage_stop", True)
+        ),
+        time_decay_exit_enabled=bool(time_decay_cfg.get("enabled", False)),
+        time_decay_min_age_minutes=_safe_float(
+            time_decay_cfg.get("min_age_minutes", 0.0),
+            0.0,
+        ),
+        time_decay_max_loss_usd=_safe_float(
+            time_decay_cfg.get("max_loss_usd", 0.0),
+            0.0,
+        ),
+        time_decay_min_age_by_strategy=time_decay_min_age_by_strategy,
     )
 
 
@@ -1359,6 +1690,86 @@ def specialist_entry_gate(
         "reason": "not_specialist_strategy",
         "sizeMultiplier": None,
     }
+
+
+def eligible_shadow_strategy_signals(
+    signals_data: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Return every directional strategy signal that passes its own entry gates.
+
+    Shadow eligibility deliberately excludes portfolio gates such as available
+    balance, daily halts, open-position limits, and cross-strategy consensus.
+    This provides an unbiased counterfactual sample for each strategy while the
+    executable portfolio remains risk constrained.
+    """
+    shadow_cfg = ((hl_cfg or {}).get("shadow_strategy_evaluation") or {})
+    enabled = shadow_cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return []
+
+    strategies = (signals_data or {}).get("strategies") or {}
+    if not isinstance(strategies, dict):
+        return []
+    allowlist = {
+        str(value or "").strip().lower()
+        for value in (shadow_cfg.get("strategies") or [])
+        if str(value or "").strip()
+    }
+
+    directional: List[Dict[str, Any]] = []
+    for strategy_name, data in strategies.items():
+        if not isinstance(data, dict):
+            continue
+        strategy_key = str(strategy_name or "").strip().lower()
+        if allowlist and strategy_key not in allowlist:
+            continue
+        side = normalize_perp_entry_signal(data.get("signal"))
+        if side not in {"long", "short"}:
+            continue
+        directional.append(
+            {
+                "strategy": strategy_key,
+                "signal": side,
+                "confidence": _safe_float(data.get("confidence"), 0.0),
+                "strength": _safe_float(data.get("strength"), 0.0),
+                "details": data,
+            }
+        )
+
+    eligible: List[Dict[str, Any]] = []
+    for candidate in directional:
+        specialist = specialist_entry_gate(candidate, hl_cfg)
+        if specialist.get("isSpecialist"):
+            if not specialist.get("allowed"):
+                continue
+            gate_name = "specialist"
+            gate_reason = specialist.get("reason")
+        else:
+            standalone = hyperliquid_standalone_entry_gate(candidate, hl_cfg)
+            if standalone.get("isStandalone") and not standalone.get("allowed"):
+                continue
+            # Strategies without an additional orchestrator gate have already
+            # passed their engine-owned setup rules by emitting long/short.
+            gate_name = "standalone" if standalone.get("isStandalone") else "engine"
+            gate_reason = (
+                standalone.get("reason")
+                if standalone.get("isStandalone")
+                else "engine_directional_signal"
+            )
+
+        # Edge and cross-strategy opposition are portfolio gates, not properties
+        # of this strategy's setup. Persist their outcome for later comparison,
+        # but do not censor the counterfactual sample with them.
+        edge = hyperliquid_min_edge_gate(candidate, hl_cfg)
+        candidate["shadow_gate"] = gate_name
+        candidate["shadow_gate_reason"] = gate_reason
+        candidate["shadow_edge_reason"] = edge.get("reason")
+        candidate["shadow_edge_passed"] = not bool(edge.get("blocked"))
+        candidate["expected_move_pct"] = edge.get("expectedMovePct")
+        eligible.append(candidate)
+
+    return eligible
 
 
 def paper_perp_position_size_multiplier(
@@ -2361,6 +2772,65 @@ def hyperliquid_strategy_side_entry_block(
     }
 
 
+def hyperliquid_strategy_open_position_limit_block(
+    strategy: str,
+    open_trades: Iterable[Dict[str, Any]],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    pending_open_count: int = 0,
+) -> Dict[str, Any]:
+    """Block a strategy when it has reached its configured open-position cap."""
+    normalized_strategy = str(strategy or "").strip().lower()
+    if not normalized_strategy:
+        return {
+            "entryBlocked": False,
+            "entryBlockReason": None,
+            "entryBlockMessage": "",
+            "openCount": 0,
+            "maxOpen": None,
+        }
+
+    raw_limits = ((hl_cfg or {}).get("strategy_open_position_limits") or {})
+    if not isinstance(raw_limits, dict):
+        raw_limits = {}
+    raw_limit = raw_limits.get(normalized_strategy)
+    if raw_limit is None:
+        raw_limit = raw_limits.get(strategy)
+    try:
+        max_open = int(raw_limit)
+    except (TypeError, ValueError):
+        max_open = 0
+    if max_open <= 0:
+        return {
+            "entryBlocked": False,
+            "entryBlockReason": None,
+            "entryBlockMessage": "",
+            "openCount": 0,
+            "maxOpen": None,
+        }
+
+    open_count = max(0, int(pending_open_count or 0))
+    for trade in open_trades or []:
+        trade_strategy = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        if trade_strategy == normalized_strategy:
+            open_count += 1
+
+    blocked = open_count >= max_open
+    return {
+        "entryBlocked": blocked,
+        "entryBlockReason": "strategy_open_position_limit" if blocked else None,
+        "entryBlockMessage": (
+            f"{normalized_strategy} open-position cap reached: {open_count}/{max_open}"
+            if blocked
+            else ""
+        ),
+        "openCount": open_count,
+        "maxOpen": max_open,
+    }
+
+
 def hyperliquid_strategy_coin_loss_streak_entry_block(
     coin: str,
     strategy: str,
@@ -2424,6 +2894,93 @@ def hyperliquid_strategy_coin_loss_streak_entry_block(
         "entryBlockUntil": None,
         "entryBlockMessage": "",
         "consecutiveLosses": streak,
+    }
+
+
+def hyperliquid_strategy_pair_stop_cooldown_block(
+    coin: str,
+    strategy: str,
+    side: str,
+    closed_trades: Iterable[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    cooldown_hours: float = 6.0,
+    stop_keywords: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Block same strategy+coin+side re-entry after a recent stop-like loss."""
+    normalized_coin = pair_to_hyperliquid_coin(coin)
+    normalized_strategy = str(strategy or "").strip().lower()
+    normalized_side = str(side or "").strip().lower()
+    hours = max(0.0, float(cooldown_hours or 0.0))
+    if not normalized_coin or not normalized_strategy or hours <= 0:
+        return {"entryBlocked": False, "entryBlockReason": None, "entryBlockMessage": ""}
+
+    keywords = [
+        str(item or "").strip().lower()
+        for item in (
+            stop_keywords
+            or [
+                "stop_loss",
+                "loss_cap",
+                "loss_recovery_expired",
+                "stagnant_loser",
+                "no_mfe",
+            ]
+        )
+        if str(item or "").strip()
+    ]
+    latest_exit: Optional[datetime] = None
+    latest_reason = ""
+    for trade in closed_trades or []:
+        trade_coin = pair_to_hyperliquid_coin(
+            trade.get("coin") or trade.get("pair") or trade.get("source_pair") or ""
+        )
+        trade_strategy = str(
+            trade.get("source_strategy") or trade.get("strategy") or ""
+        ).strip().lower()
+        trade_side = str(trade.get("side") or trade.get("position_side") or "").strip().lower()
+        if (
+            trade_coin != normalized_coin
+            or trade_strategy != normalized_strategy
+            or (normalized_side and trade_side and trade_side != normalized_side)
+        ):
+            continue
+        try:
+            pnl = float(trade.get("realized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if pnl >= 0:
+            continue
+        reason = str(trade.get("exit_reason") or trade.get("close_reason") or "").lower()
+        if keywords and not any(keyword in reason for keyword in keywords):
+            continue
+        exit_time = _parse_dt(trade.get("exit_time") or trade.get("updated_at"))
+        if exit_time is None:
+            continue
+        if latest_exit is None or exit_time > latest_exit:
+            latest_exit = exit_time
+            latest_reason = reason
+
+    now_dt = now or datetime.utcnow()
+    if latest_exit is not None:
+        until_dt = latest_exit + timedelta(hours=hours)
+        if until_dt > now_dt:
+            return {
+                "entryBlocked": True,
+                "entryBlockReason": "strategy_pair_stop_cooldown",
+                "entryBlockUntil": until_dt.isoformat() + "+00:00",
+                "entryBlockMessage": (
+                    f"{normalized_strategy} {normalized_coin} {normalized_side or 'side'} "
+                    f"stop cooldown until {until_dt.isoformat()} UTC "
+                    f"(latest={latest_reason or 'stop_like_loss'})"
+                ),
+            }
+
+    return {
+        "entryBlocked": False,
+        "entryBlockReason": None,
+        "entryBlockUntil": None,
+        "entryBlockMessage": "",
     }
 
 
@@ -2793,6 +3350,31 @@ def _stagnant_loser_decision(
     except (TypeError, ValueError):
         fast_fail_loss = -0.40
 
+    no_mfe_enabled = sl.get("no_mfe_fast_fail_enabled", True)
+    no_mfe_enabled = no_mfe_enabled is not False and str(no_mfe_enabled).lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    try:
+        no_mfe_peak = float(sl.get("no_mfe_peak_pct", 0.03) or 0.03)
+    except (TypeError, ValueError):
+        no_mfe_peak = 0.03
+    try:
+        no_mfe_age = float(sl.get("no_mfe_min_age_minutes", fast_fail_age) or fast_fail_age)
+    except (TypeError, ValueError):
+        no_mfe_age = fast_fail_age
+    try:
+        no_mfe_loss = float(sl.get("no_mfe_loss_pct", fast_fail_loss) or fast_fail_loss)
+    except (TypeError, ValueError):
+        no_mfe_loss = fast_fail_loss
+    no_mfe_fast_fail = (
+        no_mfe_enabled
+        and age_minutes >= no_mfe_age
+        and peak_pct <= no_mfe_peak
+        and pct <= no_mfe_loss
+    )
     fast_fail = (
         age_minutes >= fast_fail_age
         and peak_pct <= fast_fail_peak
@@ -2803,14 +3385,40 @@ def _stagnant_loser_decision(
         and peak_pct <= dynamic_peak_cap_pct
         and pct <= dynamic_loss_trigger_pct
     )
-    if not fast_fail and not stagnant_standard:
+    if not no_mfe_fast_fail and not fast_fail and not stagnant_standard:
         return None
 
-    tag = "fast_fail" if fast_fail else "divergence"
+    tag = "no_mfe_fast_fail" if no_mfe_fast_fail else "fast_fail" if fast_fail else "divergence"
     return (
         f"paper_stagnant_loser_{tag}@{pct:.2f}%"
         f"_peak{peak_pct:.2f}%_age{age_minutes:.0f}m"
     )
+
+
+def _estimated_perp_net_pnl_usd(
+    trade: Dict[str, Any],
+    side: str,
+    entry_price: float,
+    current_price: float,
+    cfg: PaperPerpExitConfig,
+) -> Optional[float]:
+    """Estimate current paper perp PnL including recorded costs and exit fee."""
+    size = _safe_float(trade.get("position_size"), 0.0)
+    if size <= 0:
+        notional = _safe_float(trade.get("notional_size"), 0.0)
+        if entry_price > 0 and notional > 0:
+            size = notional / entry_price
+    if size <= 0:
+        return None
+    if side == "short":
+        gross = (entry_price - current_price) * size
+    else:
+        gross = (current_price - entry_price) * size
+    recorded_costs = abs(_safe_float(trade.get("fees"), 0.0)) + abs(
+        _safe_float(trade.get("funding"), 0.0)
+    )
+    exit_fee_estimate = abs(current_price * size * cfg.fee_rate_per_side)
+    return gross - recorded_costs - exit_fee_estimate
 
 
 def evaluate_paper_perp_exit(
@@ -2836,10 +3444,99 @@ def evaluate_paper_perp_exit(
     extreme = _update_extreme_price(side, entry_price, current_price, metadata)
     pct = pnl_percentage(side, entry_price, current_price)
     peak_pct = _peak_pct(side, entry_price, extreme)
+    age_minutes = _elapsed_minutes_since_entry(trade, now=now)
+    strategy_key = str(
+        trade.get("source_strategy") or trade.get("strategy") or ""
+    ).strip().lower()
+    net_pnl_usd = _estimated_perp_net_pnl_usd(
+        trade, side, entry_price, current_price, cfg
+    )
+    suppress_percentage_stop_for_recovery = False
+
+    if cfg.dollar_loss_cap_enabled and net_pnl_usd is not None:
+        max_loss_usd = cfg.dollar_loss_cap_by_strategy.get(
+            strategy_key, cfg.dollar_loss_cap_default_usd
+        )
+        soft_loss_usd = cfg.dollar_loss_recovery_soft_usd
+        if soft_loss_usd <= 0 and max_loss_usd > 0:
+            soft_loss_usd = max_loss_usd
+        hard_loss_pct = cfg.dollar_loss_hard_pct_by_strategy.get(
+            strategy_key, cfg.dollar_loss_hard_pct
+        )
+        soft_loss_pct = cfg.dollar_loss_soft_pct
+        estimated_loss_usd = -net_pnl_usd
+        estimated_loss_pct = -pct
+        hard_cap_hit = (
+            hard_loss_pct > 0 and estimated_loss_pct >= hard_loss_pct
+        ) or (
+            hard_loss_pct <= 0 and max_loss_usd > 0 and estimated_loss_usd >= max_loss_usd
+        )
+        soft_cap_hit = (
+            soft_loss_pct > 0 and estimated_loss_pct >= soft_loss_pct
+        ) or (
+            soft_loss_pct <= 0 and soft_loss_usd > 0 and estimated_loss_usd >= soft_loss_usd
+        )
+        if hard_cap_hit:
+            cap_label = (
+                f"{hard_loss_pct:.2f}%"
+                if hard_loss_pct > 0
+                else f"${max_loss_usd:.2f}"
+            )
+            return PaperPerpExitResult(
+                f"paper_loss_cap_{cap_label}@pnl${net_pnl_usd:.2f}_{pct:.2f}%",
+                metadata,
+            )
+        if (
+            soft_cap_hit
+            and cfg.dollar_loss_recovery_minutes > 0
+            and age_minutes is not None
+            and age_minutes < cfg.dollar_loss_recovery_minutes
+        ):
+            suppress_percentage_stop_for_recovery = cfg.dollar_loss_suppress_percentage_stop
+            metadata["dollar_loss_recovery"] = {
+                "soft_loss_usd": soft_loss_usd,
+                "soft_loss_pct": soft_loss_pct,
+                "max_loss_usd": max_loss_usd,
+                "hard_loss_pct": hard_loss_pct,
+                "age_minutes": round(age_minutes, 2),
+                "estimated_pnl_usd": round(net_pnl_usd, 4),
+                "estimated_loss_pct": round(estimated_loss_pct, 4),
+            }
+        elif (
+            soft_cap_hit
+            and cfg.dollar_loss_recovery_minutes > 0
+            and age_minutes is not None
+            and age_minutes >= cfg.dollar_loss_recovery_minutes
+        ):
+            cap_label = (
+                f"{hard_loss_pct:.2f}%"
+                if hard_loss_pct > 0
+                else f"${max_loss_usd:.2f}"
+            )
+            return PaperPerpExitResult(
+                f"paper_loss_recovery_expired_{cap_label}@pnl${net_pnl_usd:.2f}_{pct:.2f}%",
+                metadata,
+            )
+
+    if (
+        cfg.time_decay_exit_enabled
+        and net_pnl_usd is not None
+        and age_minutes is not None
+        and cfg.time_decay_max_loss_usd > 0
+    ):
+        min_age = cfg.time_decay_min_age_by_strategy.get(
+            strategy_key, cfg.time_decay_min_age_minutes
+        )
+        if min_age > 0 and age_minutes >= min_age and -net_pnl_usd >= cfg.time_decay_max_loss_usd:
+            return PaperPerpExitResult(
+                f"paper_time_decay_loss_exit_${cfg.time_decay_max_loss_usd:.2f}@pnl${net_pnl_usd:.2f}_age{age_minutes:.0f}m",
+                metadata,
+            )
 
     effective_stop_pct = _effective_stop_pct(trade, cfg)
     if (
         cfg.fixed_stop_loss_enabled
+        and not suppress_percentage_stop_for_recovery
         and effective_stop_pct > 0
         and pct <= -abs(effective_stop_pct)
     ):
@@ -3024,6 +3721,83 @@ def find_mirror_spot_pair(
     return None, None
 
 
+def hyperliquid_shadow_promotion_requirement(
+    coin: str,
+    signal: Optional[Mapping[str, Any]],
+    regime: str,
+    hl_cfg: Optional[Dict[str, Any]],
+    promoted_cohorts_by_coin: Optional[Mapping[str, List[Mapping[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    """Require coin-specific shadow proof for configured risky cohorts."""
+    promotion_cfg = (hl_cfg or {}).get("shadow_cohort_promotion") or {}
+    requirements = promotion_cfg.get("require_promotion_for") or []
+    if not isinstance(requirements, list) or not requirements:
+        return {"blocked": False, "reason": "shadow_promotion_not_required"}
+
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = position_sides_from_signal((signal or {}).get("signal"))
+    regime_key = str(regime or "").strip().lower()
+    if not strategy or side not in {"long", "short"}:
+        return {"blocked": False, "reason": "shadow_promotion_no_directional_signal"}
+
+    matched_requirement = False
+    for raw in requirements:
+        if not isinstance(raw, Mapping):
+            continue
+        req_strategy = str(raw.get("strategy") or "").strip().lower()
+        req_side = str(raw.get("side") or "").strip().lower()
+        req_regimes = {
+            str(value or "").strip().lower()
+            for value in (raw.get("regimes") or [])
+            if str(value or "").strip()
+        }
+        if req_strategy and req_strategy != strategy:
+            continue
+        if req_side and req_side != side:
+            continue
+        if req_regimes and regime_key not in req_regimes:
+            continue
+        matched_requirement = True
+        break
+
+    if not matched_requirement:
+        return {"blocked": False, "reason": "shadow_promotion_not_required"}
+
+    coin_key = pair_to_hyperliquid_coin(str(coin or ""))
+    promoted_map = promoted_cohorts_by_coin or {}
+    promoted = promoted_map.get(coin_key) or []
+    if not promoted:
+        promoted = next(
+            (
+                cohorts
+                for raw_coin, cohorts in promoted_map.items()
+                if pair_to_hyperliquid_coin(str(raw_coin or "")).lower()
+                == coin_key.lower()
+            ),
+            [],
+        )
+    for cohort in promoted:
+        if (
+            str(cohort.get("strategy") or "").strip().lower() == strategy
+            and str(cohort.get("side") or "").strip().lower() == side
+            and str(cohort.get("regime") or "").strip().lower() == regime_key
+        ):
+            return {
+                "blocked": False,
+                "reason": "shadow_promoted_cohort_match",
+                "cohort": dict(cohort),
+            }
+
+    return {
+        "blocked": True,
+        "reason": f"shadow_promotion_required_{strategy}_{side}_{regime_key or 'unknown'}",
+        "message": (
+            f"{strategy} {side} {regime_key or 'unknown'} requires a profitable "
+            f"coin-specific shadow cohort before executable entry"
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Change 3: Counter-trend regime direction gate
 # ---------------------------------------------------------------------------
@@ -3044,6 +3818,7 @@ def hyperliquid_regime_direction_gate(
     confidence: float,
     strength: float,
     hl_cfg: Optional[Dict[str, Any]] = None,
+    strategy: str = "",
 ) -> Dict[str, Any]:
     """
     Block entries that go against the dominant trend direction.
@@ -3055,6 +3830,22 @@ def hyperliquid_regime_direction_gate(
     """
     side = str(signal_side or "").lower()
     regime_key = str(regime or "").lower()
+    strategy_key = str(strategy or "").strip().lower()
+    strategy_blocks = (hl_cfg or {}).get("strategy_regime_side_blocks") or {}
+    if isinstance(strategy_blocks, dict) and strategy_key:
+        raw_strategy_cfg = strategy_blocks.get(strategy_key) or strategy_blocks.get(strategy) or {}
+        if isinstance(raw_strategy_cfg, dict):
+            blocked_sides = {
+                str(value or "").strip().lower()
+                for value in (raw_strategy_cfg.get(regime_key) or [])
+            }
+            if side in blocked_sides:
+                return {
+                    "blocked": True,
+                    "reason": f"configured_strategy_regime_side_block_{strategy_key}_{regime_key}_{side}",
+                    "sizeMultiplier": None,
+                }
+
     blocked_regime_sides = (hl_cfg or {}).get("blocked_regime_sides") or {}
     configured_blocked_sides = {
         str(value or "").strip().lower()
@@ -3673,6 +4464,51 @@ def hyperliquid_daily_loss_halt(
         "dailyPnl": daily_pnl,
         "limitUsd": limit,
         "maxDailyLossPct": max_pct,
+    }
+
+
+def hyperliquid_daily_profit_target_halt(
+    closed_trades: List[Dict[str, Any]],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Block new entries once today's realized PnL reaches the configured target."""
+    target_cfg = ((hl_cfg or {}).get("daily_profit_target") or {})
+    enabled = target_cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return {"blocked": False, "reason": "daily_profit_target_disabled"}
+    target_usd = _safe_float(target_cfg.get("target_usd", 0.0), 0.0)
+    if target_usd <= 0:
+        return {"blocked": False, "reason": "daily_profit_target_disabled"}
+    now_dt = now or datetime.utcnow()
+    if now_dt.tzinfo is not None:
+        now_dt = now_dt.replace(tzinfo=None)
+    today = now_dt.date()
+    daily_pnl = 0.0
+    for row in closed_trades or []:
+        if str(row.get("status") or "").upper() != "CLOSED":
+            continue
+        ts = _parse_dt(row.get("exit_time")) or _parse_dt(row.get("entry_time"))
+        if not ts:
+            continue
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        if ts.date() != today:
+            continue
+        daily_pnl += float(row.get("realized_pnl") or 0.0)
+    if daily_pnl >= target_usd:
+        return {
+            "blocked": True,
+            "reason": "daily_profit_target",
+            "dailyPnl": daily_pnl,
+            "targetUsd": target_usd,
+        }
+    return {
+        "blocked": False,
+        "reason": "daily_profit_target_not_reached",
+        "dailyPnl": daily_pnl,
+        "targetUsd": target_usd,
     }
 
 

@@ -60,12 +60,12 @@ const decimalPct = (value) => `${(Number(value || 0) * 100).toFixed(2)}%`;
 
 const priceMoney = (value) => {
   const n = Number(value || 0);
-  const digits = Math.abs(n) >= 100 ? 2 : Math.abs(n) >= 1 ? 4 : 6;
+  const digits = Math.abs(n) >= 1 ? 6 : 8;
   return n.toLocaleString(undefined, {
     style: 'currency',
     currency: 'USD',
     maximumFractionDigits: digits,
-    minimumFractionDigits: digits,
+    minimumFractionDigits: 6,
   });
 };
 
@@ -510,8 +510,8 @@ const pairColumns = [
   { key: 'pair', label: 'Pair', sortType: 'text', sortValue: (r) => r.pair, render: (r) => `<span class="pi-pair">${escapeHtml(r.pair || '-')}</span>` },
   { key: 'status', label: 'Status', sortType: 'text', sortValue: (r) => r.status, render: (r) => statusTag(r.status, r.analysis) },
   { key: 'analysis', label: 'Analysis', sortType: 'text', sortValue: (r) => r.analysis, render: (r) => escapeHtml(spotExecutionReason(r, r.analysis || '')) },
-  { key: 'entry', label: 'Entry', sortType: 'number', sortValue: (r) => r.entryPrice, render: (r) => r.hasOpenPosition ? money(r.entryPrice) : '-' },
-  { key: 'current', label: 'Current', sortType: 'number', sortValue: (r) => r.currentPrice, render: (r) => r.hasOpenPosition ? money(r.currentPrice) : '-' },
+  { key: 'entry', label: 'Entry', sortType: 'number', sortValue: (r) => r.entryPrice, render: (r) => r.hasOpenPosition ? priceMoney(r.entryPrice) : '-' },
+  { key: 'current', label: 'Current', sortType: 'number', sortValue: (r) => r.currentPrice, render: (r) => r.hasOpenPosition ? priceMoney(r.currentPrice) : '-' },
   { key: 'size', label: 'Size', sortType: 'number', sortValue: (r) => r.positionSize, render: (r) => r.hasOpenPosition ? num(r.positionSize, 6) : '-' },
   { key: 'unrealized', label: 'Unrealized', sortType: 'number', sortValue: (r) => r.unrealizedPnl, render: (r) => r.hasOpenPosition ? `<span class="${cls(r.unrealizedPnl)}">${money(r.unrealizedPnl)}</span>` : '-' },
   { key: 'pnl24h', label: '24h PnL', sortType: 'number', sortValue: (r) => r.pnl24h, render: (r) => `<span class="${cls(r.pnl24h)}">${money(r.pnl24h)}</span>` },
@@ -558,9 +558,9 @@ const tradeColumns = [
   { key: 'pair', label: 'Pair', sortType: 'text', sortValue: (t) => t._pair, render: (t) => `<span class="pi-pair">${escapeHtml(t._pair)}</span>` },
   { key: 'status', label: 'Status', sortType: 'text', sortValue: (t) => t._status, render: (t) => `<span class="pi-signal">${escapeHtml(t._status || '-')}</span>` },
   { key: 'side', label: 'Side', sortType: 'text', sortValue: () => 'long', render: () => '<span class="pi-tag pi-side-long">long</span>' },
-  { key: 'entry', label: 'Entry', sortType: 'number', sortValue: (t) => t._entryPrice, render: (t) => money(t._entryPrice) },
-  { key: 'exit', label: 'Exit', sortType: 'number', sortValue: (t) => t._exitPrice, render: (t) => t._status === 'CLOSED' ? money(t._exitPrice) : '-' },
-  { key: 'current', label: 'Current', sortType: 'number', sortValue: (t) => t._currentPrice, render: (t) => money(t._currentPrice) },
+  { key: 'entry', label: 'Entry', sortType: 'number', sortValue: (t) => t._entryPrice, render: (t) => priceMoney(t._entryPrice) },
+  { key: 'exit', label: 'Exit', sortType: 'number', sortValue: (t) => t._exitPrice, render: (t) => t._status === 'CLOSED' ? priceMoney(t._exitPrice) : '-' },
+  { key: 'current', label: 'Current', sortType: 'number', sortValue: (t) => t._currentPrice, render: (t) => priceMoney(t._currentPrice) },
   { key: 'size', label: 'Size', sortType: 'number', sortValue: (t) => t._size, render: (t) => num(t._size, 6) },
   { key: 'notional', label: 'Value', sortType: 'number', sortValue: (t) => t._notional, render: (t) => money(t._notional) },
   { key: 'realized', label: 'Realized', sortType: 'number', sortValue: (t) => t._realized, render: (t) => `<span class="${cls(t._realized)}">${money(t._realized)}</span>` },

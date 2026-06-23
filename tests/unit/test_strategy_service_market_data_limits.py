@@ -86,6 +86,19 @@ def test_rsi_stoch_strategy_family_resolves_1m_fast_route():
     )
 
 
+def test_strategy_signal_timeframes_reads_root_target_timeframes():
+    mod = _load_strategy_service_main()
+
+    cfg = {
+        "target_timeframes": ["4h"],
+        "parameters": {"primary_timeframe": "4h"},
+    }
+    assert mod._strategy_signal_timeframes("ema50_breakout_pullback", cfg) == ["4h"]
+
+    wrapped = {"config": cfg, "enabled": True}
+    assert mod._strategy_signal_timeframes("ema50_breakout_pullback", wrapped) == ["4h"]
+
+
 def test_rsi_stoch_1m_in_standalone_applicable_strategy_list():
     module_path = (
         Path(__file__).resolve().parents[2]

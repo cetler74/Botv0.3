@@ -64,6 +64,13 @@ trading_config = config.get('trading', {})
 
 app = FastAPI(title="Exchange Service", version="1.0.0")
 
+from hyperliquid_market import HyperliquidCandleCache
+
+_hyperliquid_candle_cache = HyperliquidCandleCache(
+    max_concurrency=2,
+    min_request_interval_seconds=0.30,
+)
+
 # Include WebSocket routers
 app.include_router(binance_ws_router)
 app.include_router(cryptocom_ws_router)
@@ -191,6 +198,21 @@ class WebSocketExchangeHandler:
                     
                 try:
                     data = json.loads(message)
+                    if (
+                        self.exchange_name == "cryptocom"
+                        and isinstance(data, dict)
+                        and data.get("method") == "public/heartbeat"
+                    ):
+                        await self.connection.send(
+                            json.dumps(
+                                {
+                                    "id": data.get("id"),
+                                    "method": "public/respond-heartbeat",
+                                }
+                            )
+                        )
+                        self.last_update = datetime.utcnow().isoformat()
+                        continue
                     # Try to parse ticker updates first; if not, handle as order update
                     handled_ticker = await self._handle_ticker_update(data)
                     if not handled_ticker:
@@ -759,6 +781,10 @@ def _update_ticker_cache(
                 logger.debug("ticker redis mirror publish failed: %s", ex)
     except Exception as e:
         logger.debug(f"Failed to update ticker cache for {exchange}:{symbol}: {e}")
+
+
+if hasattr(cryptocom_websocket, "set_ticker_cache_updater"):
+    cryptocom_websocket.set_ticker_cache_updater(_update_ticker_cache)
 
 # Data Models
 class OrderRequest(BaseModel):
@@ -2048,7 +2074,7 @@ async def get_hyperliquid_ohlcv(symbol: str, timeframe: str = "1h", limit: int =
         )
 
         coin = normalize_hyperliquid_coin(symbol)
-        candles = await fetch_hyperliquid_candles(coin, timeframe, limit)
+        candles = await _hyperliquid_candle_cache.get(coin, timeframe, limit)
         if not candles:
             return {"data": None, "error": "No data available", "symbol": coin, "timeframe": timeframe}
         return {
@@ -2057,9 +2083,16 @@ async def get_hyperliquid_ohlcv(symbol: str, timeframe: str = "1h", limit: int =
             "timeframe": timeframe,
             "exchange": "hyperliquid",
         }
+    except httpx.HTTPStatusError as e:
+        status = 503 if e.response.status_code == 429 else 502
+        logger.warning("Hyperliquid OHLCV upstream HTTP %s for %s", e.response.status_code, symbol)
+        raise HTTPException(
+            status_code=status,
+            detail="Hyperliquid OHLCV temporarily unavailable; retry later",
+        )
     except Exception as e:
         logger.warning("Hyperliquid OHLCV failed for %s: %s", symbol, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 def _is_transient_public_market_error(error: Exception) -> bool:

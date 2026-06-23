@@ -430,7 +430,7 @@ class CryptocomConnectionManager:
     def _record_error(self):
         """Record error with rate limiting"""
         if self._should_record_error():
-            self._record_error()
+            self.connection_metrics["total_errors"] += 1
             
             # Auto-restart if error accumulation is excessive
             if self.connection_metrics["total_errors"] > 1000:
@@ -502,7 +502,12 @@ class CryptocomConnectionManager:
         self.message_listener_task = None
     
     async def _heartbeat_loop(self):
-        """Heartbeat loop to maintain connection"""
+        """Use WebSocket ping for transport liveness.
+
+        Crypto.com's application heartbeat is server-initiated and is handled
+        by the listener. Sending public/heartbeat from the client is invalid and
+        caused normal server closes to be counted as connection failures.
+        """
         logger.debug(f"💓 Heartbeat started (interval: {self.heartbeat_interval}s)")
         
         try:
@@ -512,25 +517,23 @@ class CryptocomConnectionManager:
                 if self.connection_state != ConnectionState.CONNECTED:
                     break
                 
-                # Send heartbeat
-                heartbeat_msg = {
-                    "id": int(datetime.utcnow().timestamp()),
-                    "method": "public/heartbeat"
-                }
-                
-                if not await self.send_message(heartbeat_msg):
-                    logger.warning("💓 Heartbeat failed")
-                    await self.error_handler.handle_error(
-                        Exception("Heartbeat failed"),
-                        "heartbeat_send"
-                    )
-                else:
-                    logger.debug("💓 Heartbeat sent")
+                if not self.websocket:
+                    break
+                pong_waiter = await self.websocket.ping()
+                await asyncio.wait_for(pong_waiter, timeout=10.0)
+                logger.debug("💓 WebSocket ping/pong succeeded")
                 
         except asyncio.CancelledError:
             logger.debug("💓 Heartbeat cancelled")
         except Exception as e:
-            await self.error_handler.handle_error(e, "heartbeat_loop")
+            self._record_error()
+            logger.warning("💓 WebSocket ping/pong failed: %s", e)
+            self.connection_state = ConnectionState.FAILED
+            if self.websocket:
+                try:
+                    await self.websocket.close()
+                except Exception:
+                    pass
     
     async def _message_listener_loop(self):
         """Listen for incoming messages"""
@@ -547,6 +550,7 @@ class CryptocomConnectionManager:
                     # Parse message
                     try:
                         data = json.loads(message)
+                        await self._respond_to_server_heartbeat(data)
                         await self._notify_message_callbacks(data)
                     except json.JSONDecodeError as e:
                         await self.error_handler.handle_error(e, "message_parsing")
@@ -564,6 +568,17 @@ class CryptocomConnectionManager:
             logger.debug("👂 Message listener cancelled")
         except Exception as e:
             await self.error_handler.handle_error(e, "message_listener")
+
+    async def _respond_to_server_heartbeat(self, data: Dict[str, Any]) -> bool:
+        """Acknowledge Crypto.com's application heartbeat request."""
+        if data.get("method") != "public/heartbeat":
+            return False
+        return await self.send_message(
+            {
+                "id": data.get("id"),
+                "method": "public/respond-heartbeat",
+            }
+        )
     
     async def _auto_reconnect_loop(self):
         """Automatic reconnection loop"""

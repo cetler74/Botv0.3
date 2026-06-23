@@ -32,7 +32,8 @@
 
   function sectionKey(section, index) {
     if (section.id) return section.id;
-    const title = section.querySelector('h2')?.textContent
+    const title = section.querySelector('.pi-section-title')?.textContent
+      || section.querySelector('h2')?.textContent
       || section.querySelector('.pi-eyebrow')?.textContent
       || '';
     return `pi-section-${slugify(title)}-${index}`;

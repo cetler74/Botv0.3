@@ -23,6 +23,7 @@ COPY core/dual_sma_audit_summary.py ./dual_sma_audit_summary.py
 COPY core/arc_audit_summary.py ./arc_audit_summary.py
 COPY core/ema50_breakout_pullback_audit_summary.py ./ema50_breakout_pullback_audit_summary.py
 COPY core/orb_5m_scalp_audit_summary.py ./orb_5m_scalp_audit_summary.py
+COPY core/shadow_episode_summary.py ./shadow_episode_summary.py
 
 # Expose port
 EXPOSE 8002

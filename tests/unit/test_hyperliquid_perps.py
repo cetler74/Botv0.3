@@ -18,19 +18,25 @@ from hyperliquid_perps import (  # noqa: E402
     build_hyperliquid_adaptive_pnl_control,
     calculate_perp_pnl,
     disabled_strategy_side_exit_reason,
+    eligible_shadow_strategy_signals,
     evaluate_paper_perp_exit,
     hyperliquid_coin_entry_block,
     hyperliquid_coin_side_entry_block,
     hyperliquid_adaptive_entry_sizing_multiplier,
     hyperliquid_min_edge_gate,
+    hyperliquid_daily_profit_target_halt,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
+    hyperliquid_shadow_promotion_requirement,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
     hyperliquid_strategy_coin_loss_streak_entry_block,
+    hyperliquid_strategy_pair_stop_cooldown_block,
+    hyperliquid_strategy_open_position_limit_block,
     hyperliquid_trend_chase_gate,
+    merge_active_trades_with_paper_perps,
     is_block_window,
     is_block_window_strategy_exempt,
     is_caution_window,
@@ -41,6 +47,9 @@ from hyperliquid_perps import (  # noqa: E402
     pair_to_hyperliquid_coin,
     pnl_percentage,
     position_sides_from_signal,
+    portfolio_control_exit_reason,
+    promoted_cohort_selection_boost,
+    executable_size_requalification_passes,
     select_mirrored_signal,
     setup_risk_metadata_from_signal,
     sma_reclaim_bull_flag_specialist_gate,
@@ -56,6 +65,36 @@ from hyperliquid_perps import (  # noqa: E402
     parse_setup_risk_from_entry_reason,
     setup_risk_from_trade_metadata,
 )
+
+
+def test_active_trade_rows_include_db_backed_paper_perps():
+    spot_rows = [
+        {
+            "trade_id": "spot-1",
+            "exchange": "binance",
+            "pair": "ETH/USDC",
+            "status": "OPEN",
+        }
+    ]
+    paper_perps = [
+        {
+            "trade_id": "perp-1",
+            "coin": "SOL",
+            "source_strategy": "supply_demand_3step",
+            "position_side": "short",
+            "status": "OPEN",
+        }
+    ]
+
+    rows = merge_active_trades_with_paper_perps(spot_rows, paper_perps)
+
+    assert len(rows) == 2
+    perp = rows[1]
+    assert perp["trade_id"] == "perp-1"
+    assert perp["exchange"] == "hyperliquid"
+    assert perp["pair"] == "SOL/USD-PERP"
+    assert perp["asset_class"] == "perp"
+    assert perp["source"] == "hyperliquid_paper_perp"
 
 
 def _spot_like_exit_cfg() -> PaperPerpExitConfig:
@@ -79,6 +118,53 @@ def _spot_like_exit_cfg() -> PaperPerpExitConfig:
                 "activation_threshold": 0.0035,
             },
         },
+    )
+
+
+def test_shadow_trade_bypasses_executable_portfolio_control_exits():
+    trade = {
+        "source_strategy": "orb_5m_scalp",
+        "position_side": "long",
+        "metadata": {
+            "shadow_trade": True,
+            "market_regime": "sideways",
+        },
+    }
+    root_config = {
+        "strategies_hyperliquid": {
+            "orb_5m_scalp": {"enabled": False},
+        }
+    }
+    hl_cfg = {
+        "_adaptive_pnl_control": {
+            "decisions": [
+                {
+                    "action": "block",
+                    "targetType": "regime_side",
+                    "target": "sideways",
+                    "side": "long",
+                }
+            ]
+        }
+    }
+
+    assert portfolio_control_exit_reason(trade, root_config, hl_cfg) is None
+
+
+def test_executable_trade_still_receives_disabled_strategy_exit():
+    trade = {
+        "source_strategy": "orb_5m_scalp",
+        "position_side": "long",
+        "metadata": {"market_regime": "sideways"},
+    }
+    root_config = {
+        "strategies_hyperliquid": {
+            "orb_5m_scalp": {"enabled": False},
+        }
+    }
+
+    assert portfolio_control_exit_reason(trade, root_config, {}) == (
+        "paper_disabled_strategy_orb_5m_scalp"
     )
 
 
@@ -152,12 +238,63 @@ def test_hyperliquid_perps_use_centralized_exit_rules():
     assert hl_cfg["profit_protection_fee_buffer"] == pytest.approx(0.0015)
     assert hl_cfg["max_margin_per_trade"] == pytest.approx(100.0)
     assert hl_cfg["max_notional_per_trade"] == pytest.approx(200.0)
-    assert hl_cfg["max_open_positions"] == 6
+    assert hl_cfg["max_open_positions"] == 15
+    assert hl_cfg["strategy_open_position_limits"]["ema50_breakout_pullback"] == 4
+    assert hl_cfg["strategy_open_position_limits"]["supply_demand_3step"] == 4
+    assert hl_cfg["shadow_cohort_promotion"]["require_promotion_for"] == [
+        {
+            "strategy": "supply_demand_3step",
+            "side": "long",
+            "regimes": ["trending_up"],
+        }
+    ]
+    assert hl_cfg["shadow_strategy_evaluation"][
+        "single_open_per_strategy_coin_side"
+    ] is True
+    assert (
+        cfg["strategies_hyperliquid"]["ema50_breakout_pullback"]["parameters"][
+            "allow_short"
+        ]
+        is False
+    )
+    assert cfg["trading"]["standalone_entry_quality"]["supply_demand_3step"][
+        "min_confidence"
+    ] == pytest.approx(0.74)
+    assert cfg["trading"]["standalone_entry_quality"]["arc_daytrade"][
+        "min_confidence"
+    ] == pytest.approx(0.74)
 
 
 def test_perp_side_fee():
     assert perp_side_fee(50.0, 0.001) == pytest.approx(0.05)
     assert perp_side_fee(0.0, 0.001) == 0.0
+
+
+def test_hyperliquid_strategy_open_position_limit_block_counts_pending():
+    open_trades = [
+        {"source_strategy": "ema50_breakout_pullback", "coin": "BTC"},
+        {"source_strategy": "ema50_breakout_pullback", "coin": "ETH"},
+        {"source_strategy": "rsi_stoch_reversal_5m", "coin": "SOL"},
+    ]
+    cfg = {"strategy_open_position_limits": {"ema50_breakout_pullback": 3}}
+
+    allowed = hyperliquid_strategy_open_position_limit_block(
+        "ema50_breakout_pullback",
+        open_trades,
+        cfg,
+    )
+    assert allowed["entryBlocked"] is False
+    assert allowed["openCount"] == 2
+
+    blocked = hyperliquid_strategy_open_position_limit_block(
+        "ema50_breakout_pullback",
+        open_trades,
+        cfg,
+        pending_open_count=1,
+    )
+    assert blocked["entryBlocked"] is True
+    assert blocked["entryBlockReason"] == "strategy_open_position_limit"
+    assert blocked["openCount"] == 3
 
 
 def test_side_aware_pnl():
@@ -218,7 +355,7 @@ def test_select_mirrored_signal_does_not_use_generic_individual_when_consensus_h
     assert selected is None
 
 
-def test_select_mirrored_signal_prioritizes_rsi_stoch_standalone_before_consensus():
+def test_select_mirrored_signal_rsi_stoch_no_longer_competes_in_standalone_lane():
     payload = {
         "consensus": {"signal": "long", "confidence": 0.8, "agreement": 70},
         "strategies": {
@@ -233,10 +370,227 @@ def test_select_mirrored_signal_prioritizes_rsi_stoch_standalone_before_consensu
 
     selected = select_mirrored_signal(payload)
 
-    assert selected["signal"] == "short"
-    assert selected["strategy"] == "rsi_stoch_reversal_5m"
-    assert selected["standalone_priority"] is True
-    assert selected["consensus_agreement"] == pytest.approx(70)
+    assert selected["signal"] == "long"
+    assert selected["strategy"] == "macd_momentum"
+
+
+def test_select_mirrored_signal_ranks_all_standalone_candidates_by_quality():
+    payload = {
+        "consensus": {"signal": "long", "confidence": 0.1, "agreement": 10},
+        "strategies": {
+            "rsi_stoch_reversal_5m": {
+                "signal": "long",
+                "confidence": 0.70,
+                "strength": 0.65,
+            },
+            "orb_5m_scalp": {
+                "signal": "long",
+                "confidence": 0.78,
+                "strength": 0.75,
+                "state": {"indicators": {"expected_move_pct": 1.2}},
+            },
+        },
+    }
+
+    selected = select_mirrored_signal(payload)
+
+    assert selected["strategy"] == "orb_5m_scalp"
+    assert selected["selection_score"] > 0
+
+
+def test_select_mirrored_signal_skips_candidate_that_will_fail_edge_gate():
+    payload = {
+        "consensus": {"signal": "long", "confidence": 0.1, "agreement": 10},
+        "strategies": {
+            "vwma_hull": {
+                "signal": "long",
+                "confidence": 0.90,
+                "strength": 0.80,
+                "state": {"indicators": {"expected_move_pct": 0.50}},
+            },
+            "orb_5m_scalp": {
+                "signal": "long",
+                "confidence": 0.76,
+                "strength": 0.70,
+                "state": {
+                    "indicators": {
+                        "expected_move_pct": 1.0,
+                        "reward_risk": 2.0,
+                        "breakout_valid": True,
+                        "retest_valid": True,
+                        "session_state": "signal",
+                        "setup": "orb_5m_scalp",
+                    }
+                },
+            },
+        },
+    }
+    cfg = {
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.80,
+            "require_expected_move": True,
+        }
+    }
+
+    selected = select_mirrored_signal(payload, cfg)
+
+    assert selected["strategy"] == "orb_5m_scalp"
+
+
+def test_select_mirrored_signal_can_execute_fee_aware_supply_demand_setup():
+    payload = {
+        "consensus": {"signal": "hold", "confidence": 0.1, "agreement": 10},
+        "strategies": {
+            "rsi_stoch_reversal_5m": {
+                "signal": "long",
+                "confidence": 0.72,
+                "strength": 0.70,
+                "state": {"indicators": {"expected_move_pct": 0.90}},
+            },
+            "supply_demand_3step": {
+                "signal": "long",
+                "confidence": 0.74,
+                "strength": 0.72,
+                "state": {
+                    "indicators": {
+                        "setup": "supply_demand_3step",
+                        "step1_pass": True,
+                        "step2_pass": True,
+                        "step3_pass": True,
+                        "reward_risk": 4.0,
+                        "expected_move_pct": 1.40,
+                    }
+                },
+            },
+        },
+    }
+    cfg = {
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.80,
+            "require_expected_move": True,
+        },
+        "specialist_strategy_gates": {
+            "supply_demand_3step": {
+                "enabled": True,
+                "min_confidence": 0.74,
+                "min_strength": 0.65,
+                "min_reward_risk": 2.5,
+                "size_multiplier": 0.40,
+            }
+        },
+    }
+
+    selected = select_mirrored_signal(payload, cfg)
+
+    assert selected["strategy"] == "supply_demand_3step"
+    assert selected["expected_move_pct"] == pytest.approx(1.40)
+    assert hyperliquid_min_edge_gate(selected, cfg)["blocked"] is False
+
+
+def test_shadow_strategy_signals_returns_every_independently_eligible_strategy():
+    payload = {
+        "strategies": {
+            "macd_momentum": {
+                "signal": "long",
+                "confidence": 0.75,
+                "strength": 0.70,
+                "state": {"indicators": {"expected_move_pct": 1.1}},
+            },
+            "rsi_stoch_reversal_5m": {
+                "signal": "long",
+                "confidence": 0.74,
+                "strength": 0.70,
+                "state": {"indicators": {"expected_move_pct": 1.0}},
+            },
+            "supertrend": {
+                "signal": "long",
+                "confidence": 0.90,
+                "strength": 0.80,
+                "state": {"indicators": {"expected_move_pct": 0.4}},
+            },
+            "arc_daytrade": {"signal": "hold", "confidence": 0.0, "strength": 0.0},
+        }
+    }
+    cfg = {
+        "shadow_strategy_evaluation": {"enabled": True},
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.8,
+            "require_expected_move": True,
+        },
+    }
+
+    eligible = eligible_shadow_strategy_signals(payload, cfg)
+
+    assert {row["strategy"] for row in eligible} == {
+        "supertrend",
+        "macd_momentum",
+        "rsi_stoch_reversal_5m",
+    }
+    low_edge = next(row for row in eligible if row["strategy"] == "supertrend")
+    assert low_edge["shadow_edge_passed"] is False
+    assert low_edge["shadow_gate"] == "engine"
+    assert low_edge["shadow_gate_reason"] == "engine_directional_signal"
+
+
+def test_shadow_strategy_signals_disabled_by_default():
+    payload = {
+        "strategies": {
+            "macd_momentum": {
+                "signal": "long",
+                "confidence": 0.9,
+                "strength": 0.8,
+            }
+        }
+    }
+    assert eligible_shadow_strategy_signals(payload, {}) == []
+
+
+def test_shadow_strategy_signals_keep_multiple_specialists_independently():
+    payload = {
+        "strategies": {
+            "supply_demand_3step": {
+                "signal": "long",
+                "confidence": 0.78,
+                "strength": 0.72,
+                "state": {
+                    "indicators": {
+                        "setup": "supply_demand_3step",
+                        "step1_pass": True,
+                        "step2_pass": True,
+                        "step3_pass": True,
+                        "reward_risk": 2.8,
+                    }
+                },
+            },
+            "dual_sma_daytrade": {
+                "signal": "short",
+                "confidence": 0.77,
+                "strength": 0.70,
+                "state": {
+                    "indicators": {
+                        "setup": "dual_sma_daytrade",
+                        "daily_pass": True,
+                        "confirm_15m_pass": True,
+                        "entry_5m_pass": True,
+                        "reward_risk": 2.0,
+                    }
+                },
+            },
+        }
+    }
+    eligible = eligible_shadow_strategy_signals(
+        payload,
+        {"shadow_strategy_evaluation": {"enabled": True}},
+    )
+
+    assert {(row["strategy"], row["signal"]) for row in eligible} == {
+        ("supply_demand_3step", "long"),
+        ("dual_sma_daytrade", "short"),
+    }
+    assert all(row["shadow_gate"] == "specialist" for row in eligible)
 
 
 def test_paper_perp_position_size_multiplier_moderate_profile():
@@ -960,6 +1314,69 @@ def test_hyperliquid_strategy_coin_loss_streak_blocks_only_matching_strategy_coi
     assert hyperliquid_strategy_coin_loss_streak_entry_block(
         "ETH", "rsi_stoch_reversal_1m", closed, now=now
     )["entryBlocked"] is False
+
+
+def test_hyperliquid_strategy_pair_stop_cooldown_blocks_same_strategy_coin_side():
+    now = datetime(2026, 6, 15, 12, 0, 0)
+    closed = [
+        {
+            "coin": "MSTR",
+            "source_strategy": "ema50_breakout_pullback",
+            "side": "long",
+            "realized_pnl": -1.75,
+            "exit_reason": "paper_stop_loss@-1.10%",
+            "exit_time": "2026-06-15T09:30:00+00:00",
+        }
+    ]
+    block = hyperliquid_strategy_pair_stop_cooldown_block(
+        "MSTR",
+        "ema50_breakout_pullback",
+        "long",
+        closed,
+        now=now,
+        cooldown_hours=6,
+    )
+    assert block["entryBlocked"] is True
+    assert block["entryBlockReason"] == "strategy_pair_stop_cooldown"
+    assert hyperliquid_strategy_pair_stop_cooldown_block(
+        "MSTR",
+        "ema50_breakout_pullback",
+        "short",
+        closed,
+        now=now,
+        cooldown_hours=6,
+    )["entryBlocked"] is False
+
+
+def test_hyperliquid_strategy_pair_stop_cooldown_ignores_non_stop_winners():
+    now = datetime(2026, 6, 15, 12, 0, 0)
+    closed = [
+        {
+            "coin": "MSTR",
+            "source_strategy": "ema50_breakout_pullback",
+            "side": "long",
+            "realized_pnl": 1.25,
+            "exit_reason": "paper_trailing_stop@1.20%",
+            "exit_time": "2026-06-15T10:00:00+00:00",
+        },
+        {
+            "coin": "MSTR",
+            "source_strategy": "ema50_breakout_pullback",
+            "side": "long",
+            "realized_pnl": -1.25,
+            "exit_reason": "paper_max_holding_time",
+            "exit_time": "2026-06-15T10:30:00+00:00",
+        },
+    ]
+    block = hyperliquid_strategy_pair_stop_cooldown_block(
+        "MSTR",
+        "ema50_breakout_pullback",
+        "long",
+        closed,
+        now=now,
+        cooldown_hours=6,
+    )
+    assert block["entryBlocked"] is False
 
 
 def test_paper_perp_exit_profile_applies_to_rsi_stoch_1m():
@@ -2134,7 +2551,7 @@ def test_stagnant_loser_fast_fail_long():
         "entry_price": 100.0,
         "position_side": "long",
         "entry_time": (now - timedelta(minutes=15)).isoformat(),
-        "metadata": {},
+        "metadata": {"highest_price": 100.1},
     }
     result = evaluate_paper_perp_exit(trade, 99.5, cfg, now=now)
     assert result.exit_reason is not None
@@ -2159,11 +2576,40 @@ def test_stagnant_loser_fast_fail_short():
         "entry_price": 100.0,
         "position_side": "short",
         "entry_time": (now - timedelta(minutes=15)).isoformat(),
-        "metadata": {},
+        "metadata": {"lowest_price": 99.9},
     }
     result = evaluate_paper_perp_exit(trade, 100.5, cfg, now=now)
     assert result.exit_reason is not None
     assert "paper_stagnant_loser_fast_fail" in result.exit_reason
+
+
+def test_stagnant_loser_no_mfe_fast_fail_long():
+    now = datetime(2026, 5, 28, 12, 0, 0)
+    cfg = PaperPerpExitConfig(
+        use_spot_exit_rules=True,
+        fixed_stop_loss_enabled=False,
+        stagnant_loser_enabled=True,
+        stagnant_loser={
+            "no_mfe_fast_fail_enabled": True,
+            "no_mfe_min_age_minutes": 10,
+            "no_mfe_peak_pct": 0.03,
+            "no_mfe_loss_pct": -0.40,
+            "fast_fail_min_age_minutes": 10,
+            "fast_fail_peak_pct": 0.15,
+            "fast_fail_loss_pct": -0.40,
+        },
+        profit_protection_enabled=False,
+        trailing_enabled=False,
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": (now - timedelta(minutes=15)).isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.5, cfg, now=now)
+    assert result.exit_reason is not None
+    assert "paper_stagnant_loser_no_mfe_fast_fail" in result.exit_reason
 
 
 def test_stagnant_loser_disabled_skips_exit():
@@ -2318,9 +2764,9 @@ def test_config_yaml_carries_perp_trailing_and_stagnant_flags():
     config_path = Path(ROOT) / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
     hl = cfg["trading"]["hyperliquid_perps"]
-    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0035)
-    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0050)
-    assert hl["trailing_stop"]["breakeven_floor_percentage"] == pytest.approx(0.0035)
+    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0100)
+    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0100)
+    assert hl["trailing_stop"]["breakeven_floor_percentage"] == pytest.approx(0.0080)
     assert hl["stagnant_loser_enabled"] is True
     assert hl["structural_exits"]["enabled"] is True
     assert "vwma_hull" in hl["structural_exits"]["strategies"]
@@ -2516,6 +2962,166 @@ def test_min_edge_gate_reads_indicator_field():
     assert result["expectedMovePct"] == pytest.approx(0.65)
 
 
+def test_promoted_cohort_selection_boost_matches_coin_strategy_side_regime():
+    cfg = {
+        "shadow_cohort_promotion": {"selection_boost": 0.35},
+    }
+    boost = promoted_cohort_selection_boost(
+        {"strategy": "ema50_breakout_pullback", "signal": "long"},
+        coin="xyz:NATGAS",
+        market_regime="sideways",
+        promoted_cohorts=[
+            {
+                "coin": "xyz:NATGAS",
+                "strategy": "ema50_breakout_pullback",
+                "side": "long",
+                "regime": "sideways",
+            }
+        ],
+        hl_cfg=cfg,
+    )
+    assert boost == pytest.approx(0.35)
+
+
+def test_promoted_cohort_selection_boost_requires_regime_match():
+    cfg = {"shadow_cohort_promotion": {"selection_boost": 0.35}}
+    boost = promoted_cohort_selection_boost(
+        {"strategy": "ema50_breakout_pullback", "signal": "long"},
+        coin="xyz:NATGAS",
+        market_regime="trending_up",
+        promoted_cohorts=[
+            {
+                "coin": "xyz:NATGAS",
+                "strategy": "ema50_breakout_pullback",
+                "side": "long",
+                "regime": "sideways",
+            }
+        ],
+        hl_cfg=cfg,
+    )
+    assert boost == 0.0
+
+
+def test_select_mirrored_signal_applies_promoted_cohort_boost():
+    payload = {
+        "market_regime": "sideways",
+        "consensus": {"signal": "hold", "confidence": 0.1, "agreement": 10},
+        "strategies": {
+            "ema50_breakout_pullback": {
+                "signal": "long",
+                "confidence": 0.74,
+                "strength": 0.70,
+                "state": {
+                    "indicators": {
+                        "expected_move_pct": 1.10,
+                        "reward_risk": 2.5,
+                        "breakout_pass": True,
+                        "pullback_pass": True,
+                        "trigger_pass": True,
+                        "setup": "ema50_breakout_pullback",
+                    }
+                },
+            },
+        },
+    }
+    cfg = {
+        "min_edge_gate": {"enabled": True, "min_edge_pct": 0.40, "edge_multiplier": 2.0},
+        "shadow_cohort_promotion": {"selection_boost": 0.35},
+        "specialist_strategy_gates": {
+            "ema50_breakout_pullback": {
+                "enabled": True,
+                "min_confidence": 0.74,
+                "min_strength": 0.65,
+                "min_reward_risk": 2.0,
+            }
+        },
+    }
+    promoted = [
+        {
+            "coin": "xyz:NATGAS",
+            "strategy": "ema50_breakout_pullback",
+            "side": "long",
+            "regime": "sideways",
+        }
+    ]
+    selected = select_mirrored_signal(
+        payload,
+        cfg,
+        coin="xyz:NATGAS",
+        market_regime="sideways",
+        promoted_cohorts=promoted,
+    )
+    assert selected["strategy"] == "ema50_breakout_pullback"
+    assert selected["promoted_cohort_boost"] == pytest.approx(0.35)
+
+
+def test_executable_size_requalification_blocks_until_sample_met():
+    cfg = {
+        "executable_size_requalification": {
+            "enabled": True,
+            "min_closed_trades": 3,
+            "min_span_days": 7,
+            "min_profit_factor": 1.25,
+            "min_realized_pnl_usd": 0.0,
+        }
+    }
+    trades = [
+        {
+            "status": "CLOSED",
+            "source_strategy": "ema50_breakout_pullback",
+            "position_side": "long",
+            "realized_pnl": 1.0,
+            "exit_time": "2026-06-20T10:00:00+00:00",
+            "metadata": {},
+        }
+    ]
+    ok, reason = executable_size_requalification_passes(
+        "ema50_breakout_pullback",
+        "long",
+        trades,
+        cfg,
+    )
+    assert ok is False
+    assert "requal_closed_1_lt_3" in reason
+
+
+def test_executable_size_requalification_passes_with_enough_edge():
+    cfg = {
+        "executable_size_requalification": {
+            "enabled": True,
+            "min_closed_trades": 2,
+            "min_span_days": 1,
+            "min_profit_factor": 1.25,
+            "min_realized_pnl_usd": 0.0,
+        }
+    }
+    trades = [
+        {
+            "status": "CLOSED",
+            "source_strategy": "ema50_breakout_pullback",
+            "position_side": "long",
+            "realized_pnl": 2.0,
+            "exit_time": "2026-06-20T10:00:00+00:00",
+            "metadata": {},
+        },
+        {
+            "status": "CLOSED",
+            "source_strategy": "ema50_breakout_pullback",
+            "position_side": "long",
+            "realized_pnl": 1.0,
+            "exit_time": "2026-06-22T10:00:00+00:00",
+            "metadata": {},
+        },
+    ]
+    ok, reason = executable_size_requalification_passes(
+        "ema50_breakout_pullback",
+        "long",
+        trades,
+        cfg,
+    )
+    assert ok is True
+    assert reason == "requal_pass"
+
 def test_min_edge_gate_normalizes_decimal_pct():
     """Values < 0.1 are interpreted as decimal form (0.002 -> 0.2%)."""
     cfg = _edge_cfg()
@@ -2661,6 +3267,183 @@ def test_pnl_tier_empty_strategy_name():
     )
     assert result["tier"] == "normal"
     assert result["reason"] == "strategy_unknown"
+
+
+def test_hyperliquid_daily_profit_target_halts_after_target():
+    now = datetime(2026, 6, 16, 18, 0, 0)
+    rows = [
+        {
+            "status": "CLOSED",
+            "realized_pnl": 15.0,
+            "exit_time": "2026-06-16T08:00:00+00:00",
+        },
+        {
+            "status": "CLOSED",
+            "realized_pnl": 12.0,
+            "exit_time": "2026-06-16T12:00:00+00:00",
+        },
+        {
+            "status": "CLOSED",
+            "realized_pnl": -50.0,
+            "exit_time": "2026-06-15T12:00:00+00:00",
+        },
+    ]
+    result = hyperliquid_daily_profit_target_halt(
+        rows,
+        {"daily_profit_target": {"enabled": True, "target_usd": 25.0}},
+        now=now,
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == "daily_profit_target"
+    assert result["dailyPnl"] == pytest.approx(27.0)
+
+
+def test_hyperliquid_daily_profit_target_allows_before_target():
+    now = datetime(2026, 6, 16, 18, 0, 0)
+    rows = [
+        {
+            "status": "CLOSED",
+            "realized_pnl": 24.99,
+            "exit_time": "2026-06-16T12:00:00+00:00",
+        },
+    ]
+    result = hyperliquid_daily_profit_target_halt(
+        rows,
+        {"daily_profit_target": {"enabled": True, "target_usd": 25.0}},
+        now=now,
+    )
+    assert result["blocked"] is False
+    assert result["reason"] == "daily_profit_target_not_reached"
+    assert result["dailyPnl"] == pytest.approx(24.99)
+
+
+def test_hyperliquid_regime_direction_gate_blocks_strategy_specific_loser():
+    result = hyperliquid_regime_direction_gate(
+        "long",
+        "high_volatility",
+        0.74,
+        0.72,
+        {
+            "strategy_regime_side_blocks": {
+                "ema50_breakout_pullback": {"high_volatility": ["long"]}
+            }
+        },
+        strategy="ema50_breakout_pullback",
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == (
+        "configured_strategy_regime_side_block_"
+        "ema50_breakout_pullback_high_volatility_long"
+    )
+
+
+def test_hyperliquid_regime_direction_gate_keeps_other_strategy_same_regime():
+    result = hyperliquid_regime_direction_gate(
+        "long",
+        "high_volatility",
+        0.72,
+        0.70,
+        {
+            "strategy_regime_side_blocks": {
+                "ema50_breakout_pullback": {"high_volatility": ["long"]}
+            }
+        },
+        strategy="rsi_stoch_reversal_5m",
+    )
+    assert result["blocked"] is False
+
+
+def test_shadow_promotion_requirement_blocks_unpromoted_risky_cohort():
+    cfg = {
+        "shadow_cohort_promotion": {
+            "require_promotion_for": [
+                {
+                    "strategy": "supply_demand_3step",
+                    "side": "long",
+                    "regimes": ["trending_up"],
+                }
+            ]
+        }
+    }
+    result = hyperliquid_shadow_promotion_requirement(
+        "FARTCOIN",
+        {"strategy": "supply_demand_3step", "signal": "long"},
+        "trending_up",
+        cfg,
+        {
+            "XYZ:MSTR": [
+                {
+                    "strategy": "supply_demand_3step",
+                    "side": "long",
+                    "regime": "trending_up",
+                    "closed": 48,
+                    "win_rate": 0.896,
+                    "realized": 98.35,
+                }
+            ]
+        },
+    )
+
+    assert result["blocked"] is True
+    assert result["reason"] == (
+        "shadow_promotion_required_supply_demand_3step_long_trending_up"
+    )
+
+
+def test_shadow_promotion_requirement_allows_matching_promoted_coin():
+    cfg = {
+        "shadow_cohort_promotion": {
+            "require_promotion_for": [
+                {
+                    "strategy": "supply_demand_3step",
+                    "side": "long",
+                    "regimes": ["trending_up"],
+                }
+            ]
+        }
+    }
+    cohort = {
+        "strategy": "supply_demand_3step",
+        "side": "long",
+        "regime": "trending_up",
+        "closed": 48,
+        "win_rate": 0.896,
+        "realized": 98.35,
+    }
+    result = hyperliquid_shadow_promotion_requirement(
+        "xyz:MSTR",
+        {"strategy": "supply_demand_3step", "signal": "long"},
+        "trending_up",
+        cfg,
+        {"XYZ:MSTR": [cohort]},
+    )
+
+    assert result["blocked"] is False
+    assert result["reason"] == "shadow_promoted_cohort_match"
+    assert result["cohort"] == cohort
+
+
+def test_shadow_promotion_requirement_ignores_unconfigured_strategy():
+    result = hyperliquid_shadow_promotion_requirement(
+        "XPL",
+        {"strategy": "swing_hull_rsi_ema", "signal": "long"},
+        "trending_up",
+        {
+            "shadow_cohort_promotion": {
+                "require_promotion_for": [
+                    {
+                        "strategy": "supply_demand_3step",
+                        "side": "long",
+                        "regimes": ["trending_up"],
+                    }
+                ]
+            }
+        },
+        {},
+    )
+
+    assert result["blocked"] is False
+    assert result["reason"] == "shadow_promotion_not_required"
 
 
 def test_dual_sma_specialist_gate_passes_valid_long():

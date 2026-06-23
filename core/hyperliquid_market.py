@@ -6,7 +6,9 @@ Shared by exchange-service and unit tests.
 
 from __future__ import annotations
 
+import asyncio
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -47,6 +49,125 @@ INTERVAL_MS: Dict[str, int] = {
     "1w": 604_800_000,
     "1M": 2_592_000_000,
 }
+
+
+@dataclass
+class _CandleCacheEntry:
+    rows: List[Dict[str, Any]]
+    fetched_at: float
+
+
+class HyperliquidCandleCache:
+    """Coalesce candle requests, pace upstream calls, and serve stale on 429.
+
+    Strategy scans request the same coin/timeframe repeatedly and concurrently.
+    Hyperliquid's public info endpoint is shared by every request type, so an
+    unpaced OHLCV fan-out can exhaust the account/IP weight budget. This cache
+    keeps the latest complete response and serializes refreshes per key.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_concurrency: int = 2,
+        min_request_interval_seconds: float = 0.30,
+    ) -> None:
+        self._entries: Dict[tuple[str, str, int], _CandleCacheEntry] = {}
+        self._locks: Dict[tuple[str, str, int], asyncio.Lock] = {}
+        self._semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+        self._rate_lock = asyncio.Lock()
+        self._last_request_at = 0.0
+        self._min_request_interval = max(0.0, float(min_request_interval_seconds))
+
+    @staticmethod
+    def ttl_seconds(timeframe: str) -> float:
+        interval = normalize_timeframe(timeframe)
+        return {
+            "1m": 45.0,
+            "3m": 90.0,
+            "5m": 120.0,
+            "15m": 240.0,
+            "30m": 300.0,
+            "1h": 600.0,
+            "2h": 900.0,
+            "4h": 1200.0,
+            "8h": 1800.0,
+            "12h": 1800.0,
+            "1d": 1800.0,
+        }.get(interval, 300.0)
+
+    async def _pace(self) -> None:
+        async with self._rate_lock:
+            now = time.monotonic()
+            delay = self._min_request_interval - (now - self._last_request_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request_at = time.monotonic()
+
+    async def get(
+        self,
+        coin: str,
+        timeframe: str,
+        limit: int,
+        *,
+        fetcher=None,
+    ) -> List[Dict[str, Any]]:
+        # The default is resolved at call time because the fetch function is
+        # declared below this class in the module.
+        if fetcher is None:
+            fetcher = fetch_hyperliquid_candles
+        key = (
+            normalize_hyperliquid_coin(coin),
+            normalize_timeframe(timeframe),
+            max(10, min(int(limit or 100), 5000)),
+        )
+        now = time.monotonic()
+        cached = self._entries.get(key)
+        if cached and now - cached.fetched_at <= self.ttl_seconds(key[1]):
+            return [dict(row) for row in cached.rows]
+
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            cached = self._entries.get(key)
+            if cached and now - cached.fetched_at <= self.ttl_seconds(key[1]):
+                return [dict(row) for row in cached.rows]
+
+            last_error: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    async with self._semaphore:
+                        await self._pace()
+                        rows = await fetcher(key[0], key[1], key[2])
+                    if rows:
+                        self._entries[key] = _CandleCacheEntry(
+                            rows=[dict(row) for row in rows],
+                            fetched_at=time.monotonic(),
+                        )
+                    return rows
+                except httpx.HTTPStatusError as exc:
+                    last_error = exc
+                    if exc.response.status_code != 429:
+                        break
+                    retry_after = exc.response.headers.get("Retry-After")
+                    try:
+                        delay = float(retry_after) if retry_after else 0.75 * (attempt + 1)
+                    except (TypeError, ValueError):
+                        delay = 0.75 * (attempt + 1)
+                    await asyncio.sleep(max(0.25, min(delay, 5.0)))
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    last_error = exc
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+            # Stale candles are safer than turning an entire strategy scan into
+            # a 500 response. Closed-bar strategies remain deterministic and the
+            # caller can refresh on the next cache window.
+            cached = self._entries.get(key)
+            if cached:
+                return [dict(row) for row in cached.rows]
+            if last_error:
+                raise last_error
+            return []
 
 
 def normalize_hyperliquid_coin(symbol: str) -> str:

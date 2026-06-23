@@ -33,15 +33,15 @@ class EngineParams:
     context_timeframes: List[str] = field(default_factory=lambda: ["1w"])
     sma20_period: int = 20
     sma200_period: int = 200
-    sma200_max_slope_pct: float = 0.0015
+    sma200_max_slope_pct: float = 0.004
     sma20_slope_lookback: int = 5
     sma20_flat_threshold: float = 0.0008
     max_extension_pct: float = 0.012
-    retrace_tolerance_pct: float = 0.003
+    retrace_tolerance_pct: float = 0.004
     retrace_lookback_bars: int = 6
     rejection_lookback_bars: int = 8
     pivot_order: int = 3
-    min_reward_risk: float = 1.8
+    min_reward_risk: float = 2.0
     stop_buffer_pct: float = 0.001
     squeeze_entries_enabled: bool = False
     allow_long: bool = True
@@ -221,6 +221,13 @@ def _evaluate_daily_bias(
     }
 
 
+def _price_near_sma20(snap: Any, tolerance_pct: float) -> bool:
+    try:
+        return abs(float(snap.price_vs_sma20_pct or 0)) <= float(tolerance_pct)
+    except (TypeError, ValueError):
+        return False
+
+
 def _evaluate_15m_confirm(
     confirm_df: pd.DataFrame,
     params: EngineParams,
@@ -248,6 +255,8 @@ def _evaluate_15m_confirm(
             "structure": structure.to_dict(),
         }
 
+    near_sma20 = _price_near_sma20(snap, params.retrace_tolerance_pct)
+
     if snap.sma20_direction == "flat":
         reason = "15m SMA20 flat — sideways, no momentum"
     elif (
@@ -271,6 +280,50 @@ def _evaluate_15m_confirm(
         confirm_pass = True
         reason = (
             f"15m downtrend: SMA20 falling above price; {structure.step1_reason}"
+        )
+    elif (
+        daily_bias in ("bullish", "squeeze")
+        and snap.sma20_direction == "rising"
+        and near_sma20
+    ):
+        trend_15m = "uptrend"
+        confirm_pass = True
+        reason = (
+            f"15m pullback: rising SMA20 price near SMA20 ({snap.price_vs_sma20_pct * 100:.2f}%); "
+            f"structure={structure.trend}; {structure.step1_reason}"
+        )
+    elif (
+        daily_bias in ("bullish", "squeeze")
+        and snap.sma20_direction == "rising"
+        and snap.price > snap.sma20
+        and structure.trend == "sideways"
+    ):
+        trend_15m = "uptrend"
+        confirm_pass = True
+        reason = (
+            f"15m momentum: rising SMA20 above price; sideways structure; {structure.step1_reason}"
+        )
+    elif (
+        daily_bias in ("bearish", "squeeze")
+        and snap.sma20_direction == "falling"
+        and near_sma20
+    ):
+        trend_15m = "downtrend"
+        confirm_pass = True
+        reason = (
+            f"15m pullback: falling SMA20 price near SMA20 ({snap.price_vs_sma20_pct * 100:.2f}%); "
+            f"structure={structure.trend}; {structure.step1_reason}"
+        )
+    elif (
+        daily_bias in ("bearish", "squeeze")
+        and snap.sma20_direction == "falling"
+        and snap.price < snap.sma20
+        and structure.trend == "sideways"
+    ):
+        trend_15m = "downtrend"
+        confirm_pass = True
+        reason = (
+            f"15m momentum: falling SMA20 below price; sideways structure; {structure.step1_reason}"
         )
     elif daily_bias == "bullish" and snap.sma20_direction == "rising" and snap.price > snap.sma20:
         reason = f"15m structure not confirmed: {structure.step1_reason}"

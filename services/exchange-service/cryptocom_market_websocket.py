@@ -298,12 +298,17 @@ class CryptocomMarketWebSocket:
             message = json.loads(message_str)
             self.metrics["messages_received"] += 1
             self.metrics["last_message_time"] = datetime.now(timezone.utc).isoformat()
-            
-            # Check for subscription confirmations
-            if message.get("method") == "subscribe":
-                result = message.get("result", {})
-                if result.get("subscription"):
-                    logger.info(f"✅ Subscription confirmed: {result['subscription']}")
+
+            # Crypto.com sends an application-level heartbeat request. The
+            # client must acknowledge it with the same id or the server closes
+            # an otherwise healthy connection roughly once per minute.
+            if message.get("method") == "public/heartbeat":
+                response = {
+                    "id": message.get("id"),
+                    "method": "public/respond-heartbeat",
+                }
+                if self.websocket:
+                    await self.websocket.send(json.dumps(response))
                 return
             
             # Process ticker data
@@ -311,6 +316,16 @@ class CryptocomMarketWebSocket:
                 subscription = message["result"]["subscription"]
                 if subscription.startswith("ticker."):
                     await self._handle_ticker_message(message)
+                    return
+
+            # Check for subscription confirmations without market data.
+            # Crypto.com ticker updates can also use method=subscribe, so this
+            # must run after the ticker-data branch.
+            if message.get("method") == "subscribe":
+                result = message.get("result", {})
+                if result.get("subscription"):
+                    logger.info(f"✅ Subscription confirmed: {result['subscription']}")
+                return
             
         except json.JSONDecodeError as e:
             logger.error(f"❌ Invalid JSON message: {e}")
@@ -367,9 +382,29 @@ class CryptocomMarketWebSocket:
     
     def get_status(self) -> Dict[str, Any]:
         """Get WebSocket status"""
+        last_message = self.metrics.get("last_message_time")
+        message_age_seconds = None
+        if last_message:
+            try:
+                parsed = datetime.fromisoformat(str(last_message).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                message_age_seconds = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - parsed).total_seconds(),
+                )
+            except (TypeError, ValueError):
+                message_age_seconds = None
         return {
             "connected": self.is_connected,
             "running": self.is_running,
+            "healthy": bool(
+                self.is_connected
+                and self.is_running
+                and message_age_seconds is not None
+                and message_age_seconds <= max(90.0, self.heartbeat_interval * 3.0)
+            ),
+            "message_age_seconds": message_age_seconds,
             "subscribed_symbols": list(self.subscribed_symbols),
             "websocket_url": self.websocket_url,
             "metrics": self.metrics.copy()

@@ -1,0 +1,11 @@
+strategy,raw,episodes
+arc_daytrade,11,11
+dual_sma_daytrade,13,11
+ema50_breakout_pullback,35,26
+orb_5m_scalp,67,38
+rsi_oversold_override,1,1
+rsi_stoch_reversal_5m,137,61
+supertrend,23,17
+supply_demand_3step,55,11
+vwap_bounce_scalping,11,11
+vwma_hull,3,3

@@ -31,7 +31,29 @@ class CryptocomAuthManager:
         
         logger.info("🔐 Crypto.com Authentication Manager initialized")
     
-    def generate_signature(self, timestamp: int, method: str, path: str, body: str = "") -> str:
+    def _params_to_string(self, params: Dict[str, Any]) -> str:
+        """Build Crypto.com's sorted key/value parameter string."""
+        if not params:
+            return ""
+        parts = []
+        for key in sorted(params):
+            value = params[key]
+            if value is None:
+                continue
+            if isinstance(value, list):
+                value = "".join(str(item) for item in value)
+            elif isinstance(value, dict):
+                value = self._params_to_string(value)
+            parts.append(f"{key}{value}")
+        return "".join(parts)
+
+    def generate_signature(
+        self,
+        nonce: int,
+        method: str,
+        request_id: int,
+        params: Dict[str, Any] | None = None,
+    ) -> str:
         """
         Generate HMAC-SHA256 signature for Crypto.com API authentication
         
@@ -45,8 +67,8 @@ class CryptocomAuthManager:
             HMAC-SHA256 signature as hex string
         """
         try:
-            # Create the message string for signing
-            message = f"{method}{path}{body}{timestamp}"
+            params_str = self._params_to_string(params or {})
+            message = f"{method}{request_id}{self.api_key}{params_str}{nonce}"
             
             # Generate HMAC-SHA256 signature
             signature = hmac.new(
@@ -55,7 +77,7 @@ class CryptocomAuthManager:
                 hashlib.sha256
             ).hexdigest()
             
-            logger.debug(f"🔐 Generated signature for timestamp {timestamp}")
+            logger.debug(f"🔐 Generated signature for nonce {nonce}")
             return signature
             
         except Exception as e:
@@ -70,15 +92,17 @@ class CryptocomAuthManager:
             Authentication message dictionary
         """
         try:
-            timestamp = int(time.time() * 1000)
-            signature = self.generate_signature(timestamp, "", "")
+            nonce = int(time.time() * 1000)
+            request_id = self._get_next_request_id()
+            method = "public/auth"
+            signature = self.generate_signature(nonce, method, request_id)
             
             auth_message = {
-                "id": self._get_next_request_id(),
-                "method": "auth",
+                "id": request_id,
+                "method": method,
                 "api_key": self.api_key,
-                "timestamp": timestamp,
-                "signature": signature
+                "sig": signature,
+                "nonce": nonce,
             }
             
             logger.info("🔐 Generated authentication message")
@@ -99,18 +123,13 @@ class CryptocomAuthManager:
             Subscription message dictionary
         """
         try:
-            timestamp = int(time.time() * 1000)
-            signature = self.generate_signature(timestamp, "", "")
-            
             subscription_message = {
                 "id": self._get_next_request_id(),
                 "method": "subscribe",
                 "params": {
                     "channels": channels
                 },
-                "api_key": self.api_key,
-                "timestamp": timestamp,
-                "signature": signature
+                "nonce": int(time.time() * 1000),
             }
             
             logger.info(f"📡 Generated subscription message for channels: {', '.join(channels)}")
@@ -131,18 +150,13 @@ class CryptocomAuthManager:
             Unsubscription message dictionary
         """
         try:
-            timestamp = int(time.time() * 1000)
-            signature = self.generate_signature(timestamp, "", "")
-            
             unsubscription_message = {
                 "id": self._get_next_request_id(),
                 "method": "unsubscribe",
                 "params": {
                     "channels": channels
                 },
-                "api_key": self.api_key,
-                "timestamp": timestamp,
-                "signature": signature
+                "nonce": int(time.time() * 1000),
             }
             
             logger.info(f"📡 Generated unsubscription message for channels: {', '.join(channels)}")
@@ -163,15 +177,22 @@ class CryptocomAuthManager:
             True if signature is valid, False otherwise
         """
         try:
-            timestamp = message.get("timestamp")
-            received_signature = message.get("signature")
+            nonce = message.get("nonce")
+            received_signature = message.get("sig")
+            method = str(message.get("method") or "")
+            request_id = int(message.get("id") or 0)
             
-            if not timestamp or not received_signature:
-                logger.warning("⚠️ Missing timestamp or signature in message")
+            if not nonce or not received_signature or not method or not request_id:
+                logger.warning("⚠️ Missing nonce, method, request id or signature in message")
                 return False
             
             # Recreate the signature
-            expected_signature = self.generate_signature(timestamp, "", "")
+            expected_signature = self.generate_signature(
+                int(nonce),
+                method,
+                request_id,
+                message.get("params") or {},
+            )
             
             # Compare signatures
             is_valid = hmac.compare_digest(expected_signature, received_signature)

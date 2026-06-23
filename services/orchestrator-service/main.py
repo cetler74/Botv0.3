@@ -30,6 +30,11 @@ import os
 import httpx
 import re
 from pathlib import Path
+from zoneinfo import ZoneInfo
+try:
+    import websockets
+except ImportError:  # pragma: no cover - optional until orchestrator image is rebuilt
+    websockets = None
 
 # Version tracking
 ORCHESTRATOR_VERSION = "2.4.0"
@@ -137,32 +142,37 @@ from pair_loss_policy import (
 )
 from adaptive_pnl_audit import merge_persisted_adaptive_history
 from hyperliquid_perps import (
-    adaptive_blocked_regime_side_exit_reason,
     apply_hyperliquid_adaptive_pnl_control,
     build_hyperliquid_adaptive_pnl_control,
     calculate_perp_pnl,
-    disabled_strategy_side_exit_reason,
+    eligible_shadow_strategy_signals,
     evaluate_paper_perp_exit,
+    executable_size_requalification_passes,
     filter_allowed_coin,
     find_mirror_spot_pair,
     hyperliquid_coin_entry_block,
     hyperliquid_coin_side_entry_block,
     hyperliquid_adaptive_entry_sizing_multiplier,
     hyperliquid_daily_loss_halt,
+    hyperliquid_daily_profit_target_halt,
     hyperliquid_min_edge_gate,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
     hyperliquid_risk_based_notional,
+    hyperliquid_shadow_promotion_requirement,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
     hyperliquid_strategy_side_entry_block,
     hyperliquid_strategy_coin_loss_streak_entry_block,
+    hyperliquid_strategy_pair_stop_cooldown_block,
+    hyperliquid_strategy_open_position_limit_block,
     hyperliquid_trend_chase_gate,
     is_block_window,
     is_block_window_strategy_exempt,
     is_caution_window,
     is_caution_window_strategy_exempt,
+    merge_active_trades_with_paper_perps,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
     perp_entry_atr_metadata as _perp_entry_atr_metadata,
@@ -170,6 +180,7 @@ from hyperliquid_perps import (
     pair_to_hyperliquid_coin,
     pnl_percentage,
     position_sides_from_signal,
+    portfolio_control_exit_reason,
     select_mirrored_signal,
     selected_mirrored_signal_metadata,
     setup_risk_metadata_from_signal,
@@ -630,6 +641,7 @@ class TradingStatus(BaseModel):
     last_loop_duration_seconds: Optional[float] = None
     cycles: Dict[str, Any] = Field(default_factory=dict)
     cycle_health: Dict[str, Any] = Field(default_factory=dict)
+    hyperliquid_mids: Dict[str, Any] = Field(default_factory=dict)
 
 class TradingCycle(BaseModel):
     cycle_id: str
@@ -686,27 +698,43 @@ database_service_url = os.getenv("DATABASE_SERVICE_URL", "http://database-servic
 exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
 # Simulation mode: dashboard reads balances from DB; seed rows were historically 0 — use this default when unset.
 SIMULATION_DEFAULT_BALANCE_USD = 10000.0
-# PnL-FIX v9 — uniform simulation fee. Cached after first config-service fetch
-# so every simulated fill (BUY and SELL) on every exchange is debited identically.
+# PnL-FIX v9 — simulation fees. Cached after first config-service fetch so every
+# simulated fill (BUY and SELL) is debited with the same rates used by PnL closing.
 _SIMULATION_FEE_RATE_PER_SIDE: Optional[float] = None
+_SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE: Optional[Dict[str, float]] = None
 
 
-async def _get_simulation_fee_rate_per_side() -> float:
+async def _get_simulation_fee_rate_per_side(exchange_name: Optional[str] = None) -> float:
     """Return the per-side simulation fee rate from config-service (cached)."""
-    global _SIMULATION_FEE_RATE_PER_SIDE
+    global _SIMULATION_FEE_RATE_PER_SIDE, _SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE
     if _SIMULATION_FEE_RATE_PER_SIDE is not None:
+        if exchange_name and _SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE:
+            exchange_key = str(exchange_name).lower()
+            return float(
+                _SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE.get(
+                    exchange_key,
+                    _SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE.get(
+                        "default", _SIMULATION_FEE_RATE_PER_SIDE
+                    ),
+                )
+            )
         return _SIMULATION_FEE_RATE_PER_SIDE
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"{config_service_url}/api/v1/config/simulation")
             if r.status_code == 200:
-                _SIMULATION_FEE_RATE_PER_SIDE = float(
-                    (r.json() or {}).get("fee_rate_per_side", 0.0005)
-                )
-                return _SIMULATION_FEE_RATE_PER_SIDE
+                data = r.json() or {}
+                _SIMULATION_FEE_RATE_PER_SIDE = float(data.get("fee_rate_per_side", 0.0005))
+                by_exchange = data.get("fee_rate_per_side_by_exchange") or {}
+                _SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE = {
+                    str(exchange).lower(): float(rate)
+                    for exchange, rate in by_exchange.items()
+                }
+                return await _get_simulation_fee_rate_per_side(exchange_name)
     except Exception:
         pass
     _SIMULATION_FEE_RATE_PER_SIDE = 0.0005
+    _SIMULATION_FEE_RATE_PER_SIDE_BY_EXCHANGE = {}
     return _SIMULATION_FEE_RATE_PER_SIDE
 strategy_service_url = os.getenv("STRATEGY_SERVICE_URL", "http://strategy-service:8004")
 
@@ -766,6 +794,17 @@ class TradingOrchestrator:
         )
         # Runtime cache only. Durable adaptive audit records live in Postgres.
         self._hyperliquid_adaptive_pnl_history: List[Dict[str, Any]] = []
+        self._hyperliquid_mids_cache: Dict[str, float] = {}
+        self._hyperliquid_mids_cached_at: float = 0.0
+        self._hyperliquid_mids_fetch_task: Optional[asyncio.Task] = None
+        self._hyperliquid_mids_min_interval_seconds: float = 20.0
+        self._hyperliquid_mids_stale_fallback_seconds: float = 180.0
+        self._hyperliquid_mids_ws_task: Optional[asyncio.Task] = None
+        self._hyperliquid_mids_ws_connected: bool = False
+        self._hyperliquid_mids_ws_last_message_at: float = 0.0
+        self._hyperliquid_mids_ws_url: str = "wss://api.hyperliquid.xyz/ws"
+        self._hyperliquid_mids_ws_fresh_seconds: float = 20.0
+        self._hyperliquid_shadow_promoted_cohorts: Dict[str, List[Dict[str, Any]]] = {}
         self.balances = {}
         self.start_time = None
         self.exiting_trades = set()  # Track trades currently being exited to prevent duplicates
@@ -776,11 +815,21 @@ class TradingOrchestrator:
         self._recent_negative_realized_blacklist_until: Dict[str, datetime] = {}
         self._pair_rotation_processed_trade_ids: set[str] = set()
         self._macd_continuation_pending_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._ema50_spot_pending_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._strategy_expectancy_cache: Dict[str, Tuple[datetime, bool, str]] = {}
-        # Global in-process pair entry reservation (across exchanges) to prevent
-        # same-cycle dual opens on the same instrument.
+        # In-process venue/pair analysis reservation. Final entry execution is
+        # separately serialized across venues below.
         self._pair_entry_reservation_lock = asyncio.Lock()
         self._pair_entry_reservations: set[str] = set()
+        # Signal analysis can run independently per venue. Actual entry
+        # execution remains serialized so cross-venue single-position checks
+        # are re-evaluated atomically before an order is queued.
+        self._spot_entry_execution_lock = asyncio.Lock()
+        self._spot_exit_cycle_lock = asyncio.Lock()
+        # Serializes paper-perp exit evaluation between the main cycle's
+        # perp_exit_update phase and the out-of-band _fast_perp_exit_loop so a
+        # position can never be closed twice concurrently.
+        self._perp_exit_cycle_lock = asyncio.Lock()
         self.momentum_filter = MomentumFilter()  # Initialize momentum filter
         self.last_pair_update = datetime.utcnow()  # Track when pairs were last updated
 
@@ -807,7 +856,10 @@ class TradingOrchestrator:
         # Wall time reserved for entry + maintenance after exit's timebox (exit_cycle_first).
         self._loop_entry_reserve_seconds: float = 90.0
         self._loop_perp_cycle_max_seconds: float = 45.0
+        self._loop_spot_cycle_max_seconds: float = 60.0
         self._loop_spot_entry_pair_timeout_seconds: float = 35.0
+        self._loop_spot_entry_check_concurrency: int = 8
+        self._loop_perp_entry_check_concurrency: int = 8
         self.cycle_telemetry: Dict[str, Dict[str, Any]] = {
             "spot_exit": self._empty_cycle_phase("spot_exit"),
             "spot_entry": self._empty_cycle_phase("spot_entry"),
@@ -1168,6 +1220,172 @@ class TradingOrchestrator:
             return max(multiplier, floor)
         return multiplier
 
+    def _good_entry_size_multiplier(
+        self,
+        signal: Optional[Dict[str, Any]],
+        cfg: Optional[Dict[str, Any]],
+    ) -> Tuple[float, str]:
+        """Increase size only for high-quality entries; defensive haircuts still apply later."""
+        root = ((cfg or {}).get("good_entry_size_scaling") or {})
+        if not isinstance(root, dict):
+            return 1.0, ""
+        enabled = root.get("enabled", True)
+        if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+            return 1.0, ""
+        signal = signal or {}
+        strategy_name = str(signal.get("strategy") or "").strip().lower()
+        strategy_cfg = {}
+        raw_by_strategy = root.get("strategies") or {}
+        if isinstance(raw_by_strategy, dict):
+            strategy_cfg = raw_by_strategy.get(strategy_name) or {}
+            if not isinstance(strategy_cfg, dict):
+                strategy_cfg = {}
+        try:
+            min_conf = float(strategy_cfg.get("min_confidence", root.get("min_confidence", 0.78)) or 0.78)
+            min_strength = float(strategy_cfg.get("min_strength", root.get("min_strength", 0.72)) or 0.72)
+            multiplier = float(strategy_cfg.get("multiplier", root.get("multiplier", 1.20)) or 1.20)
+            max_multiplier = float(root.get("max_multiplier", 1.30) or 1.30)
+        except (TypeError, ValueError):
+            return 1.0, ""
+        try:
+            min_reward_risk = float(strategy_cfg.get("min_reward_risk", root.get("min_reward_risk", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            min_reward_risk = 0.0
+        conf = float(signal.get("confidence") or 0.0)
+        strength = float(signal.get("strength") or 0.0)
+        setup_risk = setup_risk_metadata_from_signal(signal)
+        try:
+            reward_risk = float(
+                signal.get("reward_risk")
+                or signal.get("rewardRisk")
+                or setup_risk.get("reward_risk")
+                or setup_risk.get("rewardRisk")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            reward_risk = 0.0
+        if conf < min_conf or strength < min_strength:
+            return 1.0, ""
+        if min_reward_risk > 0 and reward_risk > 0 and reward_risk < min_reward_risk:
+            return 1.0, ""
+        bounded = max(1.0, min(max_multiplier, multiplier))
+        return bounded, (
+            f"conf={conf:.2f} strength={strength:.2f}"
+            + (f" rr={reward_risk:.2f}" if reward_risk > 0 else "")
+        )
+
+    # TIME_OF_DAY_POLICY_2026_06_18: reversible overlay for hour-aware gates/sizing.
+    # Restore path: set trading.time_of_day_policy.enabled=false in config/config.yaml.
+    def _time_of_day_policy_profile(
+        self,
+        cfg: Optional[Dict[str, Any]],
+        ledger: str,
+        strategy_name: str,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        root = ((cfg or {}).get("time_of_day_policy") or {})
+        if not isinstance(root, dict):
+            return {"enabled": False}
+        enabled = root.get("enabled", False)
+        if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+            return {"enabled": False}
+        tz_name = str(root.get("timezone") or "Europe/Lisbon")
+        try:
+            local_now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz_name))
+        except Exception:
+            local_now = now or datetime.utcnow()
+        hour = int(local_now.hour)
+        strategy_key = str(strategy_name or "").strip().lower()
+        ledger_key = str(ledger or "").strip().lower()
+        ledger_cfg = root.get(ledger_key) or {}
+        if not isinstance(ledger_cfg, dict):
+            ledger_cfg = {}
+        strategy_cfg = {}
+        strategies_cfg = ledger_cfg.get("strategies") or {}
+        if isinstance(strategies_cfg, dict):
+            strategy_cfg = strategies_cfg.get(strategy_key) or strategies_cfg.get(strategy_name) or {}
+            if not isinstance(strategy_cfg, dict):
+                strategy_cfg = {}
+
+        def _matches(raw_blocks: Any) -> bool:
+            blocks = raw_blocks if isinstance(raw_blocks, list) else []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                try:
+                    start = int(block.get("start_hour"))
+                    end = int(block.get("end_hour"))
+                except (TypeError, ValueError):
+                    continue
+                if start <= end:
+                    matched = start <= hour <= end
+                else:
+                    matched = hour >= start or hour <= end
+                if matched:
+                    return True
+            return False
+
+        profile_name = "neutral"
+        if _matches(strategy_cfg.get("best_hours") or ledger_cfg.get("best_hours")):
+            profile_name = "best"
+        elif _matches(strategy_cfg.get("good_hours") or ledger_cfg.get("good_hours")):
+            profile_name = "good"
+        elif _matches(strategy_cfg.get("strict_hours") or ledger_cfg.get("strict_hours")):
+            profile_name = "strict"
+
+        profiles = root.get("profiles") or {}
+        profile = profiles.get(profile_name) if isinstance(profiles, dict) else {}
+        if not isinstance(profile, dict):
+            profile = {}
+        return {
+            "enabled": True,
+            "profile": profile_name,
+            "hour": hour,
+            "timezone": tz_name,
+            "size_multiplier": float(profile.get("size_multiplier", 1.0) or 1.0),
+            "max_size_multiplier": float(profile.get("max_size_multiplier", profile.get("size_multiplier", 1.0)) or 1.0),
+            "min_confidence_delta": float(profile.get("min_confidence_delta", 0.0) or 0.0),
+            "min_strength_delta": float(profile.get("min_strength_delta", 0.0) or 0.0),
+        }
+
+    def _time_of_day_quality_ok(
+        self,
+        cfg: Optional[Dict[str, Any]],
+        ledger: str,
+        strategy_name: str,
+        signal: Optional[Dict[str, Any]],
+        base_quality_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        profile = self._time_of_day_policy_profile(cfg, ledger, strategy_name)
+        if not profile.get("enabled") or profile.get("profile") in {"best", "good", "neutral"}:
+            return True, profile
+        signal = signal or {}
+        base_quality_cfg = base_quality_cfg or {}
+        strategy_key = str(strategy_name or "").strip().lower()
+        strategy_cfg = {}
+        if isinstance(base_quality_cfg, dict):
+            raw = base_quality_cfg.get(strategy_key) or base_quality_cfg.get(strategy_name) or {}
+            if isinstance(raw, dict):
+                strategy_cfg = raw
+        try:
+            base_conf = float(strategy_cfg.get("min_confidence", base_quality_cfg.get("min_confidence", 0.70)) or 0.70)
+            base_strength = float(strategy_cfg.get("min_strength", base_quality_cfg.get("min_strength", 0.65)) or 0.65)
+            conf = float(signal.get("confidence") or 0.0)
+            strength = float(signal.get("strength") or 0.0)
+        except (TypeError, ValueError):
+            return False, profile
+        required_conf = min(0.95, base_conf + float(profile.get("min_confidence_delta", 0.0) or 0.0))
+        required_strength = min(0.95, base_strength + float(profile.get("min_strength_delta", 0.0) or 0.0))
+        profile.update(
+            {
+                "confidence": conf,
+                "strength": strength,
+                "required_confidence": required_conf,
+                "required_strength": required_strength,
+            }
+        )
+        return conf >= required_conf and strength >= required_strength, profile
+
     async def _long_entry_regime_allowed(self, stable_regime: str) -> bool:
         """Consensus-path SPOT-long regime allowlist (trading.long_entry_allowed_regimes)."""
         cfg = await self._get_config_value("trading.long_entry_allowed_regimes", {})
@@ -1190,6 +1408,25 @@ class TradingOrchestrator:
             strat_cfg = {}
         if strat_cfg.get("enabled") is False:
             return False
+        # Match HL perps' deny-list model: when the orchestrator can't classify a
+        # stable regime ("unknown"/empty), let the configured specialist playbooks
+        # through the regime ALLOW-list here. Downstream deny-list checks
+        # (_strategy_stable_regime_allowed -> blocked_regimes,
+        # strategy_regime_side_blocks) plus exchange allowlists still apply, so a
+        # single strong specialist setup can enter like a perp long instead of
+        # being blocked solely for an unclassified regime.
+        if regime_lc in ("", "unknown"):
+            policy = await self._get_config_value(
+                "trading.standalone_unknown_regime_policy", {}
+            )
+            if isinstance(policy, dict) and policy.get("enabled", False):
+                permissive = {
+                    str(s).strip()
+                    for s in (policy.get("strategies") or [])
+                    if str(s).strip()
+                }
+                if strategy_name in permissive:
+                    return True
         regimes = strat_cfg.get("regimes")
         if regimes is None and strategy_name == "macd_momentum":
             macd_cfg = await self._get_config_value("trading.macd_buy_override", {})
@@ -1323,6 +1560,48 @@ class TradingOrchestrator:
                     if allowed
                     else f"recent_expectancy_negative trades={trade_count} pnl={pnl:.2f}"
                 )
+                if not allowed:
+                    probation_size_strategies = {
+                        str(x).strip()
+                        for x in (cfg.get("probation_size_strategies") or [])
+                        if str(x).strip()
+                    }
+                    try:
+                        probation_loss_floor = -abs(
+                            float(cfg.get("probation_max_negative_pnl_usd", 1.0) or 1.0)
+                        )
+                    except (TypeError, ValueError):
+                        probation_loss_floor = -1.0
+                    per_strategy_loss_floor = cfg.get("probation_max_negative_pnl_usd_by_strategy") or {}
+                    if isinstance(per_strategy_loss_floor, dict) and strategy_name in per_strategy_loss_floor:
+                        try:
+                            probation_loss_floor = -abs(
+                                float(per_strategy_loss_floor.get(strategy_name) or abs(probation_loss_floor))
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    try:
+                        probation_multiplier = max(
+                            0.0,
+                            min(1.0, float(cfg.get("probation_size_multiplier", 0.50) or 0.50)),
+                        )
+                    except (TypeError, ValueError):
+                        probation_multiplier = 0.50
+                    per_strategy_multiplier = cfg.get("probation_size_multiplier_by_strategy") or {}
+                    if isinstance(per_strategy_multiplier, dict) and strategy_name in per_strategy_multiplier:
+                        try:
+                            probation_multiplier = max(
+                                0.0,
+                                min(1.0, float(per_strategy_multiplier.get(strategy_name) or probation_multiplier)),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if strategy_name in probation_size_strategies and pnl >= probation_loss_floor:
+                        allowed = True
+                        reason = (
+                            f"expectancy_probation_size trades={trade_count} "
+                            f"pnl={pnl:.2f} mult={probation_multiplier:.2f}"
+                        )
 
             self._strategy_expectancy_cache[strategy_name] = (now, allowed, reason)
             return allowed, reason
@@ -1390,6 +1669,153 @@ class TradingOrchestrator:
         conf = float((strategy_data or {}).get("confidence", 0) or 0)
         strength = float((strategy_data or {}).get("strength", 0) or 0)
         return conf >= min_conf and strength >= min_strength
+
+    async def _strategy_pair_entry_blocked(
+        self,
+        strategy_name: str,
+        exchange_name: str,
+        pair: str,
+    ) -> Tuple[bool, str]:
+        """Static strategy-scoped pair block, used for weak strategy/pair combinations."""
+        strategy_key = str(strategy_name or "").strip().lower()
+        exchange_key = str(exchange_name or "").strip().lower()
+        pair_key = str(pair or "").strip().upper()
+        if not strategy_key or not exchange_key or not pair_key:
+            return False, ""
+
+        root = await self._get_config_value("trading.strategy_pair_entry_blocks", {})
+        if not isinstance(root, dict):
+            return False, ""
+        strategy_cfg = root.get(strategy_key) or root.get(strategy_name) or {}
+        if not isinstance(strategy_cfg, dict):
+            return False, ""
+        blocked_pairs = strategy_cfg.get(exchange_key) or strategy_cfg.get(exchange_name) or []
+        normalized = {str(item or "").strip().upper() for item in blocked_pairs or []}
+        if pair_key in normalized:
+            return True, f"{strategy_key} blocked for {exchange_key} {pair_key}"
+        return False, ""
+
+    async def _strategy_pair_stop_cooldown_blocked(
+        self,
+        strategy_name: str,
+        exchange_name: str,
+        pair: str,
+    ) -> Tuple[bool, str]:
+        """Restart-safe same strategy/pair cooldown after stop-like losing exits."""
+        strategy_key = str(strategy_name or "").strip().lower()
+        exchange_key = str(exchange_name or "").strip().lower()
+        pair_key = str(pair or "").strip().upper()
+        if not strategy_key or not exchange_key or not pair_key:
+            return False, ""
+
+        cfg = await self._get_config_value("trading.strategy_pair_stop_cooldown", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        enabled = cfg.get("enabled", True)
+        if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+            return False, ""
+        try:
+            cooldown_hours = max(0.0, float(cfg.get("cooldown_hours", 6.0) or 6.0))
+        except (TypeError, ValueError):
+            cooldown_hours = 6.0
+        if cooldown_hours <= 0:
+            return False, ""
+        try:
+            scan_limit = max(25, int(cfg.get("scan_recent_closed_limit", 500) or 500))
+        except (TypeError, ValueError):
+            scan_limit = 500
+        keywords = [
+            str(item or "").strip().lower()
+            for item in (
+                cfg.get("stop_exit_reason_keywords")
+                or [
+                    "stop_loss",
+                    "loss_cap",
+                    "loss_recovery_expired",
+                    "stagnant_loser",
+                    "no_mfe",
+                ]
+            )
+            if str(item or "").strip()
+        ]
+        cutoff = datetime.utcnow() - timedelta(hours=cooldown_hours)
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                trades_resp = await client.get(
+                    f"{database_service_url}/api/v1/trades",
+                    params={
+                        "limit": scan_limit,
+                        "exchange": exchange_name,
+                        "sort_by": "exit_time",
+                        "sort_order": "desc",
+                    },
+                )
+            if trades_resp.status_code != 200:
+                return False, ""
+            recent_trades = (trades_resp.json() or {}).get("trades", []) or []
+        except Exception as exc:
+            logger.warning(
+                "[StrategyPairStopCooldown] check skipped for %s %s %s: %s",
+                strategy_key,
+                exchange_key,
+                pair_key,
+                exc,
+            )
+            return False, ""
+
+        latest_exit: Optional[datetime] = None
+        latest_reason = ""
+        for trade in recent_trades:
+            if str(trade.get("status") or "").upper() != "CLOSED":
+                continue
+            trade_strategy = str(trade.get("strategy") or "").strip().lower()
+            trade_exchange = str(trade.get("exchange") or "").strip().lower()
+            trade_pair = str(trade.get("pair") or "").strip().upper()
+            if (
+                trade_strategy != strategy_key
+                or trade_exchange != exchange_key
+                or trade_pair != pair_key
+            ):
+                continue
+            try:
+                realized_pnl = float(trade.get("realized_pnl") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if realized_pnl >= 0:
+                continue
+            reason = str(trade.get("exit_reason") or "").strip().lower()
+            if keywords and not any(keyword in reason for keyword in keywords):
+                continue
+            exit_time_raw = trade.get("exit_time") or trade.get("updated_at")
+            if not exit_time_raw:
+                continue
+            try:
+                exit_time = datetime.fromisoformat(
+                    str(exit_time_raw).replace("Z", "+00:00")
+                )
+                if exit_time.tzinfo:
+                    exit_time = exit_time.replace(tzinfo=None)
+            except Exception:
+                continue
+            if exit_time < cutoff:
+                continue
+            if latest_exit is None or exit_time > latest_exit:
+                latest_exit = exit_time
+                latest_reason = reason
+
+        if latest_exit is None:
+            return False, ""
+        until = latest_exit + timedelta(hours=cooldown_hours)
+        if until <= datetime.utcnow():
+            return False, ""
+        return (
+            True,
+            (
+                f"{strategy_key} {exchange_key} {pair_key} stop cooldown until "
+                f"{until.isoformat()} UTC (latest={latest_reason or 'stop_like_loss'})"
+            ),
+        )
 
     async def _fetch_live_ticker(
         self, exchange_name: str, pair: str
@@ -1721,6 +2147,146 @@ class TradingOrchestrator:
         )
         return False
 
+    async def _ema50_spot_confirmation_ready(
+        self,
+        exchange_name: str,
+        pair: str,
+        strategy_data: Dict[str, Any],
+    ) -> bool:
+        """Stage EMA50 spot entries until live price proves follow-through."""
+        cfg = await self._get_config_value("trading.ema50_spot_entry_confirmation", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if not bool(cfg.get("enabled", True)):
+            return True
+
+        indicators = ((strategy_data or {}).get("state") or {}).get("indicators") or {}
+        if not isinstance(indicators, dict):
+            indicators = {}
+        try:
+            signal_price = float(
+                indicators.get("entry_price")
+                or indicators.get("entry")
+                or indicators.get("close")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            signal_price = 0.0
+
+        try:
+            current_price = await self._get_current_price(exchange_name, pair)
+        except Exception as exc:
+            logger.warning(
+                "[EMA50Confirm] %s %s: price unavailable, holding signal: %s",
+                exchange_name,
+                pair,
+                exc,
+            )
+            return False
+        if current_price <= 0:
+            return False
+        if signal_price <= 0:
+            signal_price = current_price
+
+        try:
+            confirm_pct = max(0.0, float(cfg.get("confirm_pct", 0.0035) or 0.0035))
+        except (TypeError, ValueError):
+            confirm_pct = 0.0035
+        try:
+            timeout_minutes = max(1.0, float(cfg.get("timeout_minutes", 90.0) or 90.0))
+        except (TypeError, ValueError):
+            timeout_minutes = 90.0
+        try:
+            max_chase_pct = max(confirm_pct, float(cfg.get("max_chase_pct", 0.012) or 0.012))
+        except (TypeError, ValueError):
+            max_chase_pct = 0.012
+        try:
+            max_pullback_pct = max(0.0, float(cfg.get("max_pullback_pct", 0.004) or 0.004))
+        except (TypeError, ValueError):
+            max_pullback_pct = 0.004
+
+        key = (str(exchange_name or "").lower(), str(pair or "").upper())
+        now = datetime.utcnow()
+        trigger_price = signal_price * (1.0 + confirm_pct)
+        chase_limit = signal_price * (1.0 + max_chase_pct)
+        fail_price = signal_price * (1.0 - max_pullback_pct)
+        pending = self._ema50_spot_pending_entries.get(key)
+        pending_signal_price = 0.0
+        if pending:
+            try:
+                pending_signal_price = float(pending.get("signal_price") or 0.0)
+            except (TypeError, ValueError):
+                pending_signal_price = 0.0
+
+        signal_changed = (
+            pending_signal_price > 0
+            and abs(signal_price - pending_signal_price) / pending_signal_price > 0.001
+        )
+        if not pending or now >= pending.get("expires_at", now) or signal_changed:
+            self._ema50_spot_pending_entries[key] = {
+                "signal_price": signal_price,
+                "trigger_price": trigger_price,
+                "chase_limit": chase_limit,
+                "fail_price": fail_price,
+                "created_at": now,
+                "expires_at": now + timedelta(minutes=timeout_minutes),
+            }
+            logger.warning(
+                "[EMA50Confirm] %s %s: staged pending EMA50 entry signal=%.8f "
+                "trigger=%.8f (+%.2f%%), fail=%.8f, timeout=%.0fm",
+                exchange_name,
+                pair,
+                signal_price,
+                trigger_price,
+                confirm_pct * 100.0,
+                fail_price,
+                timeout_minutes,
+            )
+            return False
+
+        trigger_price = float(pending.get("trigger_price") or trigger_price)
+        chase_limit = float(pending.get("chase_limit") or chase_limit)
+        fail_price = float(pending.get("fail_price") or fail_price)
+        if current_price < fail_price:
+            logger.warning(
+                "[EMA50Confirm] %s %s: rejecting no-follow-through current=%.8f < fail=%.8f",
+                exchange_name,
+                pair,
+                current_price,
+                fail_price,
+            )
+            self._ema50_spot_pending_entries.pop(key, None)
+            return False
+        if current_price > chase_limit:
+            logger.warning(
+                "[EMA50Confirm] %s %s: rejecting chase current=%.8f > limit=%.8f",
+                exchange_name,
+                pair,
+                current_price,
+                chase_limit,
+            )
+            self._ema50_spot_pending_entries.pop(key, None)
+            return False
+        if current_price >= trigger_price:
+            logger.warning(
+                "[EMA50Confirm] %s %s: confirmed EMA50 entry current=%.8f >= trigger=%.8f",
+                exchange_name,
+                pair,
+                current_price,
+                trigger_price,
+            )
+            self._ema50_spot_pending_entries.pop(key, None)
+            return True
+
+        logger.info(
+            "[EMA50Confirm] %s %s: waiting current=%.8f < trigger=%.8f",
+            exchange_name,
+            pair,
+            current_price,
+            trigger_price,
+        )
+        return False
+
     async def _macd_override_qualifies(
         self,
         macd_strategy_data: Dict[str, Any],
@@ -1840,6 +2406,45 @@ class TradingOrchestrator:
                             "strategy": strat_name,
                             "confidence": float(strat_raw.get("confidence", 0) or 0),
                             "strength": float(strat_raw.get("strength", 0) or 0),
+                        },
+                    )
+                    return False
+                time_ok, time_profile = self._time_of_day_quality_ok(
+                    {"time_of_day_policy": await self._get_config_value("trading.time_of_day_policy", {})},
+                    "spot",
+                    strat_name,
+                    strat_raw,
+                    sq_root,
+                )
+                if not time_ok:
+                    logger.info(
+                        "[TimeOfDayPolicy] Reject %s %s: %s strict-hour gate failed "
+                        "(hour=%s %s conf=%.2f<%.2f str=%.2f<%.2f)",
+                        exchange_name,
+                        pair,
+                        strat_name,
+                        time_profile.get("hour"),
+                        time_profile.get("timezone"),
+                        float(time_profile.get("confidence", 0.0) or 0.0),
+                        float(time_profile.get("required_confidence", 0.0) or 0.0),
+                        float(time_profile.get("strength", 0.0) or 0.0),
+                        float(time_profile.get("required_strength", 0.0) or 0.0),
+                    )
+                    await self._record_entry_gate_event(
+                        exchange_name,
+                        pair,
+                        "time_of_day_policy",
+                        signals_data,
+                        resolved_policy,
+                        {
+                            "strategy": strat_name,
+                            "profile": time_profile.get("profile"),
+                            "hour": time_profile.get("hour"),
+                            "timezone": time_profile.get("timezone"),
+                            "confidence": time_profile.get("confidence"),
+                            "required_confidence": time_profile.get("required_confidence"),
+                            "strength": time_profile.get("strength"),
+                            "required_strength": time_profile.get("required_strength"),
                         },
                     )
                     return False
@@ -2323,7 +2928,7 @@ class TradingOrchestrator:
         notional = use_amount * float(fill_price)
         # PnL-FIX v9 — uniform per-side simulation fee on every exchange.
         # Cash ledger is debited (BUY) or credited (SELL) by notional ± fee.
-        fee_rate = await _get_simulation_fee_rate_per_side()
+        fee_rate = await _get_simulation_fee_rate_per_side(exchange_name)
         fee_usd = notional * fee_rate
         if apply_balance_delta:
             if side_l == "buy":
@@ -2549,10 +3154,35 @@ class TradingOrchestrator:
                         
                         # Check if pairs exist and are not empty
                         if all_pairs and len(all_pairs) > 0:
-                            filtered_pairs = await self._filter_stablecoin_pairs(all_pairs)
+                            try:
+                                from core.dynamic_blacklist_manager import blacklist_manager
+
+                                active_blacklist = await blacklist_manager.get_active_blacklist()
+                            except Exception as blacklist_error:
+                                logger.warning(
+                                    "[PairSelection] Could not load blacklist while initializing %s: %s",
+                                    exchange_name,
+                                    blacklist_error,
+                                )
+                                active_blacklist = []
+                            if exchange_name.lower() in ("binance", "bybit"):
+                                exchange_blacklist = [
+                                    p for p in active_blacklist if p.endswith("/USDC")
+                                ]
+                            elif exchange_name.lower() == "cryptocom":
+                                exchange_blacklist = [
+                                    p for p in active_blacklist if p.endswith("/USD")
+                                ]
+                            else:
+                                exchange_blacklist = list(active_blacklist)
+                            filtered_pairs = await self._filter_entry_candidate_pairs(
+                                exchange_name,
+                                all_pairs,
+                                exchange_blacklist,
+                            )
                             if len(filtered_pairs) < max_pairs:
                                 logger.info(
-                                    "Exchange %s: only %s pairs after stablecoin filter; regenerating selection",
+                                    "Exchange %s: only %s pairs after entry-candidate filter; regenerating selection",
                                     exchange_name,
                                     len(filtered_pairs),
                                 )
@@ -2568,7 +3198,7 @@ class TradingOrchestrator:
                                 )
                                 if db_response.status_code in (200, 201):
                                     logger.info(
-                                        "Persisted stablecoin-filtered pairs for %s (%s removed)",
+                                        "Persisted entry-filtered pairs for %s (%s removed)",
                                         exchange_name,
                                         len(all_pairs) - len(filtered_pairs),
                                     )
@@ -2682,7 +3312,11 @@ class TradingOrchestrator:
                 all_selected_pairs = combined_pairs[:target_pool_size]
                 logger.info(f"Using {len(all_selected_pairs)} combined pairs for {exchange_name}")
 
-            all_selected_pairs = await self._filter_stablecoin_pairs(all_selected_pairs)
+            all_selected_pairs = await self._filter_entry_candidate_pairs(
+                exchange_name,
+                all_selected_pairs,
+                exchange_blacklisted_pairs,
+            )
             
             # Ensure CRO/USD is always first for crypto.com
             if exchange_name.lower() == "cryptocom" and "CRO/USD" not in all_selected_pairs:
@@ -2699,7 +3333,11 @@ class TradingOrchestrator:
             selected_pairs = [
                 pair for pair in all_selected_pairs if pair not in exchange_blacklisted_pairs
             ]
-            selected_pairs = await self._filter_stablecoin_pairs(selected_pairs)
+            selected_pairs = await self._filter_entry_candidate_pairs(
+                exchange_name,
+                selected_pairs,
+                exchange_blacklisted_pairs,
+            )
             
             # Get replacement pairs if we have blacklisted pairs
             if len(exchange_blacklisted_pairs) > 0:
@@ -2966,6 +3604,29 @@ class TradingOrchestrator:
         stable_bases = await self._get_stablecoin_bases()
         return filter_stablecoin_pairs_with_bases(pairs, stable_bases)
 
+    def _known_unsupported_strategy_pairs(self, exchange_name: str) -> set[str]:
+        """Pairs confirmed to be listed but unsupported by strategy-service signals."""
+        exchange = str(exchange_name or "").lower()
+        unsupported_by_exchange = {
+            "binance": {"U/USDC"},
+            "bybit": {"OP/USDC"},
+        }
+        return set(unsupported_by_exchange.get(exchange, set()))
+
+    async def _filter_entry_candidate_pairs(
+        self,
+        exchange_name: str,
+        pairs: List[str],
+        blacklisted_pairs: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Filter selected spot pairs before they occupy active entry scan slots."""
+        filtered = await self._filter_stablecoin_pairs(pairs or [])
+        blocked = set(blacklisted_pairs or [])
+        blocked.update(self._known_unsupported_strategy_pairs(exchange_name))
+        if not blocked:
+            return filtered
+        return [pair for pair in filtered if pair not in blocked]
+
     async def _is_stablecoin_pair(self, pair: str) -> bool:
         stable_bases = await self._get_stablecoin_bases()
         return bool(stable_bases) and is_stablecoin_pair(pair, stable_bases)
@@ -2990,8 +3651,22 @@ class TradingOrchestrator:
         self._loop_entry_reserve_seconds = max(15.0, min(raw_reserve, max_reserve_for_exit))
         raw_perp_cap = float(tc.get("perp_cycle_max_seconds", 45) or 45)
         self._loop_perp_cycle_max_seconds = max(10.0, min(raw_perp_cap, max(10.0, self._loop_max_cycle_duration - 15.0)))
+        raw_spot_cap = tc.get("spot_cycle_max_seconds")
+        if raw_spot_cap is None:
+            raw_spot_cap = max(10.0, self._loop_entry_reserve_seconds - self._loop_perp_cycle_max_seconds)
+        self._loop_spot_cycle_max_seconds = max(
+            10.0,
+            min(
+                float(raw_spot_cap or 60.0),
+                max(10.0, self._loop_max_cycle_duration - self._loop_perp_cycle_max_seconds),
+            ),
+        )
         raw_pair_timeout = float(tc.get("spot_entry_pair_timeout_seconds", 35) or 35)
         self._loop_spot_entry_pair_timeout_seconds = max(8.0, min(raw_pair_timeout, 90.0))
+        raw_spot_conc = int(tc.get("spot_entry_check_concurrency", 8) or 8)
+        self._loop_spot_entry_check_concurrency = max(1, min(raw_spot_conc, 32))
+        raw_perp_conc = int(tc.get("perp_entry_check_concurrency", 8) or 8)
+        self._loop_perp_entry_check_concurrency = max(1, min(raw_perp_conc, 16))
         # Exit runs in [0, max_wall - reserve]; entry+maintenance use full max_wall deadline.
         if self._loop_exit_cycle_first:
             min_loop_wall = max(
@@ -3475,6 +4150,8 @@ class TradingOrchestrator:
             # Start order monitoring in background
             logger.info("🔄 Starting order monitoring in background")
             order_monitoring_task = asyncio.create_task(self._monitor_pending_orders())
+            fast_spot_exit_task = asyncio.create_task(self._fast_spot_exit_loop())
+            fast_perp_exit_task = asyncio.create_task(self._fast_perp_exit_loop())
             
             # New trailing stop system runs continuously after startup
             # No additional monitoring needed - system is event-driven
@@ -3524,13 +4201,15 @@ class TradingOrchestrator:
                         await self._run_exit_cycle(deadline=exit_deadline)
                         logger.info(f"✅ Exit cycle {self.cycle_count} completed")
 
-                    spot_entry_deadline = max(
-                        loop_start + 5.0,
+                    spot_entry_deadline = min(
                         full_deadline - self._loop_perp_cycle_max_seconds,
+                        time.monotonic() + self._loop_spot_cycle_max_seconds,
                     )
+                    spot_entry_deadline = max(loop_start + 5.0, spot_entry_deadline)
                     logger.info(
                         f"📥 Running entry cycle {self.cycle_count} "
                         f"(spot deadline in {spot_entry_deadline - time.monotonic():.0f}s; "
+                        f"spot cap {self._loop_spot_cycle_max_seconds:.0f}s; "
                         f"perp reserve {self._loop_perp_cycle_max_seconds:.0f}s)..."
                     )
                     try:
@@ -3598,6 +4277,18 @@ class TradingOrchestrator:
                     await order_monitoring_task
                 except asyncio.CancelledError:
                     logger.info("🛑 Order monitoring task cancelled")
+            if 'fast_spot_exit_task' in locals():
+                fast_spot_exit_task.cancel()
+                try:
+                    await fast_spot_exit_task
+                except asyncio.CancelledError:
+                    logger.info("🛑 Fast spot exit monitor cancelled")
+            if 'fast_perp_exit_task' in locals():
+                fast_perp_exit_task.cancel()
+                try:
+                    await fast_perp_exit_task
+                except asyncio.CancelledError:
+                    logger.info("🛑 Fast perp exit monitor cancelled")
             
             # Stop new trailing stop system when trading stops
             if self.activation_trigger_system:
@@ -3672,7 +4363,107 @@ class TradingOrchestrator:
         await asyncio.gather(*(fetch_one(e, p) for e, p in unique_pairs), return_exceptions=True)
         return out
             
-    async def _run_exit_cycle(self, deadline: Optional[float] = None) -> None:
+    async def _fast_spot_exit_loop(self) -> None:
+        """Lightweight open-spot risk sweep between full trading cycles."""
+        logger.info("⚡ Fast spot exit monitor starting")
+        interval = 20.0
+        while self.running:
+            try:
+                cfg = await self._get_config_value("trading.fast_spot_exit_monitor", {}) or {}
+                if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+                    await asyncio.sleep(interval)
+                    continue
+                interval = max(5.0, float(cfg.get("interval_seconds", 20) or 20))
+                await self._run_exit_cycle(source="fast_spot_exit")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[FastSpotExit] sweep failed: %s", exc)
+            await asyncio.sleep(interval)
+        logger.info("⚡ Fast spot exit monitor stopped")
+
+    async def _run_hyperliquid_paper_exit_sweep(
+        self,
+        mids: Dict[str, float],
+        cfg: Dict[str, Any],
+        *,
+        source: str = "main",
+    ) -> None:
+        """Evaluate/close open paper-perp positions under a shared lock.
+
+        Both the main cycle's perp_exit_update phase and the out-of-band
+        ``_fast_perp_exit_loop`` route through here so exits are serialized and a
+        position is never closed twice. The fast loop skips if the cycle is
+        already sweeping (the cycle is comprehensive and takes priority).
+
+        Shadow (counterfactual) positions are swept on the same cadence as
+        executable positions so the shadow results reflect the exits the real
+        entries would have had on the same cycle.
+        """
+        if source == "fast_perp_exit" and self._perp_exit_cycle_lock.locked():
+            logger.debug("[FastPerpExit] skip: perp exit sweep already running")
+            return
+        async with self._perp_exit_cycle_lock:
+            await self._update_hyperliquid_paper_positions(mids, cfg)
+
+    async def _fast_perp_exit_loop(self) -> None:
+        """Lightweight open paper-perp risk sweep between full trading cycles.
+
+        Mirrors ``_fast_spot_exit_loop`` for Hyperliquid paper perps. Driven by
+        the cached allMids websocket prices, so it reacts to protective-exit
+        conditions without waiting for (or competing with) the entry phase.
+        """
+        logger.info("⚡ Fast perp exit monitor starting")
+        interval = 10.0
+        while self.running:
+            try:
+                monitor_cfg = await self._get_config_value(
+                    "trading.fast_perp_exit_monitor", {}
+                ) or {}
+                if not isinstance(monitor_cfg, dict) or not monitor_cfg.get(
+                    "enabled", False
+                ):
+                    await asyncio.sleep(interval)
+                    continue
+                interval = max(3.0, float(monitor_cfg.get("interval_seconds", 10) or 10))
+                hl_cfg = self._hyperliquid_perps_cfg()
+                if not bool(hl_cfg.get("enabled", False)):
+                    await asyncio.sleep(interval)
+                    continue
+                # Paper-only: live mode manages exits via the exchange, not local sweeps.
+                if str(hl_cfg.get("mode", "paper")).lower() != "paper":
+                    await asyncio.sleep(interval)
+                    continue
+                mids = await self._fetch_hyperliquid_mids()
+                if not mids:
+                    await asyncio.sleep(interval)
+                    continue
+                hl_cfg = await self._hyperliquid_adaptive_runtime_cfg(hl_cfg)
+                # Sweeps both executable and shadow positions so the shadow
+                # counterfactual reflects the same exit cadence as the real book.
+                await self._run_hyperliquid_paper_exit_sweep(
+                    mids, hl_cfg, source="fast_perp_exit"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[FastPerpExit] sweep failed: %s", exc)
+            await asyncio.sleep(interval)
+        logger.info("⚡ Fast perp exit monitor stopped")
+
+    async def _run_exit_cycle(
+        self,
+        deadline: Optional[float] = None,
+        *,
+        source: str = "main",
+    ) -> None:
+        if source == "fast_spot_exit" and self._spot_exit_cycle_lock.locked():
+            logger.debug("[FastSpotExit] skip: spot exit cycle already running")
+            return
+        async with self._spot_exit_cycle_lock:
+            await self._run_exit_cycle_unlocked(deadline=deadline)
+
+    async def _run_exit_cycle_unlocked(self, deadline: Optional[float] = None) -> None:
         """Run exit cycle to check for trade exits.
 
         All open trades are targeted **every** loop; when ``deadline`` is set (exit-first scheduling),
@@ -3954,6 +4745,7 @@ class TradingOrchestrator:
             config_stop_loss_pct = trading_config.get('stop_loss_percentage', 0.02)
             default_stop_loss = -(config_stop_loss_pct * 100)
             trade_strategy_l = str(trade.get("strategy") or "").lower()
+            spot_loss_cap_config = dict(trading_config.get("spot_loss_cap", {}) or {})
             trailing_stop_config = dict(trading_config.get('trailing_stop', {}) or {})
             profit_protection_config = dict(trading_config.get('profit_protection', {}) or {})
             spot_exit_rules = spot_strategy_exit_rules_from_trading_config(
@@ -4233,6 +5025,7 @@ class TradingOrchestrator:
             exit_reason = None
             should_exit = False
             exit_trigger_price = current_price
+            suppress_percentage_stop_for_recovery = False
 
             # Profit protection: lock stop at breakeven-floor when peak PnL reaches
             # profit_protection.activation_threshold (config-driven; e.g. 0.005 = +0.5%).
@@ -4346,17 +5139,34 @@ class TradingOrchestrator:
             ):
                 pp_trigger_px = float(trade.get('trail_stop_trigger') or 0.0)
                 if pp_trigger_px > 0 and current_price <= pp_trigger_px:
-                    should_exit = True
-                    exit_trigger_price = pp_trigger_px
-                    exit_reason = (
-                        f"profit_protection_breach@{pnl_percentage:.2f}%"
-                        f"_trigger{pp_trigger_px:.6f}_px{current_price:.6f}"
+                    min_net_profit_usd = float(
+                        profit_protection_config.get(
+                            "min_net_profit_usd",
+                            (trading_config.get("profit_protection") or {}).get(
+                                "min_net_profit_usd", 0.0
+                            ),
+                        )
+                        or 0.0
                     )
-                    logger.warning(
-                        f"[Trade {trade_id}] [ProfitProtection] 🚩 PRICE-BREACH EXIT: "
-                        f"current ${current_price:.6f} <= trigger ${pp_trigger_px:.6f} "
-                        f"(PnL {pnl_percentage:.2f}%) — routing to critical market exit"
-                    )
+                    if float(unrealized_pnl) >= min_net_profit_usd:
+                        should_exit = True
+                        exit_trigger_price = pp_trigger_px
+                        exit_reason = (
+                            f"profit_protection_breach@{pnl_percentage:.2f}%"
+                            f"_trigger{pp_trigger_px:.6f}_px{current_price:.6f}"
+                        )
+                        logger.warning(
+                            f"[Trade {trade_id}] [ProfitProtection] 🚩 PRICE-BREACH EXIT: "
+                            f"current ${current_price:.6f} <= trigger ${pp_trigger_px:.6f} "
+                            f"(PnL {pnl_percentage:.2f}%, net ${float(unrealized_pnl):.2f}) "
+                            f"— routing to critical market exit"
+                        )
+                    else:
+                        logger.warning(
+                            f"[Trade {trade_id}] [ProfitProtection] NET-GUARD: breach seen but "
+                            f"estimated net ${float(unrealized_pnl):.2f} < "
+                            f"min ${min_net_profit_usd:.2f}; not using profit-protection exit"
+                        )
 
             # RSI checklist: max hold — close stale legs (e.g. multi-day ADI) regardless of SL.
             if (
@@ -4429,8 +5239,93 @@ class TradingOrchestrator:
                 exit_id = trade.get('exit_id')
                 if exit_id:
                     # Trade has active trailing stop order - check if it needs updating
-                    current_trigger_price = trade.get('trail_stop_trigger', 0)
+                    current_trigger_price = float(trade.get('trail_stop_trigger') or 0)
                     stored_highest = trade.get('highest_price', 0)
+                    await self._ensure_spot_trailing_stop_record(
+                        trade,
+                        current_price=current_price,
+                        highest_price=highest_price,
+                        trailing_stop_config=trailing_stop_config,
+                        profit_protection_config=profit_protection_config,
+                    )
+
+                    # Stale-trigger guard: config may tighten after an order was
+                    # placed. Recalculate the configured trigger every cycle, not
+                    # only after a new high, so old wide trails cannot leak profit.
+                    active_step_decimal = trailing_step_decimal
+                    active_step_pct = trailing_step_pct
+                    peak_pct_for_step = (
+                        ((highest_price - entry_price) / entry_price) * 100.0
+                        if highest_price and entry_price
+                        else pnl_percentage
+                    )
+                    if (
+                        dynamic_tightening_enabled
+                        and peak_pct_for_step >= tighten_profit_threshold_pct
+                    ):
+                        active_step_decimal = tightened_step_decimal
+                        active_step_pct = tightened_step_pct
+                    try:
+                        max_trail_distance_decimal = float(
+                            trailing_stop_config.get("max_trail_distance", 0.0) or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        max_trail_distance_decimal = 0.0
+                    if max_trail_distance_decimal > 0:
+                        active_step_decimal = min(
+                            active_step_decimal,
+                            max_trail_distance_decimal,
+                        )
+                        active_step_pct = active_step_decimal * 100.0
+                    configured_trigger_price = max(
+                        highest_price * (1 - active_step_decimal),
+                        entry_price * (1.0 + breakeven_floor_decimal),
+                    )
+                    stale_update_threshold = max(
+                        current_price * float(trailing_stop_config.get("update_threshold", 0.0003) or 0.0003),
+                        1e-9,
+                    )
+                    if (
+                        configured_trigger_price > current_trigger_price + stale_update_threshold
+                        and risk_exit_allowed_by_feed
+                    ):
+                        if current_price <= configured_trigger_price:
+                            should_exit = True
+                            exit_trigger_price = configured_trigger_price
+                            exit_reason = (
+                                f"trailing_stop_stale_trigger_breach@{pnl_percentage:.2f}%"
+                                f"_trigger{configured_trigger_price:.6f}_px{current_price:.6f}"
+                            )
+                            logger.critical(
+                                f"[Trade {trade_id}] [StaleTrailingStop] 🚨 Corrected trigger "
+                                f"${configured_trigger_price:.6f} already breached by current "
+                                f"${current_price:.6f}; exiting now"
+                            )
+                        else:
+                            try:
+                                update_result = await self._update_trailing_stop_order(
+                                    exchange, exit_id, pair, configured_trigger_price, trade_id
+                                )
+                                if update_result.get("success"):
+                                    new_exit_id = update_result.get("exit_id", exit_id)
+                                    update_data = {
+                                        "trail_stop_trigger": configured_trigger_price,
+                                        "highest_price": highest_price,
+                                    }
+                                    if new_exit_id != exit_id:
+                                        update_data["exit_id"] = new_exit_id
+                                    await self.database_manager.update_trade(trade_id, update_data)
+                                    current_trigger_price = configured_trigger_price
+                                    exit_id = new_exit_id
+                                    logger.warning(
+                                        f"[Trade {trade_id}] [StaleTrailingStop] Tightened stale "
+                                        f"trigger to ${configured_trigger_price:.6f} "
+                                        f"(step={active_step_pct:.2f}%)"
+                                    )
+                            except Exception as stale_update_err:
+                                logger.error(
+                                    f"[Trade {trade_id}] [StaleTrailingStop] update failed: {stale_update_err}"
+                                )
                     
                     # 🚨 CRITICAL TRAILING STOP PROTECTION: Check if current price has fallen below trigger
                     # This is the MOST IMPORTANT check - price must never move down or we lose profit!
@@ -4438,7 +5333,8 @@ class TradingOrchestrator:
                     # would falsely trigger every trade whose trigger sits above entry_price the
                     # moment the live feed degrades.
                     if (
-                        current_price <= current_trigger_price
+                        not should_exit
+                        and current_price <= current_trigger_price
                         and current_trigger_price > 0
                         and risk_exit_allowed_by_feed
                     ):
@@ -4485,7 +5381,8 @@ class TradingOrchestrator:
                                 f"_trigger{current_trigger_price:.6f}_px{current_price:.6f}"
                             )
                     elif (
-                        current_price <= current_trigger_price
+                        not should_exit
+                        and current_price <= current_trigger_price
                         and current_trigger_price > 0
                         and not risk_exit_allowed_by_feed
                     ):
@@ -4498,7 +5395,7 @@ class TradingOrchestrator:
 
                     # Check if highest price has increased since last update
                     # Use old_highest_price (before database update) for comparison
-                    if highest_price > old_highest_price:
+                    if not should_exit and highest_price > old_highest_price:
                         active_step_decimal = trailing_step_decimal
                         active_step_pct = trailing_step_pct
                         peak_pct_for_step = (
@@ -4849,8 +5746,146 @@ class TradingOrchestrator:
                     except (ValueError, TypeError):
                         logger.warning(f"[Trade {trade_id}] [LegacyTrailingStop] Invalid trigger price: {trade.get('trail_stop_trigger')}")
 
+            # Percentage-first loss cap for spot trades. Dollar values remain
+            # a fallback, but configured pct thresholds scale with trade size.
+            if (
+                not should_exit
+                and position_size > 0
+                and risk_exit_allowed_by_feed
+                and spot_loss_cap_config.get("enabled", False) is not False
+            ):
+                try:
+                    strategy_caps = spot_loss_cap_config.get("strategies") or {}
+                    hard_loss_pct = float(
+                        strategy_caps.get(
+                            f"{trade_strategy_l}_hard_loss_pct",
+                            strategy_caps.get(
+                                "default_hard_loss_pct",
+                                spot_loss_cap_config.get("hard_loss_pct", 0.0),
+                            ),
+                        )
+                        or 0.0
+                    )
+                    max_loss_usd = float(
+                        strategy_caps.get(
+                            trade_strategy_l,
+                            strategy_caps.get(
+                                "default",
+                                spot_loss_cap_config.get("max_loss_usd", 1.0),
+                            ),
+                        )
+                        or 1.0
+                    )
+                    soft_loss_pct = float(
+                        spot_loss_cap_config.get("soft_loss_pct", 0.0) or 0.0
+                    )
+                    soft_loss_usd = float(
+                        spot_loss_cap_config.get("soft_loss_usd", 0.0) or 0.0
+                    )
+                    if soft_loss_pct <= 0 and soft_loss_usd <= 0:
+                        fee_buffer_usd = max(
+                            0.0,
+                            float(spot_loss_cap_config.get("fee_buffer_usd", 0.0) or 0.0),
+                        )
+                        soft_loss_usd = max(0.01, max_loss_usd - fee_buffer_usd)
+                    min_hold_seconds = max(
+                        0.0,
+                        float(spot_loss_cap_config.get("min_hold_seconds", 0.0) or 0.0),
+                    )
+                    recovery_cfg = spot_loss_cap_config.get("recovery") or {}
+                    recovery_enabled = bool(recovery_cfg.get("enabled", False))
+                    recovery_seconds = max(
+                        0.0,
+                        float(recovery_cfg.get("max_recovery_seconds", 0.0) or 0.0),
+                    )
+                    suppress_pct_stop = bool(
+                        recovery_cfg.get("suppress_percentage_stop", True)
+                    )
+                    held_seconds = 0.0
+                    raw_entry_time = trade.get("entry_time")
+                    if raw_entry_time:
+                        entry_dt = datetime.fromisoformat(
+                            str(raw_entry_time).replace("Z", "+00:00")
+                        )
+                        if entry_dt.tzinfo is not None:
+                            entry_dt = entry_dt.replace(tzinfo=None)
+                        held_seconds = max(0.0, (datetime.utcnow() - entry_dt).total_seconds())
+                    estimated_loss = -float(unrealized_pnl)
+                    estimated_loss_pct = -float(pnl_percentage)
+                    hard_cap_hit = (
+                        hard_loss_pct > 0 and estimated_loss_pct >= hard_loss_pct
+                    ) or (
+                        hard_loss_pct <= 0 and max_loss_usd > 0 and estimated_loss >= max_loss_usd
+                    )
+                    soft_cap_hit = (
+                        soft_loss_pct > 0 and estimated_loss_pct >= soft_loss_pct
+                    ) or (
+                        soft_loss_pct <= 0 and soft_loss_usd > 0 and estimated_loss >= soft_loss_usd
+                    )
+                    if (
+                        hard_cap_hit
+                        and held_seconds >= min_hold_seconds
+                    ):
+                        cap_label = (
+                            f"{hard_loss_pct:.2f}%"
+                            if hard_loss_pct > 0
+                            else f"${max_loss_usd:.2f}"
+                        )
+                        should_exit = True
+                        exit_trigger_price = current_price
+                        exit_reason = (
+                            f"stop_loss_cap_{cap_label}"
+                            f"@pnl${float(unrealized_pnl):.2f}"
+                            f"_pct{pnl_percentage:.2f}%"
+                        )
+                        logger.warning(
+                            f"[Trade {trade_id}] [SpotLossCap] EXIT TRIGGERED: "
+                            f"estimated loss {estimated_loss_pct:.2f}% "
+                            f"(${estimated_loss:.2f}) >= hard cap {cap_label}"
+                        )
+                    elif (
+                        soft_cap_hit
+                        and held_seconds >= min_hold_seconds
+                        and recovery_enabled
+                        and held_seconds < recovery_seconds
+                    ):
+                        suppress_percentage_stop_for_recovery = suppress_pct_stop
+                        logger.warning(
+                            f"[Trade {trade_id}] [SpotLossRecovery] RECOVERY WINDOW: "
+                            f"estimated loss {estimated_loss_pct:.2f}% (${estimated_loss:.2f}) "
+                            f">= soft {soft_loss_pct:.2f}%/${soft_loss_usd:.2f}, "
+                            f"below hard {hard_loss_pct:.2f}%/${max_loss_usd:.2f}; "
+                            f"held {held_seconds:.0f}s < {recovery_seconds:.0f}s"
+                        )
+                    elif (
+                        soft_cap_hit
+                        and held_seconds >= min_hold_seconds
+                        and (not recovery_enabled or held_seconds >= recovery_seconds)
+                    ):
+                        cap_label = (
+                            f"{hard_loss_pct:.2f}%"
+                            if hard_loss_pct > 0
+                            else f"${max_loss_usd:.2f}"
+                        )
+                        should_exit = True
+                        exit_trigger_price = current_price
+                        exit_reason = (
+                            f"stop_loss_recovery_expired_{cap_label}"
+                            f"@pnl${float(unrealized_pnl):.2f}"
+                            f"_pct{pnl_percentage:.2f}%"
+                        )
+                        logger.warning(
+                            f"[Trade {trade_id}] [SpotLossCap] EXIT TRIGGERED: "
+                            f"soft loss ${estimated_loss:.2f} persisted beyond "
+                            f"recovery window {recovery_seconds:.0f}s"
+                        )
+                except Exception as cap_err:
+                    logger.warning(
+                        f"[Trade {trade_id}] [SpotLossCap] check skipped: {cap_err}"
+                    )
+
             # Stop loss check (percentage-based)
-            if not should_exit and trade_strategy_l in {
+            if not should_exit and not suppress_percentage_stop_for_recovery and trade_strategy_l in {
                 "sma_reclaim_bull_flag",
                 "supply_demand_3step",
                 "dual_sma_daytrade",
@@ -4901,7 +5936,12 @@ class TradingOrchestrator:
                         pass
 
             logger.info(f"[Trade {trade_id}] [StopLoss] Checking exit - PnL: {pnl_percentage:.2f}%, Stop Level: {current_stop_loss:.2f}% (source={current_price_source})")
-            if not should_exit and pnl_percentage <= current_stop_loss and risk_exit_allowed_by_feed:
+            if (
+                not should_exit
+                and not suppress_percentage_stop_for_recovery
+                and pnl_percentage <= current_stop_loss
+                and risk_exit_allowed_by_feed
+            ):
                 should_exit = True
                 exit_trigger_price = current_price
                 # PnL-FIX v9: include the ACTUAL realized PnL % (not only the
@@ -4909,11 +5949,21 @@ class TradingOrchestrator:
                 # Format: "stop_loss_<configured>%@<actual>%" e.g. "stop_loss_-1.5%@-5.10%"
                 exit_reason = f"stop_loss_{current_stop_loss:.1f}%@{pnl_percentage:.2f}%"
                 logger.info(f"[Trade {trade_id}] [StopLoss] ✅ EXIT TRIGGERED: PnL {pnl_percentage:.2f}% <= stop loss {current_stop_loss:.2f}%")
-            elif not should_exit and pnl_percentage <= current_stop_loss and not risk_exit_allowed_by_feed:
+            elif (
+                not should_exit
+                and not suppress_percentage_stop_for_recovery
+                and pnl_percentage <= current_stop_loss
+                and not risk_exit_allowed_by_feed
+            ):
                 logger.warning(
                     f"[Trade {trade_id}] [StopLoss] ⚠️ SKIPPING TRIGGER: PnL {pnl_percentage:.2f}% "
                     f"<= stop {current_stop_loss:.2f}% but price source is {current_price_source!r} "
                     f"(synthetic). Will not fire stop-loss until live feed recovers."
+                )
+            elif not should_exit and suppress_percentage_stop_for_recovery:
+                logger.info(
+                    f"[Trade {trade_id}] [StopLoss] RECOVERY ACTIVE: percentage stop "
+                    f"suppressed while dollar loss remains below hard cap"
                 )
             elif not should_exit:
                 logger.info(f"[Trade {trade_id}] [StopLoss] ❌ NO EXIT: PnL {pnl_percentage:.2f}% > stop loss {current_stop_loss:.2f}%")
@@ -5090,6 +6140,28 @@ class TradingOrchestrator:
                     fast_fail_loss = float(
                         stagnant_cfg.get("fast_fail_loss_pct", -0.55) or -0.55
                     )
+                    no_mfe_enabled = stagnant_cfg.get("no_mfe_fast_fail_enabled", True)
+                    no_mfe_enabled = no_mfe_enabled is not False and str(no_mfe_enabled).lower() not in {
+                        "0",
+                        "false",
+                        "no",
+                        "off",
+                    }
+                    no_mfe_peak = float(
+                        stagnant_cfg.get("no_mfe_peak_pct", 0.03) or 0.03
+                    )
+                    no_mfe_age = float(
+                        stagnant_cfg.get("no_mfe_min_age_minutes", fast_fail_age) or fast_fail_age
+                    )
+                    no_mfe_loss = float(
+                        stagnant_cfg.get("no_mfe_loss_pct", fast_fail_loss) or fast_fail_loss
+                    )
+                    no_mfe_fast_fail = (
+                        no_mfe_enabled
+                        and age_minutes >= no_mfe_age
+                        and peak_pct <= no_mfe_peak
+                        and pnl_percentage <= no_mfe_loss
+                    )
                     fast_fail = (
                         age_minutes >= fast_fail_age
                         and peak_pct <= fast_fail_peak
@@ -5100,10 +6172,16 @@ class TradingOrchestrator:
                         and peak_pct <= dynamic_peak_cap_pct
                         and pnl_percentage <= dynamic_loss_trigger_pct
                     )
-                    if fast_fail or stagnant_standard:
+                    if no_mfe_fast_fail or fast_fail or stagnant_standard:
                         should_exit = True
                         exit_trigger_price = current_price
-                        tag = "fast_fail" if fast_fail else "divergence"
+                        tag = (
+                            "no_mfe_fast_fail"
+                            if no_mfe_fast_fail
+                            else "fast_fail"
+                            if fast_fail
+                            else "divergence"
+                        )
                         exit_reason = (
                             f"stagnant_loser_{tag}@{pnl_percentage:.2f}%"
                             f"_peak{peak_pct:.2f}%_age{age_minutes:.0f}m"
@@ -5483,37 +6561,48 @@ class TradingOrchestrator:
                 )
 
             # Guard each pair check so one long timeout (e.g., external signal API) doesn't
-            # hold up the rest of this exchange's queue. Under a global loop deadline, cap per-pair
-            # wait so we can scan more pairs within max_cycle_duration.
+            # hold up the rest of this exchange's queue. Pairs run in parallel with a
+            # bounded semaphore so strategy-service load stays predictable.
             pair_timeout_base = self._loop_spot_entry_pair_timeout_seconds
-            for pair in scan_pairs:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        logger.warning(
-                            "[EntryCycle] %s: wall budget exhausted before pair %s; stopping exchange queue",
-                            exchange_name,
-                            pair,
+            entry_conc = max(1, min(int(self._loop_spot_entry_check_concurrency or 8), 32))
+            entry_sem = asyncio.Semaphore(entry_conc)
+            logger.info(
+                "[EntryCycle] %s: scanning %d pairs with concurrency=%d timeout=%.0fs",
+                exchange_name,
+                len(scan_pairs),
+                entry_conc,
+                pair_timeout_base,
+            )
+
+            async def _check_one_pair(pair: str) -> None:
+                async with entry_sem:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return
+                        pair_timeout_seconds = min(pair_timeout_base, max(1.0, remaining))
+                    else:
+                        pair_timeout_seconds = pair_timeout_base
+                    try:
+                        await asyncio.wait_for(
+                            self._check_pair_entry(exchange_name, pair),
+                            timeout=pair_timeout_seconds,
                         )
-                        return
-                    pair_timeout_seconds = min(pair_timeout_base, max(5.0, remaining))
-                else:
-                    pair_timeout_seconds = pair_timeout_base
-                try:
-                    await asyncio.wait_for(
-                        self._check_pair_entry(exchange_name, pair),
-                        timeout=pair_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[EntryCycle] Timeout after {pair_timeout_seconds}s for "
-                        f"{pair} on {exchange_name}; skipping pair"
-                    )
-                except Exception as pair_error:
-                    logger.error(
-                        f"[EntryCycle] Pair processing error for {pair} on "
-                        f"{exchange_name}: {pair_error}"
-                    )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[EntryCycle] Timeout after {pair_timeout_seconds}s for "
+                            f"{pair} on {exchange_name}; skipping pair"
+                        )
+                    except Exception as pair_error:
+                        logger.error(
+                            f"[EntryCycle] Pair processing error for {pair} on "
+                            f"{exchange_name}: {pair_error}"
+                        )
+
+            await asyncio.gather(
+                *(_check_one_pair(pair) for pair in scan_pairs),
+                return_exceptions=True,
+            )
         except Exception as e:
             logger.error(f"[EntryCycle] Exchange cycle error for {exchange_name}: {e}")
 
@@ -5975,54 +7064,236 @@ class TradingOrchestrator:
             if str(dex).strip()
         ]
 
-    async def _fetch_hyperliquid_mids(self) -> Dict[str, float]:
-        """Fetch live Hyperliquid perp mids. Read-only, no wallet/order side effects."""
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+    def _hyperliquid_mids_ws_subscriptions(self) -> List[Dict[str, Any]]:
+        subscriptions: List[Dict[str, Any]] = [{"type": "allMids"}]
+        for dex in self._hyperliquid_tradfi_dexes():
+            subscriptions.append({"type": "allMids", "dex": dex})
+        return subscriptions
+
+    def _parse_hyperliquid_mids_payload(self, payload: Any) -> Dict[str, float]:
+        data = payload
+        if isinstance(data, dict) and data.get("channel") == "allMids":
+            data = data.get("data") or {}
+        if isinstance(data, dict) and isinstance(data.get("mids"), dict):
+            data = data.get("mids") or {}
+        if not isinstance(data, dict):
+            return {}
+
+        mids: Dict[str, float] = {}
+        for coin, raw_price in data.items():
+            coin_key = str(coin or "").strip()
+            if not coin_key or coin_key.startswith("@"):
+                continue
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    requests = [{"type": "allMids"}]
-                    requests.extend(
-                        {"type": "allMids", "dex": dex}
-                        for dex in self._hyperliquid_tradfi_dexes()
-                    )
-                    payloads = []
-                    for req in requests:
-                        response = await client.post(
-                            "https://api.hyperliquid.xyz/info",
-                            json=req,
+                price = float(raw_price)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                mids[pair_to_hyperliquid_coin(coin_key)] = price
+        return mids
+
+    def _update_hyperliquid_mids_cache(
+        self,
+        mids: Dict[str, float],
+        *,
+        source: str,
+    ) -> None:
+        if not mids:
+            return
+        self._hyperliquid_mids_cache.update(mids)
+        self._hyperliquid_mids_cached_at = time.monotonic()
+        if source == "websocket":
+            self._hyperliquid_mids_ws_last_message_at = self._hyperliquid_mids_cached_at
+
+    def _hyperliquid_mids_status(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        cached_at = float(self._hyperliquid_mids_cached_at or 0.0)
+        ws_at = float(self._hyperliquid_mids_ws_last_message_at or 0.0)
+        cache_age = None if cached_at <= 0 else round(now - cached_at, 3)
+        ws_age = None if ws_at <= 0 else round(now - ws_at, 3)
+        return {
+            "source": (
+                "websocket"
+                if self._hyperliquid_mids_ws_connected
+                and ws_age is not None
+                and ws_age <= self._hyperliquid_mids_ws_fresh_seconds
+                else "cache_or_rest"
+            ),
+            "websocketConnected": self._hyperliquid_mids_ws_connected,
+            "websocketAgeSeconds": ws_age,
+            "cacheAgeSeconds": cache_age,
+            "cachedCount": len(self._hyperliquid_mids_cache),
+            "freshSeconds": self._hyperliquid_mids_ws_fresh_seconds,
+        }
+
+    async def _hyperliquid_mids_ws_loop(self) -> None:
+        if websockets is None:
+            logger.warning(
+                "[HyperliquidPaper] WebSocket mids disabled: websockets package unavailable"
+            )
+            return
+
+        backoff_seconds = 1.0
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self._hyperliquid_mids_ws_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    max_queue=16,
+                ) as ws:
+                    self._hyperliquid_mids_ws_connected = True
+                    backoff_seconds = 1.0
+                    subscriptions = self._hyperliquid_mids_ws_subscriptions()
+                    for sub in subscriptions:
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "method": "subscribe",
+                                    "subscription": sub,
+                                }
+                            )
                         )
-                        response.raise_for_status()
-                        payloads.append(response.json() or {})
-                mids: Dict[str, float] = {}
-                for data in payloads:
-                    if isinstance(data, dict):
-                        for coin, raw_price in data.items():
-                            try:
-                                price = float(raw_price)
-                            except (TypeError, ValueError):
-                                continue
-                            if price > 0:
-                                mids[pair_to_hyperliquid_coin(str(coin))] = price
-                return mids
-            except httpx.HTTPStatusError as e:
-                status_code = e.response.status_code if e.response else None
-                if status_code == 429 and attempt < max_attempts:
-                    delay = min(2.0, 0.5 * attempt)
-                    logger.warning(
-                        "[HyperliquidPaper] Hyperliquid mids rate-limited; "
-                        "retrying in %.1fs (%d/%d)",
-                        delay,
-                        attempt,
-                        max_attempts,
+                    logger.info(
+                        "[HyperliquidPaper] WebSocket mids connected subscriptions=%s",
+                        subscriptions,
                     )
-                    await asyncio.sleep(delay)
-                    continue
+
+                    async for message in ws:
+                        try:
+                            payload = json.loads(message)
+                        except (TypeError, ValueError):
+                            continue
+                        mids = self._parse_hyperliquid_mids_payload(payload)
+                        if mids:
+                            self._update_hyperliquid_mids_cache(
+                                mids,
+                                source="websocket",
+                            )
+                            logger.debug(
+                                "[HyperliquidPaper] WebSocket mids update count=%d",
+                                len(mids),
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._hyperliquid_mids_ws_connected = False
+                if self.running:
+                    logger.warning(
+                        "[HyperliquidPaper] WebSocket mids disconnected: %s; reconnecting in %.1fs",
+                        exc,
+                        backoff_seconds,
+                    )
+                    await asyncio.sleep(backoff_seconds)
+                    backoff_seconds = min(30.0, backoff_seconds * 2.0)
+            finally:
+                self._hyperliquid_mids_ws_connected = False
+
+    def _ensure_hyperliquid_mids_ws_task(self) -> None:
+        cfg = self._hyperliquid_perps_cfg()
+        ws_cfg = cfg.get("mids_websocket") or {}
+        enabled = ws_cfg.get("enabled", True)
+        if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+            return
+        url = str(ws_cfg.get("url") or self._hyperliquid_mids_ws_url or "").strip()
+        if url:
+            self._hyperliquid_mids_ws_url = url
+        try:
+            self._hyperliquid_mids_ws_fresh_seconds = float(
+                ws_cfg.get("fresh_seconds", self._hyperliquid_mids_ws_fresh_seconds)
+                or self._hyperliquid_mids_ws_fresh_seconds
+            )
+        except (TypeError, ValueError):
+            pass
+        if self._hyperliquid_mids_ws_task and not self._hyperliquid_mids_ws_task.done():
+            return
+        self._hyperliquid_mids_ws_task = asyncio.create_task(
+            self._hyperliquid_mids_ws_loop()
+        )
+
+    async def _stop_hyperliquid_mids_ws_task(self) -> None:
+        task = self._hyperliquid_mids_ws_task
+        self._hyperliquid_mids_ws_task = None
+        self._hyperliquid_mids_ws_connected = False
+        if not task or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _fetch_hyperliquid_mids_uncached(self) -> Dict[str, float]:
+        """Fetch live Hyperliquid perp mids once. Read-only, no wallet/order side effects."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            requests = [{"type": "allMids"}]
+            requests.extend(
+                {"type": "allMids", "dex": dex}
+                for dex in self._hyperliquid_tradfi_dexes()
+            )
+            payloads = []
+            for req in requests:
+                response = await client.post(
+                    "https://api.hyperliquid.xyz/info",
+                    json=req,
+                )
+                response.raise_for_status()
+                payloads.append(response.json() or {})
+        mids: Dict[str, float] = {}
+        for data in payloads:
+            mids.update(self._parse_hyperliquid_mids_payload(data))
+        return mids
+
+    async def _fetch_hyperliquid_mids(self, *, allow_stale: bool = True) -> Dict[str, float]:
+        """Fetch Hyperliquid mids with websocket-first cache and REST fallback."""
+        self._ensure_hyperliquid_mids_ws_task()
+        now = time.monotonic()
+        cache_age = now - float(self._hyperliquid_mids_cached_at or 0.0)
+        ws_age = now - float(self._hyperliquid_mids_ws_last_message_at or 0.0)
+        if (
+            self._hyperliquid_mids_cache
+            and self._hyperliquid_mids_ws_connected
+            and ws_age <= self._hyperliquid_mids_ws_fresh_seconds
+        ):
+            return dict(self._hyperliquid_mids_cache)
+        if self._hyperliquid_mids_cache and cache_age < self._hyperliquid_mids_min_interval_seconds:
+            return dict(self._hyperliquid_mids_cache)
+
+        task = self._hyperliquid_mids_fetch_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._fetch_hyperliquid_mids_uncached())
+            self._hyperliquid_mids_fetch_task = task
+        else:
+            logger.debug("[HyperliquidPaper] Joining in-flight Hyperliquid mids fetch")
+
+        try:
+            mids = await task
+            if mids:
+                self._update_hyperliquid_mids_cache(mids, source="rest")
+                return dict(self._hyperliquid_mids_cache)
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code if e.response else None
+            if status_code == 429:
+                logger.warning(
+                    "[HyperliquidPaper] Hyperliquid mids rate-limited; using cached mids if available"
+                )
+            else:
                 logger.warning("[HyperliquidPaper] Could not fetch live mids: %s", e)
-                return {}
-            except Exception as e:
-                logger.warning("[HyperliquidPaper] Could not fetch live mids: %s", e)
-                return {}
+        except Exception as e:
+            logger.warning("[HyperliquidPaper] Could not fetch live mids: %s", e)
+        finally:
+            if self._hyperliquid_mids_fetch_task is task and task.done():
+                self._hyperliquid_mids_fetch_task = None
+
+        cache_age = time.monotonic() - float(self._hyperliquid_mids_cached_at or 0.0)
+        if allow_stale and self._hyperliquid_mids_cache and cache_age <= self._hyperliquid_mids_stale_fallback_seconds:
+            logger.warning(
+                "[HyperliquidPaper] Falling back to cached Hyperliquid mids age=%.1fs count=%d",
+                cache_age,
+                len(self._hyperliquid_mids_cache),
+            )
+            return dict(self._hyperliquid_mids_cache)
         return {}
 
     async def _run_hyperliquid_perps_cycle(self, deadline: Optional[float] = None) -> None:
@@ -6046,8 +7317,9 @@ class TradingOrchestrator:
             return
         mode = str(cfg.get("mode", "paper")).lower()
 
+        mids = await self._fetch_hyperliquid_mids()
         try:
-            await self._refresh_hyperliquid_pair_selections(cfg)
+            await self._refresh_hyperliquid_pair_selections(cfg, mids=mids)
             await self._refresh_hyperliquid_balance(cfg)
         except Exception as e:
             self._mark_cycle_phase_started("perp_exit_update")
@@ -6056,7 +7328,6 @@ class TradingOrchestrator:
             self._finish_cycle_phase("perp_entry", status="error", error=e)
             raise
 
-        mids = await self._fetch_hyperliquid_mids()
         if not mids:
             self._mark_cycle_phase_started("perp_exit_update")
             self._finish_cycle_phase(
@@ -6171,7 +7442,7 @@ class TradingOrchestrator:
 
         self._mark_cycle_phase_started("perp_exit_update")
         try:
-            await self._update_hyperliquid_paper_positions(mids, cfg)
+            await self._run_hyperliquid_paper_exit_sweep(mids, cfg, source="main")
             self._finish_cycle_phase(
                 "perp_exit_update",
                 status="completed",
@@ -6256,6 +7527,7 @@ class TradingOrchestrator:
         self,
         cfg: Dict[str, Any],
         blocked_coins: List[str],
+        mids: Optional[Dict[str, float]] = None,
     ) -> None:
         """Persist signal snapshots for blocked HL coins without allowing entries."""
         if not blocked_coins:
@@ -6308,6 +7580,36 @@ class TradingOrchestrator:
                     if closed_resp.status_code == 200
                     else []
                 )
+                shadow_open_trade_ids: Set[str] = set()
+                shadow_fingerprints: Set[str] = set()
+                shadow_open_keys: Set[Tuple[str, str, str]] = set()
+                shadow_history_resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={
+                        "include_accounting_excluded": True,
+                        "shadow_only": True,
+                        "limit": 1000,
+                    },
+                )
+                if shadow_history_resp.status_code == 200:
+                    for row in (shadow_history_resp.json() or {}).get("trades", []) or []:
+                        metadata = self._adaptive_trade_metadata(row)
+                        if not bool(metadata.get("shadow_trade")):
+                            continue
+                        fingerprint = str(metadata.get("shadow_signal_fingerprint") or "")
+                        if fingerprint:
+                            shadow_fingerprints.add(fingerprint)
+                        if str(row.get("status") or "").upper() == "OPEN":
+                            trade_id = str(row.get("trade_id") or "")
+                            if trade_id:
+                                shadow_open_trade_ids.add(trade_id)
+                            shadow_open_keys.add(
+                                (
+                                    pair_to_hyperliquid_coin(str(row.get("coin") or "")),
+                                    str(row.get("source_strategy") or "").strip().lower(),
+                                    str(row.get("position_side") or "").strip().lower(),
+                                )
+                            )
                 open_keys = {
                     (
                         pair_to_hyperliquid_coin(str(t.get("coin") or "")),
@@ -6349,7 +7651,7 @@ class TradingOrchestrator:
                                 f"{strategy_service_url}/api/v1/signals/"
                                 f"{spot_ex}/{spot_pair.replace('/', '')}"
                             )
-                        signals_resp = await client.get(signals_url, timeout=90.0)
+                        signals_resp = await client.get(signals_url, timeout=8.0)
                         if signals_resp.status_code != 200:
                             logger.debug(
                                 "[HyperliquidPaper] Blocked diagnostic signal fetch failed %s: %s",
@@ -6368,7 +7670,38 @@ class TradingOrchestrator:
                         self._hyperliquid_blocked_signal_diagnostic_at[coin] = now
                         continue
 
-                    mirrored = select_mirrored_signal(signals_data)
+                    shadow_price = float((mids or {}).get(coin) or 0.0)
+                    if shadow_price > 0:
+                        shadow_records = await self._record_hyperliquid_shadow_trades(
+                            client,
+                            coin=coin,
+                            price=shadow_price,
+                            signals_data=signals_data,
+                            cfg=cfg,
+                            shadow_open_trade_ids=shadow_open_trade_ids,
+                            shadow_fingerprints=shadow_fingerprints,
+                            shadow_open_keys=shadow_open_keys,
+                        )
+                        await self._finalize_hyperliquid_shadow_dispositions(
+                            client,
+                            shadow_records,
+                            None,
+                            outcome="blocked_pre_signal",
+                            primary_reason=str(
+                                block.get("entryBlockReason") or "runtime_coin_block"
+                            ),
+                            message=str(block.get("entryBlockMessage") or ""),
+                            gate_trace=[
+                                {
+                                    "step": "runtime_coin_block",
+                                    "passed": False,
+                                    "message": str(block.get("entryBlockMessage") or ""),
+                                }
+                            ],
+                            apply_outcome_to_all=True,
+                        )
+
+                    mirrored = select_mirrored_signal(signals_data, cfg)
                     side = position_sides_from_signal((mirrored or {}).get("signal"))
                     signal_gate_reason = "no_actionable_signal"
                     signal_gate_pass = False
@@ -6457,13 +7790,21 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning("[HyperliquidPaper] Blocked signal diagnostics skipped: %s", e)
 
-    async def _refresh_hyperliquid_pair_selections(self, cfg: Dict[str, Any]) -> None:
+    async def _refresh_hyperliquid_pair_selections(
+        self,
+        cfg: Dict[str, Any],
+        mids: Optional[Dict[str, float]] = None,
+    ) -> None:
         """Run HL-native pair selector and persist to database (exchange=hyperliquid)."""
         global_selector = ((self._config or {}).get("pair_selector") or {}) if hasattr(self, "_config") else {}
         sel_interval = int((cfg.get("pair_selector") or {}).get("update_interval_minutes", 15) or 15)
         now = datetime.utcnow()
         runtime_blocked_coins = await self._hyperliquid_runtime_blocked_coins(cfg)
-        await self._record_hyperliquid_blocked_signal_diagnostics(cfg, runtime_blocked_coins)
+        await self._record_hyperliquid_blocked_signal_diagnostics(
+            cfg,
+            runtime_blocked_coins,
+            mids=mids,
+        )
         selector_signature = json.dumps(
             {
                 "pair_selector": cfg.get("pair_selector") or {},
@@ -6582,8 +7923,17 @@ class TradingOrchestrator:
             if state == "waiting_retest" and self._row_bool(row, "breakout_valid"):
                 return True
             signal_value = str(row.get("signal") or "").strip().lower()
+            direction = str(row.get("direction") or "").strip().lower()
             if state == "signal" and signal_value in {"buy", "sell", "long", "short"}:
                 return self._row_bool(row, "breakout_valid") and self._row_bool(row, "retest_valid")
+            if (
+                state == "signal"
+                and signal_value in {"hold", ""}
+                and direction in {"long", "short"}
+                and self._row_bool(row, "breakout_valid")
+                and self._row_bool(row, "retest_valid")
+            ):
+                return True
             return False
         signal_value = str(
             row.get("signal") or row.get("entry_signal_5m") or ""
@@ -6670,6 +8020,216 @@ class TradingOrchestrator:
                 result,
             )
         return result
+
+    async def _hyperliquid_shadow_promoted_candidate_coins(
+        self, cfg: Dict[str, Any]
+    ) -> List[str]:
+        """Coins from strong shadow cohorts that deserve a live entry scan.
+
+        Shadow rows are counterfactual evidence, not orders. This only expands
+        the scan universe; current strategy signals and all executable gates
+        still decide whether a position can open.
+        """
+        promotion_cfg = cfg.get("shadow_cohort_promotion") or {}
+        if promotion_cfg.get("enabled", False) is False:
+            return []
+
+        lookback_hours = float(promotion_cfg.get("lookback_hours", 72) or 72)
+        min_closed = int(promotion_cfg.get("min_closed", 10) or 10)
+        min_episodes = int(promotion_cfg.get("min_episodes", min_closed) or min_closed)
+        use_episode_metrics = promotion_cfg.get("use_episode_metrics", True)
+        use_episode_metrics = use_episode_metrics is not False and str(
+            use_episode_metrics
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        min_win_rate = float(promotion_cfg.get("min_win_rate", 0.70) or 0.70)
+        min_realized = float(promotion_cfg.get("min_realized_pnl_usd", 10.0) or 10.0)
+        max_candidates = int(promotion_cfg.get("max_candidates", 12) or 12)
+        limit = int(promotion_cfg.get("fetch_limit", 1000) or 1000)
+        strategies = {
+            str(value or "").strip().lower()
+            for value in (promotion_cfg.get("strategies") or [])
+            if str(value or "").strip()
+        }
+        sides = {
+            str(value or "").strip().lower()
+            for value in (promotion_cfg.get("sides") or [])
+            if str(value or "").strip()
+        }
+        regimes = {
+            str(value or "").strip().lower()
+            for value in (promotion_cfg.get("regimes") or [])
+            if str(value or "").strip()
+        }
+
+        cutoff = datetime.utcnow() - timedelta(hours=max(1.0, min(lookback_hours, 720.0)))
+        cohorts: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={
+                        "include_accounting_excluded": True,
+                        "shadow_only": True,
+                        "status": "CLOSED",
+                        "limit": max(1, min(limit, 5000)),
+                    },
+                )
+            if resp.status_code != 200:
+                logger.debug(
+                    "[HyperliquidPaper] Shadow promotion fetch failed: HTTP %s",
+                    resp.status_code,
+                )
+                return []
+            rows = (resp.json() or {}).get("trades") or []
+            if use_episode_metrics:
+                try:
+                    from core.shadow_episode_summary import (
+                        shadow_promotion_cohorts_from_trades,
+                    )
+                except ImportError:
+                    from shadow_episode_summary import (
+                        shadow_promotion_cohorts_from_trades,
+                    )
+                cohorts = shadow_promotion_cohorts_from_trades(rows, cutoff=cutoff)
+            else:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    exit_raw = row.get("exit_time") or row.get("updated_at")
+                    try:
+                        exit_time = datetime.fromisoformat(
+                            str(exit_raw).replace("Z", "+00:00")
+                        )
+                        if exit_time.tzinfo is not None:
+                            exit_time = exit_time.replace(tzinfo=None)
+                    except Exception:
+                        continue
+                    if exit_time < cutoff:
+                        continue
+
+                    metadata = self._adaptive_trade_metadata(row)
+                    coin = pair_to_hyperliquid_coin(str(row.get("coin") or ""))
+                    strategy = str(row.get("source_strategy") or "").strip().lower()
+                    side = str(row.get("position_side") or "").strip().lower()
+                    regime = str(metadata.get("market_regime") or "").strip().lower()
+                    if not coin or not strategy or side not in {"long", "short"}:
+                        continue
+                    key = (coin, strategy, side, regime)
+                    cohort = cohorts.setdefault(
+                        key,
+                        {
+                            "coin": coin,
+                            "strategy": strategy,
+                            "side": side,
+                            "regime": regime,
+                            "episodes": 0,
+                            "closed": 0,
+                            "wins": 0,
+                            "realized": 0.0,
+                            "last_exit": exit_time,
+                        },
+                    )
+                    pnl = 0.0
+                    try:
+                        pnl = float(row.get("realized_pnl") or 0.0)
+                    except (TypeError, ValueError):
+                        pnl = 0.0
+                    cohort["closed"] += 1
+                    cohort["episodes"] = int(cohort.get("closed") or 0)
+                    if pnl > 0:
+                        cohort["wins"] += 1
+                    cohort["realized"] += pnl
+                    if exit_time > cohort["last_exit"]:
+                        cohort["last_exit"] = exit_time
+        except Exception as exc:
+            logger.warning("[HyperliquidPaper] Shadow promotion scan skipped: %s", exc)
+            return []
+
+        eligible = []
+        for cohort in cohorts.values():
+            strategy = str(cohort.get("strategy") or "").strip().lower()
+            side = str(cohort.get("side") or "").strip().lower()
+            regime = str(cohort.get("regime") or "").strip().lower()
+            if strategies and strategy not in strategies:
+                continue
+            if sides and side not in sides:
+                continue
+            if regimes and regime not in regimes:
+                continue
+            sample_count = int(
+                cohort.get("episodes") if use_episode_metrics else cohort.get("closed") or 0
+            )
+            min_sample = min_episodes if use_episode_metrics else min_closed
+            if sample_count <= 0:
+                continue
+            win_rate = float(cohort.get("wins") or 0) / float(sample_count)
+            realized = float(cohort.get("realized") or 0.0)
+            if sample_count < min_sample or win_rate < min_win_rate or realized < min_realized:
+                continue
+            eligible.append(
+                {
+                    **cohort,
+                    "closed": sample_count,
+                    "win_rate": win_rate,
+                }
+            )
+
+        eligible.sort(
+            key=lambda item: (
+                float(item.get("realized") or 0.0),
+                float(item.get("win_rate") or 0.0),
+                int(item.get("closed") or 0),
+            ),
+            reverse=True,
+        )
+        self._hyperliquid_shadow_promoted_cohorts = {}
+        for item in eligible[:max_candidates]:
+            coin_key = pair_to_hyperliquid_coin(str(item.get("coin") or ""))
+            if not coin_key:
+                continue
+            self._hyperliquid_shadow_promoted_cohorts.setdefault(coin_key, []).append(
+                {
+                    "coin": coin_key,
+                    "strategy": str(item.get("strategy") or "").strip().lower(),
+                    "side": str(item.get("side") or "").strip().lower(),
+                    "regime": str(item.get("regime") or "").strip().lower(),
+                    "closed": int(item.get("closed") or 0),
+                    "win_rate": float(item.get("win_rate") or 0.0),
+                    "realized": float(item.get("realized") or 0.0),
+                }
+            )
+        result = self._merge_hyperliquid_coins(
+            [str(item["coin"]) for item in eligible[:max_candidates]]
+        )
+        if result:
+            summary = [
+                (
+                    f"{item['coin']} {item['strategy']} {item['side']} "
+                    f"{item['regime']} n={item['closed']} "
+                    f"wr={item['win_rate'] * 100:.1f}% pnl={item['realized']:.2f}"
+                )
+                for item in eligible[:max_candidates]
+            ]
+            logger.warning(
+                "[HyperliquidPaper] Adding shadow-promoted candidates to entry scan: %s",
+                summary,
+            )
+        return result
+
+    def _hyperliquid_shadow_promotion_requirement(
+        self,
+        coin: str,
+        mirrored: Optional[Dict[str, Any]],
+        signals_data: Optional[Dict[str, Any]],
+        cfg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return hyperliquid_shadow_promotion_requirement(
+            coin,
+            mirrored,
+            str((signals_data or {}).get("market_regime") or ""),
+            cfg,
+            self._hyperliquid_shadow_promoted_cohorts,
+        )
 
     async def _finish_hyperliquid_global_skip(
         self,
@@ -6775,6 +8335,251 @@ class TradingOrchestrator:
             logger.warning("[HyperliquidPaper] balance lookup failed: %s", exc)
             return None
 
+    @staticmethod
+    def _hyperliquid_shadow_fingerprint(
+        coin: str,
+        candidate: Dict[str, Any],
+    ) -> str:
+        """Stable identity for one strategy setup so repeated scans do not duplicate it."""
+        details = (candidate or {}).get("details") or {}
+        state = details.get("state") or {} if isinstance(details, dict) else {}
+        indicators = state.get("indicators") or {} if isinstance(state, dict) else {}
+        setup = setup_risk_metadata_from_signal(candidate)
+        strategy = str(candidate.get("strategy") or "").strip().lower()
+        retest_zone = indicators.get("retest_zone") or {}
+        if not isinstance(retest_zone, dict):
+            retest_zone = {}
+        # Supply/demand signals can remain directional for many scans while the
+        # same zone is being retested. Anchor their identity to the zone rather
+        # than the latest scan/candle timestamp so one market episode is sampled
+        # once. Other strategies keep their closed-candle identity.
+        setup_anchor: Any
+        if strategy == "supply_demand_3step" and retest_zone:
+            setup_anchor = {
+                "kind": retest_zone.get("kind"),
+                "timestamp": retest_zone.get("timestamp"),
+                "zone_high": retest_zone.get("zone_high"),
+                "zone_low": retest_zone.get("zone_low"),
+                "bar_index": retest_zone.get("bar_index"),
+                "impulse_bar_index": retest_zone.get("impulse_bar_index"),
+            }
+        else:
+            setup_anchor = (
+                indicators.get("candle_ts")
+                or indicators.get("bar_timestamp")
+                or indicators.get("signal_candle_ts")
+                or details.get("candle_ts")
+                or details.get("timestamp")
+                or state.get("timestamp")
+            )
+        identity = {
+            "coin": pair_to_hyperliquid_coin(coin),
+            "strategy": strategy,
+            "side": position_sides_from_signal(candidate.get("signal")),
+            "setup_anchor": setup_anchor,
+            "entry": setup.get("entry_price") or indicators.get("entry_price"),
+            "stop": setup.get("stop_hint") or setup.get("stop_pct"),
+            "target": setup.get("target_hint") or setup.get("target_pct"),
+            "reason": indicators.get("entry_reason") or state.get("entry_reason"),
+        }
+        stable = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, stable))
+
+    async def _record_hyperliquid_shadow_trades(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        coin: str,
+        price: float,
+        signals_data: Dict[str, Any],
+        cfg: Dict[str, Any],
+        shadow_open_trade_ids: Set[str],
+        shadow_fingerprints: Set[str],
+        shadow_open_keys: Set[Tuple[str, str, str]],
+    ) -> List[Dict[str, Any]]:
+        """Persist normalized, accounting-excluded positions for all eligible strategies."""
+        shadow_cfg = (cfg.get("shadow_strategy_evaluation") or {})
+        candidates = eligible_shadow_strategy_signals(signals_data, cfg)
+        if not candidates:
+            return []
+        notional = max(1.0, float(shadow_cfg.get("notional_size", 200.0) or 200.0))
+        leverage = max(1.0, float(shadow_cfg.get("leverage", 1.0) or 1.0))
+        max_open = max(1, int(shadow_cfg.get("max_open_positions", 500) or 500))
+        single_open_per_key = shadow_cfg.get(
+            "single_open_per_strategy_coin_side", True
+        )
+        single_open_per_key = single_open_per_key is not False and str(
+            single_open_per_key
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
+        consensus = (signals_data or {}).get("consensus") or {}
+        recorded: List[Dict[str, Any]] = []
+
+        for candidate in candidates:
+            if len(shadow_open_trade_ids) >= max_open:
+                break
+            strategy = str(candidate.get("strategy") or "").strip().lower()
+            side = position_sides_from_signal(candidate.get("signal"))
+            open_key = (pair_to_hyperliquid_coin(coin), strategy, str(side or ""))
+            if single_open_per_key and open_key in shadow_open_keys:
+                continue
+            fingerprint = self._hyperliquid_shadow_fingerprint(coin, candidate)
+            if fingerprint in shadow_fingerprints:
+                continue
+            entry_fee = perp_side_fee(notional, fee_rate)
+            setup_risk = setup_risk_metadata_from_signal(candidate)
+            trade_id = str(uuid.uuid4())
+            metadata = {
+                "accounting_excluded": True,
+                "shadow_trade": True,
+                "shadow_version": 2,
+                "shadow_exit_policy_version": 2,
+                "shadow_portfolio_exits_excluded": True,
+                "shadow_signal_fingerprint": fingerprint,
+                "shadow_gate": candidate.get("shadow_gate"),
+                "shadow_gate_reason": candidate.get("shadow_gate_reason"),
+                "shadow_edge_reason": candidate.get("shadow_edge_reason"),
+                "shadow_edge_passed": candidate.get("shadow_edge_passed"),
+                "expected_move_pct": candidate.get("expected_move_pct"),
+                "market_regime": signals_data.get("market_regime"),
+                "stable_regime": signals_data.get("stable_regime"),
+                "setup_risk": setup_risk,
+                "real_execution_status": "pending",
+                "downstream_block_reason": None,
+                "downstream_block_message": None,
+                "downstream_gate_trace": [],
+            }
+            payload = {
+                "trade_id": trade_id,
+                "venue": "hyperliquid",
+                "coin": coin,
+                "pair": f"{coin}/USD-PERP",
+                "source_exchange": "hyperliquid",
+                "source_pair": f"{coin}/USD-PERP",
+                "source_strategy": strategy,
+                "source_signal": candidate.get("signal"),
+                "position_side": side,
+                "leverage": leverage,
+                "margin_used": notional / leverage,
+                "notional_size": notional,
+                "position_size": notional / price,
+                "entry_price": price,
+                "current_price": price,
+                "status": "OPEN",
+                "entry_time": datetime.utcnow().isoformat() + "+00:00",
+                "unrealized_pnl": -entry_fee,
+                "realized_pnl": 0.0,
+                "fees": entry_fee,
+                "funding": 0.0,
+                "confidence": float(candidate.get("confidence") or 0.0),
+                "strength": float(candidate.get("strength") or 0.0),
+                "consensus_confidence": float(consensus.get("confidence") or 0.0),
+                "consensus_agreement": float(consensus.get("agreement") or 0.0),
+                "mode": "shadow",
+                "metadata": metadata,
+            }
+            response = await client.post(
+                f"{database_service_url}/api/v1/perps/paper-trades",
+                json=payload,
+            )
+            if response.status_code in (200, 201):
+                shadow_open_trade_ids.add(trade_id)
+                shadow_fingerprints.add(fingerprint)
+                shadow_open_keys.add(open_key)
+                recorded.append(
+                    {
+                        "trade_id": trade_id,
+                        "strategy": strategy,
+                        "side": side,
+                        "fingerprint": fingerprint,
+                        "metadata": metadata,
+                    }
+                )
+                logger.info(
+                    "[HyperliquidShadow] Opened %s %s strategy=%s notional=%.2f",
+                    side,
+                    coin,
+                    strategy,
+                    notional,
+                )
+            else:
+                logger.warning(
+                    "[HyperliquidShadow] DB create failed %s %s strategy=%s: %s %s",
+                    side,
+                    coin,
+                    strategy,
+                    response.status_code,
+                    _http_response_log_snippet(response),
+                )
+        return recorded
+
+    async def _finalize_hyperliquid_shadow_dispositions(
+        self,
+        client: httpx.AsyncClient,
+        records: List[Dict[str, Any]],
+        selected: Optional[Dict[str, Any]],
+        *,
+        outcome: str,
+        primary_reason: str,
+        message: str = "",
+        gate_trace: Optional[List[Dict[str, Any]]] = None,
+        apply_outcome_to_all: bool = False,
+    ) -> None:
+        """Attach the real execution decision to every shadow opportunity."""
+        if not records:
+            return
+        selected_strategy = str((selected or {}).get("strategy") or "").strip().lower()
+        selected_side = position_sides_from_signal((selected or {}).get("signal"))
+        executed = str(outcome or "").lower() == "entered"
+        observed_at = datetime.utcnow().isoformat() + "+00:00"
+        for record in records:
+            is_selected = (
+                bool(selected_strategy)
+                and record.get("strategy") == selected_strategy
+                and record.get("side") == selected_side
+            )
+            if apply_outcome_to_all or is_selected:
+                execution_status = "executed" if executed else "blocked"
+                block_reason = None if executed else (primary_reason or "unknown_block")
+                block_message = None if executed else (message or block_reason)
+            else:
+                execution_status = "not_selected"
+                block_reason = "cross_strategy_selection"
+                block_message = (
+                    f"Executable lane selected {selected_strategy or 'no strategy'}"
+                )
+            metadata = dict(record.get("metadata") or {})
+            metadata.update(
+                {
+                    "real_execution_status": execution_status,
+                    "downstream_block_reason": block_reason,
+                    "downstream_block_message": block_message,
+                    "downstream_gate_trace": list(gate_trace or []),
+                    "real_execution_observed_at": observed_at,
+                    "real_selected_strategy": selected_strategy or None,
+                    "real_selected_side": selected_side,
+                }
+            )
+            try:
+                response = await client.put(
+                    f"{database_service_url}/api/v1/perps/paper-trades/{record.get('trade_id')}",
+                    json={"metadata": metadata},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[HyperliquidShadow] Disposition update failed trade=%s: %s",
+                    record.get("trade_id"),
+                    exc,
+                )
+                continue
+            if response.status_code != 200:
+                logger.warning(
+                    "[HyperliquidShadow] Disposition update failed trade=%s status=%s: %s",
+                    record.get("trade_id"),
+                    response.status_code,
+                    _http_response_log_snippet(response),
+                )
+
     async def _update_hyperliquid_paper_positions(self, mids: Dict[str, float], cfg: Dict[str, Any]) -> None:
         try:
             fee_rate = float(cfg.get("fee_rate_per_side", 0.001) or 0.001)
@@ -6786,6 +8591,30 @@ class TradingOrchestrator:
                     logger.warning("[HyperliquidPaper] open positions fetch failed: %s", open_resp.status_code)
                     return
                 open_trades = (open_resp.json() or {}).get("trades", []) or []
+                # Shadow (accounting-excluded) positions are exit-evaluated in the
+                # same pass as executable positions so the counterfactual reflects
+                # the same exit cadence the real entries would have had. Both the
+                # main cycle and the fast exit loop run this, serialized by
+                # _perp_exit_cycle_lock.
+                shadow_resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={
+                        "status": "OPEN",
+                        "include_accounting_excluded": True,
+                        "limit": 1000,
+                    },
+                )
+                if shadow_resp.status_code == 200:
+                    for candidate in (shadow_resp.json() or {}).get("trades", []) or []:
+                        metadata = self._adaptive_trade_metadata(candidate)
+                        if not bool(metadata.get("shadow_trade")):
+                            continue
+                        trade_id = str(candidate.get("trade_id") or "")
+                        if trade_id and not any(
+                            str(row.get("trade_id") or "") == trade_id
+                            for row in open_trades
+                        ):
+                            open_trades.append(candidate)
                 for trade in open_trades:
                     coin = pair_to_hyperliquid_coin(str(trade.get("coin") or ""))
                     current_price = mids.get(coin)
@@ -6796,13 +8625,11 @@ class TradingOrchestrator:
                     side = str(trade.get("position_side") or "long").lower()
                     fees = float(trade.get("fees") or 0.0) + float(trade.get("funding") or 0.0)
                     unrealized = calculate_perp_pnl(side, entry_price, current_price, size, fees)
-                    exit_reason = disabled_strategy_side_exit_reason(
-                        trade, self._config or {}
+                    exit_reason = portfolio_control_exit_reason(
+                        trade,
+                        self._config or {},
+                        cfg,
                     )
-                    if not exit_reason:
-                        exit_reason = adaptive_blocked_regime_side_exit_reason(
-                            trade, cfg
-                        )
                     if not exit_reason and use_strategy_exits and trade.get("source_strategy"):
                         try:
                             advice_resp = await client.post(
@@ -6927,9 +8754,12 @@ class TradingOrchestrator:
 
             selector_coins = list(self.hyperliquid_pair_selections or [])
             setup_candidate_coins = []
+            shadow_promoted_coins = []
             if signal_source == "hyperliquid_strategies" and not coin_filter:
                 setup_candidate_coins = await self._hyperliquid_fresh_setup_candidate_coins(cfg)
+                shadow_promoted_coins = await self._hyperliquid_shadow_promoted_candidate_coins(cfg)
             hl_coins = self._merge_hyperliquid_coins(
+                shadow_promoted_coins,
                 setup_candidate_coins,
                 selector_coins,
             )
@@ -6962,6 +8792,41 @@ class TradingOrchestrator:
                     if closed_resp.status_code == 200
                     else []
                 )
+                shadow_open_trade_ids: Set[str] = set()
+                shadow_fingerprints: Set[str] = set()
+                shadow_open_keys: Set[Tuple[str, str, str]] = set()
+                if execution_mode == "paper" and bool(
+                    (cfg.get("shadow_strategy_evaluation") or {}).get("enabled", False)
+                ):
+                    shadow_history_resp = await client.get(
+                        f"{database_service_url}/api/v1/perps/paper-trades",
+                        params={
+                            "include_accounting_excluded": True,
+                            "shadow_only": True,
+                            "limit": 1000,
+                        },
+                    )
+                    if shadow_history_resp.status_code == 200:
+                        for row in (shadow_history_resp.json() or {}).get("trades", []) or []:
+                            metadata = self._adaptive_trade_metadata(row)
+                            if not bool(metadata.get("shadow_trade")):
+                                continue
+                            fingerprint = str(
+                                metadata.get("shadow_signal_fingerprint") or ""
+                            )
+                            if fingerprint:
+                                shadow_fingerprints.add(fingerprint)
+                                if str(row.get("status") or "").upper() == "OPEN":
+                                    trade_id = str(row.get("trade_id") or "")
+                                    if trade_id:
+                                        shadow_open_trade_ids.add(trade_id)
+                                    shadow_open_keys.add(
+                                        (
+                                            pair_to_hyperliquid_coin(str(row.get("coin") or "")),
+                                            str(row.get("source_strategy") or "").strip().lower(),
+                                            str(row.get("position_side") or "").strip().lower(),
+                                        )
+                                    )
                 open_keys = {
                     (
                         pair_to_hyperliquid_coin(str(t.get("coin") or "")),
@@ -6969,15 +8834,12 @@ class TradingOrchestrator:
                     )
                     for t in (open_trades or [])
                 }
+                real_entry_block: Optional[Tuple[str, str]] = None
                 if len(open_trades or []) >= max_open:
-                    await self._finish_hyperliquid_global_skip(
-                        hl_coins,
-                        primary_reason="max_open_positions",
-                        message=(
-                            f"Max open positions reached: {len(open_trades or [])}/{max_open}"
-                        ),
+                    real_entry_block = (
+                        "max_open_positions",
+                        f"Max open positions reached: {len(open_trades or [])}/{max_open}",
                     )
-                    return
 
                 account_equity = float(cfg.get("starting_balance_usd", 5000.0) or 5000.0)
                 daily_halt = hyperliquid_daily_loss_halt(
@@ -6990,15 +8852,27 @@ class TradingOrchestrator:
                         float(daily_halt.get("limitUsd") or 0.0),
                         float(daily_halt.get("maxDailyLossPct") or 0.0) * 100.0,
                     )
-                    await self._finish_hyperliquid_global_skip(
-                        hl_coins,
-                        primary_reason="daily_loss_halt",
-                        message=(
+                    real_entry_block = (
+                        "daily_loss_halt",
+                        (
                             f"Daily loss halt active: pnl=${float(daily_halt.get('dailyPnl') or 0.0):.2f}, "
                             f"limit=${float(daily_halt.get('limitUsd') or 0.0):.2f}"
                         ),
                     )
-                    return
+                daily_target = hyperliquid_daily_profit_target_halt(closed_trades, cfg)
+                if daily_target.get("blocked"):
+                    logger.warning(
+                        "[HyperliquidPaper] Daily profit target reached: pnl=$%.2f target=$%.2f; blocking new entries",
+                        float(daily_target.get("dailyPnl") or 0.0),
+                        float(daily_target.get("targetUsd") or 0.0),
+                    )
+                    real_entry_block = (
+                        "daily_profit_target",
+                        (
+                            f"Daily profit target reached: pnl=${float(daily_target.get('dailyPnl') or 0.0):.2f}, "
+                            f"target=${float(daily_target.get('targetUsd') or 0.0):.2f}"
+                        ),
+                    )
 
                 trading_cfg: Dict[str, Any] = {}
                 try:
@@ -7012,10 +8886,83 @@ class TradingOrchestrator:
                     )
 
                 opened = 0
+                opened_by_strategy: Dict[str, int] = {}
+                prefetched_signals: Dict[str, Dict[str, Any]] = {}
+                if not fast_signal_by_coin:
+                    prefetch_conc = max(
+                        1, min(int(self._loop_perp_entry_check_concurrency or 8), 16)
+                    )
+                    prefetch_sem = asyncio.Semaphore(prefetch_conc)
+                    coin_filter_set = (
+                        {
+                            pair_to_hyperliquid_coin(str(c))
+                            for c in (coin_filter or [])
+                        }
+                        if coin_filter
+                        else None
+                    )
+
+                    async def _prefetch_hl_signals(coin_raw: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+                        coin_key = pair_to_hyperliquid_coin(str(coin_raw))
+                        if coin_filter_set is not None and coin_key not in coin_filter_set:
+                            return coin_key, None
+                        if deadline is not None and time.monotonic() >= deadline:
+                            return coin_key, None
+                        async with prefetch_sem:
+                            try:
+                                if signal_source == "hyperliquid_strategies":
+                                    signals_url = (
+                                        f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin_key}"
+                                    )
+                                else:
+                                    spot_ex, spot_pair = find_mirror_spot_pair(
+                                        coin_key, mirror_exchanges, self.pair_selections
+                                    )
+                                    if not spot_ex or not spot_pair:
+                                        return coin_key, None
+                                    strategy_pair = spot_pair.replace("/", "")
+                                    signals_url = (
+                                        f"{strategy_service_url}/api/v1/signals/"
+                                        f"{spot_ex}/{strategy_pair}"
+                                    )
+                                signals_resp = await client.get(signals_url, timeout=8.0)
+                                if signals_resp.status_code == 200:
+                                    payload = signals_resp.json()
+                                    if isinstance(payload, dict):
+                                        return coin_key, payload
+                            except Exception as prefetch_exc:
+                                logger.debug(
+                                    "[HyperliquidPaper] Prefetch signal failed for %s: %s",
+                                    coin_key,
+                                    prefetch_exc,
+                                )
+                        return coin_key, None
+
+                    logger.info(
+                        "[HyperliquidPaper] Prefetching entry signals for %d coins "
+                        "(concurrency=%d)",
+                        len(hl_coins),
+                        prefetch_conc,
+                    )
+                    prefetch_results = await asyncio.gather(
+                        *(_prefetch_hl_signals(c) for c in hl_coins),
+                        return_exceptions=True,
+                    )
+                    for item in prefetch_results:
+                        if (
+                            isinstance(item, tuple)
+                            and len(item) == 2
+                            and isinstance(item[1], dict)
+                        ):
+                            prefetched_signals[item[0]] = item[1]
+                    logger.info(
+                        "[HyperliquidPaper] Prefetched %d/%d coin signal payloads",
+                        len(prefetched_signals),
+                        len(hl_coins),
+                    )
+
                 for coin in hl_coins:
                     if deadline is not None and time.monotonic() >= deadline:
-                        return
-                    if len(open_trades or []) + opened >= max_open:
                         return
 
                     coin = pair_to_hyperliquid_coin(str(coin))
@@ -7077,58 +9024,115 @@ class TradingOrchestrator:
                             float(mirrored.get("confidence") or 0),
                         )
                     else:
-                        try:
-                            if signal_source == "hyperliquid_strategies":
-                                signals_url = (
-                                    f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin}"
-                                )
-                            else:
-                                spot_ex, spot_pair = find_mirror_spot_pair(
-                                    coin, mirror_exchanges, self.pair_selections
-                                )
-                                if not spot_ex or not spot_pair:
-                                    logger.debug(
-                                        "[HyperliquidPaper] No mirror spot pair for HL coin %s",
-                                        coin,
-                                    )
-                                    await recorder.finish(
-                                        outcome="not_scanned",
-                                        primary_reason="no_mirror_pair",
-                                        message="No mirror spot pair configured",
-                                    )
-                                    continue
-                                exchange_name = spot_ex
-                                pair = spot_pair
-                                strategy_pair = pair.replace("/", "")
-                                signals_url = (
-                                    f"{strategy_service_url}/api/v1/signals/{spot_ex}/{strategy_pair}"
-                                )
-                            signals_resp = await client.get(signals_url, timeout=90.0)
-                            if signals_resp.status_code != 200:
-                                await recorder.finish(
-                                    outcome="not_scanned",
-                                    primary_reason="signal_fetch_failed",
-                                    message=f"Strategy service HTTP {signals_resp.status_code}",
-                                )
-                                continue
-                            signals_data = signals_resp.json()
-                        except Exception as e:
-                            logger.debug(
-                                "[HyperliquidPaper] Signal fetch failed for %s: %s",
-                                coin,
-                                e,
-                            )
+                        signals_data = prefetched_signals.get(coin) or {}
+                        if not signals_data:
                             await recorder.finish(
                                 outcome="not_scanned",
-                                primary_reason="signal_fetch_error",
-                                message=str(e)[:200],
+                                primary_reason="signal_prefetch_miss",
+                                message="No signal payload returned by parallel prefetch",
                             )
                             continue
 
                     recorder.set_signals(signals_data)
+                    promoted_cohorts = self._hyperliquid_shadow_promoted_cohorts.get(coin) or []
+                    if promoted_cohorts:
+                        current_regime = str(
+                            signals_data.get("market_regime") or ""
+                        ).strip().lower()
+                        strategies_payload = signals_data.get("strategies") or {}
+                        if not isinstance(strategies_payload, dict):
+                            strategies_payload = {}
+                        matches = []
+                        for cohort in promoted_cohorts:
+                            strategy_key = str(cohort.get("strategy") or "").strip().lower()
+                            side_key = str(cohort.get("side") or "").strip().lower()
+                            regime_key = str(cohort.get("regime") or "").strip().lower()
+                            strategy_payload = strategies_payload.get(strategy_key) or {}
+                            current_side = position_sides_from_signal(
+                                (strategy_payload or {}).get("signal")
+                            )
+                            if (
+                                current_side == side_key
+                                and (not regime_key or current_regime == regime_key)
+                            ):
+                                matches.append(
+                                    (
+                                        f"{strategy_key} {side_key} {regime_key or 'any_regime'} "
+                                        f"n={int(cohort.get('closed') or 0)} "
+                                        f"wr={float(cohort.get('win_rate') or 0.0) * 100:.1f}% "
+                                        f"pnl={float(cohort.get('realized') or 0.0):.2f}"
+                                    )
+                                )
+                        if matches:
+                            logger.warning(
+                                "[HyperliquidPaper] Current signal matches shadow-promoted cohort %s: %s",
+                                coin,
+                                matches,
+                            )
+                        else:
+                            logger.info(
+                                "[HyperliquidPaper] Shadow-promoted %s scanned but current regime/signal does not match promoted cohorts",
+                                coin,
+                            )
                     if mirrored is None:
-                        mirrored = select_mirrored_signal(signals_data)
+                        mirrored = select_mirrored_signal(
+                            signals_data,
+                            cfg,
+                            coin=coin,
+                            market_regime=str(signals_data.get("market_regime") or ""),
+                            promoted_cohorts=promoted_cohorts,
+                        )
                     recorder.set_mirrored(mirrored)
+                    shadow_records: List[Dict[str, Any]] = []
+                    if execution_mode == "paper":
+                        shadow_records = await self._record_hyperliquid_shadow_trades(
+                            client,
+                            coin=coin,
+                            price=price,
+                            signals_data=signals_data,
+                            cfg=cfg,
+                            shadow_open_trade_ids=shadow_open_trade_ids,
+                            shadow_fingerprints=shadow_fingerprints,
+                            shadow_open_keys=shadow_open_keys,
+                        )
+
+                        async def _finish_shadow_dispositions(
+                            outcome: str,
+                            primary_reason: str,
+                            message: str,
+                            gate_trace: List[Dict[str, Any]],
+                            *,
+                            _records: List[Dict[str, Any]] = shadow_records,
+                            _selected: Optional[Dict[str, Any]] = mirrored,
+                        ) -> None:
+                            await self._finalize_hyperliquid_shadow_dispositions(
+                                client,
+                                _records,
+                                _selected,
+                                outcome=outcome,
+                                primary_reason=primary_reason,
+                                message=message,
+                                gate_trace=gate_trace,
+                            )
+
+                        recorder.set_finish_callback(_finish_shadow_dispositions)
+                    if real_entry_block is not None:
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason=real_entry_block[0],
+                            message=real_entry_block[1],
+                        )
+                        continue
+                    if len(open_trades or []) + opened >= max_open:
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="max_open_positions",
+                            message=(
+                                f"Max open positions reached: "
+                                f"{len(open_trades or []) + opened}/{max_open}"
+                            ),
+                        )
+                        continue
                     if not mirrored:
                         await recorder.finish(
                             outcome="no_actionable_signal",
@@ -7144,7 +9148,32 @@ class TradingOrchestrator:
                     )
 
                     entry_path = "cycle_slow"
-                    src_strat = str(mirrored.get("strategy") or "")
+                    src_strat = str(mirrored.get("strategy") or "") if mirrored else ""
+                    strategy_limit_block = hyperliquid_strategy_open_position_limit_block(
+                        src_strat,
+                        open_trades,
+                        cfg,
+                        pending_open_count=opened_by_strategy.get(src_strat.lower(), 0),
+                    )
+                    if strategy_limit_block.get("entryBlocked"):
+                        limit_message = str(strategy_limit_block.get("entryBlockMessage") or "")
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s: strategy=%s (%s)",
+                            coin,
+                            src_strat or "unknown",
+                            limit_message,
+                        )
+                        recorder.add_gate(
+                            "strategy_open_position_limit",
+                            False,
+                            limit_message,
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="strategy_open_position_limit",
+                            message=limit_message,
+                        )
+                        continue
 
                     if execution_mode == "live":
                         allow = [
@@ -7175,6 +9204,46 @@ class TradingOrchestrator:
                             message="Selected signal is not long/short",
                         )
                         continue
+                    promotion_requirement = self._hyperliquid_shadow_promotion_requirement(
+                        coin,
+                        mirrored,
+                        signals_data,
+                        cfg,
+                    )
+                    if promotion_requirement.get("blocked"):
+                        message = str(
+                            promotion_requirement.get("message")
+                            or promotion_requirement.get("reason")
+                            or ""
+                        )
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s",
+                            side,
+                            coin,
+                            message,
+                        )
+                        recorder.add_gate(
+                            "shadow_promotion_required",
+                            False,
+                            message,
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="shadow_promotion_required",
+                            message=message,
+                        )
+                        continue
+                    if promotion_requirement.get("cohort"):
+                        cohort = promotion_requirement.get("cohort") or {}
+                        recorder.add_gate(
+                            "shadow_promotion_required",
+                            True,
+                            (
+                                f"promoted cohort n={int(cohort.get('closed') or 0)} "
+                                f"wr={float(cohort.get('win_rate') or 0.0) * 100:.1f}% "
+                                f"pnl={float(cohort.get('realized') or 0.0):.2f}"
+                            ),
+                        )
                     side_block = hyperliquid_coin_side_entry_block(
                         coin,
                         side,
@@ -7257,6 +9326,7 @@ class TradingOrchestrator:
                         side, market_regime, conf,
                         float(mirrored.get("strength") or 0.0),
                         cfg,
+                        strategy=str(mirrored.get("strategy") or ""),
                     )
                     if regime_gate.get("blocked"):
                         logger.info(
@@ -7342,6 +9412,33 @@ class TradingOrchestrator:
                         )
                         continue
                     recorder.add_gate("strategy_coin_loss_streak", True, "loss streak clear")
+
+                    stop_cooldown_cfg = cfg.get("strategy_pair_stop_cooldown") or {}
+                    if not isinstance(stop_cooldown_cfg, dict):
+                        stop_cooldown_cfg = {}
+                    stop_cooldown_enabled = stop_cooldown_cfg.get("enabled", True)
+                    if stop_cooldown_enabled is not False and str(stop_cooldown_enabled).lower() not in {"0", "false", "no", "off"}:
+                        stop_cooldown = hyperliquid_strategy_pair_stop_cooldown_block(
+                            coin,
+                            mirrored.get("strategy") or "",
+                            side,
+                            closed_trades,
+                            cooldown_hours=float(stop_cooldown_cfg.get("cooldown_hours", 6.0) or 6.0),
+                            stop_keywords=stop_cooldown_cfg.get("stop_exit_reason_keywords"),
+                        )
+                        if stop_cooldown.get("entryBlocked"):
+                            recorder.add_gate(
+                                "strategy_pair_stop_cooldown",
+                                False,
+                                str(stop_cooldown.get("entryBlockMessage") or ""),
+                            )
+                            await recorder.finish(
+                                outcome="skipped",
+                                primary_reason="strategy_pair_stop_cooldown",
+                                message=str(stop_cooldown.get("entryBlockMessage") or ""),
+                            )
+                            continue
+                    recorder.add_gate("strategy_pair_stop_cooldown", True, "stop cooldown clear")
 
                     cooldown_minutes = int(
                         cfg.get("perp_reentry_cooldown_minutes", 30) or 30
@@ -7491,6 +9588,46 @@ class TradingOrchestrator:
                             consensus_agreement,
                             conf,
                             specialist_gate.get("reason") if specialist_gate.get("bypassConsensus") else standalone_gate.get("reason"),
+                        )
+                    perp_time_quality_ok, perp_time_quality = self._time_of_day_quality_ok(
+                        {"time_of_day_policy": trading_cfg.get("time_of_day_policy", {})},
+                        "perp",
+                        mirrored.get("strategy") or "unknown",
+                        mirrored,
+                        (cfg.get("standalone_strategy_gates") or {}).get(
+                            str(mirrored.get("strategy") or "").strip().lower(), {}
+                        )
+                        if isinstance(cfg.get("standalone_strategy_gates"), dict)
+                        else {},
+                    )
+                    if not perp_time_quality_ok:
+                        recorder.add_gate(
+                            "time_of_day_policy",
+                            False,
+                            (
+                                f"{perp_time_quality.get('profile')} hour "
+                                f"{perp_time_quality.get('hour')} {perp_time_quality.get('timezone')} "
+                                f"conf {float(perp_time_quality.get('confidence', 0.0) or 0.0):.2f}/"
+                                f"{float(perp_time_quality.get('required_confidence', 0.0) or 0.0):.2f} "
+                                f"strength {float(perp_time_quality.get('strength', 0.0) or 0.0):.2f}/"
+                                f"{float(perp_time_quality.get('required_strength', 0.0) or 0.0):.2f}"
+                            ),
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="time_of_day_policy",
+                            message="Strict-hour time policy quality gate failed",
+                        )
+                        continue
+                    if perp_time_quality.get("enabled"):
+                        recorder.add_gate(
+                            "time_of_day_policy",
+                            True,
+                            (
+                                f"profile={perp_time_quality.get('profile')} "
+                                f"hour={perp_time_quality.get('hour')} "
+                                f"{perp_time_quality.get('timezone')}"
+                            ),
                         )
                     strategy_side_block = hyperliquid_strategy_side_entry_block(
                         mirrored.get("strategy") or "unknown",
@@ -7655,6 +9792,66 @@ class TradingOrchestrator:
                             "[HyperliquidPaper] %s %s strategy size hint: mult=%.2f",
                             side, coin, signal_size_mult,
                         )
+                    good_mult, good_reason = self._good_entry_size_multiplier(mirrored, cfg)
+                    requal_cfg = cfg.get("executable_size_requalification") or {}
+                    require_requal = (cfg.get("good_entry_size_scaling") or {}).get(
+                        "require_executable_requalification", True
+                    )
+                    require_requal = require_requal is not False and str(
+                        require_requal
+                    ).strip().lower() not in {"0", "false", "no", "off"}
+                    if good_mult > 1.0 and require_requal:
+                        requal_ok, requal_reason = executable_size_requalification_passes(
+                            perp_strategy_name,
+                            side,
+                            closed_trades,
+                            cfg,
+                        )
+                        if not requal_ok:
+                            logger.info(
+                                "[HyperliquidPaper] %s %s good-entry sizing withheld: %s",
+                                side,
+                                coin,
+                                requal_reason,
+                            )
+                            good_mult = 1.0
+                            good_reason = requal_reason
+                    promoted_boost = float(
+                        (cfg.get("good_entry_size_scaling") or {}).get(
+                            "promoted_cohort_multiplier", 1.0
+                        )
+                        or 1.0
+                    )
+                    if promoted_boost > 1.0 and promoted_cohorts:
+                        regime_key = str(market_regime or "").strip().lower()
+                        for cohort in promoted_cohorts:
+                            if (
+                                str(cohort.get("strategy") or "").strip().lower()
+                                == perp_strategy_name
+                                and str(cohort.get("side") or "").strip().lower() == side
+                                and (
+                                    not cohort.get("regime")
+                                    or str(cohort.get("regime")).strip().lower()
+                                    == regime_key
+                                )
+                            ):
+                                size_multiplier *= promoted_boost
+                                logger.warning(
+                                    "[HyperliquidPaper] %s %s promoted-cohort sizing: mult *= %.2f",
+                                    side,
+                                    coin,
+                                    promoted_boost,
+                                )
+                                break
+                    if good_mult > 1.0:
+                        size_multiplier *= good_mult
+                        logger.warning(
+                            "[HyperliquidPaper] %s %s good-entry sizing: mult *= %.2f (%s)",
+                            side,
+                            coin,
+                            good_mult,
+                            good_reason,
+                        )
                     adaptive_size_mult = hyperliquid_adaptive_entry_sizing_multiplier(
                         mirrored,
                         market_regime,
@@ -7671,6 +9868,25 @@ class TradingOrchestrator:
                             market_regime or "unknown",
                             adaptive_size_mult,
                         )
+                    perp_time_profile = self._time_of_day_policy_profile(
+                        {"time_of_day_policy": trading_cfg.get("time_of_day_policy", {})},
+                        "perp",
+                        mirrored.get("strategy") or "unknown",
+                    )
+                    perp_time_mult = float(perp_time_profile.get("size_multiplier", 1.0) or 1.0)
+                    if perp_time_profile.get("enabled") and perp_time_mult != 1.0:
+                        size_multiplier *= max(0.0, perp_time_mult)
+                        logger.warning(
+                            "[HyperliquidPaper][TimeOfDayPolicy] %s %s strategy=%s "
+                            "profile=%s hour=%s %s sizing *= %.2f",
+                            side,
+                            coin,
+                            mirrored.get("strategy") or "unknown",
+                            perp_time_profile.get("profile"),
+                            perp_time_profile.get("hour"),
+                            perp_time_profile.get("timezone"),
+                            perp_time_mult,
+                        )
                     adaptive_cfg = (cfg.get("adaptive_pnl_control") or {})
                     max_size_multiplier = 1.0
                     if adaptive_cfg.get("enabled", False) is not False:
@@ -7681,11 +9897,53 @@ class TradingOrchestrator:
                                 float(adaptive_cfg.get("scale_up_multiplier", 1.25) or 1.25),
                             ),
                         )
+                    good_entry_cfg = cfg.get("good_entry_size_scaling") or {}
+                    if isinstance(good_entry_cfg, dict):
+                        try:
+                            max_size_multiplier = max(
+                                max_size_multiplier,
+                                min(1.5, float(good_entry_cfg.get("max_multiplier", 1.30) or 1.30)),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if perp_time_profile.get("enabled"):
+                        try:
+                            max_size_multiplier = max(
+                                max_size_multiplier,
+                                min(2.5, float(perp_time_profile.get("max_size_multiplier", 1.0) or 1.0)),
+                            )
+                        except (TypeError, ValueError):
+                            pass
                     size_multiplier = max(0.0, min(max_size_multiplier, size_multiplier))
                     perp_strategy_name = str(mirrored.get("strategy") or "")
                     tier_floor = strategy_min_size_multiplier(perp_strategy_name, trading_cfg)
                     if tier_floor is not None:
                         size_multiplier = max(size_multiplier, tier_floor)
+                    high_vol_controls = cfg.get("high_volatility_strategy_controls") or {}
+                    ema50_high_vol_cfg = (
+                        high_vol_controls.get(perp_strategy_name)
+                        or high_vol_controls.get(perp_strategy_name.lower())
+                        or {}
+                    )
+                    if (
+                        market_regime == "high_volatility"
+                        and perp_strategy_name == "ema50_breakout_pullback"
+                        and isinstance(ema50_high_vol_cfg, dict)
+                    ):
+                        hv_enabled = ema50_high_vol_cfg.get("enabled", True)
+                        if hv_enabled is not False and str(hv_enabled).lower() not in {"0", "false", "no", "off"}:
+                            try:
+                                hv_size_mult = float(ema50_high_vol_cfg.get("size_multiplier", 0.50) or 0.50)
+                            except (TypeError, ValueError):
+                                hv_size_mult = 0.50
+                            hv_size_mult = max(0.0, min(1.0, hv_size_mult))
+                            size_multiplier *= hv_size_mult
+                            logger.warning(
+                                "[HyperliquidPaper] %s %s high-volatility EMA50 control: sizing *= %.2f",
+                                side,
+                                coin,
+                                hv_size_mult,
+                            )
                     strategy_notional_cap = strategy_max_notional(perp_strategy_name, cfg)
                     strategy_margin_cap = strategy_notional_cap / max(leverage, 1e-9)
                     effective_max_notional = max(max_notional, strategy_notional_cap)
@@ -7881,6 +10139,9 @@ class TradingOrchestrator:
                         if live_result.get("ok"):
                             open_keys.add((coin, side))
                             opened += 1
+                            opened_by_strategy[src_strat.lower()] = (
+                                opened_by_strategy.get(src_strat.lower(), 0) + 1
+                            )
                             available_balance = max(
                                 0.0, available_balance - margin_used
                             )
@@ -7916,6 +10177,9 @@ class TradingOrchestrator:
                     if create_resp.status_code in (200, 201):
                         open_keys.add((coin, side))
                         opened += 1
+                        opened_by_strategy[src_strat.lower()] = (
+                            opened_by_strategy.get(src_strat.lower(), 0) + 1
+                        )
                         available_balance = max(0.0, available_balance - margin_used)
                         logger.warning(
                             "[HyperliquidPaper] Opened PAPER %s %s from %s %s strategy=%s conf=%.2f notional=%.2f lev=%.1fx size_mult=%.2f",
@@ -8551,8 +10815,13 @@ class TradingOrchestrator:
         params = rsi_cfg.get("parameters") or {}
         return params, bool(params.get("allow_short", False))
 
-    async def _fetch_spot_rsi_stoch_raw(
-        self, exchange: str, pair: str
+    async def _fetch_spot_strategy_raw(
+        self,
+        exchange: str,
+        pair: str,
+        strategy_name: str,
+        *,
+        timeout_seconds: float = 10.0,
     ) -> Optional[Dict[str, Any]]:
         from strategy.fast_signal_cache import (
             STRATEGY_KEY,
@@ -8560,50 +10829,76 @@ class TradingOrchestrator:
         )
 
         sym = str(pair or "").replace("/", "")
+        strategy_key = str(strategy_name or STRATEGY_KEY).strip().lower()
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 resp = await client.get(
                     f"{strategy_service_url}/api/v1/signals/{exchange}/"
-                    f"{sym}/{STRATEGY_KEY}"
+                    f"{sym}/{strategy_key}"
                 )
             if resp.status_code != 200:
                 return None
             live = resp.json() or {}
             live["signal"] = str(live.get("signal") or "hold").lower()
-            return fast_payload_from_hl_strategy_signal(live)
+            payload = fast_payload_from_hl_strategy_signal(live)
+            payload["strategy"] = strategy_key
+            return payload
         except Exception as exc:
             logger.debug(
-                "[FastEntry] Spot rsi_stoch fetch failed %s %s: %s",
+                "[FastEntry] Spot %s fetch failed %s %s: %s",
+                strategy_key,
                 exchange,
                 pair,
                 exc,
             )
             return None
 
-    async def _fetch_hl_rsi_stoch_raw(self, coin: str) -> Optional[Dict[str, Any]]:
-        """Fetch strategy-service HL rsi_stoch payload (any signal, including hold)."""
-        from strategy.fast_signal_cache import (
-            STRATEGY_KEY,
-            fast_payload_from_hl_strategy_signal,
-        )
+    async def _fetch_spot_rsi_stoch_raw(
+        self, exchange: str, pair: str
+    ) -> Optional[Dict[str, Any]]:
+        from strategy.fast_signal_cache import STRATEGY_KEY
+
+        return await self._fetch_spot_strategy_raw(exchange, pair, STRATEGY_KEY)
+
+    async def _fetch_hl_strategy_raw(
+        self,
+        coin: str,
+        strategy_name: str,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch strategy-service HL single-strategy payload (any signal, including hold)."""
+        from strategy.fast_signal_cache import fast_payload_from_hl_strategy_signal
 
         coin_u = pair_to_hyperliquid_coin(str(coin or ""))
+        strategy_key = str(strategy_name or "").strip().lower()
+        if not strategy_key:
+            return None
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 resp = await client.get(
                     f"{strategy_service_url}/api/v1/signals/hyperliquid/"
-                    f"{coin_u}/{STRATEGY_KEY}"
+                    f"{coin_u}/{strategy_key}"
                 )
             if resp.status_code != 200:
                 return None
-            return fast_payload_from_hl_strategy_signal(resp.json() or {})
+            payload = fast_payload_from_hl_strategy_signal(resp.json() or {})
+            payload["strategy"] = strategy_key
+            return payload
         except Exception as exc:
             logger.debug(
-                "[FastEntry] Live HL rsi_stoch fetch failed for %s: %s",
+                "[FastEntry] Live HL %s fetch failed for %s: %s",
+                strategy_key,
                 coin_u,
                 exc,
             )
             return None
+
+    async def _fetch_hl_rsi_stoch_raw(self, coin: str) -> Optional[Dict[str, Any]]:
+        """Fetch strategy-service HL rsi_stoch payload (any signal, including hold)."""
+        from strategy.fast_signal_cache import STRATEGY_KEY
+
+        return await self._fetch_hl_strategy_raw(coin, STRATEGY_KEY)
 
     async def _fetch_hl_rsi_stoch_live_signal(
         self, coin: str
@@ -8654,9 +10949,98 @@ class TradingOrchestrator:
             meta["fast_redis_signal"] = str(fast_payload.get("signal") or "")
         return meta
 
+    async def _validate_fast_hl_live_payload(
+        self,
+        strategy_name: str,
+        live_payload: Dict[str, Any],
+        *,
+        redis_side: str,
+        strategy_age: float,
+    ) -> Tuple[bool, str]:
+        from strategy.fast_signal_cache import (
+            ORB_STRATEGY_KEY,
+            RSI_STOCH_REVERSAL_STRATEGIES,
+            validate_generic_fast_actionable,
+            validate_orb_actionable,
+            validate_rsi_stoch_actionable,
+            normalize_perp_side,
+        )
+
+        strategy_key = str(strategy_name or "").strip().lower()
+        live_side = normalize_perp_side(str(live_payload.get("signal") or ""))
+        if strategy_key == ORB_STRATEGY_KEY:
+            orb_cfg = (
+                await self._get_config_value(
+                    f"strategies_hyperliquid.{ORB_STRATEGY_KEY}.parameters",
+                    {},
+                )
+                or {}
+            )
+            ok, reason = validate_orb_actionable(
+                live_payload,
+                allow_short=bool(orb_cfg.get("allow_short", True)),
+                min_reward_risk=float(orb_cfg.get("target_reward_risk", 2.0) or 2.0),
+                max_signal_age_seconds=strategy_age,
+            )
+            if ok and not live_side:
+                live_side = redis_side
+            return ok, reason
+
+        if strategy_key in RSI_STOCH_REVERSAL_STRATEGIES:
+            if live_side != redis_side:
+                return False, f"live_side_mismatch_{live_side or 'hold'}_vs_{redis_side}"
+            params, allow_short = self._hl_rsi_stoch_params()
+            return validate_rsi_stoch_actionable(
+                live_payload,
+                allow_short=allow_short,
+                params=params,
+                max_bar_age_seconds=strategy_age,
+            )
+
+        if live_side != redis_side:
+            return False, f"live_side_mismatch_{live_side or 'hold'}_vs_{redis_side}"
+        gate_cfg = (
+            await self._get_config_value(
+                f"trading.hyperliquid_perps.specialist_strategy_gates.{strategy_key}",
+                {},
+            )
+            or {}
+        )
+        if not isinstance(gate_cfg, dict) or not gate_cfg:
+            gate_cfg = (
+                await self._get_config_value(
+                    f"trading.standalone_entry_quality.{strategy_key}",
+                    {},
+                )
+                or {}
+            )
+        min_conf = float(gate_cfg.get("min_confidence", 0.70) or 0.70)
+        min_strength = float(gate_cfg.get("min_strength", 0.65) or 0.65)
+        hl_params = (
+            await self._get_config_value(
+                f"strategies_hyperliquid.{strategy_key}.parameters",
+                {},
+            )
+            or {}
+        )
+        return validate_generic_fast_actionable(
+            live_payload,
+            allow_short=bool(hl_params.get("allow_short", True)),
+            min_confidence=min_conf,
+            min_strength=min_strength,
+            max_signal_age_seconds=strategy_age,
+        )
+
     async def _fast_entry_loop(self) -> None:
         """Redis-first fast entries for configured standalone strategies (30s)."""
-        from strategy.fast_signal_cache import read_fast_signal, signal_age_seconds
+        from strategy.fast_signal_cache import (
+            RSI_STOCH_BAR_MAX_AGE_SECONDS,
+            RSI_STOCH_REVERSAL_STRATEGIES,
+            read_fast_signal,
+            signal_age_seconds,
+            validate_generic_fast_actionable,
+            validate_rsi_stoch_actionable,
+        )
 
         logger.info("[FastEntry] Starting fast entry loop")
         while self.running:
@@ -8668,68 +11052,250 @@ class TradingOrchestrator:
                     continue
                 interval = float(cfg.get("interval_seconds", 30) or 30)
                 max_age = float(cfg.get("redis_max_age_seconds", 40) or 40)
+                rsi_stoch_bar_age = float(
+                    cfg.get("rsi_stoch_bar_max_age_seconds", RSI_STOCH_BAR_MAX_AGE_SECONDS)
+                    or RSI_STOCH_BAR_MAX_AGE_SECONDS
+                )
+                fast_strategy_timeout = max(
+                    2.0,
+                    min(float(cfg.get("single_strategy_timeout_seconds", 8) or 8), 20.0),
+                )
+                per_strategy_age = cfg.get("strategy_redis_max_age_seconds") or {}
+                fast_strategies = [
+                    str(x).strip().lower()
+                    for x in (cfg.get("strategies") or ["rsi_stoch_reversal_5m"])
+                    if str(x).strip()
+                ]
                 await self._refresh_entry_guard_sources()
                 redis_client = getattr(self.redis_order_manager, "redis_client", None)
+                active_fast_keys: List[Tuple[str, str, str]] = []
+                if redis_client is not None:
+                    try:
+                        async for raw_key in redis_client.scan_iter(
+                            match="trading:fast_signal:*",
+                            count=200,
+                        ):
+                            key_s = (
+                                raw_key.decode()
+                                if isinstance(raw_key, bytes)
+                                else str(raw_key)
+                            )
+                            parts = key_s.split(":", 4)
+                            if len(parts) != 5:
+                                continue
+                            _, _, strategy_name, venue, symbol = parts
+                            strategy_name = str(strategy_name or "").strip().lower()
+                            if strategy_name in fast_strategies:
+                                active_fast_keys.append(
+                                    (
+                                        strategy_name,
+                                        str(venue or "").strip().lower(),
+                                        str(symbol or "").strip(),
+                                    )
+                                )
+                    except Exception as scan_exc:
+                        logger.debug("[FastEntry] Redis fast-key scan failed: %s", scan_exc)
+                if active_fast_keys:
+                    logger.info("[FastEntry] Redis active keys: %s", active_fast_keys[:12])
 
-                for exchange_name, pairs in (self.pair_selections or {}).items():
-                    for pair in pairs or []:
-                        sym = str(pair or "").replace("/", "")
-                        payload = await read_fast_signal(
-                            redis_client, exchange_name, sym
+                def strategy_age_seconds(strategy_name: str) -> float:
+                    strategy_age = max_age
+                    if isinstance(per_strategy_age, dict):
+                        try:
+                            strategy_age = float(
+                                per_strategy_age.get(strategy_name, max_age) or max_age
+                            )
+                        except (TypeError, ValueError):
+                            strategy_age = max_age
+                    return strategy_age
+
+                spot_pair_by_key: Dict[Tuple[str, str], str] = {}
+                for ex_name, pairs in (self.pair_selections or {}).items():
+                    for configured_pair in pairs or []:
+                        spot_pair_by_key[
+                            (
+                                str(ex_name or "").strip().lower(),
+                                str(configured_pair or "").replace("/", "").upper(),
+                            )
+                        ] = str(configured_pair)
+
+                for strategy_name, venue, symbol in active_fast_keys:
+                    if venue == "hyperliquid":
+                        continue
+                    exchange_name = venue
+                    pair = spot_pair_by_key.get((exchange_name, symbol.upper()))
+                    if not pair:
+                        logger.debug(
+                            "[FastEntry] Skip spot key %s %s %s: not in selected pairs",
+                            exchange_name,
+                            symbol,
+                            strategy_name,
                         )
-                        if not payload:
-                            continue
-                        age = signal_age_seconds(payload)
-                        if age is None or age > max_age:
-                            continue
-                        if str(payload.get("signal", "")).lower() == "buy":
-                            logger.info(
-                                "[FastEntry] Spot trigger %s %s from Redis (age=%.1fs)",
-                                exchange_name,
-                                pair,
-                                age,
-                            )
-                            await self._check_pair_entry(
-                                exchange_name,
-                                pair,
-                                fast_rsi_stoch_payload=payload,
-                            )
-
-                hl_cfg = self._hyperliquid_perps_cfg()
-                mids = await self._fetch_hyperliquid_mids()
-                fast_hl_by_coin: Dict[str, Dict[str, Any]] = {}
-                from strategy.fast_signal_cache import normalize_perp_side
-
-                for coin in self.hyperliquid_pair_selections or []:
-                    coin_u = pair_to_hyperliquid_coin(str(coin))
+                        continue
                     payload = await read_fast_signal(
-                        redis_client, "hyperliquid", coin_u
+                        redis_client,
+                        exchange_name,
+                        symbol,
+                        strategy_key=strategy_name,
                     )
                     if not payload:
                         continue
                     age = signal_age_seconds(payload)
-                    if age is None or age > max_age:
+                    strategy_age = strategy_age_seconds(strategy_name)
+                    if age is None or age > strategy_age:
                         continue
-                    redis_side = normalize_perp_side(str(payload.get("signal", "")))
-                    if not redis_side:
+                    if str(payload.get("signal", "")).lower() != "buy":
                         continue
-                    live_payload = await self._fetch_hl_rsi_stoch_raw(coin_u)
+                    live_payload = await self._fetch_spot_strategy_raw(
+                        exchange_name,
+                        pair,
+                        strategy_name,
+                        timeout_seconds=fast_strategy_timeout,
+                    )
                     if not live_payload:
                         logger.info(
-                            "[FastEntry] Skip HL %s: no live rsi_stoch response",
-                            coin_u,
+                            "[FastEntry] Skip spot %s %s %s: live confirm unavailable",
+                            exchange_name,
+                            pair,
+                            strategy_name,
                         )
                         continue
-                    live_side = normalize_perp_side(str(live_payload.get("signal", "")))
-                    if live_side != redis_side:
-                        logger.warning(
-                            "[FastEntry] Skip HL %s: Redis=%s live=%s (stale fast cache)",
-                            coin_u,
-                            redis_side,
-                            live_side or "hold",
+                    if str(live_payload.get("signal", "")).lower() != "buy":
+                        logger.debug(
+                            "[FastEntry] Skip spot %s %s %s: Redis=buy live=%s",
+                            exchange_name,
+                            pair,
+                            strategy_name,
+                            live_payload.get("signal"),
                         )
                         continue
-                    fast_hl_by_coin[coin_u] = live_payload
+                    if strategy_name in RSI_STOCH_REVERSAL_STRATEGIES:
+                        spot_params, allow_short = self._hl_rsi_stoch_params()
+                        ok, reason = validate_rsi_stoch_actionable(
+                            live_payload,
+                            allow_short=allow_short,
+                            params=spot_params,
+                            max_bar_age_seconds=rsi_stoch_bar_age,
+                        )
+                    else:
+                        quality_cfg = (
+                            await self._get_config_value(
+                                f"trading.standalone_entry_quality.{strategy_name}",
+                                {},
+                            )
+                            or {}
+                        )
+                        ok, reason = validate_generic_fast_actionable(
+                            live_payload,
+                            allow_short=False,
+                            min_confidence=float(
+                                quality_cfg.get("min_confidence", 0.70) or 0.70
+                            ),
+                            min_strength=float(
+                                quality_cfg.get("min_strength", 0.65) or 0.65
+                            ),
+                            max_signal_age_seconds=strategy_age,
+                        )
+                    if not ok:
+                        logger.info(
+                            "[FastEntry] Skip spot %s %s %s: %s",
+                            exchange_name,
+                            pair,
+                            strategy_name,
+                            reason,
+                        )
+                        continue
+                    logger.info(
+                        "[FastEntry] Spot trigger %s %s %s from Redis (age=%.1fs)",
+                        exchange_name,
+                        pair,
+                        strategy_name,
+                        age or 0.0,
+                    )
+                    await self._check_pair_entry(
+                        exchange_name,
+                        pair,
+                        fast_signal_payload=live_payload,
+                    )
+
+                active_hl_keys = [
+                    item for item in active_fast_keys if item[1] == "hyperliquid"
+                ]
+                hl_cfg = self._hyperliquid_perps_cfg()
+                mids = await self._fetch_hyperliquid_mids(allow_stale=True) if active_hl_keys else {}
+                fast_hl_by_coin: Dict[str, Dict[str, Any]] = {}
+                from strategy.fast_signal_cache import normalize_perp_side
+
+                for strategy_name, venue, symbol in active_hl_keys:
+                    coin_u = pair_to_hyperliquid_coin(symbol)
+                    strategy_age = strategy_age_seconds(strategy_name)
+                    payload = await read_fast_signal(
+                        redis_client,
+                        "hyperliquid",
+                        coin_u,
+                        strategy_key=strategy_name,
+                    )
+                    if not payload:
+                        continue
+                    age = signal_age_seconds(payload)
+                    if age is None or age > strategy_age:
+                        continue
+                    redis_side = normalize_perp_side(str(payload.get("signal") or ""))
+                    if not redis_side:
+                        continue
+                    live_payload = await self._fetch_hl_strategy_raw(
+                        coin_u,
+                        strategy_name,
+                        timeout_seconds=fast_strategy_timeout,
+                    )
+                    if not live_payload:
+                        logger.info(
+                            "[FastEntry] Skip HL %s: no live %s response",
+                            coin_u,
+                            strategy_name,
+                        )
+                        continue
+                    live_side = normalize_perp_side(str(live_payload.get("signal") or ""))
+                    ok, reason = await self._validate_fast_hl_live_payload(
+                        strategy_name,
+                        live_payload,
+                        redis_side=redis_side,
+                        strategy_age=strategy_age,
+                    )
+                    if not ok:
+                        logger.info(
+                            "[FastEntry] Skip HL %s %s: live not actionable (%s)",
+                            coin_u,
+                            strategy_name,
+                            reason,
+                        )
+                        continue
+                    if not live_side:
+                        live_side = redis_side
+                    fast_hl_by_coin[coin_u] = {
+                        **payload,
+                        "strategy": strategy_name,
+                        "signal": live_side or redis_side,
+                        "confidence": float(
+                            live_payload.get("confidence")
+                            or payload.get("confidence")
+                            or 0
+                        ),
+                        "strength": float(
+                            live_payload.get("strength")
+                            or payload.get("strength")
+                            or 0
+                        ),
+                        "indicators": live_payload.get("indicators")
+                        or payload.get("indicators")
+                        or {},
+                    }
+                    logger.info(
+                        "[FastEntry] HL trigger %s %s from Redis (age=%.1fs)",
+                        coin_u,
+                        strategy_name,
+                        age or 0.0,
+                    )
                 if fast_hl_by_coin and mids:
                     logger.info(
                         "[FastEntry] HL trigger coins=%s (full entry guards)",
@@ -8976,12 +11542,17 @@ class TradingOrchestrator:
 
     async def _reserve_pair_entry(self, exchange_name: str, pair: str) -> bool:
         """
-        Reserve a normalized pair while evaluating/placing a new entry.
-        Prevents same-cycle concurrent entries on the same pair across exchanges.
+        Reserve a venue/pair while evaluating a new entry.
+
+        Cross-venue analysis must remain independent; otherwise BTC analysis on
+        one venue suppresses BTC on every other venue before any signal exists.
+        Actual order execution is globally serialized by
+        ``_spot_entry_execution_lock`` below.
         """
-        key = self._entry_cluster_key(pair)
-        if not key:
+        cluster = self._entry_cluster_key(pair)
+        if not cluster:
             return False
+        key = f"{str(exchange_name or '').strip().lower()}:{cluster}"
         async with self._pair_entry_reservation_lock:
             if key in self._pair_entry_reservations:
                 logger.warning(
@@ -8994,10 +11565,11 @@ class TradingOrchestrator:
             logger.info("🔒 [PAIR RESERVATION] Reserved %s for %s %s", key, exchange_name, pair)
             return True
 
-    async def _release_pair_entry_reservation(self, pair: str) -> None:
-        key = self._entry_cluster_key(pair)
-        if not key:
+    async def _release_pair_entry_reservation(self, exchange_name: str, pair: str) -> None:
+        cluster = self._entry_cluster_key(pair)
+        if not cluster:
             return
+        key = f"{str(exchange_name or '').strip().lower()}:{cluster}"
         async with self._pair_entry_reservation_lock:
             if key in self._pair_entry_reservations:
                 self._pair_entry_reservations.remove(key)
@@ -9304,6 +11876,7 @@ class TradingOrchestrator:
         pair: str,
         *,
         fast_rsi_stoch_payload: Optional[Dict[str, Any]] = None,
+        fast_signal_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Check if a pair should be entered - each strategy is independent with detailed logging"""
         pair_reserved = False
@@ -9378,59 +11951,80 @@ class TradingOrchestrator:
             else:
                 logger.info(f"✅ [CONDITION 1] Risk management check passed for {pair} on {exchange_name}")
             
-            # Handle different symbol formats for different exchanges
-            # All exchanges use format without slashes for strategy service
-            strategy_pair = pair.replace('/', '')
-            
-            # CONDITION CHECK 2: Get Strategy Signals (retries: strategy-service + Bybit OHLCV often exceed a single timeout)
-            logger.info(f"🔍 [CONDITION 2] Fetching strategy signals for {strategy_pair} on {exchange_name}")
-            signals_url = f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}"
-            signals_data = None
-            signal_attempts = 3
-            signal_timeout = 180.0
-            for attempt in range(signal_attempts):
-                try:
-                    async with httpx.AsyncClient(timeout=signal_timeout) as client:
-                        response = await client.get(signals_url)
-                    if response.status_code == 404:
-                        logger.info(
-                            f"❌ [CONDITION 2] No signals available for {pair} on {exchange_name} - pair not supported by strategy service"
-                        )
-                        return
-                    response.raise_for_status()
-                    signals_data = response.json()
-                    break
-                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as net_err:
-                    if attempt < signal_attempts - 1:
-                        wait_s = 2**attempt
-                        logger.warning(
-                            f"⏱️ [CONDITION 2] Strategy service unreachable/timeout for {pair} on {exchange_name} "
-                            f"({type(net_err).__name__}, attempt {attempt + 1}/{signal_attempts}) — retry in {wait_s}s"
-                        )
-                        await asyncio.sleep(wait_s)
-                    else:
-                        logger.warning(
-                            f"⏱️ [CONDITION 2] Skipping {pair} on {exchange_name}: strategy service still unavailable "
-                            f"after {signal_attempts} attempts ({type(net_err).__name__})"
-                        )
-                        return
+            fast_lane_payload = fast_signal_payload or fast_rsi_stoch_payload
+            if fast_lane_payload:
+                from strategy.fast_signal_cache import (
+                    merge_fast_spot_signal_into_signals,
+                    spot_signals_data_from_fast_payload,
+                )
 
-            if not signals_data:
-                return
-            if fast_rsi_stoch_payload:
-                from strategy.fast_signal_cache import merge_rsi_stoch_spot_buy_into_signals
+                strategy_key = str(
+                    fast_lane_payload.get("strategy") or "rsi_stoch_reversal_5m"
+                ).strip().lower()
+                signals_data = spot_signals_data_from_fast_payload(
+                    fast_lane_payload,
+                    exchange_name,
+                    pair,
+                    strategy_key=strategy_key,
+                )
+                # Keep the merge helper in the path for backward compatibility with
+                # older payload shapes that only carry top-level signal fields.
+                merge_fast_spot_signal_into_signals(
+                    signals_data,
+                    fast_lane_payload,
+                    strategy_key=strategy_key,
+                )
+                logger.info(
+                    "[FastEntry] Spot using Redis %s BUY envelope for %s %s "
+                    "(conf=%.2f str=%.2f)",
+                    strategy_key,
+                    exchange_name,
+                    pair,
+                    float(fast_lane_payload.get("confidence") or 0),
+                    float(fast_lane_payload.get("strength") or 0),
+                )
+            else:
+                # Handle different symbol formats for different exchanges.
+                # All exchanges use format without slashes for strategy service.
+                strategy_pair = pair.replace('/', '')
 
-                if merge_rsi_stoch_spot_buy_into_signals(
-                    signals_data, fast_rsi_stoch_payload
-                ):
-                    logger.info(
-                        "[FastEntry] Spot merged Redis rsi_stoch BUY into %s %s "
-                        "(conf=%.2f str=%.2f)",
-                        exchange_name,
-                        pair,
-                        float(fast_rsi_stoch_payload.get("confidence") or 0),
-                        float(fast_rsi_stoch_payload.get("strength") or 0),
-                    )
+                # CONDITION CHECK 2: Get Strategy Signals. Keep this bounded by the
+                # outer pair worker deadline, but retry once for transient strategy
+                # service read timeouts so one slow OHLCV fetch does not skip a pair.
+                logger.info(f"🔍 [CONDITION 2] Fetching strategy signals for {strategy_pair} on {exchange_name}")
+                signals_url = f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}"
+                signals_data = None
+                signal_attempts = 2
+                signal_timeout = max(1.0, min(self._loop_spot_entry_pair_timeout_seconds, 15.0))
+                for attempt in range(signal_attempts):
+                    try:
+                        async with httpx.AsyncClient(timeout=signal_timeout) as client:
+                            response = await client.get(signals_url)
+                        if response.status_code == 404:
+                            logger.info(
+                                f"❌ [CONDITION 2] No signals available for {pair} on {exchange_name} - pair not supported by strategy service"
+                            )
+                            return
+                        response.raise_for_status()
+                        signals_data = response.json()
+                        break
+                    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as net_err:
+                        if attempt < signal_attempts - 1:
+                            wait_s = 2**attempt
+                            logger.warning(
+                                f"⏱️ [CONDITION 2] Strategy service unreachable/timeout for {pair} on {exchange_name} "
+                                f"({type(net_err).__name__}, attempt {attempt + 1}/{signal_attempts}) — retry in {wait_s}s"
+                            )
+                            await asyncio.sleep(wait_s)
+                        else:
+                            logger.warning(
+                                f"⏱️ [CONDITION 2] Skipping {pair} on {exchange_name}: strategy service still unavailable "
+                                f"after {signal_attempts} attempts ({type(net_err).__name__})"
+                            )
+                            return
+
+                if not signals_data:
+                    return
             resolved_policy = self._resolve_regime_policy(signals_data)
             stable_regime = resolved_policy.get("stable_regime", "unknown")
             policy_version = resolved_policy.get("policy_version", "unversioned")
@@ -9640,6 +12234,20 @@ class TradingOrchestrator:
                 for name in SPOT_RSI_STOCH_REVERSAL_STRATEGIES
                 if str((strategies.get(name, {}) or {}).get("signal", "hold")).lower() == "buy"
             }
+            for rsi_stoch_name in list(rsi_stoch_buy_overrides.keys()):
+                pair_blocked, pair_block_reason = await self._strategy_pair_entry_blocked(
+                    rsi_stoch_name,
+                    exchange_name,
+                    pair,
+                )
+                if pair_blocked:
+                    logger.info(
+                        "[EntryGate] Reject %s %s: %s",
+                        exchange_name,
+                        pair,
+                        pair_block_reason,
+                    )
+                    rsi_stoch_buy_overrides.pop(rsi_stoch_name, None)
             rsi_stoch_is_buy_override = bool(rsi_stoch_buy_overrides)
             standalone_buy_overrides = (
                 bool(intraday_buy_overrides)
@@ -9961,6 +12569,18 @@ class TradingOrchestrator:
                         "strategy_expectancy_guard",
                     )
                     return
+                expectancy_size_multiplier = 1.0
+                if expectancy_reason.startswith("expectancy_probation_size"):
+                    match = re.search(r"mult=([0-9]+(?:\.[0-9]+)?)", expectancy_reason)
+                    if match:
+                        expectancy_size_multiplier = max(0.0, min(1.0, float(match.group(1))))
+                    logger.warning(
+                        "[StrategyExpectancyGuard] Probation allow %s %s: strategy=%s %s",
+                        exchange_name,
+                        pair,
+                        best_strategy,
+                        expectancy_reason,
+                    )
             elif not await self._long_entry_regime_allowed(stable_regime):
                 logger.info(
                     "[EntryGate] Reject %s %s: stable_regime=%s not in long_entry_allowed_regimes (consensus path)",
@@ -10031,6 +12651,25 @@ class TradingOrchestrator:
                     )
                     return
 
+            if is_standalone_entry and best_strategy == "ema50_breakout_pullback":
+                if not await self._ema50_spot_confirmation_ready(
+                    exchange_name,
+                    pair,
+                    strategies.get(best_strategy, {}),
+                ):
+                    logger.info(
+                        "[EntryGate] %s %s: EMA50 waiting for live follow-through confirmation",
+                        exchange_name,
+                        pair,
+                    )
+                    self._record_regime_entry_decision(
+                        exchange_name,
+                        stable_regime,
+                        "rejected",
+                        "ema50_followthrough_confirmation_pending",
+                    )
+                    return
+
             logger.info(
                 f"🚀 [TRADE EXECUTION] Entry approved for {pair} on {exchange_name} "
                 f"(consensus={c_conf:.2f}/{c_agreement:.1f}%, strategy={best_strategy}, conf={best_conf:.2f})"
@@ -10076,6 +12715,7 @@ class TradingOrchestrator:
                         )
                     )
                 ),
+                'entry_size_multiplier': expectancy_size_multiplier if is_standalone_entry else 1.0,
                 'resolved_policy': resolved_policy,
                 'strategy_data': strategies.get(best_strategy, {}),
             })
@@ -10088,7 +12728,7 @@ class TradingOrchestrator:
             logger.error(f"Full traceback: {traceback.format_exc()}")
         finally:
             if pair_reserved:
-                await self._release_pair_entry_reservation(pair)
+                await self._release_pair_entry_reservation(exchange_name, pair)
 
     async def _check_pair_risk_management(self, exchange_name: str, pair: str) -> bool:
         """
@@ -10338,6 +12978,11 @@ class TradingOrchestrator:
             return False
             
     async def _execute_trade_entry(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
+        """Serialize final spot entry checks and queue submission across venues."""
+        async with self._spot_entry_execution_lock:
+            return await self._execute_trade_entry_locked(exchange_name, pair, signal)
+
+    async def _execute_trade_entry_locked(self, exchange_name: str, pair: str, signal: Dict[str, Any]) -> None:
         """Execute trade entry with Redis queue-based processing (HYBRID MODE)"""
         try:
             standalone_strategies = {
@@ -10353,6 +12998,12 @@ class TradingOrchestrator:
                 "small_size_momentum_scalp",
                 "rsi_stoch_reversal_5m",
                 "rsi_stoch_reversal_1m",
+                "sma_reclaim_bull_flag",
+                "supply_demand_3step",
+                "dual_sma_daytrade",
+                "arc_daytrade",
+                "ema50_breakout_pullback",
+                "orb_5m_scalp",
             }
             strategy_name = str(signal.get("strategy") or "")
             stable_regime = str(signal.get("stable_regime") or "unknown")
@@ -10391,6 +13042,30 @@ class TradingOrchestrator:
                         pair,
                         strategy_name,
                         stable_regime,
+                    )
+                    return
+
+            if strategy_name:
+                static_blocked, static_reason = await self._strategy_pair_entry_blocked(
+                    strategy_name, exchange_name, pair
+                )
+                if static_blocked:
+                    logger.warning(
+                        "[StrategyPairBlock] Final block %s %s: %s",
+                        exchange_name,
+                        pair,
+                        static_reason,
+                    )
+                    return
+                cooldown_blocked, cooldown_reason = await self._strategy_pair_stop_cooldown_blocked(
+                    strategy_name, exchange_name, pair
+                )
+                if cooldown_blocked:
+                    logger.warning(
+                        "[StrategyPairStopCooldown] Final block %s %s: %s",
+                        exchange_name,
+                        pair,
+                        cooldown_reason,
                     )
                     return
 
@@ -10524,6 +13199,91 @@ class TradingOrchestrator:
                     available_balance * position_percentage,
                     max_position_usd
                 )
+            try:
+                trading_cfg = await self._get_config_value("trading", {}) or {}
+            except Exception:
+                trading_cfg = {}
+            good_mult, good_reason = self._good_entry_size_multiplier(
+                signal,
+                trading_cfg if isinstance(trading_cfg, dict) else {},
+            )
+            if good_mult > 1.0:
+                good_cfg = (
+                    (trading_cfg or {}).get("good_entry_size_scaling") or {}
+                    if isinstance(trading_cfg, dict)
+                    else {}
+                )
+                try:
+                    cap_mult = float(good_cfg.get("max_position_cap_multiplier", 1.25) or 1.25)
+                except (TypeError, ValueError):
+                    cap_mult = 1.25
+                boosted_cap = max_position_usd * max(1.0, min(1.5, cap_mult))
+                original_value = position_value_usdc
+                position_value_usdc = min(
+                    position_value_usdc * good_mult,
+                    boosted_cap,
+                    available_balance,
+                )
+                logger.warning(
+                    "[GoodEntrySizing] %s %s %s size increased: $%.2f -> $%.2f "
+                    "(mult=%.2f %s)",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    original_value,
+                    position_value_usdc,
+                    good_mult,
+                    good_reason,
+                )
+            time_profile = self._time_of_day_policy_profile(
+                trading_cfg if isinstance(trading_cfg, dict) else {},
+                "spot",
+                strategy_name,
+            )
+            time_mult = float(time_profile.get("size_multiplier", 1.0) or 1.0)
+            if time_profile.get("enabled") and time_mult != 1.0:
+                original_value = position_value_usdc
+                try:
+                    time_cap = float(time_profile.get("max_size_multiplier", time_mult) or time_mult)
+                except (TypeError, ValueError):
+                    time_cap = time_mult
+                boosted_cap = max_position_usd * max(1.0, min(1.75, time_cap))
+                position_value_usdc = min(
+                    position_value_usdc * max(0.0, time_mult),
+                    boosted_cap,
+                    available_balance,
+                )
+                logger.warning(
+                    "[TimeOfDayPolicy] %s %s %s size adjusted: $%.2f -> $%.2f "
+                    "(profile=%s hour=%s %s mult=%.2f)",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    original_value,
+                    position_value_usdc,
+                    time_profile.get("profile"),
+                    time_profile.get("hour"),
+                    time_profile.get("timezone"),
+                    time_mult,
+                )
+            try:
+                entry_size_multiplier = float(signal.get("entry_size_multiplier") or 1.0)
+            except (TypeError, ValueError):
+                entry_size_multiplier = 1.0
+            entry_size_multiplier = max(0.0, min(1.0, entry_size_multiplier))
+            if entry_size_multiplier < 1.0:
+                original_value = position_value_usdc
+                position_value_usdc *= entry_size_multiplier
+                logger.warning(
+                    "[StrategyExpectancyGuard] %s %s %s probation size reduced: "
+                    "$%.2f -> $%.2f (mult=%.2f)",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    original_value,
+                    position_value_usdc,
+                    entry_size_multiplier,
+                )
             # Adaptive size haircut for pairs with consecutive recent losses.
             pair_loss_mult = await self._get_pair_loss_size_multiplier(
                 exchange_name,
@@ -10531,7 +13291,6 @@ class TradingOrchestrator:
                 signal.get("resolved_policy"),
             )
             try:
-                trading_cfg = await self._get_config_value("trading", {}) or {}
                 if isinstance(trading_cfg, dict):
                     floored_mult = self._apply_strategy_size_floor(
                         strategy_name,
@@ -12108,6 +14867,87 @@ class TradingOrchestrator:
             logger.error(f"Exception type: {type(e).__name__}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
+
+    async def _ensure_spot_trailing_stop_record(
+        self,
+        trade: Dict[str, Any],
+        *,
+        current_price: float,
+        highest_price: float,
+        trailing_stop_config: Dict[str, Any],
+        profit_protection_config: Dict[str, Any],
+    ) -> None:
+        """Keep the newer trailing_stops table in sync with legacy trade-level trail fields."""
+        trade_id = str(trade.get("trade_id") or "")
+        if not trade_id:
+            return
+        if str(trade.get("trail_stop") or "").lower() != "active":
+            return
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                existing = await client.get(
+                    f"{database_service_url}/api/v1/trailing-stops/{trade_id}"
+                )
+                if existing.status_code == 200:
+                    await client.put(
+                        f"{database_service_url}/api/v1/trailing-stops/{trade_id}/activate"
+                    )
+                    return
+                if existing.status_code != 404:
+                    logger.debug(
+                        "[SpotTrailingSync] trailing stop lookup returned HTTP %s for %s",
+                        existing.status_code,
+                        trade_id,
+                    )
+                    return
+                payload = {
+                    "trade_id": trade_id,
+                    "exchange": trade.get("exchange"),
+                    "pair": trade.get("pair"),
+                    "trailing_enabled": True,
+                    "trailing_trigger_percentage": float(
+                        trailing_stop_config.get("activation_threshold", 0.0) or 0.0
+                    ),
+                    "trailing_step_percentage": float(
+                        trailing_stop_config.get("step_percentage", 0.0) or 0.0
+                    ),
+                    "max_trail_distance_percentage": float(
+                        trailing_stop_config.get("max_trail_distance", 0.0) or 0.0
+                    ),
+                    "entry_price": float(trade.get("entry_price") or 0.0),
+                    "current_price": float(current_price or 0.0),
+                    "highest_price_seen": float(highest_price or current_price or 0.0),
+                    "lowest_price_seen": float(trade.get("entry_price") or current_price or 0.0),
+                    "position_side": "long",
+                    "profit_protection_enabled": bool(
+                        profit_protection_config.get("enabled", True)
+                    ),
+                    "profit_lock_percentage": float(
+                        trailing_stop_config.get("breakeven_floor_percentage", 0.0) or 0.0
+                    ),
+                }
+                created = await client.post(
+                    f"{database_service_url}/api/v1/trailing-stops",
+                    json=payload,
+                )
+                if created.status_code in (200, 201):
+                    await client.put(
+                        f"{database_service_url}/api/v1/trailing-stops/{trade_id}/activate"
+                    )
+                    logger.warning(
+                        "[SpotTrailingSync] Backfilled active trailing_stop row for %s %s",
+                        trade.get("exchange"),
+                        trade.get("pair"),
+                    )
+                else:
+                    logger.debug(
+                        "[SpotTrailingSync] create failed for %s: HTTP %s %s",
+                        trade_id,
+                        created.status_code,
+                        _http_response_log_snippet(created),
+                    )
+        except Exception as exc:
+            logger.debug("[SpotTrailingSync] skipped for %s: %s", trade_id, exc)
             
     async def verify_all_trades(self) -> Dict[str, Any]:
         """Verify all recent orders from exchanges are properly recorded in database"""
@@ -13168,41 +16008,60 @@ class TradingOrchestrator:
             
     async def _run_maintenance_tasks(self, deadline: Optional[float] = None) -> None:
         """Run maintenance tasks (best-effort; may truncate when loop wall budget is exhausted)."""
+        async def run_with_budget(label: str, task_factory):
+            if deadline is None:
+                return await task_factory()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("⏱️ Maintenance skipped before %s: wall budget exhausted", label)
+                return None
+            try:
+                return await asyncio.wait_for(task_factory(), timeout=max(0.1, remaining))
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Maintenance timed out during %s: wall budget exhausted", label)
+                return None
+
         try:
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Maintenance skipped: trading-loop wall budget exhausted")
                 return
 
             # Update balances
-            await self._update_balances()
+            await run_with_budget("balance update", self._update_balances)
 
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Maintenance truncated after balance update: wall budget exhausted")
                 return
             
             # Check if pair selection needs updating
-            await self._check_pair_selection_update()
+            await run_with_budget("pair-selection check", self._check_pair_selection_update)
 
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Maintenance truncated after pair-selection check: wall budget exhausted")
                 return
             
             # Clean up old data
-            await self._cleanup_old_data()
+            await run_with_budget("cleanup", self._cleanup_old_data)
 
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Maintenance truncated after cleanup: wall budget exhausted")
                 return
             
             # 🚨 CRITICAL FIX: Check for filled orders that should close trades
-            await self._check_filled_orders_for_trade_closure()
+            await run_with_budget(
+                "filled-order reconciliation",
+                self._check_filled_orders_for_trade_closure,
+            )
 
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning("⏱️ Maintenance truncated after filled-order reconciliation: wall budget exhausted")
                 return
 
             # Enforce pair rotation even when trades were closed by fallback/sync paths.
-            await self._enforce_pair_rotation_from_recent_losses()
+            await run_with_budget(
+                "recent-loss pair rotation",
+                self._enforce_pair_rotation_from_recent_losses,
+            )
             
         except Exception as e:
             logger.error(f"Error in maintenance tasks: {str(e)}")
@@ -15261,6 +18120,25 @@ class TradingOrchestrator:
 orchestrator = TradingOrchestrator()
 
 # API Endpoints
+async def _open_paper_perp_trades_for_status() -> List[Dict[str, Any]]:
+    """Best-effort DB-backed open Hyperliquid paper perps for status endpoints."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
+        if resp.status_code != 200:
+            logger.debug(
+                "Open paper perps status fetch failed: %s %s",
+                resp.status_code,
+                _http_response_log_snippet(resp),
+            )
+            return []
+        rows = (resp.json() or {}).get("trades", [])
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    except Exception as exc:
+        logger.debug("Open paper perps status fetch failed: %s", exc)
+        return []
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
@@ -15268,7 +18146,11 @@ async def health_check():
         # Safely get global variables with defaults
         current_trading_status = globals().get('trading_status', 'initializing')
         current_cycle_count = globals().get('cycle_count', 0)
-        current_active_trades = len(globals().get('active_trades_dict', {}))
+        active_rows = merge_active_trades_with_paper_perps(
+            globals().get('active_trades_dict', {}).values(),
+            await _open_paper_perp_trades_for_status(),
+        )
+        current_active_trades = len(active_rows)
         
         return HealthResponse(
             status="healthy",
@@ -15355,11 +18237,15 @@ async def get_trading_status():
     uptime = None
     if orchestrator.start_time:
         uptime = datetime.utcnow() - orchestrator.start_time
+    active_rows = merge_active_trades_with_paper_perps(
+        orchestrator.active_trades_dict.values(),
+        await _open_paper_perp_trades_for_status(),
+    )
         
     return TradingStatus(
         status="running" if orchestrator.running else "stopped",
         cycle_count=orchestrator.cycle_count,
-        active_trades=len(orchestrator.active_trades_dict),
+        active_trades=len(active_rows),
         total_pnl=0.0,  # Would calculate from trades
         last_cycle=datetime.utcnow(),
         uptime=uptime or timedelta(0),
@@ -15368,6 +18254,7 @@ async def get_trading_status():
         ),
         cycles=orchestrator._cycle_phase_snapshot(),
         cycle_health=orchestrator._cycle_health_snapshot(),
+        hyperliquid_mids=orchestrator._hyperliquid_mids_status(),
     )
 
 
@@ -15448,9 +18335,13 @@ async def run_exit_cycle():
 @app.get("/api/v1/trading/active-trades")
 async def get_active_trades():
     """Get active trades"""
+    active_rows = merge_active_trades_with_paper_perps(
+        active_trades_dict.values(),
+        await _open_paper_perp_trades_for_status(),
+    )
     return {
-        "active_trades": list(active_trades_dict.values()),
-        "count": len(active_trades_dict)
+        "active_trades": active_rows,
+        "count": len(active_rows)
     }
 
 @app.get("/api/v1/trading/cycle-stats")
@@ -15976,6 +18867,7 @@ async def shutdown_event():
     global telegram_hourly_report_task
     if orchestrator.running:
         await orchestrator.stop_trading()
+    await orchestrator._stop_hyperliquid_mids_ws_task()
     if telegram_hourly_report_task:
         telegram_hourly_report_task.cancel()
         try:

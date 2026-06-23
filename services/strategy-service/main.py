@@ -77,13 +77,22 @@ def _strategy_signal_timeframes(strategy_name: str, strategy_data: Any = None) -
         if value and value not in ordered:
             ordered.append(value)
 
+    # Strategy configuration keeps ``target_timeframes`` at the strategy root,
+    # while several older strategies keep timeframe hints under ``parameters``.
+    # Read both shapes. Missing the root value made the daytrade fast publisher
+    # evaluate EMA50 with its generic fallback frame, so the 4h-only engine
+    # returned ``missing_timeframe:4h`` even though the exchange had 4h candles.
+    for tf in cfg.get("target_timeframes") or []:
+        add(tf)
     for tf in params.get("target_timeframes") or []:
         add(tf)
+    add(params.get("primary_timeframe"))
     add(params.get("structure_timeframe"))
     add(params.get("entry_timeframe"))
     add(params.get("bias_timeframe"))
     add(params.get("precision_timeframe"))
-    add(_strategy_entry_timeframe(strategy_name, cfg))
+    if not ordered:
+        add(_strategy_entry_timeframe(strategy_name, cfg))
     confirmation = str(params.get("confirmation_timeframe") or "").strip().lower()
     add(confirmation)
     for tf in params.get("context_timeframes") or []:

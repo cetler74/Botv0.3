@@ -406,8 +406,11 @@ async def get_trading_config():
         "max_cycle_duration",
         "entry_loop_reserve_seconds",
         "perp_cycle_max_seconds",
+        "spot_cycle_max_seconds",
         "spot_entry_pair_timeout_seconds",
         "spot_entry_pair_priority",
+        "spot_entry_check_concurrency",
+        "perp_entry_check_concurrency",
         "exit_check_concurrency",
         "exit_price_prefetch_concurrency",
     ):
@@ -567,9 +570,14 @@ async def get_simulation_settings():
     if not config_data:
         raise HTTPException(status_code=503, detail="Configuration not loaded")
     sim = (config_data.get('trading', {}) or {}).get('simulation', {}) or {}
+    fee_rate_by_exchange = sim.get("fee_rate_per_side_by_exchange") or {}
     return {
         "starting_balance_per_exchange_usd": float(sim.get('starting_balance_per_exchange_usd', 2000.0)),
         "fee_rate_per_side": float(sim.get('fee_rate_per_side', 0.0005)),
+        "fee_rate_per_side_by_exchange": {
+            str(exchange).lower(): float(rate)
+            for exchange, rate in fee_rate_by_exchange.items()
+        },
     }
 
 

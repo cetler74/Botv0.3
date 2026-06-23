@@ -112,6 +112,7 @@ def test_buy_on_valid_uptrend_demand_retest():
         assert result.indicators["step2_pass"] is True
         assert result.indicators["step3_pass"] is True
         assert result.indicators["reward_risk"] >= 1.5
+        assert result.indicators["expected_move_pct"] > 0
         assert "Supply/Demand 3-Step LONG" in result.indicators["entry_reason"]
 
 

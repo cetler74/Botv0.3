@@ -1400,6 +1400,7 @@ async def get_simulation_settings_cached() -> Dict[str, float]:
     Provides the single source of truth for paper-trading P&L:
       - starting_balance_per_exchange_usd
       - fee_rate_per_side
+      - fee_rate_per_side_by_exchange
     Falls back to safe defaults if config-service is unreachable.
     """
     try:
@@ -1412,10 +1413,20 @@ async def get_simulation_settings_cached() -> Dict[str, float]:
                         data.get("starting_balance_per_exchange_usd", 2000.0)
                     ),
                     "fee_rate_per_side": float(data.get("fee_rate_per_side", 0.0005)),
+                    "fee_rate_per_side_by_exchange": {
+                        str(exchange).lower(): float(rate)
+                        for exchange, rate in (
+                            data.get("fee_rate_per_side_by_exchange") or {}
+                        ).items()
+                    },
                 }
     except Exception as e:
         logger.debug("get_simulation_settings_cached: %s", e)
-    return {"starting_balance_per_exchange_usd": 2000.0, "fee_rate_per_side": 0.0005}
+    return {
+        "starting_balance_per_exchange_usd": 2000.0,
+        "fee_rate_per_side": 0.0005,
+        "fee_rate_per_side_by_exchange": {},
+    }
 
 
 async def get_hyperliquid_perps_settings_cached() -> Dict[str, Any]:
@@ -2669,6 +2680,7 @@ async def get_perp_paper_trades(
     coin: Optional[str] = None,
     position_side: Optional[str] = None,
     include_accounting_excluded: bool = False,
+    shadow_only: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
@@ -2687,6 +2699,8 @@ async def get_perp_paper_trades(
         if position_side:
             where_conditions.append("position_side = %s")
             params.append(position_side.lower())
+        if shadow_only:
+            where_conditions.append("COALESCE(metadata->>'shadow_trade', 'false') = 'true'")
         if not include_accounting_excluded:
             where_conditions.append(PERP_PAPER_ACCOUNTING_INCLUDED_SQL)
 
@@ -2718,9 +2732,161 @@ async def get_open_perp_paper_trades(coin: Optional[str] = None):
         status="OPEN",
         coin=coin,
         include_accounting_excluded=False,
+        shadow_only=False,
         limit=1000,
         offset=0,
     )
+
+
+@app.get("/api/v1/perps/paper-shadow-summary")
+async def get_perp_paper_shadow_summary(
+    hours: Optional[int] = Query(
+        default=None,
+        ge=0,
+        le=8760,
+        description="Rolling window in hours (0 or omit = all time). Closed rows use exit_time; open rows use entry_time.",
+    ),
+):
+    """Comparable strategy results from accounting-excluded shadow positions."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    period_hours: Optional[int] = None
+    if hours is not None and int(hours) > 0:
+        period_hours = int(hours)
+
+    time_filter = ""
+    time_params: List[Any] = []
+    if period_hours is not None:
+        time_filter = """
+          AND (
+            (status = 'CLOSED' AND exit_time >= NOW() - (%s * INTERVAL '1 hour'))
+            OR (status = 'OPEN' AND entry_time >= NOW() - (%s * INTERVAL '1 hour'))
+          )
+        """
+        time_params = [period_hours, period_hours]
+
+    rows = await db_manager.execute_query(
+        f"""
+        SELECT
+            source_strategy,
+            position_side,
+            COALESCE(metadata->>'market_regime', 'unknown') AS market_regime,
+            COALESCE(metadata->>'shadow_edge_passed', 'unknown') AS edge_gate_passed,
+            COALESCE(metadata->>'real_execution_status', 'legacy_unclassified')
+                AS real_execution_status,
+            COALESCE(metadata->>'downstream_block_reason', 'none')
+                AS downstream_block_reason,
+            COALESCE(metadata->>'shadow_exit_policy_version', 'legacy')
+                AS shadow_exit_policy_version,
+            COUNT(*) AS opportunity_count,
+            COUNT(*) FILTER (WHERE status = 'OPEN') AS open_count,
+            COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_count,
+            COUNT(*) FILTER (WHERE status = 'CLOSED' AND realized_pnl > 0) AS wins,
+            COUNT(*) FILTER (WHERE status = 'CLOSED' AND realized_pnl < 0) AS losses,
+            COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
+            COALESCE(SUM(fees) FILTER (WHERE status = 'CLOSED'), 0) AS fees,
+            COALESCE(SUM(realized_pnl) FILTER (
+                WHERE status = 'CLOSED' AND realized_pnl > 0
+            ), 0) AS gross_wins,
+            ABS(COALESCE(SUM(realized_pnl) FILTER (
+                WHERE status = 'CLOSED' AND realized_pnl < 0
+            ), 0)) AS gross_losses,
+            AVG(EXTRACT(EPOCH FROM (exit_time - entry_time)) / 60.0)
+                FILTER (WHERE status = 'CLOSED') AS average_hold_minutes,
+            MIN(entry_time) AS first_entry_time,
+            MAX(COALESCE(exit_time, entry_time)) AS last_activity_time
+        FROM trading.perp_paper_trades
+        WHERE COALESCE(metadata->>'shadow_trade', 'false') = 'true'
+          AND COALESCE(metadata->>'accounting_excluded', 'false') = 'true'
+          {time_filter}
+        GROUP BY
+            source_strategy,
+            position_side,
+            COALESCE(metadata->>'market_regime', 'unknown'),
+            COALESCE(metadata->>'shadow_edge_passed', 'unknown'),
+            COALESCE(metadata->>'real_execution_status', 'legacy_unclassified'),
+            COALESCE(metadata->>'downstream_block_reason', 'none'),
+            COALESCE(metadata->>'shadow_exit_policy_version', 'legacy')
+        ORDER BY
+            source_strategy,
+            position_side,
+            market_regime,
+            real_execution_status,
+            downstream_block_reason,
+            shadow_exit_policy_version,
+            edge_gate_passed
+        """,
+        tuple(time_params),
+    )
+    summary = []
+    window_start: Optional[datetime] = None
+    window_end: Optional[datetime] = None
+    for row in rows or []:
+        item = dict(row)
+        closed = int(item.get("closed_count") or 0)
+        wins = int(item.get("wins") or 0)
+        gross_losses = float(item.get("gross_losses") or 0.0)
+        item["win_rate"] = (wins / closed) if closed else None
+        item["profit_factor"] = (
+            float(item.get("gross_wins") or 0.0) / gross_losses
+            if gross_losses > 0
+            else None
+        )
+        first_entry = item.pop("first_entry_time", None)
+        last_activity = item.pop("last_activity_time", None)
+        if first_entry is not None:
+            if window_start is None or first_entry < window_start:
+                window_start = first_entry
+        if last_activity is not None:
+            if window_end is None or last_activity > window_end:
+                window_end = last_activity
+        summary.append(item)
+
+    shadow_trades = await db_manager.execute_query(
+        f"""
+        SELECT
+            source_strategy,
+            position_side,
+            coin,
+            status,
+            entry_time,
+            exit_time,
+            realized_pnl,
+            fees,
+            metadata
+        FROM trading.perp_paper_trades
+        WHERE COALESCE(metadata->>'shadow_trade', 'false') = 'true'
+          AND COALESCE(metadata->>'accounting_excluded', 'false') = 'true'
+          {time_filter}
+        ORDER BY entry_time ASC
+        """,
+        tuple(time_params),
+    )
+    try:
+        from core.shadow_episode_summary import (
+            enrich_shadow_summary_cohorts,
+            shadow_summary_totals,
+        )
+    except ImportError:
+        from shadow_episode_summary import (
+            enrich_shadow_summary_cohorts,
+            shadow_summary_totals,
+        )
+    trade_rows = [dict(row) for row in (shadow_trades or [])]
+    summary = enrich_shadow_summary_cohorts(summary, trade_rows)
+    totals = shadow_summary_totals(summary, trade_rows)
+
+    return {
+        "strategies": summary,
+        "totals": totals,
+        "accounting_excluded": True,
+        "period_hours": period_hours,
+        "window_start": window_start.isoformat() if window_start else None,
+        "window_end": window_end.isoformat() if window_end else None,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "cohort_count": len(summary),
+        "episode_reporting": True,
+    }
 
 
 @app.post("/api/v1/perps/adaptive-pnl-decisions/sync")

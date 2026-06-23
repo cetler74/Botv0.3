@@ -44,6 +44,13 @@ class StrategyManager:
             'rsi_oversold_checklist': 'RSIOversoldChecklistStrategy',
             'rsi_oversold_override': 'RSIOversoldOverrideStrategy',
             'macd_momentum': 'MACDMomentumStrategy',
+            'sma_reclaim_bull_flag': 'SmaReclaimBullFlagStrategy',
+            'supply_demand_3step': 'SupplyDemand3StepStrategy',
+            'dual_sma_daytrade': 'DualSmaDaytradeStrategy',
+            'arc_daytrade': 'ArcDaytradeStrategy',
+            'ema50_breakout_pullback': 'Ema50BreakoutPullbackStrategy',
+            'rsi_stoch_reversal_5m': 'RsiStochReversal5mStrategy',
+            'rsi_stoch_reversal_1m': 'RsiStochReversal1mStrategy',
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
@@ -56,6 +63,13 @@ class StrategyManager:
             'rsi_oversold_checklist': 'strategy.rsi_oversold_checklist_strategy',
             'rsi_oversold_override': 'strategy.rsi_oversold_override_strategy',
             'macd_momentum': 'strategy.macd_momentum_strategy',
+            'sma_reclaim_bull_flag': 'strategy.sma_reclaim_bull_flag_strategy',
+            'supply_demand_3step': 'strategy.supply_demand_3step_strategy',
+            'dual_sma_daytrade': 'strategy.dual_sma_daytrade_strategy',
+            'arc_daytrade': 'strategy.arc_daytrade_strategy',
+            'ema50_breakout_pullback': 'strategy.ema50_breakout_pullback_strategy',
+            'rsi_stoch_reversal_5m': 'strategy.rsi_stoch_reversal_5m_strategy',
+            'rsi_stoch_reversal_1m': 'strategy.rsi_stoch_reversal_1m_strategy',
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         for strategy_name, strategy_config in strategies_config.items():

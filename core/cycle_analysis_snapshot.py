@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 SNAPSHOT_ENTRY_CONFIDENCE = 0.3
 HL_CYCLE_REDIS_PREFIX = "cycle:hl:"
@@ -349,6 +349,9 @@ class HlCoinCycleRecorder:
         self.signals_data: Dict[str, Any] = {}
         self.mirrored: Optional[Dict[str, Any]] = None
         self.gate_chain: List[Dict[str, Any]] = []
+        self.finish_callback: Optional[
+            Callable[[str, str, str, List[Dict[str, Any]]], Awaitable[None]]
+        ] = None
 
     def set_signals(self, signals_data: Optional[Mapping[str, Any]]) -> None:
         self.signals_data = dict(signals_data or {})
@@ -365,6 +368,15 @@ class HlCoinCycleRecorder:
             }
         )
 
+    def set_finish_callback(
+        self,
+        callback: Optional[
+            Callable[[str, str, str, List[Dict[str, Any]]], Awaitable[None]]
+        ],
+    ) -> None:
+        """Attach optional durable side effects to the terminal cycle outcome."""
+        self.finish_callback = callback
+
     async def finish(
         self,
         *,
@@ -372,6 +384,13 @@ class HlCoinCycleRecorder:
         primary_reason: str,
         message: str = "",
     ) -> None:
+        if self.finish_callback is not None:
+            await self.finish_callback(
+                str(outcome or ""),
+                str(primary_reason or ""),
+                str(message or ""),
+                [dict(gate) for gate in self.gate_chain],
+            )
         snapshot = merge_hl_cycle_snapshot(
             coin=self.coin,
             cycle_count=self.cycle_count,

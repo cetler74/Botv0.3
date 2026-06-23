@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Hyperliquid Paper Perps</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260528" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260608-section-collapse">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260620-shadow-exit-policy">
 </head>
 <body>
     <header class="pi-topbar">
@@ -16,6 +16,20 @@
                 <p>Perpetual paper trading</p>
             </div>
         </div>
+        <nav class="pi-topbar-nav" aria-label="Trading dashboards">
+            <a href="/portfolio-dashboard" class="pi-hero-nav-link pi-hero-nav-link-perp is-active" aria-current="page" title="Perpetual trading dashboard">
+                <i class="fas fa-water" aria-hidden="true"></i>
+                <span>Perpetual trading</span>
+            </a>
+            <a href="/spot-dashboard" class="pi-hero-nav-link pi-hero-nav-link-spot" title="Open spot trading dashboard">
+                <i class="fas fa-coins" aria-hidden="true"></i>
+                <span>Spot trading</span>
+            </a>
+            <a href="#shadow-strategy-results" class="pi-hero-nav-link pi-hero-nav-link-shadow" title="View normalized shadow strategy results">
+                <i class="fas fa-flask" aria-hidden="true"></i>
+                <span>Shadow results</span>
+            </a>
+        </nav>
         <div class="pi-topbar-center">
             <span class="pi-live"><span></span>Live</span>
             <span class="pi-pill pi-pill-hl" id="hl-mode-pill">HL: Paper</span>
@@ -33,11 +47,7 @@
         <section class="pi-hero pi-hero-hl">
             <div class="pi-hero-main">
                 <div class="pi-hero-head">
-                    <p class="pi-eyebrow">Hyperliquid venue · <span id="hl-balance-source">paper</span></p>
-                    <a href="/spot-dashboard" class="pi-hero-nav-link pi-hero-nav-link-spot" title="Open spot trading dashboard">
-                        <i class="fas fa-coins" aria-hidden="true"></i>
-                        <span>Spot trading</span>
-                    </a>
+                    <h2 class="pi-section-title">Hyperliquid venue · <span id="hl-balance-source">paper</span></h2>
                 </div>
                 <p class="pi-hero-balance-label">Settled balance</p>
                 <div class="pi-portfolio-value" id="hero-equity">$0.00</div>
@@ -194,6 +204,81 @@
                     <button type="button" class="pi-page-btn" id="pnl-prev" aria-label="Previous PnL page">Prev</button>
                     <button type="button" class="pi-page-btn" id="pnl-next" aria-label="Next PnL page">Next</button>
                 </div>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-shadow-results" id="shadow-strategy-results">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Counterfactual paper analysis</p>
+                    <h2>Shadow strategy results</h2>
+                </div>
+                <div class="pi-head-actions">
+                    <span class="pi-muted" id="shadow-results-meta">Loading...</span>
+                    <a class="pi-page-btn" href="/api/v1/perps/paper-shadow-summary" target="_blank" rel="noopener" id="shadow-raw-link">
+                        Raw results
+                    </a>
+                </div>
+            </div>
+            <div class="pi-filter-bar pi-shadow-tabs" role="tablist" aria-label="Shadow results period">
+                <button type="button" class="pi-filter-btn active" data-shadow-period="168">7d</button>
+                <button type="button" class="pi-filter-btn" data-shadow-period="720">30d</button>
+                <button type="button" class="pi-filter-btn" data-shadow-period="0">All</button>
+            </div>
+            <div class="pi-shadow-totals" id="shadow-results-totals" hidden>
+                <article class="pi-kpi">
+                    <span>Raw closed rows</span>
+                    <strong id="shadow-raw-closed">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Independent episodes</span>
+                    <strong id="shadow-episode-closed">0</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Raw net PnL</span>
+                    <strong id="shadow-raw-pnl">$0.00</strong>
+                </article>
+                <article class="pi-kpi pi-kpi-primary">
+                    <span>Episode net PnL</span>
+                    <strong id="shadow-episode-pnl">$0.00</strong>
+                </article>
+            </div>
+            <div class="pi-shadow-explainer">
+                <i class="fas fa-circle-info" aria-hidden="true"></i>
+                <p>
+                    Every unique directional setup passing its strategy-owned gates receives the same $200 paper notional.
+                    <strong>Episode</strong> columns dedupe repeated scans on the same strategy/coin/side while a setup is still live — use episode PnL for tuning, not raw row counts.
+                    Real outcome and downstream block show why the executable portfolio did or did not take it.
+                    Shadow positions remain accounting-excluded and never affect PnL, margin, or execution limits.
+                </p>
+            </div>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-shadow-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Strategy</th>
+                            <th>Side</th>
+                            <th>Regime</th>
+                            <th>Exit policy</th>
+                            <th>Real outcome</th>
+                            <th>Downstream block</th>
+                            <th>Edge gate</th>
+                            <th>Raw rows</th>
+                            <th>Episodes</th>
+                            <th>Open</th>
+                            <th>Closed</th>
+                            <th>Win rate</th>
+                            <th>Raw PnL</th>
+                            <th>Episode PnL</th>
+                            <th>Fees</th>
+                            <th>Episode PF</th>
+                            <th>Avg hold</th>
+                        </tr>
+                    </thead>
+                    <tbody id="shadow-results-body">
+                        <tr><td colspan="17" class="pi-empty">Loading shadow strategy results...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </section>
 
@@ -664,7 +749,7 @@
         </section>
     </main>
 
-    <script src="/static/js/portfolio-panel-collapse.js?v=20260608-section-collapse"></script>
-    <script src="/static/js/portfolio-dashboard.js?v=20260609-orb-pagination-fix"></script>
+    <script src="/static/js/portfolio-panel-collapse.js?v=20260610-topbar-nav"></script>
+    <script src="/static/js/portfolio-dashboard.js?v=20260623-dashboard-cache-bust"></script>
 </body>
 </html>

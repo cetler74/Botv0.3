@@ -94,3 +94,24 @@ def test_bearish_breakout_retest():
     assert result.fire_signal is True
     assert result.direction == "short"
     assert result.stop_hint == 99.0
+
+
+def test_grace_bar_fires_after_retest_bar():
+    df = _session_df()
+    or_candle = find_session_or_candle(df, session_date="2025-06-02")
+    assert or_candle is not None
+    retest_idx = or_candle.or_idx + 3
+    current_idx = retest_idx + 1
+    rows = df.iloc[current_idx].to_dict()
+    rows["close"] = 101.6
+    df.iloc[current_idx] = rows
+    result = scan_orb_retest_fsm(
+        df,
+        or_candle,
+        current_idx,
+        entry_grace_bars=3,
+    )
+    assert result.fire_signal is True
+    assert result.session_state == "signal"
+    assert result.direction == "long"
+    assert result.entry_price == 101.5

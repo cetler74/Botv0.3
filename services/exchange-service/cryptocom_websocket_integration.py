@@ -6,7 +6,7 @@ Integrates Crypto.com User Data Stream with the existing exchange service
 import asyncio
 import logging
 import os
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException
 from cryptocom_user_data_stream import CryptocomUserDataStreamManager
 from cryptocom_event_processors import CryptocomEventProcessorManager
@@ -31,12 +31,20 @@ class CryptocomWebSocketIntegration:
         self.stream_manager: Optional[CryptocomUserDataStreamManager] = None
         self.event_processor_manager: Optional[CryptocomEventProcessorManager] = None
         self.market_websocket: Optional[CryptocomMarketWebSocket] = None
+        self._update_ticker_cache: Optional[Callable[[str, str, float, float, float], None]] = None
         
         # State
         self.is_initialized = False
         self.is_running = False
         
         logger.info(f"🏢 Crypto.com WebSocket Integration initialized (enabled: {self.enabled})")
+
+    def set_ticker_cache_updater(
+        self,
+        updater: Callable[[str, str, float, float, float], None],
+    ) -> None:
+        """Provide the exchange-service ticker cache updater without importing main.py."""
+        self._update_ticker_cache = updater
     
     async def initialize(self) -> bool:
         """Initialize the WebSocket integration"""
@@ -64,16 +72,10 @@ class CryptocomWebSocketIntegration:
             # Create market data WebSocket (always enabled for price feeds)
             self.market_websocket = CryptocomMarketWebSocket()
             
-            # Import ticker cache update function from main module
-            from main import _update_ticker_cache
-            
             # Register market data callbacks
             self.market_websocket.add_ticker_callback(self._handle_ticker_update)
             self.market_websocket.add_error_callback(self._handle_market_error)
             self.market_websocket.add_connection_callback(self._handle_market_connection_change)
-            
-            # Store ticker cache update function
-            self._update_ticker_cache = _update_ticker_cache
             
             # Register event callbacks
             self.stream_manager.add_order_callback(self._handle_order_event)
@@ -192,6 +194,9 @@ class CryptocomWebSocketIntegration:
     async def _handle_ticker_update(self, exchange: str, symbol: str, last_price: float, bid_price: float, ask_price: float):
         """Handle ticker updates from market data WebSocket"""
         try:
+            if not self._update_ticker_cache:
+                logger.warning("Crypto.com ticker cache updater is not configured")
+                return
             # Update ticker cache using the imported function
             self._update_ticker_cache(exchange, symbol, last_price, bid_price, ask_price)
             logger.debug(f"📊 Updated ticker cache: {exchange}/{symbol} = ${last_price:.8f}")
@@ -235,6 +240,8 @@ class CryptocomWebSocketIntegration:
         # Get market data WebSocket status
         market_status = self.market_websocket.get_status() if self.market_websocket else {}
         is_market_connected = market_status.get('connected', False)
+        is_market_healthy = market_status.get('healthy', False)
+        is_user_healthy = self.stream_manager.is_healthy()
         
         return {
             'enabled': True,
@@ -246,7 +253,7 @@ class CryptocomWebSocketIntegration:
             'market_data_connected': is_market_connected,
             'stream_status': stream_status,
             'market_data_status': market_status,
-            'stream_healthy': self.stream_manager.is_healthy()
+            'stream_healthy': bool(is_user_healthy and is_market_healthy)
         }
     
     def get_metrics(self) -> Dict[str, Any]:

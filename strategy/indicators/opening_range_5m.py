@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from typing import Any, Dict, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -174,6 +174,22 @@ def _compute_risk_levels(
     return None, None, None
 
 
+def _finalize_pending_signal(
+    pending: OrbScanResult,
+    pending_retest_idx: int,
+    current_idx: int,
+    entry_grace_bars: int,
+) -> OrbScanResult:
+    """Fire entry while retest confirmation is still inside the grace window."""
+    if current_idx - pending_retest_idx <= max(0, int(entry_grace_bars)):
+        return replace(pending, fire_signal=True, rejection_reason="")
+    return replace(
+        pending,
+        fire_signal=False,
+        rejection_reason="session_entry_taken",
+    )
+
+
 def scan_orb_retest_fsm(
     df: pd.DataFrame,
     or_candle: OpeningRangeCandle,
@@ -183,6 +199,7 @@ def scan_orb_retest_fsm(
     or_close_time: str = "09:35",
     entry_watch_end: str = "16:00",
     target_reward_risk: float = 2.0,
+    entry_grace_bars: int = 3,
     now: Optional[datetime] = None,
 ) -> OrbScanResult:
     """Stateless forward scan from OR close through current_idx."""
@@ -230,6 +247,8 @@ def scan_orb_retest_fsm(
     direction: Direction = "none"
     breakout_idx: Optional[int] = None
     last_retest_reason = ""
+    pending_signal: Optional[OrbScanResult] = None
+    pending_retest_idx: Optional[int] = None
 
     for j in range(or_idx + 1, current_idx + 1):
         if _is_past_watch_end(
@@ -352,8 +371,12 @@ def scan_orb_retest_fsm(
                 base["session_state"] = "waiting_retest"
                 base["retest_valid"] = False
                 base["retest_reason"] = last_retest_reason
+                pending_signal = None
+                pending_retest_idx = None
                 continue
             if touched and c > or_high:
+                if pending_signal is not None:
+                    continue
                 entry = c
                 stop, target, rr = _compute_risk_levels(
                     direction="long",
@@ -381,37 +404,14 @@ def scan_orb_retest_fsm(
                         breakout_idx=breakout_idx,
                         breakout_candle_ts=base["breakout_candle_ts"],
                     )
-                if j == current_idx:
-                    return OrbScanResult(
-                        session_state="signal",
-                        direction="long",
-                        breakout_valid=True,
-                        retest_valid=True,
-                        breakout_reason=base["breakout_reason"],
-                        retest_reason="retest_held_or_high_close_above",
-                        rejection_reason="",
-                        entry_price=entry,
-                        stop_hint=stop,
-                        target_hint=target,
-                        reward_risk=rr,
-                        or_high=or_high,
-                        or_low=or_low,
-                        or_mid=or_mid,
-                        or_candle_ts=or_candle.or_candle_ts,
-                        breakout_idx=breakout_idx,
-                        breakout_candle_ts=base["breakout_candle_ts"],
-                        retest_idx=j,
-                        retest_candle_ts=_ts_iso(df.index[j]),
-                        fire_signal=True,
-                    )
-                return OrbScanResult(
+                pending_signal = OrbScanResult(
                     session_state="signal",
                     direction="long",
-                    rejection_reason="session_entry_taken",
                     breakout_valid=True,
                     retest_valid=True,
                     breakout_reason=base["breakout_reason"],
                     retest_reason="retest_held_or_high_close_above",
+                    rejection_reason="",
                     entry_price=entry,
                     stop_hint=stop,
                     target_hint=target,
@@ -426,6 +426,8 @@ def scan_orb_retest_fsm(
                     retest_candle_ts=_ts_iso(df.index[j]),
                     fire_signal=False,
                 )
+                pending_retest_idx = j
+                continue
 
         if direction == "short":
             touched = h >= or_low
@@ -434,8 +436,12 @@ def scan_orb_retest_fsm(
                 base["session_state"] = "waiting_retest"
                 base["retest_valid"] = False
                 base["retest_reason"] = last_retest_reason
+                pending_signal = None
+                pending_retest_idx = None
                 continue
             if touched and c < or_low:
+                if pending_signal is not None:
+                    continue
                 entry = c
                 stop, target, rr = _compute_risk_levels(
                     direction="short",
@@ -463,37 +469,14 @@ def scan_orb_retest_fsm(
                         breakout_idx=breakout_idx,
                         breakout_candle_ts=base["breakout_candle_ts"],
                     )
-                if j == current_idx:
-                    return OrbScanResult(
-                        session_state="signal",
-                        direction="short",
-                        breakout_valid=True,
-                        retest_valid=True,
-                        breakout_reason=base["breakout_reason"],
-                        retest_reason="retest_held_or_low_close_below",
-                        rejection_reason="",
-                        entry_price=entry,
-                        stop_hint=stop,
-                        target_hint=target,
-                        reward_risk=rr,
-                        or_high=or_high,
-                        or_low=or_low,
-                        or_mid=or_mid,
-                        or_candle_ts=or_candle.or_candle_ts,
-                        breakout_idx=breakout_idx,
-                        breakout_candle_ts=base["breakout_candle_ts"],
-                        retest_idx=j,
-                        retest_candle_ts=_ts_iso(df.index[j]),
-                        fire_signal=True,
-                    )
-                return OrbScanResult(
+                pending_signal = OrbScanResult(
                     session_state="signal",
                     direction="short",
-                    rejection_reason="session_entry_taken",
                     breakout_valid=True,
                     retest_valid=True,
                     breakout_reason=base["breakout_reason"],
                     retest_reason="retest_held_or_low_close_below",
+                    rejection_reason="",
                     entry_price=entry,
                     stop_hint=stop,
                     target_hint=target,
@@ -508,9 +491,19 @@ def scan_orb_retest_fsm(
                     retest_candle_ts=_ts_iso(df.index[j]),
                     fire_signal=False,
                 )
+                pending_retest_idx = j
+                continue
 
         base["session_state"] = "waiting_retest"
         base["direction"] = direction
+
+    if pending_signal is not None and pending_retest_idx is not None:
+        return _finalize_pending_signal(
+            pending_signal,
+            pending_retest_idx,
+            current_idx,
+            entry_grace_bars,
+        )
 
     return OrbScanResult(
         session_state=base["session_state"],

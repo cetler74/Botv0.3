@@ -1735,6 +1735,32 @@ async def get_perps_paper_pnl_report(hours: float = 24.0, limit: int = 2000):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/perps/paper-shadow-summary")
+async def get_perps_paper_shadow_summary(
+    hours: Optional[int] = Query(
+        default=None,
+        ge=0,
+        le=8760,
+        description="Rolling window in hours (0 or omit = all time).",
+    ),
+):
+    """Proxy accounting-excluded shadow strategy comparison results."""
+    try:
+        params: Dict[str, Any] = {}
+        if hours is not None:
+            params["hours"] = hours
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                f"{database_service_url}/api/v1/perps/paper-shadow-summary",
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error getting paper-perp shadow summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/perps/paper-trades")
 async def get_perps_paper_trades(status: Optional[str] = None, limit: int = 100):
     """Get Hyperliquid paper-perp trades."""

@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Spot Trading Intelligence</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260604" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260608-section-collapse">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260614-mobile-fullbleed2">
 </head>
 <body>
     <header class="pi-topbar">
@@ -16,6 +16,16 @@
                 <p>Multi-exchange spot trading</p>
             </div>
         </div>
+        <nav class="pi-topbar-nav" aria-label="Trading dashboards">
+            <a href="/portfolio-dashboard" class="pi-hero-nav-link pi-hero-nav-link-perp" title="Open perpetual trading dashboard">
+                <i class="fas fa-water" aria-hidden="true"></i>
+                <span>Perpetual trading</span>
+            </a>
+            <a href="/spot-dashboard" class="pi-hero-nav-link pi-hero-nav-link-spot is-active" aria-current="page" title="Spot trading dashboard">
+                <i class="fas fa-coins" aria-hidden="true"></i>
+                <span>Spot trading</span>
+            </a>
+        </nav>
         <div class="pi-topbar-center">
             <span class="pi-live"><span></span>Live</span>
             <span class="pi-pill pi-pill-spot" id="spot-mode-pill">Spot: Long only</span>
@@ -31,11 +41,7 @@
         <section class="pi-hero pi-hero-spot">
             <div class="pi-hero-main">
                 <div class="pi-hero-head">
-                    <p class="pi-eyebrow">Spot portfolio</p>
-                    <a href="/portfolio-dashboard" class="pi-hero-nav-link pi-hero-nav-link-perp" title="Open perpetual trading dashboard">
-                        <i class="fas fa-water" aria-hidden="true"></i>
-                        <span>Perpetual trading</span>
-                    </a>
+                    <h2 class="pi-section-title">Spot portfolio</h2>
                 </div>
                 <div class="pi-portfolio-value" id="hero-equity">$0.00</div>
                 <div class="pi-portfolio-sub">
@@ -505,7 +511,7 @@
         </section>
     </main>
 
-    <script src="/static/js/portfolio-panel-collapse.js?v=20260608-section-collapse"></script>
-    <script src="/static/js/spot-dashboard.js?v=20260608-spot-exit-columns"></script>
+    <script src="/static/js/portfolio-panel-collapse.js?v=20260610-topbar-nav"></script>
+    <script src="/static/js/spot-dashboard.js?v=20260613-price-precision"></script>
 </body>
 </html>

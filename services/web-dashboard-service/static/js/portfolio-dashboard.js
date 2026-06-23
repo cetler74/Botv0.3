@@ -48,6 +48,7 @@ const state = {
     trades: { key: 'time', direction: 'desc' },
   }),
   columns: loadStorage(STORAGE_KEYS.columns, {}),
+  shadowPeriodHours: 168,
   watchlistExpandedCoins: new Set(),
 };
 
@@ -63,11 +64,11 @@ const decimalPct = (value) => `${(Number(value || 0) * 100).toFixed(2)}%`;
 
 const priceMoney = (value) => {
   const n = Number(value || 0);
-  const digits = Math.abs(n) >= 100 ? 2 : Math.abs(n) >= 1 ? 4 : 6;
+  const digits = Math.abs(n) >= 1 ? 6 : 8;
   return n.toLocaleString(undefined, {
     style: 'currency',
     currency: 'USD',
-    minimumFractionDigits: Math.min(2, digits),
+    minimumFractionDigits: 6,
     maximumFractionDigits: digits,
   });
 };
@@ -289,10 +290,12 @@ function renderCyclePill(id, label, phase, health) {
   const cycleText = cycle > 0 ? ` · cycle ${cycle}` : '';
   el.textContent = `${label}: ${formatRelativeTime(ranAt)} · ${status.replace(/_/g, ' ')}${cycleText}`;
   el.classList.remove('ok', 'warn', 'bad');
-  if (status === 'error' || phaseHealth.ok === false) {
+  if (status === 'error' || phaseData.last_error) {
     el.classList.add('bad');
   } else if (status === 'completed') {
     el.classList.add('ok');
+  } else if (phaseHealth.ok === false) {
+    el.classList.add('bad');
   } else {
     el.classList.add('warn');
   }
@@ -1967,6 +1970,125 @@ function renderSystemStrip(data) {
     .join('');
 }
 
+function renderShadowStrategyResults(payload) {
+  const body = document.getElementById('shadow-results-body');
+  if (!body) return;
+  const rows = Array.isArray(payload?.strategies) ? payload.strategies : [];
+  const periodHours = Number(payload?.period_hours || 0);
+  const windowLabel = payload?.window_start && payload?.window_end
+    ? formatReportWindow(payload.window_start, payload.window_end)
+    : periodHours > 0
+      ? `last ${Math.round(periodHours / 24)}d`
+      : 'all time';
+  const generatedAt = payload?.generated_at
+    ? formatAdaptiveTime(payload.generated_at)
+    : null;
+  const totals = payload?.totals || {};
+  const rawTotals = totals.raw || {};
+  const episodeTotals = totals.episode || {};
+  const totalsEl = document.getElementById('shadow-results-totals');
+  if (totalsEl) {
+    const hasTotals = payload?.episode_reporting && (rawTotals.closed_count || episodeTotals.closed_count);
+    totalsEl.hidden = !hasTotals;
+    if (hasTotals) {
+      setText('shadow-raw-closed', num(rawTotals.closed_count, 0));
+      setText('shadow-episode-closed', num(episodeTotals.closed_count, 0));
+      const rawPnlEl = document.getElementById('shadow-raw-pnl');
+      const episodePnlEl = document.getElementById('shadow-episode-pnl');
+      if (rawPnlEl) {
+        rawPnlEl.textContent = money(rawTotals.realized_pnl);
+        rawPnlEl.className = cls(rawTotals.realized_pnl);
+      }
+      if (episodePnlEl) {
+        episodePnlEl.textContent = money(episodeTotals.realized_pnl);
+        episodePnlEl.className = cls(episodeTotals.realized_pnl);
+      }
+    }
+  }
+  const metaParts = [
+    rows.length ? `${rows.length} cohorts` : 'No cohorts in window',
+    payload?.episode_reporting ? 'episode-adjusted PnL shown' : 'normalized $200 notional',
+    windowLabel,
+  ];
+  if (generatedAt) metaParts.push(`as of ${generatedAt}`);
+  setText('shadow-results-meta', metaParts.join(' · '));
+  document.querySelectorAll('[data-shadow-period]').forEach((btn) => {
+    const btnHours = Number(btn.dataset.shadowPeriod || 0);
+    const activeHours = Number(state.shadowPeriodHours || 0);
+    btn.classList.toggle('active', btnHours === activeHours);
+  });
+  const rawLink = document.getElementById('shadow-raw-link');
+  if (rawLink) {
+    const linkHours = Number(state.shadowPeriodHours || 0);
+    const qs = linkHours > 0 ? `?hours=${linkHours}` : '';
+    rawLink.href = `/api/v1/perps/paper-shadow-summary${qs}`;
+  }
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="17" class="pi-empty">No shadow opportunities in this window. Try a wider period or wait for eligible strategy setups.</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((row) => {
+    const closed = Number(row.closed_count || 0);
+    const episodeClosed = Number(row.episode_closed_count || 0);
+    const edgePassed = String(row.edge_gate_passed || 'unknown').toLowerCase();
+    const edgeLabel = edgePassed === 'true' ? 'Pass' : edgePassed === 'false' ? 'Fail' : 'Unknown';
+    const edgeClass = edgePassed === 'true' ? 'ok' : edgePassed === 'false' ? 'risk' : 'muted';
+    const winRate = row.win_rate == null ? 'n/a' : pct(Number(row.win_rate) * 100);
+    const episodePf = row.episode_profit_factor == null ? 'n/a' : num(row.episode_profit_factor, 2);
+    const hold = row.average_hold_minutes == null ? 'n/a' : `${num(row.average_hold_minutes, 0)} min`;
+    const executionStatus = String(row.real_execution_status || 'legacy_unclassified').toLowerCase();
+    const executionLabels = {
+      executed: 'Executed',
+      blocked: 'Blocked',
+      not_selected: 'Not selected',
+      pending: 'Pending',
+      legacy_unclassified: 'Legacy',
+    };
+    const executionClass = executionStatus === 'executed'
+      ? 'ok'
+      : executionStatus === 'blocked'
+        ? 'risk'
+        : 'muted';
+    const blockReason = String(row.downstream_block_reason || 'none').replaceAll('_', ' ');
+    const exitPolicyVersion = String(row.shadow_exit_policy_version || 'legacy').toLowerCase();
+    const exitPolicyLabel = exitPolicyVersion === '2' ? 'Independent v2' : 'Legacy';
+    const exitPolicyClass = exitPolicyVersion === '2' ? 'ok' : 'muted';
+    const episodePnl = row.episode_realized_pnl != null ? row.episode_realized_pnl : row.realized_pnl;
+    const duplicateHint = closed > episodeClosed && episodeClosed > 0
+      ? ` title="Raw rows include ${closed - episodeClosed} duplicate scan(s) in this cohort"`
+      : '';
+    return `<tr>
+      <td data-label="Strategy"><strong>${escapeHtml(row.source_strategy || 'unknown')}</strong></td>
+      <td data-label="Side">${signalChip(row.position_side)}</td>
+      <td data-label="Regime">${escapeHtml(row.market_regime || 'unknown')}</td>
+      <td data-label="Exit policy"><span class="pi-tag ${exitPolicyClass}">${exitPolicyLabel}</span></td>
+      <td data-label="Real outcome"><span class="pi-tag ${executionClass}">${escapeHtml(executionLabels[executionStatus] || executionStatus)}</span></td>
+      <td data-label="Downstream block">${escapeHtml(blockReason)}</td>
+      <td data-label="Edge gate"><span class="pi-tag ${edgeClass}">${edgeLabel}</span></td>
+      <td data-label="Raw rows"${duplicateHint}>${num(row.opportunity_count, 0)}</td>
+      <td data-label="Episodes">${num(episodeClosed, 0)}</td>
+      <td data-label="Open">${num(row.open_count, 0)}</td>
+      <td data-label="Closed">${num(closed, 0)}</td>
+      <td data-label="Win rate">${winRate}</td>
+      <td data-label="Raw PnL" class="${cls(row.realized_pnl)}">${money(row.realized_pnl)}</td>
+      <td data-label="Episode PnL" class="${cls(episodePnl)}">${money(episodePnl)}</td>
+      <td data-label="Fees">${money(row.fees)}</td>
+      <td data-label="Episode PF">${episodePf}</td>
+      <td data-label="Avg hold">${hold}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadShadowStrategyResults() {
+  const hours = Number(state.shadowPeriodHours || 0);
+  const url = hours > 0
+    ? `/api/v1/perps/paper-shadow-summary?hours=${hours}`
+    : '/api/v1/perps/paper-shadow-summary';
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error('Shadow strategy results failed');
+  renderShadowStrategyResults(await response.json());
+}
+
 async function loadDashboard() {
   const response = await fetch('/api/v1/dashboard/portfolio-intelligence', { cache: 'no-store' });
   if (!response.ok) throw new Error('Dashboard payload failed');
@@ -2055,6 +2177,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  document.querySelectorAll('[data-shadow-period]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.shadowPeriodHours = Number(btn.dataset.shadowPeriod || 0);
+      loadShadowStrategyResults().catch(console.error);
+    });
+  });
+
   const activeOnly = document.getElementById('watchlist-active-only');
   if (activeOnly) {
     activeOnly.addEventListener('change', () => {
@@ -2110,5 +2239,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (adaptiveBody) adaptiveBody.innerHTML = '<tr><td colspan="6" class="pi-empty">Failed to load adaptive control data.</td></tr>';
     setText('adaptive-summary', `Dashboard payload failed: ${err.message || err}`);
   });
+  loadShadowStrategyResults().catch((err) => {
+    console.error(err);
+    setText('shadow-results-meta', 'Unavailable');
+    const body = document.getElementById('shadow-results-body');
+    if (body) body.innerHTML = '<tr><td colspan="11" class="pi-empty">Failed to load shadow strategy results.</td></tr>';
+  });
   setInterval(() => loadDashboard().catch(console.error), 30000);
+  setInterval(() => loadShadowStrategyResults().catch(console.error), 30000);
 });

@@ -14,7 +14,7 @@ def test_orchestrator_supports_probation_exempt_strategies():
     assert "probation_exempt_fresh_sample" in source
 
 
-def test_config_declares_probation_exempt_arc_and_supply_demand():
+def test_config_does_not_exempt_proven_spot_losers_from_expectancy_guard():
     import yaml
 
     cfg = yaml.safe_load(
@@ -24,5 +24,6 @@ def test_config_declares_probation_exempt_arc_and_supply_demand():
     )
     guard = (cfg.get("trading") or {}).get("strategy_expectancy_guard") or {}
     exempt = guard.get("probation_exempt_strategies") or []
-    assert "arc_daytrade" in exempt
-    assert "supply_demand_3step" in exempt
+    assert "arc_daytrade" not in exempt
+    assert "supply_demand_3step" not in exempt
+    assert "orb_5m_scalp" in exempt
