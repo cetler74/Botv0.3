@@ -36,9 +36,9 @@ from strategy.indicators.volume_profile import (
 
 @dataclass
 class EngineParams:
-    entry_timeframe: str = "5m"
-    execution_timeframe: str = "1m"
-    context_timeframes: List[str] = field(default_factory=lambda: ["1d"])
+    entry_timeframe: str = "15m"
+    execution_timeframe: str = "15m"
+    context_timeframes: List[str] = field(default_factory=lambda: ["1h"])
     sma_periods: List[int] = field(default_factory=lambda: [21, 50, 80, 100, 200])
     rsi_period: int = 14
     stoch_rsi_enabled: bool = True

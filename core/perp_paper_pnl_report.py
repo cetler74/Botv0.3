@@ -6,6 +6,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+try:
+    from strategy_trade_evidence import normalized_closed_trade_evidence
+except ImportError:  # pragma: no cover - package imports
+    from core.strategy_trade_evidence import normalized_closed_trade_evidence
+
 
 def parse_ts(raw: Optional[str]) -> Optional[datetime]:
     if not raw:
@@ -195,8 +200,21 @@ def build_paper_pnl_report(
     else:
         stamps = [trade_window_timestamp(r) for r in filtered]
         stamps = [t for t in stamps if t is not None]
-        window_start = min(stamps).isoformat() if stamps else None
-        window_end = max(stamps).isoformat() if stamps else None
+        window_start = (
+            min(stamps).astimezone(timezone.utc).isoformat() if stamps else None
+        )
+        window_end = (
+            max(stamps).astimezone(timezone.utc).isoformat() if stamps else None
+        )
+    normalized_evidence = [
+        normalized_closed_trade_evidence(
+            row,
+            market_type="perp",
+            exit_bucket_value=exit_bucket(str(row.get("exit_reason") or "")),
+        )
+        for row in filtered
+        if str(row.get("status") or "").upper() == "CLOSED"
+    ]
 
     return {
         "hours": hours,
@@ -205,10 +223,18 @@ def build_paper_pnl_report(
         "windowStart": window_start,
         "windowEnd": window_end,
         "aggregate": aggregate_trades(filtered),
+        "normalizedEvidence": normalized_evidence,
         "breakdowns": {
             "strategy": group_breakdown(
                 filtered,
                 lambda r: (r.get("source_strategy") or "unknown").strip().lower(),
+            ),
+            "strategyVersion": group_breakdown(
+                filtered,
+                lambda r: (
+                    f"{(_trade_metadata(r).get('strategy_key') or r.get('source_strategy') or 'unknown')}"
+                    f"@{(_trade_metadata(r).get('strategy_version') or 'unversioned')}"
+                ).strip().lower(),
             ),
             "positionSide": group_breakdown(
                 filtered,

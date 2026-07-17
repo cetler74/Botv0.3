@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from strategy.playbooks.ohlcv_closed_bar import prepare_closed_ohlcv
+from strategy.hyperliquid.indicators import closed_bar_snapshot
 from strategy.playbooks.rsi_stoch_reversal_5m_engine import (
     EngineParams,
     evaluate_rsi_stoch_reversal_5m,
@@ -35,6 +36,16 @@ def test_prepare_closed_ohlcv_drops_forming_candle():
     df.index = pd.date_range(now - timedelta(minutes=45), periods=10, freq="5min", tz="UTC")
     trimmed = prepare_closed_ohlcv(df, "5m")
     assert len(trimmed) == len(df) - 1
+
+
+def test_hyperliquid_closed_bar_snapshot_supports_1m():
+    now = datetime(2024, 6, 1, 0, 10, tzinfo=timezone.utc)
+    df = _ohlcv(10, freq="1min")
+    snapshot, metadata = closed_bar_snapshot(df, "1m", now=now)
+
+    assert len(snapshot) == 10
+    assert metadata["bar_closed"] is True
+    assert metadata["bar_count"] == 10
 
 
 def test_engine_uses_last_row_after_prepare_not_prior_bar():

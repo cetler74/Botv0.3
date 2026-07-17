@@ -402,6 +402,16 @@ def evaluate_rsi_stoch_reversal_5m(
         else:
             long_ok = False
 
+    bias_clause = ""
+    if confirmation_tf:
+        bias_clause = (
+            f"; {confirmation_tf} bias confirmed "
+            f"(RSI={float(base_ind.get('confirmation_rsi', 0.0)):.2f}, "
+            f"close={float(base_ind.get('confirmation_close', 0.0)):.6f}, "
+            f"EMA{int(params.confirmation_ema_period)}="
+            f"{float(base_ind.get('confirmation_ema', 0.0)):.6f})"
+        )
+
     if long_ok:
         if rsi_closed < rsi_os:
             rsi_clause = f"RSI={rsi_closed:.2f} < {rsi_os}"
@@ -412,7 +422,8 @@ def evaluate_rsi_stoch_reversal_5m(
             )
         reason = (
             f"RSI+StochRSI long ({tf}): {rsi_clause}, "
-            f"K={k_closed:.2f} < {stoch_os}, D={d_closed:.2f} < {stoch_os}, K >= D"
+            f"K={k_closed:.2f} < {stoch_os}, D={d_closed:.2f} < {stoch_os}, "
+            f"K >= D{bias_clause}"
         )
         return EngineResult(
             signal="buy",
@@ -435,7 +446,7 @@ def evaluate_rsi_stoch_reversal_5m(
         reason = (
             f"RSI+StochRSI short ({tf}): RSI={rsi_closed:.2f} > {rsi_ob}, "
             f"K={k_closed:.2f} > {stoch_ob}, "
-            f"D={d_closed:.2f} > {stoch_ob}, D >= K"
+            f"D={d_closed:.2f} > {stoch_ob}, D >= K{bias_clause}"
         )
         return EngineResult(
             signal="sell",

@@ -63,7 +63,7 @@ def test_hyperliquid_strategy_manager_builds_fresh_instances(monkeypatch):
     assert second.config["parameters"]["nested"]["value"] == 1
 
 
-def test_hyperliquid_strategy_manager_includes_sma_reclaim_required_timeframes(monkeypatch):
+def test_hyperliquid_strategy_manager_filters_legacy_sma_reclaim_timeframes(monkeypatch):
     import hyperliquid_strategy_manager as manager_module
 
     monkeypatch.setitem(
@@ -94,13 +94,39 @@ def test_hyperliquid_strategy_manager_includes_sma_reclaim_required_timeframes(m
 
     tfs = manager._resolve_timeframes(None, ["sma_reclaim_bull_flag"])
 
-    assert "5m" in tfs
-    assert "1m" in tfs
-    assert "1d" in tfs
+    assert tfs == ["1h", "15m"]
+
+
+def test_hyperliquid_strategy_manager_allows_heikin_ashi_1m_scalper_timeframe(monkeypatch):
+    import hyperliquid_strategy_manager as manager_module
+
+    monkeypatch.setitem(
+        manager_module.HYPERLIQUID_STRATEGY_MAPPING,
+        "heikin_ashi_1m_scalper",
+        ("fake_hl_strategy_module", "FakePerpStrategy"),
+    )
+    monkeypatch.setattr(
+        manager_module.importlib,
+        "import_module",
+        lambda module_path: types.SimpleNamespace(FakePerpStrategy=FakePerpStrategy),
+    )
+
+    manager = manager_module.HyperliquidStrategyManager(
+        {
+            "heikin_ashi_1m_scalper": {
+                "enabled": True,
+                "parameters": {"entry_timeframe": "1m"},
+                "target_timeframes": ["1m"],
+            }
+        },
+        "http://exchange-service:8003",
+    )
+
+    assert manager._resolve_timeframes(None, ["heikin_ashi_1m_scalper"]) == ["1h", "15m", "1m"]
 
 
 @pytest.mark.asyncio
-async def test_hyperliquid_strategy_manager_fetches_dual_sma_weekly_context_limit(monkeypatch):
+async def test_hyperliquid_strategy_manager_fetches_only_canonical_timeframes(monkeypatch):
     import pandas as pd
     import hyperliquid_strategy_manager as manager_module
 
@@ -127,11 +153,9 @@ async def test_hyperliquid_strategy_manager_fetches_dual_sma_weekly_context_limi
     monkeypatch.setattr(manager_module, "HyperliquidExchangeAdapter", FakeAdapter)
     manager = manager_module.HyperliquidStrategyManager({}, "http://exchange-service:8003")
 
-    await manager._get_market_data("BTC", ["1d", "1w", "5m"])
+    await manager._get_market_data("BTC", ["1d", "1h", "15m", "5m"])
 
-    assert requested["1d"] >= 260
-    assert requested["1w"] >= 220
-    assert requested["5m"] >= 260
+    assert requested == {"1h": 240, "15m": 240}
 
 
 @pytest.mark.asyncio
@@ -175,6 +199,49 @@ async def test_hyperliquid_strategy_manager_normalizes_short_signal(monkeypatch)
 
     assert result["strategies"]["fake_perp"]["signal"] == "short"
     assert result["consensus"]["signal"] == "short"
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_strategy_manager_attaches_closed_bar_ta_contract(monkeypatch):
+    import pandas as pd
+    import hyperliquid_strategy_manager as manager_module
+
+    monkeypatch.setitem(
+        manager_module.HYPERLIQUID_STRATEGY_MAPPING,
+        "fake_perp",
+        ("fake_hl_strategy_module", "FakePerpStrategy"),
+    )
+    monkeypatch.setattr(
+        manager_module.importlib,
+        "import_module",
+        lambda module_path: types.SimpleNamespace(FakePerpStrategy=FakePerpStrategy),
+    )
+    index = pd.date_range("2026-01-01", periods=80, freq="1h", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": [100.0] * 80,
+            "high": [101.0] * 80,
+            "low": [99.0] * 80,
+            "close": [100.0] * 80,
+            "volume": [1000.0] * 80,
+        },
+        index=index,
+    )
+    manager = manager_module.HyperliquidStrategyManager(
+        {"fake_perp": {"enabled": True, "parameters": {}}},
+        "http://exchange-service:8003",
+    )
+
+    async def fake_market_data(*args, **kwargs):
+        return {"1h": frame, "15m": frame}
+
+    monkeypatch.setattr(manager, "_get_market_data", fake_market_data)
+    result = await manager.analyze_coin("BTC")
+
+    assert result["ta_contract"]["timeframes"] == ["1h", "15m"]
+    assert result["ta_contract"]["bar_closed"] is True
+    assert result["strategies"]["fake_perp"]["ta_evidence"]["bar_closed"] is True
+    assert result["strategies"]["fake_perp"]["ta_evidence"]["inputs"] == {}
 
 
 def test_deprecated_strategy_logs_warning(monkeypatch, caplog):

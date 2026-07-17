@@ -6,6 +6,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 try:
+    from strategy_trade_evidence import (
+        normalized_closed_trade_evidence,
+        parse_strategy_evidence_entry_reason,
+    )
+except ImportError:  # pragma: no cover - package imports
+    from core.strategy_trade_evidence import (
+        normalized_closed_trade_evidence,
+        parse_strategy_evidence_entry_reason,
+    )
+
+try:
     from perp_paper_pnl_report import (
         aggregate_trades,
         exit_bucket,
@@ -63,7 +74,30 @@ def normalize_spot_trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "metadata": trade.get("metadata") or {},
         "exchange": exchange,
         "pair": pair or "unknown",
+        "entry_price": trade.get("entry_price"),
+        "highest_price": trade.get("highest_price"),
+        "entry_reason": trade.get("entry_reason") or "",
+        "market_regime": trade.get("market_regime") or trade.get("stable_regime"),
     }
+
+
+def _spot_strategy_version(trade: Dict[str, Any]) -> str:
+    metadata = trade.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    evidence = parse_strategy_evidence_entry_reason(str(trade.get("entry_reason") or ""))
+    strategy = (
+        metadata.get("strategy_key")
+        or evidence.get("strategy_key")
+        or trade.get("source_strategy")
+        or "unknown"
+    )
+    version = (
+        metadata.get("strategy_version")
+        or evidence.get("strategy_version")
+        or "unversioned"
+    )
+    return f"{strategy}@{version}".strip().lower()
 
 
 def build_spot_pnl_report(
@@ -85,8 +119,21 @@ def build_spot_pnl_report(
     else:
         stamps = [trade_window_timestamp(r) for r in filtered]
         stamps = [t for t in stamps if t is not None]
-        window_start = min(stamps).isoformat() if stamps else None
-        window_end = max(stamps).isoformat() if stamps else None
+        window_start = (
+            min(stamps).astimezone(timezone.utc).isoformat() if stamps else None
+        )
+        window_end = (
+            max(stamps).astimezone(timezone.utc).isoformat() if stamps else None
+        )
+    normalized_evidence = [
+        normalized_closed_trade_evidence(
+            row,
+            market_type="spot",
+            exit_bucket_value=exit_bucket(str(row.get("exit_reason") or "")),
+        )
+        for row in filtered
+        if str(row.get("status") or "").upper() == "CLOSED"
+    ]
 
     return {
         "hours": hours,
@@ -96,11 +143,13 @@ def build_spot_pnl_report(
         "windowStart": window_start,
         "windowEnd": window_end,
         "aggregate": aggregate_trades(filtered),
+        "normalizedEvidence": normalized_evidence,
         "breakdowns": {
             "strategy": group_breakdown(
                 filtered,
                 lambda r: str(r.get("source_strategy") or "unknown").strip().lower(),
             ),
+            "strategyVersion": group_breakdown(filtered, _spot_strategy_version),
             "exchange": group_breakdown(
                 filtered,
                 lambda r: str(r.get("exchange") or "unknown").strip().lower(),

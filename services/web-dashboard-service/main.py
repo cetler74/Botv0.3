@@ -2048,6 +2048,95 @@ def _nested_config(config_payload: Any, *keys: str) -> Dict[str, Any]:
     return node if isinstance(node, dict) else {}
 
 
+def _build_progress_why_for_market(
+    *,
+    market_type: str,
+    config_payload: Dict[str, Any],
+    closed_trades: List[Dict[str, Any]],
+    open_trades: List[Dict[str, Any]],
+    starting_equity: float,
+    adaptive_control: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compose Progress & Why from existing config + closed-trade evidence."""
+    try:
+        try:
+            from progress_why import (
+                build_progress_why_payload,
+                enabled_strategy_map,
+                load_validation_manifest,
+            )
+        except ImportError:  # pragma: no cover
+            from core.progress_why import (
+                build_progress_why_payload,
+                enabled_strategy_map,
+                load_validation_manifest,
+            )
+
+        if market_type == "perp":
+            strategies_cfg = _nested_config(config_payload, "strategies_hyperliquid")
+            hl_cfg = _hyperliquid_perps_config_from_all(config_payload)
+            target_cfg = hl_cfg.get("daily_profit_target") or {}
+            daily_target = _safe_float(target_cfg.get("target_usd"), 20.0)
+            live_allowlist = list(hl_cfg.get("live_strategy_allowlist") or [])
+            shadow_strategies = list(
+                ((hl_cfg.get("shadow_cohort_promotion") or {}).get("strategies") or [])
+            )
+            require_promotion = list(
+                ((hl_cfg.get("shadow_cohort_promotion") or {}).get("require_promotion_for") or [])
+            )
+            size_multipliers = {
+                str(k).lower(): _safe_float(v, 1.0)
+                for k, v in ((hl_cfg.get("strategy_size_multipliers") or {})).items()
+            }
+        else:
+            strategies_cfg = _nested_config(config_payload, "strategies")
+            daily_target = 20.0
+            live_allowlist = [
+                name for name, cfg in (strategies_cfg or {}).items()
+                if isinstance(cfg, dict) and cfg.get("enabled")
+            ]
+            shadow_strategies = []
+            require_promotion = []
+            size_multipliers = {}
+
+        adaptive_actions: Dict[str, str] = {}
+        if isinstance(adaptive_control, dict):
+            for row in adaptive_control.get("actions") or adaptive_control.get("decisions") or []:
+                if not isinstance(row, dict):
+                    continue
+                strategy = str(row.get("strategy") or row.get("strategy_name") or "").strip().lower()
+                action = str(row.get("action") or row.get("decision") or "").strip().lower()
+                if strategy and action:
+                    adaptive_actions[strategy] = action
+
+        return build_progress_why_payload(
+            market_type=market_type,
+            closed_trades=closed_trades,
+            open_trades=open_trades,
+            starting_equity=starting_equity,
+            daily_target_usd=daily_target,
+            max_drawdown_pct=5.0,
+            rolling_days=30,
+            enabled_map=enabled_strategy_map(strategies_cfg),
+            live_allowlist=live_allowlist,
+            shadow_strategies=shadow_strategies,
+            require_promotion=require_promotion,
+            adaptive_actions=adaptive_actions,
+            validation_manifest=load_validation_manifest(),
+            size_multipliers=size_multipliers,
+        )
+    except Exception as exc:  # pragma: no cover - keep dashboard alive if composer fails
+        logger.error("progressWhy composition failed: %s", exc)
+        return {
+            "marketType": market_type,
+            "kpis": {},
+            "lanes": [],
+            "targets": {"dailyProfitUsd": 20.0, "maxDrawdownPct": 5.0, "rollingDays": 30},
+            "chartsDeepLink": "/strategy-performance",
+            "error": str(exc),
+        }
+
+
 SPOT_EXCHANGES = ("binance", "bybit", "cryptocom")
 HL_AUDIT_VENUE = "hyperliquid"
 
@@ -2483,12 +2572,26 @@ async def get_spot_intelligence():
             from core.spot_pnl_report import build_spot_pnl_report
 
         spot_pnl_report = build_spot_pnl_report(open_trades, closed_trades, hours=24, limit=2000)
+        portfolio_summary = _spot_portfolio_summary(
+            portfolio_payload if isinstance(portfolio_payload, dict) else {}
+        )
+        progress_why = _build_progress_why_for_market(
+            market_type="spot",
+            config_payload=config_payload if isinstance(config_payload, dict) else {},
+            closed_trades=closed_trades,
+            open_trades=open_trades,
+            starting_equity=_safe_float(
+                portfolio_summary.get("equity") or portfolio_summary.get("startingBalance"),
+                10000.0,
+            ),
+        )
 
         return {
             "timestamp": _iso_now(),
             "uiVersion": dashboard_ui_version,
             "marketType": "spot",
-            "portfolio": _spot_portfolio_summary(portfolio_payload if isinstance(portfolio_payload, dict) else {}),
+            "portfolio": portfolio_summary,
+            "progressWhy": progress_why,
             "spotPnlReport": spot_pnl_report,
             "supplyDemandAudit": supply_demand_audit if isinstance(supply_demand_audit, dict) else {},
             "dualSmaAudit": dual_sma_audit if isinstance(dual_sma_audit, dict) else {},
@@ -2553,7 +2656,7 @@ async def get_portfolio_intelligence():
             client,
             f"{database_service_url}/api/v1/perps/paper-trades",
             default={},
-            params={"status": "CLOSED", "limit": 200},
+            params={"status": "CLOSED", "limit": 1000},
         )
         adaptive_control_task = _fetch_json(
             client,
@@ -2702,6 +2805,17 @@ async def get_portfolio_intelligence():
             hl_cfg=hl_cfg,
         )
         portfolio = _perp_portfolio_summary(paper_summary, by_side, hl_balance)
+        progress_why = _build_progress_why_for_market(
+            market_type="perp",
+            config_payload=config_payload if isinstance(config_payload, dict) else {},
+            closed_trades=closed_trades,
+            open_trades=open_trades,
+            starting_equity=_safe_float(
+                portfolio.get("startingBalance") or portfolio.get("equity"),
+                10000.0,
+            ),
+            adaptive_control=adaptive_control if isinstance(adaptive_control, dict) else {},
+        )
         trading_cfg = _nested_config(config_payload, "trading")
         trailing_cfg = hl_cfg.get("trailing_stop") or trading_cfg.get("trailing_stop") or {}
         profit_protection_cfg = (
@@ -2773,6 +2887,7 @@ async def get_portfolio_intelligence():
             "timestamp": _iso_now(),
             "uiVersion": dashboard_ui_version,
             "portfolio": portfolio,
+            "progressWhy": progress_why,
             "hyperliquid": {
                 "config": {
                     "enabled": bool(hl_cfg.get("enabled", False)),

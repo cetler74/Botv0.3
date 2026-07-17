@@ -35,8 +35,8 @@ class SmaReclaimBullFlagStrategy(BaseStrategy):
             dict(config.get("parameters") or {}) if isinstance(config, dict) else {}
         )
         cfg_params = config.get("parameters") or {}
-        self.entry_timeframe = str(cfg_params.get("entry_timeframe", "5m")).lower()
-        self.execution_timeframe = str(cfg_params.get("execution_timeframe", "1m")).lower()
+        self.entry_timeframe = str(cfg_params.get("entry_timeframe", "15m")).lower()
+        self.execution_timeframe = str(cfg_params.get("execution_timeframe", "15m")).lower()
         self._current_ohlcv = None
 
     async def initialize(self, pair: str) -> None:

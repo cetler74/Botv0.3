@@ -6,6 +6,10 @@ HYPERLIQUID_STRATEGY_MAPPING = {
     "rsi_oversold_override": ("strategy.hyperliquid.rsi_oversold_override_perp", "RsiOversoldOverridePerpStrategy"),
     "macd_momentum": ("strategy.hyperliquid.macd_momentum_perp", "MacdMomentumPerpStrategy"),
     "heikin_ashi": ("strategy.hyperliquid.heikin_ashi_perp", "HeikinAshiPerpStrategy"),
+    "heikin_ashi_1m_scalper": (
+        "strategy.hyperliquid.heikin_ashi_1m_scalper_perp",
+        "HeikinAshi1mScalperPerpStrategy",
+    ),
     "multi_timeframe_confluence": ("strategy.hyperliquid.multi_timeframe_confluence_perp", "MultiTimeframeConfluencePerpStrategy"),
     "engulfing_multi_tf": ("strategy.hyperliquid.engulfing_multi_tf_perp", "EngulfingMultiTfPerpStrategy"),
     "macd_ema_vwap_scalper": ("strategy.hyperliquid.macd_ema_vwap_scalper_perp", "MacdEmaVwapScalperPerpStrategy"),
@@ -19,13 +23,9 @@ HYPERLIQUID_STRATEGY_MAPPING = {
         "strategy.hyperliquid.sma_reclaim_bull_flag_perp",
         "SmaReclaimBullFlagPerpStrategy",
     ),
-    "rsi_stoch_reversal_5m": (
-        "strategy.hyperliquid.rsi_stoch_reversal_5m_perp",
-        "RsiStochReversal5mPerpStrategy",
-    ),
-    "rsi_stoch_reversal_1m": (
-        "strategy.hyperliquid.rsi_stoch_reversal_1m_perp",
-        "RsiStochReversal1mPerpStrategy",
+    "rsi_stoch_reversal_15m": (
+        "strategy.hyperliquid.rsi_stoch_reversal_15m_perp",
+        "RsiStochReversal15mPerpStrategy",
     ),
     "supply_demand_3step": (
         "strategy.hyperliquid.supply_demand_3step_perp",
@@ -46,5 +46,13 @@ HYPERLIQUID_STRATEGY_MAPPING = {
     "orb_5m_scalp": (
         "strategy.hyperliquid.orb_5m_scalp_perp",
         "Orb5mScalpPerpStrategy",
+    ),
+    "donchian_atr_pullback": (
+        "strategy.hyperliquid.donchian_atr_pullback_perp",
+        "DonchianAtrPullbackPerpStrategy",
+    ),
+    "vwap_rsi_mean_reversion": (
+        "strategy.hyperliquid.vwap_rsi_mean_reversion_perp",
+        "VwapRsiMeanReversionPerpStrategy",
     ),
 }

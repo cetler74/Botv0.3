@@ -1,8 +1,7 @@
 """
 Dual-SMA day-trading — shared engine for spot and HL perps.
 
-Top-down: daily bias (SMA200 flat + gap) → 15m trend (SMA20 + structure)
-→ 5m entry (retrace/rejection) → optional 1m precision.
+Top-down: 1h bias (SMA200 flat + gap) → 15m trend and entry confirmation.
 """
 
 from __future__ import annotations
@@ -25,12 +24,12 @@ from strategy.playbooks.ohlcv_closed_bar import prepare_closed_ohlcv
 
 @dataclass
 class EngineParams:
-    bias_timeframe: str = "1d"
+    bias_timeframe: str = "1h"
     confirmation_timeframe: str = "15m"
-    entry_timeframe: str = "5m"
-    precision_timeframe: str = "1m"
+    entry_timeframe: str = "15m"
+    precision_timeframe: str = "15m"
     use_precision_entry: bool = False
-    context_timeframes: List[str] = field(default_factory=lambda: ["1w"])
+    context_timeframes: List[str] = field(default_factory=list)
     sma20_period: int = 20
     sma200_period: int = 200
     sma200_max_slope_pct: float = 0.004

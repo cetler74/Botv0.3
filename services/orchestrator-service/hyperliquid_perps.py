@@ -7,15 +7,48 @@ signals into isolated paper positions so spot trading remains untouched.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from strategy.hyperliquid.consensus import normalize_perp_entry_signal
 
 logger = logging.getLogger(__name__)
+
+
+def ta_evidence_from_signal(signal: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return bounded, serializable closed-bar TA evidence from a selected signal."""
+    details = signal.get("details") if isinstance(signal, Mapping) else {}
+    source = details.get("ta_evidence") if isinstance(details, Mapping) else {}
+    if not isinstance(source, Mapping):
+        return {}
+    raw_inputs = source.get("inputs")
+    inputs: Dict[str, float] = {}
+    if isinstance(raw_inputs, Mapping):
+        for key, value in raw_inputs.items():
+            if len(inputs) >= 16:
+                break
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                inputs[str(key)] = numeric
+    return {
+        "bar_closed": bool(source.get("bar_closed")),
+        "timeframes": [
+            str(timeframe)
+            for timeframe in source.get("timeframes") or ()
+            if str(timeframe) in {"1h", "15m"}
+        ][:2],
+        "bar_times": dict(source.get("bar_times") or {}) if isinstance(source.get("bar_times"), Mapping) else {},
+        "inputs": inputs,
+    }
 
 
 HYPERLIQUID_STRATEGY_FAMILIES = {
@@ -33,6 +66,7 @@ HYPERLIQUID_STRATEGY_FAMILIES = {
     "rsi_oversold_override": "reversal_reclaim",
     "breakout_retest_long": "pattern_breakout",
     "engulfing_multi_tf": "pattern_breakout",
+    "rsi_stoch_reversal_15m": "reversal_reclaim",
     "rsi_stoch_reversal_5m": "reversal_reclaim",
     "rsi_stoch_reversal_1m": "reversal_reclaim",
     "supply_demand_3step": "pattern_breakout",
@@ -55,6 +89,7 @@ DEFAULT_STANDALONE_STRATEGY_GATES = {
     "small_size_momentum_scalp": {"min_confidence": 0.70, "min_strength": 0.55, "size_multiplier": None},
     "breakout_retest_long": {"min_confidence": 0.70, "min_strength": 0.70, "size_multiplier": None},
     "engulfing_multi_tf": {"min_confidence": 0.72, "min_strength": 0.70, "size_multiplier": None},
+    "rsi_stoch_reversal_15m": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
     "rsi_stoch_reversal_5m": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
     "rsi_stoch_reversal_1m": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
     "supply_demand_3step": {"min_confidence": 0.70, "min_strength": 0.65, "size_multiplier": None},
@@ -66,11 +101,15 @@ DEFAULT_STANDALONE_STRATEGY_GATES = {
 
 
 PRIORITY_STANDALONE_ENTRY_STRATEGIES = (
+    "rsi_stoch_reversal_15m",
     "supply_demand_3step",
     "dual_sma_daytrade",
-    "arc_daytrade",
-    "ema50_breakout_pullback",
-    "orb_5m_scalp",
+)
+
+DEFAULT_CONSENSUS_EXECUTABLE_DENYLIST = (
+    "rsi_stoch_reversal_15m",
+    "rsi_stoch_reversal_5m",
+    "rsi_stoch_reversal_1m",
 )
 
 
@@ -271,6 +310,36 @@ def promoted_cohort_selection_boost(
     return 0.0
 
 
+def perp_lane_notional_multiplier(
+    strategy: str,
+    side: str,
+    regime: str,
+    hl_cfg: Optional[Mapping[str, Any]] = None,
+) -> float:
+    """Return a fixed-paper notional multiplier for one strategy/side/regime lane.
+
+    Fixed paper sizing intentionally ignores the broad adaptive multiplier stack.
+    This narrow overlay lets explicitly configured probation lanes use less
+    exposure without changing the deterministic notional of validated lanes.
+    """
+    lane_cfg = (hl_cfg or {}).get("lane_notional_multipliers") or {}
+    if not isinstance(lane_cfg, Mapping):
+        return 1.0
+    strategy_cfg = lane_cfg.get(str(strategy or "").strip().lower()) or {}
+    if not isinstance(strategy_cfg, Mapping):
+        return 1.0
+    regime_cfg = strategy_cfg.get(str(regime or "").strip().lower()) or {}
+    if not isinstance(regime_cfg, Mapping):
+        return 1.0
+    raw = regime_cfg.get(str(side or "").strip().lower())
+    if raw is None:
+        return 1.0
+    try:
+        return max(0.05, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def _is_executable_perp_trade(trade: Mapping[str, Any]) -> bool:
     meta = trade.get("metadata") or {}
     if not isinstance(meta, dict):
@@ -357,6 +426,20 @@ def executable_size_requalification_passes(
     return True, "requal_pass"
 
 
+def consensus_executable_denylist(hl_cfg: Optional[Dict[str, Any]] = None) -> set[str]:
+    """Strategies that must never win the consensus fallback selection path."""
+    raw = (hl_cfg or {}).get("consensus_executable_denylist")
+    if raw is None:
+        return {str(name).strip().lower() for name in DEFAULT_CONSENSUS_EXECUTABLE_DENYLIST}
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {
+        str(name or "").strip().lower()
+        for name in raw
+        if str(name or "").strip()
+    }
+
+
 def select_mirrored_signal(
     signals_data: Dict[str, Any],
     hl_cfg: Optional[Dict[str, Any]] = None,
@@ -379,6 +462,8 @@ def select_mirrored_signal(
     if not isinstance(strategies, dict):
         strategies = {}
 
+    denied_consensus = consensus_executable_denylist(hl_cfg)
+
     def best_strategy_for(
         side: str,
         *,
@@ -387,6 +472,9 @@ def select_mirrored_signal(
         candidates = []
         for name, data in strategies.items():
             if not isinstance(data, dict):
+                continue
+            strategy_key = str(name or "").strip().lower()
+            if require_runtime_eligibility and strategy_key in denied_consensus:
                 continue
             if normalize_perp_entry_signal(data.get("signal", "")) != side:
                 continue
@@ -453,12 +541,25 @@ def select_mirrored_signal(
             "consensus_agreement": float(consensus.get("agreement", 0) or 0),
             "details": data,
             "standalone_priority": True,
+            "market_regime": str(
+                market_regime or signals_data.get("market_regime") or ""
+            ).strip().lower(),
         }
         # Do not let a fixed strategy-list order monopolize execution. Rank every
         # complete standalone setup by signal quality, and when runtime config is
         # available discard candidates that are certain to fail the downstream
         # edge/specialist gates. All gates still run again before an order opens.
         if hl_cfg is not None:
+            regime_gate = hyperliquid_regime_direction_gate(
+                side,
+                selected["market_regime"],
+                conf,
+                strength,
+                hl_cfg,
+                strategy=strategy_name,
+            )
+            if regime_gate.get("blocked"):
+                continue
             edge_gate = hyperliquid_min_edge_gate(selected, hl_cfg)
             if edge_gate.get("blocked"):
                 continue
@@ -799,6 +900,150 @@ def strategy_min_notional(
     return _safe_float((hl_cfg or {}).get("min_notional_per_trade", 0.0), 0.0)
 
 
+def dynamic_min_notional(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    size_multiplier: float = 1.0,
+) -> Dict[str, Any]:
+    """Return a fee/edge-aware notional floor that follows adaptive sizing.
+
+    The old global floor treated a reduced-risk trade like a full-size trade.
+    This floor instead targets a small absolute net profit at the signal's
+    expected edge, while preserving an exchange/order floor and optional
+    per-strategy values.  Every strategy value scales down with the final
+    position-size multiplier; the exchange floor does not.
+    """
+    cfg = (hl_cfg or {}).get("dynamic_notional_gate") or {}
+    enabled = cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        legacy = strategy_min_notional(str((signal or {}).get("strategy") or ""), hl_cfg)
+        return {
+            "enabled": False,
+            "minNotional": max(0.0, legacy),
+            "reason": "legacy_min_notional",
+        }
+
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    overrides = cfg.get("strategy_overrides") or {}
+    strategy_cfg = overrides.get(strategy) or {} if isinstance(overrides, dict) else {}
+    if not isinstance(strategy_cfg, dict):
+        strategy_cfg = {}
+
+    multiplier = max(0.0, float(size_multiplier or 0.0))
+    exchange_floor = max(
+        0.0,
+        _safe_float(cfg.get("exchange_min_notional_usd", 10.0), 10.0),
+    )
+    base_floor = max(
+        0.0,
+        _safe_float(
+            strategy_cfg.get(
+                "minimum_viable_notional_usd",
+                cfg.get("minimum_viable_notional_usd", 25.0),
+            ),
+            25.0,
+        ),
+    )
+    target_profit = max(
+        0.0,
+        _safe_float(
+            strategy_cfg.get(
+                "min_expected_net_profit_usd",
+                cfg.get("min_expected_net_profit_usd", 0.25),
+            ),
+            0.25,
+        ),
+    )
+    fallback_floor = max(
+        0.0,
+        _safe_float(
+            strategy_cfg.get(
+                "fallback_min_notional_usd",
+                cfg.get("fallback_min_notional_usd", base_floor),
+            ),
+            base_floor,
+        ),
+    )
+    max_floor = max(
+        exchange_floor,
+        _safe_float(cfg.get("max_dynamic_min_notional_usd", 200.0), 200.0),
+    )
+
+    edge = hyperliquid_min_edge_gate(signal, hl_cfg)
+    expected_pct = edge.get("expectedMovePct")
+    cost_pct = max(0.0, _safe_float(edge.get("estimatedCostPct"), 0.0))
+    scaled_base = base_floor * multiplier
+    scaled_target_profit = target_profit * multiplier
+    if expected_pct is None:
+        required = fallback_floor * multiplier
+        reason = "dynamic_min_notional_fallback"
+        net_edge_pct = None
+    else:
+        net_edge_pct = max(0.0, _safe_float(expected_pct, 0.0) - cost_pct)
+        required = (
+            scaled_target_profit / (net_edge_pct / 100.0)
+            if scaled_target_profit > 0 and net_edge_pct > 0
+            else scaled_base
+        )
+        reason = "dynamic_min_notional_fee_edge"
+
+    floor = max(exchange_floor, scaled_base, required)
+    floor = min(floor, max_floor)
+    return {
+        "enabled": True,
+        "minNotional": floor,
+        "reason": reason,
+        "strategy": strategy,
+        "sizeMultiplier": multiplier,
+        "expectedMovePct": expected_pct,
+        "estimatedCostPct": cost_pct,
+        "netEdgePct": net_edge_pct,
+        "targetNetProfitUsd": scaled_target_profit,
+    }
+
+
+def adaptive_perp_leverage(
+    signal: Dict[str, Any],
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Choose 1x-5x leverage from setup stop distance and strategy limits.
+
+    Leverage changes collateral usage only.  The caller must continue sizing
+    notional from the risk budget so higher leverage cannot increase loss at
+    the setup stop.
+    """
+    cfg = (hl_cfg or {}).get("adaptive_leverage") or {}
+    default = _safe_float(
+        cfg.get("default", (hl_cfg or {}).get("default_leverage", 2.0)),
+        2.0,
+    )
+    enabled = cfg.get("enabled", False)
+    if enabled is False or str(enabled).lower() in {"0", "false", "no", "off"}:
+        return max(1.0, min(5.0, default))
+
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    overrides = cfg.get("strategy_overrides") or {}
+    strategy_cfg = overrides.get(strategy) or {} if isinstance(overrides, dict) else {}
+    if not isinstance(strategy_cfg, dict):
+        strategy_cfg = {}
+    minimum = max(1.0, _safe_float(strategy_cfg.get("min", cfg.get("min", 1.0)), 1.0))
+    maximum = min(5.0, _safe_float(strategy_cfg.get("max", cfg.get("max", 5.0)), 5.0))
+    if maximum < minimum:
+        maximum = minimum
+    selected = _safe_float(strategy_cfg.get("default", default), default)
+    stop_pct = stop_distance_pct_from_signal(signal, hl_cfg)
+    tight_stop = _safe_float(cfg.get("tight_stop_max_pct", 0.60), 0.60)
+    medium_stop = _safe_float(cfg.get("medium_stop_max_pct", 1.25), 1.25)
+    if stop_pct <= tight_stop:
+        selected = maximum
+    elif stop_pct <= medium_stop:
+        selected = min(maximum, selected + 1.0)
+    elif stop_pct > _safe_float(cfg.get("wide_stop_min_pct", 2.0), 2.0):
+        selected = minimum
+    return max(minimum, min(maximum, selected))
+
+
 def strategy_sizing_tier_multiplier(
     strategy: str,
     trading_cfg: Optional[Dict[str, Any]] = None,
@@ -989,8 +1234,16 @@ def paper_perp_exit_config_from_yaml(
     trailing_activation = max(_dec("activation_threshold", 0.0050), fee_floor)
     pp_activation = max(pp_activation, fee_floor)
 
-    if strategy_key == "rsi_stoch_reversal_5m":
-        risk_cfg = trading_cfg.get("rsi_stoch_reversal_5m_risk") or {}
+    if strategy_key in {
+        "rsi_stoch_reversal_15m",
+        "rsi_stoch_reversal_5m",
+        "rsi_stoch_reversal_1m",
+    }:
+        risk_cfg = (
+            trading_cfg.get(f"{strategy_key}_risk")
+            or trading_cfg.get("rsi_stoch_reversal_15m_risk")
+            or {}
+        )
         try:
             pp_activation = max(
                 float(risk_cfg.get("profit_activation_threshold", pp_activation) or pp_activation),
@@ -1362,6 +1615,11 @@ def supply_demand_3step_specialist_gate(
     min_strength = _safe_float(gates.get("min_strength", 0.65), 0.65)
     min_rr = _safe_float(gates.get("min_reward_risk", 2.5), 2.5)
     size_mult = _safe_float(gates.get("size_multiplier", 0.40), 0.40)
+    side_mults = gates.get("size_multiplier_by_side") or {}
+    if isinstance(side_mults, dict) and side in {"long", "short"}:
+        raw_side_mult = side_mults.get(side)
+        if raw_side_mult is not None:
+            size_mult = _safe_float(raw_side_mult, size_mult)
 
     conf = _safe_float((signal or {}).get("confidence"), 0.0)
     strength = _safe_float((signal or {}).get("strength"), 0.0)
@@ -1734,6 +1992,9 @@ def eligible_shadow_strategy_signals(
                 "confidence": _safe_float(data.get("confidence"), 0.0),
                 "strength": _safe_float(data.get("strength"), 0.0),
                 "details": data,
+                "market_regime": str(
+                    (signals_data or {}).get("market_regime") or ""
+                ).strip().lower(),
             }
         )
 
@@ -2995,18 +3256,13 @@ def _peak_pct(side: str, entry_price: float, extreme_price: float) -> float:
 def _update_extreme_price(
     side: str, entry_price: float, current_price: float, metadata: Dict[str, Any]
 ) -> float:
+    highest = max(float(metadata.get("highest_price") or entry_price), current_price)
+    lowest = min(float(metadata.get("lowest_price") or entry_price), current_price)
+    metadata["highest_price"] = highest
+    metadata["lowest_price"] = lowest
     if side == "short":
-        key = "lowest_price"
-        extreme = float(metadata.get(key) or entry_price)
-        if current_price < extreme:
-            extreme = current_price
-    else:
-        key = "highest_price"
-        extreme = float(metadata.get(key) or entry_price)
-        if current_price > extreme:
-            extreme = current_price
-    metadata[key] = extreme
-    return extreme
+        return lowest
+    return highest
 
 
 def _active_trail_step_decimal(cfg: PaperPerpExitConfig, peak_pct: float) -> float:
@@ -3467,9 +3723,8 @@ def evaluate_paper_perp_exit(
         estimated_loss_usd = -net_pnl_usd
         estimated_loss_pct = -pct
         hard_cap_hit = (
-            hard_loss_pct > 0 and estimated_loss_pct >= hard_loss_pct
-        ) or (
-            hard_loss_pct <= 0 and max_loss_usd > 0 and estimated_loss_usd >= max_loss_usd
+            (hard_loss_pct > 0 and estimated_loss_pct >= hard_loss_pct)
+            or (max_loss_usd > 0 and estimated_loss_usd >= max_loss_usd)
         )
         soft_cap_hit = (
             soft_loss_pct > 0 and estimated_loss_pct >= soft_loss_pct
@@ -3479,7 +3734,7 @@ def evaluate_paper_perp_exit(
         if hard_cap_hit:
             cap_label = (
                 f"{hard_loss_pct:.2f}%"
-                if hard_loss_pct > 0
+                if hard_loss_pct > 0 and estimated_loss_pct >= hard_loss_pct
                 else f"${max_loss_usd:.2f}"
             )
             return PaperPerpExitResult(
@@ -3705,6 +3960,241 @@ def filter_allowed_coin(coin: str, allowed_symbols: Iterable[str]) -> bool:
     return not allowed or str(coin or "").upper().strip() in allowed
 
 
+def hyperliquid_signal_prefetch_settings(
+    hl_cfg: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve orchestrator HL signal prefetch knobs from hyperliquid_perps config."""
+    raw = (hl_cfg or {}).get("signal_prefetch") or {}
+    if not isinstance(raw, Mapping):
+        raw = {}
+    return {
+        "timeout_seconds": max(
+            5.0,
+            min(float(raw.get("timeout_seconds", 20.0) or 20.0), 45.0),
+        ),
+        "retries": max(0, min(int(raw.get("retries", 2) or 2), 4)),
+        "retry_delay_seconds": max(
+            0.0,
+            min(float(raw.get("retry_delay_seconds", 0.35) or 0.35), 2.0),
+        ),
+        "inline_fallback": bool(raw.get("inline_fallback", True)),
+        "max_prefetch_seconds": max(
+            10.0,
+            min(float(raw.get("max_prefetch_seconds", 30.0) or 30.0), 60.0),
+        ),
+        "entry_evaluation_reserve_seconds": max(
+            5.0,
+            min(float(raw.get("entry_evaluation_reserve_seconds", 12.0) or 12.0), 30.0),
+        ),
+    }
+
+
+def hyperliquid_signal_prefetch_health(stats: Mapping[str, Any]) -> str:
+    """Classify last perp entry signal prefetch outcome: ok | degraded | failed | unknown."""
+    if stats.get("skipped"):
+        return "ok"
+    requested = int(stats.get("requested") or 0)
+    if requested <= 0:
+        return "unknown"
+    scanned_missed = int(stats.get("scanned_missed") or 0)
+    if scanned_missed == 0:
+        return "ok"
+    ratio = (requested - scanned_missed) / float(requested)
+    if ratio >= 0.9:
+        return "degraded"
+    return "failed"
+
+
+def _hyperliquid_signals_url(
+    *,
+    coin_key: str,
+    signal_source: str,
+    strategy_service_url: str,
+    mirror_exchanges: Iterable[str],
+    pair_selections: Mapping[str, Any],
+) -> Tuple[Optional[str], str]:
+    if str(signal_source or "").lower() == "hyperliquid_strategies":
+        return (
+            f"{strategy_service_url.rstrip('/')}/api/v1/signals/hyperliquid/{coin_key}",
+            "hyperliquid_strategies",
+        )
+    spot_ex, spot_pair = find_mirror_spot_pair(
+        coin_key, mirror_exchanges, dict(pair_selections or {})
+    )
+    if not spot_ex or not spot_pair:
+        return None, "no_mirror_pair"
+    strategy_pair = str(spot_pair).replace("/", "")
+    return (
+        f"{strategy_service_url.rstrip('/')}/api/v1/signals/{spot_ex}/{strategy_pair}",
+        "mirror_spot",
+    )
+
+
+async def fetch_hyperliquid_entry_signal_payload(
+    client: Any,
+    *,
+    coin_key: str,
+    signal_source: str,
+    strategy_service_url: str,
+    mirror_exchanges: Iterable[str],
+    pair_selections: Mapping[str, Any],
+    timeout_seconds: float = 20.0,
+    retries: int = 2,
+    retry_delay_seconds: float = 0.35,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Fetch one coin's strategy payload. Returns (payload, reason)."""
+    signals_url, source_kind = _hyperliquid_signals_url(
+        coin_key=coin_key,
+        signal_source=signal_source,
+        strategy_service_url=strategy_service_url,
+        mirror_exchanges=mirror_exchanges,
+        pair_selections=pair_selections,
+    )
+    if not signals_url:
+        return None, source_kind
+
+    attempts = max(1, int(retries or 0) + 1)
+    last_reason = "unknown"
+    for attempt in range(1, attempts + 1):
+        try:
+            signals_resp = await client.get(signals_url, timeout=float(timeout_seconds))
+            if signals_resp.status_code == 200:
+                payload = signals_resp.json()
+                if isinstance(payload, dict) and payload:
+                    return payload, "ok"
+                last_reason = "empty_payload"
+            else:
+                last_reason = f"http_{signals_resp.status_code}"
+        except Exception as exc:
+            last_reason = f"error:{type(exc).__name__}"
+            logger.warning(
+                "[HyperliquidPaper] Signal fetch failed for %s (%s) attempt %s/%s: %s",
+                coin_key,
+                source_kind,
+                attempt,
+                attempts,
+                exc,
+            )
+        if attempt < attempts and retry_delay_seconds > 0:
+            await asyncio.sleep(float(retry_delay_seconds))
+    return None, last_reason
+
+
+async def prefetch_hyperliquid_entry_signals(
+    client: Any,
+    *,
+    coins: Sequence[str],
+    signal_source: str,
+    strategy_service_url: str,
+    mirror_exchanges: Iterable[str],
+    pair_selections: Mapping[str, Any],
+    hl_cfg: Optional[Mapping[str, Any]] = None,
+    deadline: Optional[float] = None,
+    coin_filter_set: Optional[set] = None,
+    concurrency: int = 8,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Parallel prefetch with retry pass for misses."""
+    settings = hyperliquid_signal_prefetch_settings(hl_cfg)
+    prefetch_conc = max(1, min(int(concurrency or 8), 16))
+    prefetch_sem = asyncio.Semaphore(prefetch_conc)
+    prefetched: Dict[str, Dict[str, Any]] = {}
+    failure_reasons: Dict[str, str] = {}
+
+    if deadline is not None:
+        remaining = max(0.0, deadline - time.monotonic())
+        reserve = float(settings["entry_evaluation_reserve_seconds"])
+        budget = min(settings["max_prefetch_seconds"], max(0.0, remaining - reserve))
+    else:
+        budget = settings["max_prefetch_seconds"]
+    if budget <= 0.5:
+        logger.warning(
+            "[HyperliquidPaper] Signal prefetch budget exhausted (%.2fs left, reserve %.0fs)",
+            max(0.0, (deadline - time.monotonic()) if deadline else 0.0),
+            settings["entry_evaluation_reserve_seconds"],
+        )
+        return prefetched, {
+            "requested": len(coins or []),
+            "ok": 0,
+            "missed": len(coins or []),
+            "failure_reasons": {"__deadline__": "prefetch_budget_exhausted"},
+        }
+
+    async def _fetch_one(coin_raw: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
+        coin_key = pair_to_hyperliquid_coin(str(coin_raw))
+        if coin_filter_set is not None and coin_key not in coin_filter_set:
+            return coin_key, None, "coin_filter"
+        if deadline is not None:
+            reserve = float(settings["entry_evaluation_reserve_seconds"])
+            if time.monotonic() >= deadline - reserve:
+                return coin_key, None, "deadline"
+        async with prefetch_sem:
+            if deadline is not None:
+                reserve = float(settings["entry_evaluation_reserve_seconds"])
+                remaining = deadline - time.monotonic() - reserve
+                if remaining <= 0.5:
+                    return coin_key, None, "deadline"
+                req_timeout = min(
+                    float(settings["timeout_seconds"]),
+                    remaining,
+                )
+            else:
+                req_timeout = float(settings["timeout_seconds"])
+            payload, reason = await fetch_hyperliquid_entry_signal_payload(
+                client,
+                coin_key=coin_key,
+                signal_source=signal_source,
+                strategy_service_url=strategy_service_url,
+                mirror_exchanges=mirror_exchanges,
+                pair_selections=pair_selections,
+                timeout_seconds=req_timeout,
+                retries=settings["retries"],
+                retry_delay_seconds=settings["retry_delay_seconds"],
+            )
+            return coin_key, payload, reason
+
+    async def _run_pass(target_coins: Sequence[str]) -> None:
+        results = await asyncio.gather(
+            *(_fetch_one(c) for c in target_coins),
+            return_exceptions=True,
+        )
+        for item in results:
+            if not isinstance(item, tuple) or len(item) != 3:
+                continue
+            coin_key, payload, reason = item
+            if isinstance(payload, dict):
+                prefetched[coin_key] = payload
+                failure_reasons.pop(coin_key, None)
+            elif coin_key not in prefetched:
+                failure_reasons[coin_key] = str(reason or "miss")
+
+    await _run_pass(coins)
+
+    missed_keys = [
+        pair_to_hyperliquid_coin(str(c))
+        for c in (coins or [])
+        if pair_to_hyperliquid_coin(str(c)) not in prefetched
+        and (coin_filter_set is None or pair_to_hyperliquid_coin(str(c)) in coin_filter_set)
+    ]
+    if missed_keys:
+        if deadline is not None:
+            retry_budget = max(
+                0.0,
+                min(15.0, deadline - time.monotonic() - settings["entry_evaluation_reserve_seconds"]),
+            )
+        else:
+            retry_budget = min(15.0, settings["max_prefetch_seconds"] * 0.4)
+        if retry_budget > 1.0:
+            await _run_pass(missed_keys)
+
+    stats = {
+        "requested": len(coins or []),
+        "ok": len(prefetched),
+        "missed": max(0, len(coins or []) - len(prefetched)),
+        "failure_reasons": dict(failure_reasons),
+    }
+    return prefetched, stats
+
+
 def find_mirror_spot_pair(
     coin: str,
     mirror_exchanges: Iterable[str],
@@ -3798,6 +4288,62 @@ def hyperliquid_shadow_promotion_requirement(
     }
 
 
+def hyperliquid_coin_strategy_entry_deny(
+    coin: str,
+    signal: Optional[Mapping[str, Any]],
+    regime: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Hard deny specific coin/strategy/side/regime combinations before entry."""
+    denies = (hl_cfg or {}).get("coin_strategy_entry_denies") or []
+    if not isinstance(denies, list) or not denies:
+        return {"blocked": False, "reason": "coin_strategy_deny_not_configured"}
+
+    strategy = str((signal or {}).get("strategy") or "").strip().lower()
+    side = position_sides_from_signal((signal or {}).get("signal"))
+    regime_key = str(regime or "").strip().lower()
+    coin_key = pair_to_hyperliquid_coin(str(coin or ""))
+    if not coin_key or not strategy or side not in {"long", "short"}:
+        return {"blocked": False, "reason": "coin_strategy_deny_incomplete_signal"}
+
+    for raw in denies:
+        if not isinstance(raw, Mapping):
+            continue
+        deny_coin = pair_to_hyperliquid_coin(str(raw.get("coin") or ""))
+        if deny_coin and deny_coin.lower() != coin_key.lower():
+            continue
+        deny_strategy = str(raw.get("strategy") or "").strip().lower()
+        if deny_strategy and deny_strategy != strategy:
+            continue
+        deny_sides = {
+            str(value or "").strip().lower()
+            for value in (raw.get("sides") or [])
+            if str(value or "").strip()
+        }
+        if deny_sides and side not in deny_sides:
+            continue
+        deny_regimes = {
+            str(value or "").strip().lower()
+            for value in (raw.get("regimes") or [])
+            if str(value or "").strip()
+        }
+        if deny_regimes and regime_key not in deny_regimes:
+            continue
+        return {
+            "blocked": True,
+            "reason": (
+                f"coin_strategy_entry_denied_{coin_key}_{strategy}_{side}_"
+                f"{regime_key or 'any_regime'}"
+            ),
+            "message": (
+                f"{coin_key} {strategy} {side} "
+                f"{regime_key or 'any regime'} is on the executable denylist"
+            ),
+        }
+
+    return {"blocked": False, "reason": "coin_strategy_deny_clear"}
+
+
 # ---------------------------------------------------------------------------
 # Change 3: Counter-trend regime direction gate
 # ---------------------------------------------------------------------------
@@ -3857,6 +4403,30 @@ def hyperliquid_regime_direction_gate(
             "reason": f"configured_regime_side_block_{regime_key}_{side}",
             "sizeMultiplier": None,
         }
+
+    allowed_lanes = (hl_cfg or {}).get("counter_trend_allowed_lanes") or []
+    if isinstance(allowed_lanes, list) and strategy_key:
+        for raw in allowed_lanes:
+            if not isinstance(raw, Mapping):
+                continue
+            lane_strategy = str(raw.get("strategy") or "").strip().lower()
+            lane_side = str(raw.get("side") or "").strip().lower()
+            lane_regimes = {
+                str(value or "").strip().lower()
+                for value in (raw.get("regimes") or [])
+                if str(value or "").strip()
+            }
+            if lane_strategy != strategy_key:
+                continue
+            if lane_side and lane_side != side:
+                continue
+            if lane_regimes and regime_key not in lane_regimes:
+                continue
+            return {
+                "blocked": False,
+                "reason": "counter_trend_allowed_lane",
+                "sizeMultiplier": None,
+            }
 
     blocked_side = _COUNTER_TREND_BLOCKS.get(regime_key)
 
@@ -4121,12 +4691,46 @@ def hyperliquid_min_edge_gate(
         (hl_cfg or {}).get("fee_rate_per_side", 0.001), 0.001
     )
     fee_round_trip_pct = fee_rate_per_side * 2.0 * 100.0
-    threshold_pct = max(min_edge_pct, fee_round_trip_pct * edge_multiplier)
+    slippage_round_trip_pct = max(
+        0.0,
+        _safe_float(edge_cfg.get("estimated_round_trip_slippage_pct", 0.0), 0.0),
+    )
+    total_cost_pct = fee_round_trip_pct + slippage_round_trip_pct
+    threshold_pct = max(min_edge_pct, total_cost_pct * edge_multiplier)
+
+    strategy_name = str(signal.get("strategy") or "").strip().lower()
+    side = position_sides_from_signal(signal.get("signal"))
+    regime = str(signal.get("market_regime") or "").strip().lower()
+    evidence_exempt_lanes = edge_cfg.get("evidence_exempt_lanes") or []
+    if isinstance(evidence_exempt_lanes, list):
+        for raw in evidence_exempt_lanes:
+            if not isinstance(raw, Mapping):
+                continue
+            lane_strategy = str(raw.get("strategy") or "").strip().lower()
+            lane_side = str(raw.get("side") or "").strip().lower()
+            lane_regimes = {
+                str(value or "").strip().lower()
+                for value in (raw.get("regimes") or [])
+                if str(value or "").strip()
+            }
+            if lane_strategy and lane_strategy != strategy_name:
+                continue
+            if lane_side and lane_side != side:
+                continue
+            if lane_regimes and regime not in lane_regimes:
+                continue
+            return {
+                "blocked": False,
+                "reason": "min_edge_evidence_exempt_lane",
+                "expectedMovePct": _expected_move_pct_from_signal(signal),
+                "thresholdPct": threshold_pct,
+                "estimatedCostPct": total_cost_pct,
+                "evidenceExempt": True,
+            }
 
     expected = _expected_move_pct_from_signal(signal)
     if expected is None:
         require_expected_move = edge_cfg.get("require_expected_move", False)
-        strategy_name = str(signal.get("strategy") or "").strip().lower()
         allow_missing = {
             str(value or "").strip().lower()
             for value in (edge_cfg.get("allow_missing_expected_move_strategies") or [])
@@ -4137,6 +4741,7 @@ def hyperliquid_min_edge_gate(
                 "reason": "min_edge_missing_allowed_for_strategy",
                 "expectedMovePct": None,
                 "thresholdPct": threshold_pct,
+                "estimatedCostPct": total_cost_pct,
             }
         if require_expected_move is True or str(require_expected_move).lower() in {
             "1", "true", "yes", "on"
@@ -4146,12 +4751,14 @@ def hyperliquid_min_edge_gate(
                 "reason": "min_edge_blocked_expected_move_missing",
                 "expectedMovePct": None,
                 "thresholdPct": threshold_pct,
+                "estimatedCostPct": total_cost_pct,
             }
         return {
             "blocked": False,
             "reason": "min_edge_no_data",
             "expectedMovePct": None,
             "thresholdPct": threshold_pct,
+            "estimatedCostPct": total_cost_pct,
         }
 
     if expected < threshold_pct:
@@ -4162,6 +4769,7 @@ def hyperliquid_min_edge_gate(
             ),
             "expectedMovePct": expected,
             "thresholdPct": threshold_pct,
+            "estimatedCostPct": total_cost_pct,
         }
 
     return {
@@ -4169,6 +4777,7 @@ def hyperliquid_min_edge_gate(
         "reason": "min_edge_pass",
         "expectedMovePct": expected,
         "thresholdPct": threshold_pct,
+        "estimatedCostPct": total_cost_pct,
     }
 
 

@@ -43,7 +43,7 @@ def test_insufficient_candles_hold():
 
 def test_session_blocked_hold():
     params = EngineParams()
-    md = {"5m": _ohlcv(260), "1m": _ohlcv(260)}
+    md = {"1h": _ohlcv(260), "15m": _ohlcv(260)}
     cfg = default_lisbon_session_config()
     mon_am = datetime(2024, 6, 3, 9, 0, tzinfo=ZoneInfo("Europe/Lisbon"))
     result = evaluate_sma_reclaim_bull_flag(md, params, session_cfg=cfg, now=mon_am)
@@ -104,7 +104,7 @@ def test_sma_stack_compression():
 
 def test_blocked_regime_hold():
     params = EngineParams()
-    md = {"5m": _ohlcv(260), "1m": _ohlcv(260)}
+    md = {"1h": _ohlcv(260), "15m": _ohlcv(260)}
     tue = datetime(2024, 6, 4, 14, 0, tzinfo=ZoneInfo("Europe/Lisbon"))
     result = evaluate_sma_reclaim_bull_flag(
         md, params, market_regime="trending_down", now=tue

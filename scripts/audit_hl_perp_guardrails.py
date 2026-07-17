@@ -34,6 +34,7 @@ from hyperliquid_perps import (  # noqa: E402
     position_sides_from_signal,
     select_mirrored_signal,
 )
+from core.shadow_episode_summary import shadow_promotion_cohorts_from_trades  # noqa: E402
 
 
 def _get_json(url: str, timeout: float = 20.0) -> Dict[str, Any]:
@@ -96,52 +97,50 @@ def _promoted_cohorts(
     promotion = hl_cfg.get("shadow_cohort_promotion") or {}
     lookback_hours = float(promotion.get("lookback_hours", 72) or 72)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    use_episode_metrics = promotion.get("use_episode_metrics", True) is not False
     min_closed = int(promotion.get("min_closed", 5) or 5)
+    min_episodes = int(promotion.get("min_episodes", min_closed) or min_closed)
     min_win_rate = float(promotion.get("min_win_rate", 0.70) or 0.70)
     min_pnl = float(promotion.get("min_realized_pnl_usd", 5.0) or 5.0)
+    min_profit_factor = float(promotion.get("min_profit_factor", 1.2) or 1.2)
+    require_positive_holdout = promotion.get("require_positive_holdout", True) is not False
+    max_winner_contribution = float(promotion.get("max_winner_contribution", 1.0) or 1.0)
     max_candidates = int(promotion.get("max_candidates", 8) or 8)
     allowed_strategies = {str(x).strip().lower() for x in promotion.get("strategies", [])}
     allowed_sides = {str(x).strip().lower() for x in promotion.get("sides", [])}
     allowed_regimes = {str(x).strip().lower() for x in promotion.get("regimes", [])}
 
-    cohorts: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
-    for row in shadow_rows:
-        exit_time = _parse_dt(row.get("exit_time") or row.get("updated_at"))
-        if not exit_time or exit_time < cutoff:
-            continue
-        coin, strategy, side, regime = _cohort_key(row)
-        if not coin or not strategy or side not in {"long", "short"}:
-            continue
-        if allowed_strategies and strategy not in allowed_strategies:
-            continue
-        if allowed_sides and side not in allowed_sides:
-            continue
-        if allowed_regimes and regime not in allowed_regimes:
-            continue
-        key = (coin, strategy, side, regime)
-        cohort = cohorts.setdefault(
-            key,
-            {
-                "coin": coin,
-                "strategy": strategy,
-                "side": side,
-                "regime": regime,
-                "closed": 0,
-                "wins": 0,
-                "realized": 0.0,
-            },
-        )
-        pnl = float(row.get("realized_pnl") or 0.0)
-        cohort["closed"] += 1
-        cohort["wins"] += int(pnl > 0)
-        cohort["realized"] += pnl
+    rows = list(shadow_rows)
+    if use_episode_metrics:
+        cohorts = shadow_promotion_cohorts_from_trades(rows, cutoff=cutoff)
+    else:
+        cohorts = _shadow_cohort_stats(rows, hl_cfg)
 
     eligible = []
     for cohort in cohorts.values():
-        closed = int(cohort["closed"])
+        closed = int(cohort.get("episodes") if use_episode_metrics else cohort.get("closed") or 0)
         win_rate = float(cohort["wins"]) / closed if closed else 0.0
-        if closed >= min_closed and win_rate >= min_win_rate and cohort["realized"] >= min_pnl:
-            eligible.append({**cohort, "win_rate": win_rate})
+        profit_factor = cohort.get("profit_factor")
+        training_realized = float(cohort.get("training_realized") or 0.0)
+        holdout_realized = float(cohort.get("holdout_realized") or 0.0)
+        winner_contribution = cohort.get("max_winner_contribution")
+        min_sample = min_episodes if use_episode_metrics else min_closed
+        if allowed_strategies and cohort["strategy"] not in allowed_strategies:
+            continue
+        if allowed_sides and cohort["side"] not in allowed_sides:
+            continue
+        if allowed_regimes and cohort["regime"] not in allowed_regimes:
+            continue
+        if (
+            closed >= min_sample
+            and win_rate >= min_win_rate
+            and cohort["realized"] >= min_pnl
+            and profit_factor is not None
+            and float(profit_factor) >= min_profit_factor
+            and (not require_positive_holdout or (training_realized > 0 and holdout_realized > 0))
+            and (winner_contribution is None or float(winner_contribution) <= max_winner_contribution)
+        ):
+            eligible.append({**cohort, "closed": closed, "win_rate": win_rate})
     eligible.sort(key=lambda c: (c["realized"], c["win_rate"], c["closed"]), reverse=True)
 
     out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)

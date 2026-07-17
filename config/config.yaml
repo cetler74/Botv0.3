@@ -1203,7 +1203,7 @@ strategies:
       confirm_bullish_bars: 2
       min_adx: 32.0
       adx_period: 14
-      require_volume_confirmation: true
+      require_volume_confirmation: false
       volume_window: 20
       volume_multiplier: 1.35
     target_timeframes:
@@ -1349,7 +1349,7 @@ strategies:
     - 1m
   sma_reclaim_bull_flag:
     # Long-only: selloff + RSI bullish divergence, SMA200 reclaim, bull flag entry.
-    enabled: true
+    enabled: false  # 2026-06-28 spot review: not enough positive closed-trade evidence; keep shadow/perp lanes separate.
     parameters:
       entry_timeframe: 5m
       execution_timeframe: 1m
@@ -1428,10 +1428,10 @@ strategies:
     - 5m
     - 1m
   rsi_stoch_reversal_5m:
-    # Spot long-only: RSI<30 + Stoch K&D<30 + K>D on closed 5m (same rules as HL long).
+    # Historical 5m attribution alias; retained for old trade/report labels only.
     # 2026-06-13: re-enabled after fee recalculation, but only the Crypto.com
     # spot lane is allowed by standalone_entry_regimes.
-    enabled: true
+    enabled: false  # 2026-06-28 spot review: pause broad spot lane; require shadow/perp proof before re-enable.
     parameters:
       entry_timeframe: 5m
       rsi_period: 14
@@ -1464,8 +1464,8 @@ strategies:
     target_timeframes:
     - 5m
   rsi_stoch_reversal_1m:
-    # Spot long-only 1m replica of the HL RSI/Stoch reversal playbook.
-    enabled: true
+    # Historical attribution alias only; no execution or shadow evaluation.
+    enabled: false
     parameters:
       entry_timeframe: 1m
       rsi_period: 14
@@ -1501,8 +1501,39 @@ strategies:
     target_timeframes:
     - 1m
     - 5m
-  supply_demand_3step:
+  rsi_stoch_reversal_15m:
+    # Spot long-only: 1h directional bias with a closed 15m RSI/Stoch reversal trigger.
     enabled: true
+    parameters:
+      entry_timeframe: 15m
+      confirmation_timeframe: 1h
+      require_confirmation: true
+      confirmation_rsi_period: 14
+      confirmation_ema_period: 9
+      rsi_period: 14
+      rsi_oversold: 30
+      rsi_overbought: 80
+      stoch_oversold: 30
+      stoch_overbought: 80
+      stoch_rsi_length: 14
+      stoch_k_smooth: 3
+      stoch_d_smooth: 3
+      rsi_reclaim_enabled: true
+      rsi_reclaim_lookback_bars: 3
+      rsi_reclaim_ceiling: 32
+      buy_confidence: 0.72
+      buy_strength: 0.70
+      allow_long: true
+      allow_short: false
+      fast_signal_enabled: true
+      fast_signal_interval_seconds: 30
+      blocked_regimes:
+      - trending_down
+    target_timeframes:
+    - 1h
+    - 15m
+  supply_demand_3step:
+    enabled: false  # 2026-06-28 spot review: worst spot loser; retain Hyperliquid/perp shadow evaluation separately.
     # Standalone price-action playbook: 1H structure + 15m demand/supply retest, min 2.5R.
     target_timeframes:
     - 1h
@@ -1537,7 +1568,7 @@ strategies:
       fast_signal_enabled: true
       fast_signal_interval_seconds: 30
   dual_sma_daytrade:
-    enabled: true
+    enabled: false  # 2026-06-28 spot review: negative closed spot expectancy; pause until new evidence improves.
     # Standalone dual-SMA daytrade: daily bias + 15m confirm + 5m entry (1m precision optional).
     # 2026-06-13: profitability profile — gentler SMA200 slope, wider retrace, 2.0R floor.
     target_timeframes:
@@ -1574,7 +1605,7 @@ strategies:
       fast_signal_enabled: true
       fast_signal_interval_seconds: 30
   arc_daytrade:
-    enabled: true
+    enabled: false  # 2026-06-28 spot review: spot long-only edge is negative; perp short edge remains separate.
     # Standalone ARC daytrade: daily box + 5m range/candle (1m precision optional).
     target_timeframes:
     - 1d
@@ -1611,7 +1642,7 @@ strategies:
       fast_signal_enabled: true
       fast_signal_interval_seconds: 30
   ema50_breakout_pullback:
-    enabled: true
+    enabled: false  # 2026-06-28 spot review: pause spot; Hyperliquid long shadow cohort remains available.
     # Standalone entry when enabled (orchestrator standalone_entry_quality + regime gates).
     # Data Trader 50 EMA Breakout Pullback — 4H single-TF, Chandelier SL, 2R TP.
     target_timeframes:
@@ -1640,7 +1671,7 @@ strategies:
       fast_signal_enabled: true
       fast_signal_interval_seconds: 30
   rsi_oversold_override:
-    enabled: true  # 2026-05-29: re-enabled (fee-aware expansion). Lifetime breakeven (193 trades, PF 1.01, +$1.93); restricted below to its viable regimes + off bybit, with strategy_expectancy_guard as auto-probation backstop. Simulation mode.
+    enabled: false  # 2026-06-28 spot review: near-breakeven/negative; keep only rsi_oversold_checklist active for spot recovery.
     parameters:
       # Independent override strategy (15m trigger + 1h safety guards):
       # - Base trigger: 15m RSI oversold.
@@ -1667,16 +1698,16 @@ strategies:
     target_timeframes:
     - 15m
   rsi_oversold_checklist:
-    enabled: true  # Profit-recovery mode 2026-05-23: 30d +$31.52, 68% WR, best measured expectancy
+    enabled: true  # 2026-07-11: re-enabled with setup_memory blocking bad historical setup cohorts.
     parameters:
       # Stricter profile: the previous "simple band only" mode (reclaim off + no recent
       # touch) stayed BUY for every bar while RSI sat in a wide band → many pairs opened
       # at once. Reclaim + structure filters require an actual oversold dip and bounce.
-      require_price_above_ema20: true
+      require_price_above_ema20: false
       reclaim_cross_bars: 2
-      require_rsi_reclaim: true
+      require_rsi_reclaim: false
       require_simple_recent_touch: false
-      simple_oversold_rsi_max: 48
+      simple_oversold_rsi_max: 58
       simple_oversold_lookback_bars: 24
       simple_touch_rsi_max: 42
       rsi_period: 14
@@ -1688,21 +1719,21 @@ strategies:
         trending: 25.0
         volatile: 22.0
       exec_rsi_min: 26.0
-      exec_rsi_max: 52.0
+      exec_rsi_max: 58.0
       trend_rsi_min: 38.0
       ema_fast_period: 20
       ema_mid_period: 50
       ema_slow_period: 200
       volume_window: 20
-      volume_multiplier: 1.06
+      volume_multiplier: 0.70
       support_lookback: 30
       support_tolerance_pct: 0.012
       divergence_lookback: 14
-      require_volume_confirmation: true
+      require_volume_confirmation: false
       require_support_proximity: false
       require_bullish_divergence: false
       require_multi_tf_rsi: true
-      require_macro_trend_filter: true
+      require_macro_trend_filter: false
       support_confidence_boost: 0.02
       support_strength_boost: 0.02
       divergence_confidence_boost: 0.03
@@ -1715,12 +1746,11 @@ strategies:
       rsi_slope_strength_boost: 0.015
       buy_confidence: 0.97
       buy_strength: 0.92
-      # PnL-FIX v14: cap stale checklist legs (orchestrator enforces on open trades).
+      # 2026-07-11: loosened to restart spot entries while setup_memory blocks bad cohorts.
       max_hold_hours: 60
       blocked_entry_regimes:
       - trending_down
       - high_volatility
-      - sideways
     regime_overrides:
       reversal_zone:
         require_price_above_ema20: false
@@ -1735,6 +1765,83 @@ strategies:
     target_timeframes:
     - 15m
     - 1h
+  weekly_fibonacci_spot:
+    # Spot-only simulation cohort: one selective 15m-confirmed pullback from the
+    # prior 168 closed 1h candles. Setup metadata drives the structural stop and
+    # Fibonacci target; target is never below +3% and reward/risk must be >=2.
+    enabled: true
+    parameters:
+      range_bars: 168
+      trend_fast_ema: 20
+      trend_slow_ema: 50
+      entry_fib_shallow: 0.50
+      entry_fib_deep: 0.786
+      stop_atr_buffer: 0.15
+      min_target_pct: 3.0
+      max_stop_pct: 3.0
+      min_reward_risk: 2.0
+      rsi_period: 14
+      rsi_min: 35.0
+      rsi_max: 58.0
+      volume_window: 20
+      min_volume_ratio: 1.0
+      buy_confidence: 0.88
+      buy_strength: 0.82
+    target_timeframes:
+    - 1h
+    - 15m
+  donchian_atr_pullback:
+    # Candidate: 1h trend bias + 15m Donchian breakout-pullback. Disabled until
+    # offline walk-forward / holdout gates pass ($20/day, <=5% DD).
+    enabled: false
+    target_timeframes:
+    - 1h
+    - 15m
+    parameters:
+      bias_timeframe: 1h
+      entry_timeframe: 15m
+      bias_ema_period: 20
+      donchian_period: 20
+      atr_period: 14
+      atr_stop_mult: 1.2
+      pullback_lookback_bars: 8
+      min_reward_risk: 1.5
+      allow_long: true
+      allow_short: false
+      buy_confidence: 0.74
+      buy_strength: 0.72
+      blocked_regimes:
+      - low_volatility
+      - sideways
+  vwap_rsi_mean_reversion:
+    # Candidate: 1h range qualification + 15m VWAP/Bollinger excursion with RSI reclaim.
+    # Disabled until offline walk-forward / holdout gates pass.
+    enabled: false
+    target_timeframes:
+    - 1h
+    - 15m
+    parameters:
+      bias_timeframe: 1h
+      entry_timeframe: 15m
+      bias_ema_period: 20
+      max_bias_slope_pct: 0.004
+      vwap_lookback_bars: 48
+      bb_period: 20
+      bb_std: 2.0
+      rsi_period: 14
+      rsi_oversold: 35.0
+      rsi_reclaim: 40.0
+      atr_period: 14
+      atr_stop_mult: 1.0
+      min_reward_risk: 1.2
+      allow_long: true
+      allow_short: false
+      buy_confidence: 0.72
+      buy_strength: 0.70
+      blocked_regimes:
+      - trending_up
+      - trending_down
+      - breakout
   vwma_hull:
     # PnL-FIX v3 — Added ADX>=22 + 4h macro-trend HARD VETOS in strategy code.
     # 2026-05: paused — 33% WR, -$8.09/7d; stagnant_loser exits dominate.
@@ -1870,7 +1977,7 @@ strategies:
     - 15m
 strategies_hyperliquid:
   regime_stability:
-    enabled: true
+    enabled: false  # Disabled: hard 4h macro veto cannot be faithfully retimed to the 1h/15m contract.
     min_dwell_seconds: 120
     hysteresis_delta: 0.08
     trend_lookback_bars: 4
@@ -1930,7 +2037,7 @@ strategies_hyperliquid:
     - 15m
     - 5m
   vwma_hull:
-    enabled: true
+    enabled: false  # Disabled: hard 4h macro veto cannot be faithfully retimed.
     parameters:
       allow_long: true
       allow_short: false  # 2026-05-31 24h review: shorts -$2.49 book-wide; vwma 33% WR PF 0.32
@@ -1950,8 +2057,41 @@ strategies_hyperliquid:
       min_confidence_score: 0.55
       stop_loss_pct: 1.5
       take_profit_pct: 2.5
+  heikin_ashi_1m_scalper:
+    enabled: false  # New YouTube-derived 1m HA scalper; keep disabled until 300+ trade backtest and paper review.
+    target_timeframes:
+    - 1m
+    parameters:
+      entry_timeframe: 1m
+      ema_period: 100
+      min_candles: 130
+      session_timezone: America/New_York
+      session_start: "10:00"
+      session_end: "12:00"
+      block_outside_session: true
+      block_weekends: false
+      allow_long: true
+      allow_short: true
+      min_pullback_candles: 2
+      flat_wick_tolerance_pct: 0.0002
+      doji_body_max_pct: 0.25
+      doji_wick_min_pct: 0.20
+      high_range_lookback: 2
+      ema_chop_buffer_pct: 0.0002
+      ema_chop_lookback: 8
+      max_recent_ema_crosses: 1
+      target_reward_risk: 1.0
+      stop_buffer_pct: 0.0
+      min_stop_pct: 0.0005
+      max_stop_pct: 0.02
+      buy_confidence: 0.74
+      buy_strength: 0.72
+      sell_confidence: 0.74
+      sell_strength: 0.72
+      blocked_regimes:
+      - low_volatility
   multi_timeframe_confluence:
-    enabled: true
+    enabled: false  # Disabled: legacy daily context is outside the executable 1h/15m contract.
     parameters:
       allow_long: true
       allow_short: true
@@ -2039,10 +2179,8 @@ strategies_hyperliquid:
       stop_loss_pct: 1.0
       take_profit_pct: 1.8
   rsi_stoch_reversal_5m:
-    # HL perp: long RSI<30 + Stoch K&D<30 + K>D; short RSI>80 + Stoch K&D>80 + D>K.
-    # 2026-06-13: re-enabled after maker-fee recalculation. All-time corrected
-    # sample is positive; keep the tighter strategy hard-loss cap active.
-    enabled: true
+    # Historical attribution alias only. Never execute, shadow-evaluate, or fetch.
+    enabled: false
     parameters:
       entry_timeframe: 5m
       rsi_period: 14
@@ -2072,8 +2210,8 @@ strategies_hyperliquid:
     target_timeframes:
     - 5m
   rsi_stoch_reversal_1m:
-    # HL perp 1m replica: same RSI/Stoch rules as 5m, without breakout long or high-vol short blocks.
-    enabled: true
+    # Historical attribution alias only. Never execute, shadow-evaluate, or fetch.
+    enabled: false
     parameters:
       entry_timeframe: 1m
       rsi_period: 14
@@ -2108,15 +2246,49 @@ strategies_hyperliquid:
     target_timeframes:
     - 1m
     - 5m
+  rsi_stoch_reversal_15m:
+    # Versioned executable reversal: 1h directional bias + closed 15m RSI/Stoch trigger.
+    enabled: true
+    parameters:
+      entry_timeframe: 15m
+      confirmation_timeframe: 1h
+      require_confirmation: true
+      confirmation_rsi_period: 14
+      confirmation_ema_period: 9
+      rsi_period: 14
+      rsi_oversold: 30
+      rsi_overbought: 80
+      stoch_oversold: 30
+      stoch_overbought: 80
+      stoch_rsi_length: 14
+      stoch_k_smooth: 3
+      stoch_d_smooth: 3
+      buy_confidence: 0.72
+      buy_strength: 0.70
+      sell_confidence: 0.72
+      sell_strength: 0.70
+      allow_long: true
+      allow_short: true
+      fast_signal_enabled: false
+      fast_signal_interval_seconds: 30
+      blocked_regimes:
+      - trending_down
+      - low_volatility
+      - breakout
+      short_blocked_regimes:
+      - high_volatility
+    target_timeframes:
+    - 1h
+    - 15m
   sma_reclaim_bull_flag:
     enabled: true
     parameters:
       allow_long: true
       allow_short: false
-      entry_timeframe: 5m
-      execution_timeframe: 1m
+      entry_timeframe: 15m
+      execution_timeframe: 15m
       context_timeframes:
-      - 1d
+      - 1h
       session_tz: Europe/Lisbon
       session_filter:
         enabled: true
@@ -2183,9 +2355,8 @@ strategies_hyperliquid:
       - trending_down
       - low_volatility
     target_timeframes:
-    - 1d
-    - 5m
-    - 1m
+    - 1h
+    - 15m
   supply_demand_3step:
     enabled: true
     # Standalone price-action playbook: 1H structure + 15m demand/supply retest, min 2.5R.
@@ -2223,27 +2394,87 @@ strategies_hyperliquid:
       sell_strength: 0.72
       blocked_regimes:
       - low_volatility
+      # 2026-07-10 review: Jul 9–10 executable bleed was almost entirely
+      # supply_demand_3step in sideways (stop/loss_cap). Block chop until OOS
+      # proves a positive sideways cohort.
+      - sideways
+      - reversal_zone
       # 2026-06-14: disable HL background fast-signal publishing; regular
       # orchestrator perps scans remain enabled, and this avoids OHLCV 429 bursts.
       fast_signal_enabled: false
       fast_signal_interval_seconds: 30
+  donchian_atr_pullback:
+    # Candidate: 1h trend + 15m Donchian pullback. Disabled until OOS/holdout gates pass.
+    enabled: false
+    target_timeframes:
+    - 1h
+    - 15m
+    parameters:
+      bias_timeframe: 1h
+      entry_timeframe: 15m
+      bias_ema_period: 20
+      donchian_period: 20
+      atr_period: 14
+      atr_stop_mult: 1.2
+      pullback_lookback_bars: 8
+      min_reward_risk: 1.5
+      allow_long: true
+      allow_short: true
+      buy_confidence: 0.74
+      buy_strength: 0.72
+      sell_confidence: 0.74
+      sell_strength: 0.72
+      blocked_regimes:
+      - low_volatility
+      - sideways
+      fast_signal_enabled: false
+  vwap_rsi_mean_reversion:
+    # Candidate: 1h range + 15m VWAP/RSI mean-reversion. Disabled until OOS/holdout gates pass.
+    enabled: false
+    target_timeframes:
+    - 1h
+    - 15m
+    parameters:
+      bias_timeframe: 1h
+      entry_timeframe: 15m
+      bias_ema_period: 20
+      max_bias_slope_pct: 0.004
+      vwap_lookback_bars: 48
+      bb_period: 20
+      bb_std: 2.0
+      rsi_period: 14
+      rsi_oversold: 35.0
+      rsi_reclaim: 40.0
+      rsi_overbought: 65.0
+      rsi_release: 60.0
+      atr_period: 14
+      atr_stop_mult: 1.0
+      min_reward_risk: 1.2
+      allow_long: true
+      allow_short: true
+      buy_confidence: 0.72
+      buy_strength: 0.70
+      sell_confidence: 0.72
+      sell_strength: 0.70
+      blocked_regimes:
+      - trending_up
+      - trending_down
+      - breakout
+      fast_signal_enabled: false
   dual_sma_daytrade:
     enabled: true
-    # Standalone dual-SMA daytrade: daily bias + 15m confirm + 5m entry (1m precision optional).
+    # Standalone dual-SMA daytrade: 1h bias + 15m confirmation and entry.
     # 2026-06-13: profitability profile — gentler SMA200 slope, wider retrace, 2.0R floor.
     target_timeframes:
-    - 1d
+    - 1h
     - 15m
-    - 5m
-    - 1m
     parameters:
-      bias_timeframe: 1d
+      bias_timeframe: 1h
       confirmation_timeframe: 15m
-      entry_timeframe: 5m
-      precision_timeframe: 1m
+      entry_timeframe: 15m
+      precision_timeframe: 15m
       use_precision_entry: false
-      context_timeframes:
-      - 1w
+      context_timeframes: []
       sma20_period: 20
       sma200_period: 200
       sma200_max_slope_pct: 0.004
@@ -2266,8 +2497,8 @@ strategies_hyperliquid:
       fast_signal_enabled: false
       fast_signal_interval_seconds: 30
   arc_daytrade:
-    enabled: true
-    # Standalone ARC daytrade: daily box + 5m range/candle (1m precision optional).
+    enabled: false  # Disabled: daily-box and 5m John Wick geometry cannot be faithfully retimed.
+    # Historical ARC definition retained for attribution and offline reporting.
     target_timeframes:
     - 1d
     - 5m
@@ -2306,8 +2537,8 @@ strategies_hyperliquid:
       blocked_regimes:
       - low_volatility
   ema50_breakout_pullback:
-    enabled: true
-    # Standalone HL perp: 4H EMA50 breakout-pullback, long-only after 2026-06-14 review.
+    enabled: false  # Disabled: 4h single-frame setup has no faithful 1h-context/15m-trigger port.
+    # Historical 4h EMA50 breakout-pullback definition retained for attribution.
     target_timeframes:
     - 4h
     parameters:
@@ -2336,8 +2567,8 @@ strategies_hyperliquid:
       fast_signal_enabled: false
       fast_signal_interval_seconds: 30
   orb_5m_scalp:
-    enabled: true
-    # Casper SMC ORB+retest: 9:30–9:35 AM ET opening range on 5m, all HL pairs.
+    enabled: false  # Disabled: a 9:30–9:35 opening range cannot be reconstructed from 15m bars.
+    # Historical Casper SMC ORB+retest definition retained for attribution.
     target_timeframes:
     - 5m
     parameters:
@@ -2384,6 +2615,32 @@ trading:
   min_confidence_threshold: 0.45    # PnL-FIX v3: was 0.30 — match higher signal quality
   max_total_loss: 0.10              # PnL-FIX v5: was 0.01 — 10% account drawdown is the actual stop-the-bot line
   max_trades_per_exchange: 15       # was 5 — higher per-venue cap while max_concurrent_trades caps total risk
+  setup_memory:
+    enabled: true
+    mode: blocking  # advisory | size_down | blocking
+    include_shadow: true
+    lookback_days: 90
+    min_real_samples: 5
+    min_shadow_episodes: 10
+    recent_loss_cooldown_hours: 4
+    exact_setup_loss_streak_block: 2
+    block_expectancy_below: 0.0
+    block_profit_factor_below: 0.8
+    caution_profit_factor_below: 1.1
+    caution_win_rate_below: 0.45
+    size_down_multiplier: 0.5
+    closed_trade_fetch_limit: 1000
+    spot:
+      enabled: true
+      include_shadow: false
+      min_real_samples: 2
+      block_all_loss_cohorts: true
+      broad_all_loss_min_samples: 4
+      block_negative_expectancy_broad: true
+    perps:
+      enabled: true
+      include_shadow: true
+      closed_trade_fetch_limit: 1000
 
   # PnL-FIX v3 — Per-pair cooldown + correlation cap (enforced by orchestrator)
   # `pair_cooldown_minutes`: minimum minutes between consecutive entries on the
@@ -2462,6 +2719,17 @@ trading:
     enabled: true
     mode: paper
     signal_source: hyperliquid_strategies
+    # Exit sweep can consume most of the perp timebox and starve signal prefetch
+    # (observed 0/40 and partial 15/41 misses). Timebox exits; give entry a fresh budget.
+    perp_exit_max_seconds: 12
+    perp_entry_cycle_seconds: 75
+    signal_prefetch:
+      timeout_seconds: 25
+      retries: 2
+      retry_delay_seconds: 0.4
+      inline_fallback: true
+      max_prefetch_seconds: 50
+      entry_evaluation_reserve_seconds: 15
     strategy_consensus:
       min_agreement: 50
       min_confidence_long: 0.64
@@ -2479,13 +2747,13 @@ trading:
     # Manual live pilot (rsi_stoch only). Set mode: live + allow_live_orders: true after
     # scripts/check_hl_live_readiness.py passes and ./scripts/apply_config.sh.
     live_strategy_allowlist:
-      - rsi_stoch_reversal_5m
+      - rsi_stoch_reversal_15m
     live_max_margin_per_trade: 25
     live_max_open_positions: 2
     live_kill_switch: false
     live_promotion:
       enabled: false
-      strategy: rsi_stoch_reversal_5m
+      strategy: rsi_stoch_reversal_15m
       min_closed_trades: 30
       lookback_hours: 168
       min_realized_pnl_usd: 25.0
@@ -2493,22 +2761,80 @@ trading:
       min_win_rate: 0.52
       max_consecutive_losses: 4
       require_positive_last_24h: true
+      # Offline walk-forward must approve the strategy/version before live pilot.
+      require_validation_manifest: true
     default_leverage: 2.0
+    adaptive_leverage:
+      enabled: true
+      min: 1.0
+      max: 5.0
+      default: 2.0
+      tight_stop_max_pct: 0.60
+      medium_stop_max_pct: 1.25
+      wide_stop_min_pct: 2.0
+      # Strategy caps reflect setup speed and stop behavior. Leverage only
+      # reduces collateral; risk-sized notional is never increased by it.
+      strategy_overrides:
+        supply_demand_3step: {min: 1.0, max: 3.0, default: 2.0}
+        ema50_breakout_pullback: {min: 1.0, max: 3.0, default: 2.0}
+        rsi_stoch_reversal_15m: {min: 1.0, max: 5.0, default: 3.0}
+        swing_hull_rsi_ema: {min: 1.0, max: 3.0, default: 2.0}
+        arc_daytrade: {min: 1.0, max: 3.0, default: 2.0}
+        sma_reclaim_bull_flag: {min: 1.0, max: 3.0, default: 2.0}
     # Paper sizing: margin is the collateral locked; notional is exposure.
     # Target full paper-balance deployment across the 20-pair HL universe.
     # At 2x, $250 margin opens a $500 paper position.
-    max_margin_per_trade: 100.0
-    min_notional_per_trade: 200.0
-    max_notional_per_trade: 200.0
+    max_margin_per_trade: 250.0
+    # Execution viability is fee/edge-aware below. Keep the legacy hard floor
+    # disabled so adaptive risk reductions can produce valid smaller positions.
+    min_notional_per_trade: 0.0
+    max_notional_per_trade: 500.0
+    # Paper experiment: once an entry passes every quality/risk gate, use a
+    # deterministic position size. Adaptive multipliers remain observable but
+    # no longer turn accepted paper trades into $25-$150 positions.
+    fixed_paper_notional:
+      enabled: true
+      target_usd: 500.0
+    dynamic_notional_gate:
+      enabled: true
+      # Absolute exchange/order safety floor; unlike strategy floors this does
+      # not scale down with adaptive sizing.
+      exchange_min_notional_usd: 10.0
+      # Default floor and expected-net-profit target both scale with the final
+      # position multiplier (for example, a 0.35 risk reduction).
+      minimum_viable_notional_usd: 40.0
+      min_expected_net_profit_usd: 0.25
+      fallback_min_notional_usd: 50.0
+      max_dynamic_min_notional_usd: 200.0
+      strategy_overrides:
+        supply_demand_3step:
+          minimum_viable_notional_usd: 50.0
+          min_expected_net_profit_usd: 0.25
+        ema50_breakout_pullback:
+          minimum_viable_notional_usd: 60.0
+          min_expected_net_profit_usd: 0.30
+        rsi_stoch_reversal_15m:
+          minimum_viable_notional_usd: 40.0
+          min_expected_net_profit_usd: 0.20
+        swing_hull_rsi_ema:
+          minimum_viable_notional_usd: 50.0
+          min_expected_net_profit_usd: 0.25
+        arc_daytrade:
+          minimum_viable_notional_usd: 50.0
+          min_expected_net_profit_usd: 0.25
+        sma_reclaim_bull_flag:
+          minimum_viable_notional_usd: 60.0
+          min_expected_net_profit_usd: 0.30
     max_open_positions: 15
     strategy_open_position_limits:
       # Do not let the improved EMA50 long lane consume the expanded 15-position book.
       ema50_breakout_pullback: 4
       # 2026-06-23 review: shadow supply_demand_3step long/trending_up was the
       # strongest missed cohort (+$98.54 over 45 closed shadow opportunities).
-      # Give it enough room to be selected without letting one playbook consume
-      # the whole 15-position paper book.
-      supply_demand_3step: 4
+      # Give it enough room to scale proven long lanes without letting one
+      # playbook consume the whole 15-position paper book.
+      supply_demand_3step: 2
+      arc_daytrade: 3
     # Counterfactual strategy evaluation. These positions use fixed notional and
     # are accounting-excluded, so they never affect portfolio PnL, margin, risk
     # halts, adaptive controls, or normal open-position limits.
@@ -2530,23 +2856,39 @@ trading:
       enabled: true
       lookback_hours: 72
       fetch_limit: 1000
-      max_candidates: 8
-      min_closed: 5
-      min_win_rate: 0.70
+      max_candidates: 10
+      # Eight independent episodes plus positive train/holdout, PF and winner
+      # concentration checks admit validated paper cohorts without reopening a
+      # broad strategy/regime lane.
+      min_closed: 8
+      min_episodes: 8
+      use_episode_metrics: true
+      min_win_rate: 0.55
       min_realized_pnl_usd: 5.0
+      min_profit_factor: 1.25
+      require_positive_holdout: true
+      max_winner_contribution: 0.35
       # Additive cross-strategy score when live coin/strategy/side/regime matches
       # a promoted cohort — favors NATGAS-style ema50 without global bias inflation.
-      selection_boost: 0.35
+      selection_boost: 0.40
       strategies:
         - supply_demand_3step
-        - ema50_breakout_pullback
+        - supertrend
+        - rsi_stoch_reversal_15m
+        - swing_hull_rsi_ema
       sides:
         - long
+        - short
       regimes:
         - trending_up
-        - sideways
+        - trending_down
         - breakout
+        - high_volatility
       require_promotion_for:
+        # 2026-06-28 bidirectional perp review: shorts are profitable in specific
+        # regime/strategy lanes (arc counter-trend, supertrend downtrend, vwma
+        # trending_down). Require coin-specific shadow proof per lane — not a
+        # blanket short block.
         # 2026-06-23: supply_demand_3step long/trending_up is only profitable
         # when it is the shadow-proven promoted cohort (mostly XYZ:MSTR). The
         # same lane on non-promoted coins, especially FARTCOIN, was negative in
@@ -2555,6 +2897,65 @@ trading:
           side: long
           regimes:
             - trending_up
+            - breakout
+            - high_volatility
+        - strategy: supertrend
+          side: short
+          regimes:
+            - trending_down
+            - high_volatility
+        - strategy: supply_demand_3step
+          side: short
+          regimes:
+            - trending_down
+            - high_volatility
+        # 2026-07-10: unlock standalone trending_up / high_volatility longs for
+        # the 15m RSI/Stoch lane (commented intent). Keep promotion only on the
+        # mixed/negative chop and breakout long regimes; shorts in trending_up
+        # still need coin-specific proof.
+        - strategy: rsi_stoch_reversal_15m
+          side: long
+          regimes:
+            - reversal_zone
+            - sideways
+            - breakout
+        - strategy: rsi_stoch_reversal_15m
+          side: short
+          regimes:
+            - trending_up
+    lane_notional_multipliers: {}
+    # Hard deny known toxic coin/strategy lanes even if other gates pass.
+    coin_strategy_entry_denies:
+      - strategy: breakout_retest_long
+      - strategy: rsi_stoch_reversal_1m
+      - strategy: heikin_ashi
+      - strategy: vwap_bounce_scalping
+      - strategy: orb_5m_scalp
+      - strategy: pullback_long_scalping
+      - coin: XRP
+      - coin: XYZ:MSTR
+      - coin: XYZ:SMSN
+      - coin: FARTCOIN
+        strategy: supply_demand_3step
+        sides:
+          - long
+      - coin: EIGEN
+        strategy: ema50_breakout_pullback
+      - coin: WLD
+        strategy: breakout_retest_long
+      - coin: WLD
+        strategy: vwma_hull
+      - coin: XPL
+        strategy: ema50_breakout_pullback
+      - coin: NEAR
+        strategy: vwma_hull
+        sides:
+          - short
+    # rsi_stoch must not win via consensus fallback when standalone is quiet.
+    consensus_executable_denylist:
+      - rsi_stoch_reversal_15m
+      - rsi_stoch_reversal_5m
+      - rsi_stoch_reversal_1m
     mids_websocket:
       enabled: true
       url: wss://api.hyperliquid.xyz/ws
@@ -2575,18 +2976,18 @@ trading:
       - no_mfe
     high_volatility_strategy_controls:
       ema50_breakout_pullback:
-        enabled: true
+        enabled: false
         size_multiplier: 0.50
     good_entry_size_scaling:
       enabled: true
       require_executable_requalification: true
       # Only apply extra size on coin-specific promoted cohort matches.
-      promoted_cohort_multiplier: 1.15
+      promoted_cohort_multiplier: 1.25
       min_confidence: 0.78
       min_strength: 0.72
       min_reward_risk: 0.0
       multiplier: 1.20
-      max_multiplier: 1.30
+      max_multiplier: 1.35
       strategies:
         ema50_breakout_pullback:
           min_confidence: 0.80
@@ -2620,11 +3021,11 @@ trading:
       # blocks were starving executable perps after the entry gate tightening,
       # while shadow diagnostics still need live executable sampling.
       block_windows_enabled: false
-      # rsi_stoch_reversal_5m is a fast 5m exhaustion setup; let its own strict
+      # The versioned 15m exhaustion setup uses its own strict
       # RSI/StochRSI gate decide instead of suppressing it by broad hour blocks.
       block_window_exempt_strategies:
-        - rsi_stoch_reversal_5m
-      # 4H setup strategies carry their own swing timing; avoid evening scalp caution.
+        - rsi_stoch_reversal_15m
+      # Structural playbooks can opt out of evening scalp caution.
       caution_window_exempt_strategies:
         - ema50_breakout_pullback
         - supply_demand_3step
@@ -2650,19 +3051,26 @@ trading:
     dollar_loss_cap:
       enabled: true
       soft_loss_pct: 0.50
-      hard_loss_pct: 1.25
+      hard_loss_pct: 0.75
       default_max_loss_usd: 0.0
       soft_loss_usd: 0.0
-      max_recovery_minutes: 90
-      suppress_percentage_stop: true
+      max_recovery_minutes: 0
+      suppress_percentage_stop: false
       strategy_hard_loss_pct:
+        rsi_stoch_reversal_15m: 0.75
         rsi_stoch_reversal_5m: 0.75
         rsi_stoch_reversal_1m: 0.75
-        ema50_breakout_pullback: 1.10
+        ema50_breakout_pullback: 0.75
+        # 2026-07-10: SD loss_cap 0.75% spent ~half the daily halt on ETH/LIT.
+        # Cut SD earlier so one idea cannot exhaust the day.
+        supply_demand_3step: 0.40
       strategy_max_loss_usd:
+        rsi_stoch_reversal_15m: 0.0
         rsi_stoch_reversal_5m: 0.0
         rsi_stoch_reversal_1m: 0.0
         ema50_breakout_pullback: 0.0
+        # Soft USD backstop when pct mark lags; hard pct above still primary.
+        supply_demand_3step: 3.0
     time_decay_exit:
       enabled: true
       min_age_minutes: 360
@@ -2674,25 +3082,22 @@ trading:
     blocked_regime_sides:
       reversal_zone:
         - long
+    # Perps can profit counter-trend when shadow proves the lane (e.g. arc short
+    # in trending_up). Skip the default trending_up/short block for these lanes.
+    counter_trend_allowed_lanes:
+      - strategy: rsi_stoch_reversal_15m
+        side: short
+        regimes:
+          - sideways
     strategy_regime_side_blocks:
-      ema50_breakout_pullback:
-        # 2026-06-23 PnL review: EMA50 shorts remain the largest all-time drain
-        # (trending_down short -$52.36; sideways short -$6.57). Disable the short
-        # lane persistently across known regimes; keep only the long playbook.
+      vwma_hull:
+        # Block vwma shorts outside trending_down; that lane was +$2.23 / PF 4.64
+        # in 30d executable while other vwma short regimes bled.
         trending_up:
-        # 2026-06-23 continuation review: this lane turned negative in the
-        # active regime window (72h -$7.06 PF 0.65; 168h -$2.91 PF 0.88) and
-        # produced the biggest 24h executable loss (XYZ:MU -$4.54). Keep EMA50
-        # longs in the shadow-promoted sideways/breakout cohorts, but stop
-        # trending_up execution until evidence improves.
-        - long
-        - short
-        trending_down:
         - short
         sideways:
         - short
         high_volatility:
-        - long
         - short
         breakout:
         - short
@@ -2700,12 +3105,47 @@ trading:
         - short
         low_volatility:
         - short
-      rsi_stoch_reversal_5m:
-        # 2026-06-23 shadow review: high-volatility longs were strongly negative
-        # (54 opportunities, -$35.54, 19.6% WR). Make the adaptive runtime block
-        # persistent so it cannot disappear before the cohort improves.
+      swing_hull_rsi_ema:
+        trending_up:
+        - short
+      pullback_long_scalping:
+        trending_up:
+        - long
+        - short
+        trending_down:
+        - long
+        - short
+        sideways:
+        - long
+        - short
         high_volatility:
         - long
+        - short
+      ema50_breakout_pullback:
+        # 2026-07-05: admit only promoted trend-up/high-volatility longs.
+        # Sideways shadow PF=0.71 and today's trend-down entries lost $8.10.
+        trending_up:
+        - short
+        trending_down:
+        - long
+        - short
+        sideways:
+        - long
+        - short
+        high_volatility:
+        - short
+        breakout:
+        - long
+        - short
+        reversal_zone:
+        - short
+        low_volatility:
+        - long
+        - short
+      rsi_stoch_reversal_5m:
+        # 2026-06-29 shadow review: high-volatility longs improved materially
+        # (40 independent episodes, +$33.51, PF 2.05). Reopen this lane only
+        # through the coin-specific shadow-promotion requirement below.
         reversal_zone:
         - long
         - short
@@ -2723,6 +3163,24 @@ trading:
         sideways:
         - long
         - short
+      supply_demand_3step:
+        # 2026-07-10: executable SD bleed was sideways long+short stop/loss_cap.
+        # Defense in depth with strategy blocked_regimes; also deny non-promoted
+        # short regimes so only trending_down / high_volatility shorts can pass
+        # (and those still require shadow promotion).
+        sideways:
+        - long
+        - short
+        reversal_zone:
+        - long
+        - short
+        trending_up:
+        - short
+        breakout:
+        - short
+        low_volatility:
+        - long
+        - short
       rsi_stoch_reversal_1m:
         trending_up:
         - long
@@ -2738,9 +3196,27 @@ trading:
     # must not block RSI long entries on unrelated tokens.
     strategy_side_block_after_negative_realized_hours: 0
     strategy_coin_loss_streak_cooldowns:
+      default:
+        consecutive_losses: 2
+        cooldown_hours: 12
+      supply_demand_3step:
+        # 2026-07-10: after one SD loss_cap, pause that coin for the session
+        # so a second chop idea cannot finish the daily halt.
+        consecutive_losses: 1
+        cooldown_hours: 12
       rsi_stoch_reversal_1m:
         consecutive_losses: 2
         cooldown_hours: 12
+      ema50_breakout_pullback:
+        consecutive_losses: 2
+        cooldown_hours: 48
+        per_coin:
+          EIGEN:
+            consecutive_losses: 2
+            cooldown_hours: 72
+          XYZ:MU:
+            consecutive_losses: 2
+            cooldown_hours: 48
     # Phase 3 (2026-05-27): exit reworks driven by 35×$3.60 paper_stop_loss
     # losses and 19×$4.18 paper_max_holding_time dumps in the 166-trade sample.
     # max_holding_minutes_hard extends the holding window for a salvage trail
@@ -2764,6 +3240,12 @@ trading:
       ONDO: 1.2
       HYPE: 1.2
       LIT: 1.2
+      FARTCOIN: 1.2
+      EIGEN: 1.2
+      XRP: 1.1
+      XPL: 1.1
+      XYZ:MSTR: 1.1
+      XYZ:SMSN: 1.1
     # 2026-06-08: raise profit floor so $120-$200 notional winners are not
     # harvested below $1 after fees.
     trailing_stop:
@@ -2792,44 +3274,70 @@ trading:
     # the fee-aware floor is 0.50% expected move; min_edge_pct raises it to 0.55%.
     min_edge_gate:
       enabled: true
-      min_edge_pct: 0.55
-      edge_multiplier: 2.5
+      # 2026-06-28 review: all-time fee drag exceeded gross edge (105%). Raise
+      # the floor so high-churn setups must show more expected move before entry.
+      min_edge_pct: 0.65
+      edge_multiplier: 3.5
+      estimated_round_trip_slippage_pct: 0.10
       require_expected_move: true
-      # Only rsi_stoch lacks a stable expected-move estimate on HL perps.
-      allow_missing_expected_move_strategies:
-        - rsi_stoch_reversal_5m
+      allow_missing_expected_move_strategies: []
+      # These ARC lanes are profitable in independent shadow episodes even
+      # though ARC's conservative expected-move estimate fails this gate.
+      evidence_exempt_lanes:
+        - {strategy: supply_demand_3step, side: short, regimes: [sideways]}
+        - {strategy: arc_daytrade, side: long, regimes: [high_volatility, trending_down]}
+        - {strategy: arc_daytrade, side: short, regimes: [breakout, high_volatility, reversal_zone]}
+        - {strategy: dual_sma_daytrade, side: long, regimes: [breakout, high_volatility]}
+        - {strategy: dual_sma_daytrade, side: short, regimes: [trending_down]}
+        - {strategy: rsi_stoch_reversal_15m, side: long, regimes: [high_volatility, trending_up]}
+        - {strategy: rsi_stoch_reversal_15m, side: short, regimes: [sideways]}
     # 2026-05-31: halt new HL paper entries when today's realized PnL breaches budget.
     daily_loss_halt:
       enabled: true
-      max_daily_loss_pct: 0.003
+      max_daily_loss_pct: 0.002
     daily_profit_target:
       enabled: true
-      # Current 15-day best is ~$29 at existing size; lock a realistic green day
-      # first. $100/day requires better edge before higher exposure is justified.
-      target_usd: 25.0
-      aspirational_target_usd: 100.0
+      # 2026-06-28 review: winner-lane focus averaged ~$2.91/day over 30d at
+      # current size. Lock the operational daily goal at $20 and stop giving
+      # back green days once reached; aspirational remains a stretch target.
+      target_usd: 20.0
+      aspirational_target_usd: 50.0
     # 2026-05-31: risk-% sizing — notional = (equity × risk%) / (stop_distance / 100).
     risk_based_sizing:
       enabled: true
-      risk_per_trade_pct: 0.0075
+      risk_per_trade_pct: 0.0004
     strategy_risk_overrides:
       sma_reclaim_bull_flag:
-        risk_per_trade_pct: 0.012
+        risk_per_trade_pct: 0.0004
       supply_demand_3step:
-        risk_per_trade_pct: 0.010
+        risk_per_trade_pct: 0.0010
       ema50_breakout_pullback:
-        risk_per_trade_pct: 0.012
+        risk_per_trade_pct: 0.0004
       orb_5m_scalp:
-        risk_per_trade_pct: 0.010
+        risk_per_trade_pct: 0.0004
+      arc_daytrade:
+        risk_per_trade_pct: 0.0010
+      rsi_stoch_reversal_15m:
+        risk_per_trade_pct: 0.0010
+      supertrend:
+        risk_per_trade_pct: 0.0007
     strategy_notional_overrides:
       sma_reclaim_bull_flag:
         max_notional_per_trade: 300.0
       supply_demand_3step:
-        max_notional_per_trade: 250.0
+        max_notional_per_trade: 500.0
       arc_daytrade:
-        max_notional_per_trade: 250.0
-      ema50_breakout_pullback:
+        max_notional_per_trade: 500.0
+      supertrend:
         max_notional_per_trade: 400.0
+      ema50_breakout_pullback:
+        max_notional_per_trade: 280.0
+      rsi_stoch_reversal_15m:
+        max_notional_per_trade: 500.0
+      swing_hull_rsi_ema:
+        max_notional_per_trade: 280.0
+      small_size_momentum_scalp:
+        max_notional_per_trade: 240.0
     # 2026-05-31: per-strategy-family exit profiles (scalp vs swing).
     exit_profiles:
       supply_demand_3step:
@@ -2918,6 +3426,12 @@ trading:
       rsi_stoch_reversal_5m:
         strategies:
           - rsi_stoch_reversal_5m
+        stop_loss_pct: 1.0
+      rsi_stoch_reversal_15m:
+        strategies:
+          - rsi_stoch_reversal_15m
+        max_holding_minutes: 60
+        max_holding_minutes_hard: 90
         stop_loss_pct: 1.0
       scalp:
         strategies:
@@ -3014,15 +3528,10 @@ trading:
       strong_strength: 0.68
       normal_agreement: 60
       strong_agreement: 65
-    # Episode-adjusted shadow review (2026-06-23): avoid global supply_demand bias
-    # inflation from duplicate MSTR scans. Use shadow_cohort_promotion.selection_boost
-    # for coin-specific promoted edges (e.g. NATGAS ema50 sideways) instead.
-    cross_strategy_selection_bias:
-      supply_demand_3step: 0.20
-      arc_daytrade: 0.12
-      rsi_stoch_reversal_5m: -0.25
-      dual_sma_daytrade: -0.05
-      ema50_breakout_pullback: -0.10
+    # Static strategy preferences became stale and selected weak coins while
+    # discarding profitable alternatives. Cross-strategy ranking now uses
+    # signal quality plus the coin/side/regime promoted-cohort boost above.
+    cross_strategy_selection_bias: {}
     specialist_strategy_gates:
       sma_reclaim_bull_flag:
         enabled: true
@@ -3040,9 +3549,12 @@ trading:
         min_confidence: 0.74
         min_strength: 0.65
         min_reward_risk: 2.5
-        # Episode-adjusted shadow review: keep base size conservative until
-        # executable_size_requalification passes for this strategy lane.
-        size_multiplier: 0.75
+        # 2026-06-29 review: executable longs are positive in high-volatility
+        # and sideways regimes; let those lanes use the raised $500 cap.
+        size_multiplier: 1.0
+        size_multiplier_by_side:
+          short: 0.85
+          long: 1.0
       dual_sma_daytrade:
         enabled: true
         bypass_consensus: true
@@ -3051,14 +3563,21 @@ trading:
         min_reward_risk: 2.0
         size_multiplier: 0.50
       arc_daytrade:
-        enabled: true
+        enabled: false
         bypass_consensus: true
         min_confidence: 0.74
         min_strength: 0.65
         min_reward_risk: 1.2
         size_multiplier: 0.45
-      ema50_breakout_pullback:
+      supertrend:
         enabled: true
+        bypass_consensus: true
+        min_confidence: 0.74
+        min_strength: 0.38
+        min_reward_risk: 1.5
+        size_multiplier: 0.50
+      ema50_breakout_pullback:
+        enabled: false
         bypass_consensus: true
         min_confidence: 0.74
         min_strength: 0.65
@@ -3089,16 +3608,17 @@ trading:
         min_confidence: 0.75
         min_strength: 0.50
       vwma_hull:
-        enabled: true
-        min_confidence: 0.72  # 2026-05-31 24h review: -$0.97 on 6 closes, PF 0.32
-        min_confidence_short: 0.85  # shorts disabled at strategy level; gate kept as belt-and-suspenders
-        min_strength: 0.20
+        enabled: false
+        min_confidence: 0.74
+        min_confidence_short: 0.90
+        min_strength: 0.25
+        size_multiplier: 0.5
       macd_momentum:
         enabled: true
         min_confidence: 0.65
         min_strength: 0.50
       multi_timeframe_confluence:
-        enabled: true
+        enabled: false
         min_confidence: 0.65
         min_strength: 0.50
       swing_hull_rsi_ema:
@@ -3107,10 +3627,8 @@ trading:
         min_confidence_short: 0.72  # 2026-05-31 24h review: shorts net -$2.49
         min_strength: 0.60
       pullback_long_scalping:
-        enabled: true
-        # 2026-05-27: 78% WR but avg win +$0.42 vs avg loss -$3.28 (PF 0.46).
-        # 2026-05-29: leashed to 0.4x size — penny-collector (PF 0.43 lifetime);
-        # keep tradeable but small until it shows PF > 1 on a fresh sample.
+        # 2026-06-28 review: 71% WR but -$2.68 lifetime; tail losses dominate.
+        enabled: false
         min_confidence: 0.78
         min_strength: 0.70
         size_multiplier: 0.4
@@ -3146,12 +3664,12 @@ trading:
         min_confidence: 0.70
         min_strength: 0.65
       arc_daytrade:
-        enabled: true
+        enabled: false
         bypass_consensus: true
         min_confidence: 0.70
         min_strength: 0.65
       ema50_breakout_pullback:
-        enabled: true
+        enabled: false
         min_confidence: 0.70
         min_strength: 0.65
       orb_5m_scalp:
@@ -3160,7 +3678,7 @@ trading:
         min_confidence: 0.70
         min_strength: 0.65
         min_reward_risk: 2.0
-      rsi_stoch_reversal_5m:
+      rsi_stoch_reversal_15m:
         enabled: true
         min_confidence: 0.70
         min_strength: 0.65
@@ -3177,9 +3695,9 @@ trading:
     # Thresholds align with root pair_selector.selection_criteria where noted below.
     pair_selector:
       enabled: true
-      # 2026-06-23: 40 total — 20 crypto + 20 tradfi (tradfi.max_pairs below).
-      # perp_entry_check_concurrency=8 keeps strategy-service fan-out under max_concurrent_analyses=10.
-      max_pairs: 40
+      # 2026-06-28: 30 total — ~15 crypto + 15 tradfi (tradfi.max_pairs below).
+      # Smaller universe reduces signal_prefetch_miss under strategy-service load.
+      max_pairs: 30
       update_interval_minutes: 15
       min_day_notional_volume: 2000000
       min_open_interest: 50000
@@ -3250,8 +3768,8 @@ trading:
           pre_ipo:
             - SPCX
             - MINIMAX
-        # 2026-06-23: half of the 40-pair universe reserved for HIP-3 TradFi.
-        max_pairs: 20
+        # 2026-06-28: half of the 30-pair universe reserved for HIP-3 TradFi.
+        max_pairs: 15
         min_day_notional_volume: 1000000
         min_open_interest: 50000
         max_impact_spread_pct: 1.0
@@ -3264,6 +3782,10 @@ trading:
   # API3/USD trade did before this fix.
   per_slot_diversification_overcap: 1.5
   position_size_percentage: 0.05  # Profit-recovery mode: halve default trade size
+  # Simulation-only experiment. Applied after strategy/adaptive/diversification
+  # sizing so every accepted paper spot trade has comparable $500 exposure.
+  # Live modes continue to use the normal percentage/risk sizing path.
+  fixed_simulation_position_usd: 500.0
   strategy_sizing_tiers:
     ordered:
       - sma_reclaim_bull_flag
@@ -3300,6 +3822,10 @@ trading:
     rsi_oversold_checklist:
       # Best measured expectancy, but recovery mode still caps damage while
       # we collect a clean sample after disabling losing strategies.
+      position_size_percentage: 0.05
+      max_position_usd: 150
+      priority: high
+    weekly_fibonacci_spot:
       position_size_percentage: 0.05
       max_position_usd: 150
       priority: high
@@ -3354,6 +3880,7 @@ trading:
       priority: low
   strategy_max_open_trades:
     enabled: true
+    weekly_fibonacci_spot: 1
     macd_ema_vwap_scalper: 1
     swing_hull_rsi_ema: 1
     pullback_long_scalping: 1
@@ -3525,12 +4052,9 @@ trading:
     # bypass_consensus specialists (kept in sync with
     # strategy_expectancy_guard.probation_size_strategies).
     strategies:
-    - rsi_stoch_reversal_5m
-    - rsi_stoch_reversal_1m
-    - ema50_breakout_pullback
+    - rsi_stoch_reversal_15m
     - supply_demand_3step
     - dual_sma_daytrade
-    - arc_daytrade
   # Standalone MACD execution: min quality + regime allowlist (not 0.52 / strength 0).
   macd_buy_override:
     enabled: true
@@ -3547,9 +4071,8 @@ trading:
     timeout_minutes: 30       # roughly two 15m candles
     max_chase_pct: 0.009      # reject if confirmation comes after a >0.9% chase
   ema50_spot_entry_confirmation:
-    enabled: true
-    # Keep EMA50 spot active, but stop immediate no-MFE entries: stage the 4h
-    # setup and require live follow-through before placing the spot order.
+    enabled: false
+    # Historical 4h EMA50 entry confirmation; strategy is not executable.
     confirm_pct: 0.0035       # require +0.35% above the EMA50 setup price
     timeout_minutes: 90       # allow a 4h setup to prove itself without all-day drift
     max_chase_pct: 0.012      # reject entries that confirm only after a late chase
@@ -3569,21 +4092,20 @@ trading:
   rsi_stoch_reversal_1m_risk:
     profit_activation_threshold: 0.0150
     trailing_activation_threshold: 0.0150
+  rsi_stoch_reversal_15m_risk:
+    profit_activation_threshold: 0.0150
+    trailing_activation_threshold: 0.0150
   fast_entry:
     enabled: true
     interval_seconds: 30
     redis_max_age_seconds: 40
     single_strategy_timeout_seconds: 8
     # Redis payload freshness and closed-candle freshness are separate clocks:
-    # a 5m strategy can republish a current setup every 30s while the latest
-    # closed 5m bar is naturally several minutes old.
-    rsi_stoch_bar_max_age_seconds: 360
+    # A 15m strategy can republish a current setup while its latest closed bar ages.
+    rsi_stoch_bar_max_age_seconds: 960
     strategies:
-    - rsi_stoch_reversal_5m
-    - rsi_stoch_reversal_1m
-    - orb_5m_scalp
-    - ema50_breakout_pullback
-    - arc_daytrade
+    - rsi_stoch_reversal_15m
+    - supertrend
     - dual_sma_daytrade
     - supply_demand_3step
     strategy_redis_max_age_seconds:
@@ -3659,6 +4181,9 @@ trading:
     rsi_oversold_checklist:
       min_confidence: 0.70
       min_strength: 0.35
+    weekly_fibonacci_spot:
+      min_confidence: 0.85
+      min_strength: 0.80
     rsi_oversold_override:
       # 2026-05-29: high bar for the re-enabled override (its internal buy_confidence
       # is already 0.95) to keep it fee-aware and selective.
@@ -3772,7 +4297,7 @@ trading:
   - arc_daytrade
   standalone_entry_regimes:
     macd_momentum:
-      enabled: true
+      enabled: false
       regimes:
       - trending_up
       - breakout
@@ -3793,8 +4318,23 @@ trading:
       - trending_down
       - sideways
       - low_volatility
-    rsi_oversold_override:
+    weekly_fibonacci_spot:
       enabled: true
+      # The strategy independently requires a bullish daily EMA structure,
+      # 4h reversal confirmation, <=3% structural risk, and >=2R.
+      regimes:
+      - trending_up
+      - breakout
+      - reversal_zone
+      - sideways
+      - low_volatility
+      - high_volatility
+      allowed_exchanges:
+      - binance
+      - bybit
+      - cryptocom
+    rsi_oversold_override:
+      enabled: false
       # 2026-05-29: re-enabled, fee-aware expansion. Trend-confirmed oversold
       # reclaim (requires price>EMA20 + MACD bias); excludes trending_down/
       # high_volatility internally. Allowed in sideways + reversal_zone + breakout
@@ -3811,7 +4351,7 @@ trading:
     rsi_stoch_reversal_5m:
       # 2026-06-13: corrected-fee review supports Crypto.com only. Binance and
       # Bybit remain negative and stay excluded from this spot lane.
-      enabled: true
+      enabled: false
       # 2026-06-02: fast standalone 5m exhaustion strategy. Its own parameters
       # still block trending_down and low_volatility, but high_volatility is a
       # valid reversal context and must not fall back to the generic long regimes.
@@ -3827,7 +4367,7 @@ trading:
       allowed_exchanges:
       - cryptocom
     rsi_stoch_reversal_1m:
-      enabled: true
+      enabled: false
       # Long-only 1m RSI/Stoch exhaustion; same regime lane as 5m but with
       # 5m confirmation in the strategy itself.
       # 2026-06-14: added low_volatility lane (engine block also lifted above).
@@ -3839,8 +4379,20 @@ trading:
       - sideways
       - high_volatility
       - low_volatility
-    macd_ema_vwap_scalper:
+    rsi_stoch_reversal_15m:
       enabled: true
+      # Versioned 1h-bias/15m-trigger lane; legacy 1m/5m aliases remain disabled.
+      regimes:
+      - trending_up
+      - breakout
+      - reversal_zone
+      - sideways
+      - high_volatility
+      - low_volatility
+      allowed_exchanges:
+      - cryptocom
+    macd_ema_vwap_scalper:
+      enabled: false
       regimes:
       - trending_up
       allowed_exchanges:
@@ -3868,20 +4420,20 @@ trading:
       - trending_up
       - breakout
     supertrend:
-      enabled: true
+      enabled: false
       regimes:
       - trending_up
       allowed_exchanges:
       - binance
     swing_hull_rsi_ema:
-      enabled: true
+      enabled: false
       regimes:
       - trending_up
       allowed_exchanges:
       - binance
       - bybit
     sma_reclaim_bull_flag:
-      enabled: true
+      enabled: false
       # 2026-05-29: added sideways (range reclaim is a valid bull-flag context in
       # the +$24.74 sideways regime). Left trending_down off — bull-flag reclaim is
       # long-biased continuation, less suited to downtrends.
@@ -3913,7 +4465,7 @@ trading:
       - bybit
       - cryptocom
     dual_sma_daytrade:
-      enabled: true
+      enabled: false
       # 2026-06-14: added low_volatility lane (engine block also lifted above).
       regimes:
       - trending_up
@@ -3945,7 +4497,7 @@ trading:
       - bybit
       - cryptocom
     ema50_breakout_pullback:
-      enabled: true
+      enabled: false
       regimes:
       - trending_up
       - trending_down
@@ -3956,7 +4508,7 @@ trading:
       - bybit
       - cryptocom
     orb_5m_scalp:
-      enabled: true
+      enabled: false
       regimes:
       - trending_up
       - trending_down
@@ -3971,8 +4523,7 @@ trading:
     strategy_min_total_pnl_usd:
       # Allow small negative recent sample so one mild 5-trade probe does not
       # completely starve the only currently firing long-only spot entry.
-      rsi_stoch_reversal_5m: -1.0
-      rsi_stoch_reversal_1m: -1.0
+      rsi_stoch_reversal_15m: -1.0
     cache_seconds: 300
     probation_size_multiplier: 0.50
     # 2026-06-21: spot was frozen (0 entries/24h) because the guard HARD-BLOCKS
@@ -3988,23 +4539,12 @@ trading:
     # size-down) rather than freezing out long-only entries entirely.
     probation_size_strategies:
     - dual_sma_daytrade
-    - rsi_stoch_reversal_5m
-    - rsi_stoch_reversal_1m
-    - ema50_breakout_pullback
+    - rsi_stoch_reversal_15m
     - supply_demand_3step
-    - arc_daytrade
-    # Temporary fresh-sample window. Proven recent losers must pass the normal
-    # expectancy guard; only ORB remains exempt while it collects its first sample.
-    probation_exempt_strategies:
-    - orb_5m_scalp
+    probation_exempt_strategies: []
     allow_unproven_strategies:
     - rsi_oversold_checklist
-    - breakout_retest_long
-    - rsi_stoch_reversal_5m
-    - rsi_stoch_reversal_1m
-    - dual_sma_daytrade
-    - ema50_breakout_pullback
-    - orb_5m_scalp
+    - weekly_fibonacci_spot
   adaptive_position_sizing:
     enabled: true
     lookback_trades: 20
@@ -4039,6 +4579,18 @@ trading:
   # Per-strategy spot exit overrides (orchestrator _check_trade_exit).
   # Global trailing_stop / profit_protection remain defaults for other strategies.
   exit_profiles:
+    weekly_fibonacci_spot:
+      strategies:
+        - weekly_fibonacci_spot
+      use_setup_stops: true
+      use_setup_targets: true
+      stagnant_loser_enabled: false
+      max_holding_minutes: 10080
+      take_profit_pct: 0
+      trailing_stop:
+        enabled: false
+      profit_protection:
+        enabled: false
     arc_daytrade:
       strategies:
         - arc_daytrade
@@ -4287,7 +4839,7 @@ trading_manager:
   # 2026-06-14: spot entries first, while preserving a real HL perps window.
   # The orchestrator clamps this to at least 10s; keep 45s so perps entry scans
   # do not depend on the minimum cap after spot recovery work.
-  perp_cycle_max_seconds: 45
+  perp_cycle_max_seconds: 90
   # Give spot enough wall-clock to finish real pair evaluations. Lower
   # concurrency reduces burst OHLCV pressure and improves completed checks.
   spot_cycle_max_seconds: 110
@@ -4295,12 +4847,9 @@ trading_manager:
   # Two workers per venue complete the 8-pair universe inside the spot budget
   # without recreating the earlier high-fanout OHLCV burst.
   spot_entry_check_concurrency: 2
-  # 2026-06-21: 2 -> 8. This governs the per-coin signal prefetch fan-out to the
-  # internal strategy-service only (GET /signals/hyperliquid/{coin}); it does NOT
-  # touch Hyperliquid (mids come from one allMids websocket; paper orders write to
-  # the DB). 8 stays under strategy-service max_concurrent_analyses=10. Cuts the
-  # perp entry-scan time so exits/entries finish inside the cycle timebox.
-  perp_entry_check_concurrency: 8
+  # 2026-06-28: 8 -> 6. Partial prefetch misses (15/41, 22/40) traced to strategy-service
+  # latency under burst fan-out; 6 reduces saturation while inline fallback covers stragglers.
+  perp_entry_check_concurrency: 6
   spot_entry_pair_priority:
     enabled: true
     lookback_hours: 4

@@ -49,8 +49,12 @@ class StrategyManager:
             'dual_sma_daytrade': 'DualSmaDaytradeStrategy',
             'arc_daytrade': 'ArcDaytradeStrategy',
             'ema50_breakout_pullback': 'Ema50BreakoutPullbackStrategy',
+            'rsi_stoch_reversal_15m': 'RsiStochReversal15mStrategy',
             'rsi_stoch_reversal_5m': 'RsiStochReversal5mStrategy',
             'rsi_stoch_reversal_1m': 'RsiStochReversal1mStrategy',
+            'donchian_atr_pullback': 'DonchianAtrPullbackStrategy',
+            'vwap_rsi_mean_reversion': 'VwapRsiMeanReversionStrategy',
+            'weekly_fibonacci_spot': 'WeeklyFibonacciSpotStrategy',
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         
@@ -68,8 +72,12 @@ class StrategyManager:
             'dual_sma_daytrade': 'strategy.dual_sma_daytrade_strategy',
             'arc_daytrade': 'strategy.arc_daytrade_strategy',
             'ema50_breakout_pullback': 'strategy.ema50_breakout_pullback_strategy',
+            'rsi_stoch_reversal_15m': 'strategy.rsi_stoch_reversal_15m_strategy',
             'rsi_stoch_reversal_5m': 'strategy.rsi_stoch_reversal_5m_strategy',
             'rsi_stoch_reversal_1m': 'strategy.rsi_stoch_reversal_1m_strategy',
+            'donchian_atr_pullback': 'strategy.donchian_atr_pullback_strategy',
+            'vwap_rsi_mean_reversion': 'strategy.vwap_rsi_mean_reversion_strategy',
+            'weekly_fibonacci_spot': 'strategy.weekly_fibonacci_spot_strategy',
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         for strategy_name, strategy_config in strategies_config.items():

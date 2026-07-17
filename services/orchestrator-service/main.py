@@ -63,6 +63,11 @@ from redis_order_manager import RedisOrderManager
 from redis_realtime_order_manager import redis_realtime_manager
 from core.database_manager import DatabaseManager
 from core.cycle_analysis_snapshot import HlCoinCycleRecorder
+from core.strategy_trade_evidence import (
+    build_strategy_entry_evidence,
+    freeze_perp_close_evidence,
+)
+from core.setup_memory import evaluate_setup_memory, setup_memory_config
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
@@ -105,11 +110,23 @@ def _hyperliquid_strategy_side_realized_loss_block_hours(cfg: Dict[str, Any]) ->
 
 
 def _hyperliquid_strategy_coin_loss_streak_cfg(
-    cfg: Dict[str, Any], strategy: str
+    cfg: Dict[str, Any], strategy: str, coin: str = ""
 ) -> Dict[str, Any]:
     root = cfg.get("strategy_coin_loss_streak_cooldowns") or {}
-    value = root.get(str(strategy or "").strip().lower()) or {}
-    return value if isinstance(value, dict) else {}
+    default_value = root.get("default") or {}
+    value = root.get(str(strategy or "").strip().lower()) or default_value
+    if not isinstance(value, dict):
+        return {}
+    coin_key = pair_to_hyperliquid_coin(str(coin or ""))
+    per_coin = value.get("per_coin") or {}
+    if coin_key and isinstance(per_coin, dict):
+        coin_cfg = per_coin.get(coin_key) or per_coin.get(coin_key.upper())
+        if isinstance(coin_cfg, dict) and coin_cfg:
+            merged = dict(value)
+            merged.update(coin_cfg)
+            merged.pop("per_coin", None)
+            return merged
+    return value
 
 
 def _extract_trigger_price_from_exit_reason(exit_reason: str) -> float:
@@ -148,11 +165,15 @@ from hyperliquid_perps import (
     eligible_shadow_strategy_signals,
     evaluate_paper_perp_exit,
     executable_size_requalification_passes,
+    fetch_hyperliquid_entry_signal_payload,
     filter_allowed_coin,
     find_mirror_spot_pair,
+    hyperliquid_signal_prefetch_health,
+    hyperliquid_signal_prefetch_settings,
     hyperliquid_coin_entry_block,
     hyperliquid_coin_side_entry_block,
     hyperliquid_adaptive_entry_sizing_multiplier,
+    hyperliquid_coin_strategy_entry_deny,
     hyperliquid_daily_loss_halt,
     hyperliquid_daily_profit_target_halt,
     hyperliquid_min_edge_gate,
@@ -175,15 +196,18 @@ from hyperliquid_perps import (
     merge_active_trades_with_paper_perps,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
+    perp_lane_notional_multiplier,
     perp_entry_atr_metadata as _perp_entry_atr_metadata,
     perp_side_fee,
     pair_to_hyperliquid_coin,
+    prefetch_hyperliquid_entry_signals,
     pnl_percentage,
     position_sides_from_signal,
     portfolio_control_exit_reason,
     select_mirrored_signal,
     selected_mirrored_signal_metadata,
     setup_risk_metadata_from_signal,
+    ta_evidence_from_signal,
     resolve_setup_target_pct,
     resolve_setup_stop_pct,
     signal_position_size_multiplier,
@@ -192,6 +216,8 @@ from hyperliquid_perps import (
     stop_distance_pct_from_signal,
     strategy_max_notional,
     strategy_min_notional,
+    dynamic_min_notional,
+    adaptive_perp_leverage,
     strategy_min_size_multiplier,
     setup_risk_from_trade_metadata,
 )
@@ -207,6 +233,9 @@ from spot_exit_config import (
 custom_registry = CollectorRegistry()
 
 SPOT_RSI_STOCH_REVERSAL_STRATEGIES = {
+    "rsi_stoch_reversal_15m",
+}
+HISTORICAL_RSI_STOCH_REVERSAL_STRATEGIES = {
     "rsi_stoch_reversal_5m",
     "rsi_stoch_reversal_1m",
 }
@@ -776,6 +805,7 @@ class TradingOrchestrator:
         self._hyperliquid_pair_selector_signature: Optional[str] = None
         self._hyperliquid_blocked_signal_diagnostic_at: Dict[str, datetime] = {}
         self._last_hyperliquid_entry_scan_coins: List[str] = []
+        self._last_perp_signal_prefetch: Dict[str, Any] = {}
         self._hyperliquid_adaptive_pnl_control: Dict[str, Any] = {
             "enabled": False,
             "decisions": [],
@@ -899,6 +929,7 @@ class TradingOrchestrator:
             "processed_count": None,
             "message": None,
             "last_error": None,
+            "metadata": {},
         }
 
     def _mark_cycle_phase_started(self, phase: str) -> None:
@@ -916,6 +947,7 @@ class TradingOrchestrator:
         processed_count: Optional[int] = None,
         message: Optional[str] = None,
         error: Optional[Exception] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         phase_state = self.cycle_telemetry.get(phase) or self._empty_cycle_phase(phase)
         started_at = phase_state.get("started_at")
@@ -923,7 +955,7 @@ class TradingOrchestrator:
         duration_seconds = None
         if isinstance(started_at, datetime):
             duration_seconds = round((completed_at - started_at).total_seconds(), 3)
-        self.cycle_telemetry[phase] = {
+        phase_payload = {
             **phase_state,
             "cycle_count": self.cycle_count,
             "status": status,
@@ -933,6 +965,41 @@ class TradingOrchestrator:
             "message": message,
             "last_error": str(error) if error else None,
         }
+        if metadata:
+            phase_payload["metadata"] = metadata
+        self.cycle_telemetry[phase] = phase_payload
+
+    def _finalize_perp_signal_prefetch_health(self) -> None:
+        stats = dict(self._last_perp_signal_prefetch or {})
+        if not stats:
+            return
+        if stats.get("skipped"):
+            stats["health"] = "ok"
+        else:
+            requested = int(stats.get("requested") or 0)
+            prefetch_ok = int(stats.get("prefetch_ok") or 0)
+            prefetch_missed = int(stats.get("prefetch_missed") or 0)
+            fallback_recovered = int(stats.get("fallback_recovered") or 0)
+            scanned_ok = int(stats.get("scanned_ok") or 0)
+            scanned_missed = int(stats.get("scanned_missed") or 0)
+            if requested > 0 and (scanned_ok + scanned_missed) < requested:
+                stats["loop_incomplete"] = True
+                scanned_ok = max(scanned_ok, prefetch_ok + fallback_recovered)
+                scanned_missed = max(scanned_missed, max(0, prefetch_missed - fallback_recovered))
+                remaining = requested - scanned_ok - scanned_missed
+                if remaining > 0:
+                    scanned_missed += remaining
+                stats["scanned_ok"] = scanned_ok
+                stats["scanned_missed"] = scanned_missed
+            stats["health"] = hyperliquid_signal_prefetch_health(stats)
+        self._last_perp_signal_prefetch = stats
+
+    def _perp_entry_cycle_metadata(self) -> Dict[str, Any]:
+        self._finalize_perp_signal_prefetch_health()
+        stats = self._last_perp_signal_prefetch or {}
+        if not stats:
+            return {}
+        return {"signal_prefetch": stats}
 
     def _cycle_phase_snapshot(self) -> Dict[str, Any]:
         def serialize_phase_time(value: Any) -> Any:
@@ -971,6 +1038,18 @@ class TradingOrchestrator:
                 "status": status,
                 "cycle_count": phase_cycle,
             }
+            if phase == "perp_entry":
+                prefetch = ((data.get("metadata") or {}).get("signal_prefetch") or {})
+                pref_health = str(prefetch.get("health") or "unknown")
+                details[phase]["signal_prefetch"] = prefetch
+                if (
+                    running
+                    and ran_this_cycle
+                    and pref_health == "failed"
+                    and not prefetch.get("skipped")
+                ):
+                    healthy = False
+                    details[phase]["ok"] = False
         return {
             "ok": healthy,
             "current_cycle": current_cycle,
@@ -1037,8 +1116,9 @@ class TradingOrchestrator:
         signals_data: Optional[Dict[str, Any]] = None,
         resolved_policy: Optional[Dict[str, Any]] = None,
         details: Optional[Dict[str, Any]] = None,
+        event_type: str = "entry_rejected",
     ) -> None:
-        """Persist rejected-entry snapshots for post-hoc missed-trade analysis."""
+        """Persist entry-gate snapshots for post-hoc missed-trade analysis."""
         try:
             signals_data = signals_data or {}
             consensus = signals_data.get("consensus", {}) or {}
@@ -1092,7 +1172,7 @@ class TradingOrchestrator:
             event = {
                 "aggregate_id": f"{exchange_name}:{pair}",
                 "aggregate_type": "entry_gate",
-                "event_type": "entry_rejected",
+                "event_type": event_type,
                 "payload": payload,
             }
             async with httpx.AsyncClient(timeout=3.0) as client:
@@ -2334,14 +2414,12 @@ class TradingOrchestrator:
             consensus_excluded_strategies = {
                 "macd_momentum",
                 "rsi_oversold_checklist",
+                "weekly_fibonacci_spot",
                 "macd_ema_vwap_scalper",
                 "supertrend",
                 "swing_hull_rsi_ema",
-                "rsi_stoch_reversal_5m",
-                "rsi_stoch_reversal_1m",
+                "rsi_stoch_reversal_15m",
                 "dual_sma_daytrade",
-                "arc_daytrade",
-                "ema50_breakout_pullback",
                 "sma_reclaim_bull_flag",
                 "supply_demand_3step",
             }
@@ -2363,6 +2441,7 @@ class TradingOrchestrator:
             )
             standalone_buy_strategies = (
                 "rsi_oversold_checklist",
+                "weekly_fibonacci_spot",
                 "macd_ema_vwap_scalper",
                 "supertrend",
                 "swing_hull_rsi_ema",
@@ -2374,10 +2453,7 @@ class TradingOrchestrator:
                 "sma_reclaim_bull_flag",
                 "supply_demand_3step",
                 "dual_sma_daytrade",
-                "arc_daytrade",
-                "ema50_breakout_pullback",
-                "rsi_stoch_reversal_5m",
-                "rsi_stoch_reversal_1m",
+                "rsi_stoch_reversal_15m",
             )
             for strat_name in standalone_buy_strategies:
                 strat_raw = strategies.get(strat_name, {}) or {}
@@ -4811,11 +4887,14 @@ class TradingOrchestrator:
                     or "rsi_gate=false" in entry_reason_lc
                 )
             )
-            is_rsi_stoch_trade = trade_strategy_l in SPOT_RSI_STOCH_REVERSAL_STRATEGIES
+            is_rsi_stoch_trade = trade_strategy_l in (
+                SPOT_RSI_STOCH_REVERSAL_STRATEGIES
+                | HISTORICAL_RSI_STOCH_REVERSAL_STRATEGIES
+            )
             if is_rsi_stoch_trade:
                 rsi_stoch_risk = (
                     trading_config.get(f"{trade_strategy_l}_risk", {})
-                    or trading_config.get("rsi_stoch_reversal_5m_risk", {})
+                    or trading_config.get("rsi_stoch_reversal_15m_risk", {})
                     or {}
                 )
                 pp_activation_decimal = float(
@@ -4935,6 +5014,7 @@ class TradingOrchestrator:
             current_stop_loss = default_stop_loss  # This is already the correct negative percentage (e.g., -0.8%)
             setup_risk = setup_risk_from_trade_metadata(trade)
             if trade_strategy_l in {
+                "weekly_fibonacci_spot",
                 "sma_reclaim_bull_flag",
                 "supply_demand_3step",
                 "dual_sma_daytrade",
@@ -5752,6 +5832,7 @@ class TradingOrchestrator:
                 not should_exit
                 and position_size > 0
                 and risk_exit_allowed_by_feed
+                and trade_strategy_l != "weekly_fibonacci_spot"
                 and spot_loss_cap_config.get("enabled", False) is not False
             ):
                 try:
@@ -5886,6 +5967,7 @@ class TradingOrchestrator:
 
             # Stop loss check (percentage-based)
             if not should_exit and not suppress_percentage_stop_for_recovery and trade_strategy_l in {
+                "weekly_fibonacci_spot",
                 "sma_reclaim_bull_flag",
                 "supply_demand_3step",
                 "dual_sma_daytrade",
@@ -7412,9 +7494,15 @@ class TradingOrchestrator:
                         or []
                     ),
                     message="Live Hyperliquid entries scanned",
+                    metadata=self._perp_entry_cycle_metadata(),
                 )
             except Exception as e:
-                self._finish_cycle_phase("perp_entry", status="error", error=e)
+                self._finish_cycle_phase(
+                    "perp_entry",
+                    status="error",
+                    error=e,
+                    metadata=self._perp_entry_cycle_metadata(),
+                )
                 raise
             return
 
@@ -7440,31 +7528,73 @@ class TradingOrchestrator:
 
         cfg = await self._hyperliquid_adaptive_runtime_cfg(cfg)
 
+        exit_max_seconds = max(
+            5.0,
+            min(
+                float(cfg.get("perp_exit_max_seconds") or 12.0),
+                float(self._loop_perp_cycle_max_seconds or 45) * 0.35,
+            ),
+        )
         self._mark_cycle_phase_started("perp_exit_update")
         try:
-            await self._run_hyperliquid_paper_exit_sweep(mids, cfg, source="main")
+            await asyncio.wait_for(
+                self._run_hyperliquid_paper_exit_sweep(mids, cfg, source="main"),
+                timeout=exit_max_seconds,
+            )
             self._finish_cycle_phase(
                 "perp_exit_update",
                 status="completed",
                 processed_count=len(mids),
                 message="Paper positions updated and exits evaluated",
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[HyperliquidPaper] Exit sweep timed out after %.0fs; continuing to entry scan",
+                exit_max_seconds,
+            )
+            self._finish_cycle_phase(
+                "perp_exit_update",
+                status="completed",
+                processed_count=len(mids),
+                message=f"Exit sweep timeboxed at {exit_max_seconds:.0f}s",
+            )
         except Exception as e:
             self._finish_cycle_phase("perp_exit_update", status="error", error=e)
             raise
-        if deadline is not None and time.monotonic() >= deadline:
+        entry_start = time.monotonic()
+        prefetch_cfg = cfg.get("signal_prefetch") or {}
+        entry_budget_seconds = max(
+            20.0,
+            float(
+                cfg.get("perp_entry_cycle_seconds")
+                or prefetch_cfg.get("entry_cycle_seconds")
+                or 38.0
+            ),
+        )
+        entry_deadline = entry_start + entry_budget_seconds
+        if deadline is not None:
+            entry_deadline = min(entry_deadline, deadline)
+        remaining_entry = entry_deadline - entry_start
+        if remaining_entry < 15.0:
+            logger.warning(
+                "[HyperliquidPaper] Only %.1fs for entry scan after exit sweep "
+                "(budget %.0fs); signal prefetch may partial-fail",
+                remaining_entry,
+                entry_budget_seconds,
+            )
+        if entry_deadline <= entry_start + 0.5:
             self._mark_cycle_phase_started("perp_entry")
             self._finish_cycle_phase(
                 "perp_entry",
                 status="skipped",
                 processed_count=0,
-                message="Trading-loop wall budget exhausted after perps exit/update",
+                message="No time remaining for perp entry scan after exit sweep",
             )
             return
         self._mark_cycle_phase_started("perp_entry")
         try:
             await self._run_hyperliquid_strategy_entries(
-                mids, cfg, deadline=deadline, execution_mode="paper"
+                mids, cfg, deadline=entry_deadline, execution_mode="paper"
             )
             self._finish_cycle_phase(
                 "perp_entry",
@@ -7475,14 +7605,25 @@ class TradingOrchestrator:
                     or []
                 ),
                 message="Paper Hyperliquid entries scanned",
+                metadata=self._perp_entry_cycle_metadata(),
             )
         except Exception as e:
-            self._finish_cycle_phase("perp_entry", status="error", error=e)
+            self._finish_cycle_phase(
+                "perp_entry",
+                status="error",
+                error=e,
+                metadata=self._perp_entry_cycle_metadata(),
+            )
             raise
 
     async def _hyperliquid_runtime_blocked_coins(self, cfg: Dict[str, Any]) -> List[str]:
         """Coins where both long and short entries are currently blocked."""
         try:
+            setup_memory_perps_cfg = setup_memory_config(self._config or {}, "perps")
+            perps_memory_limit = min(
+                1000,
+                max(1, int(setup_memory_perps_cfg.get("closed_trade_fetch_limit") or 1000)),
+            )
             async with httpx.AsyncClient(timeout=20.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
                 open_trades = (
@@ -7492,7 +7633,7 @@ class TradingOrchestrator:
                 )
                 closed_resp = await client.get(
                     f"{database_service_url}/api/v1/perps/paper-trades",
-                    params={"status": "CLOSED", "limit": 200},
+                    params={"status": "CLOSED", "limit": perps_memory_limit},
                 )
                 closed_trades = (
                     (closed_resp.json() or {}).get("trades", [])
@@ -7564,6 +7705,11 @@ class TradingOrchestrator:
             mirror_exchanges = list(self.pair_selections.keys())
 
         try:
+            setup_memory_perps_cfg = setup_memory_config(self._config or {}, "perps")
+            perps_memory_limit = min(
+                1000,
+                max(1, int(setup_memory_perps_cfg.get("closed_trade_fetch_limit") or 1000)),
+            )
             async with httpx.AsyncClient(timeout=30.0) as client:
                 open_resp = await client.get(f"{database_service_url}/api/v1/perps/paper-trades/open")
                 open_trades = (
@@ -7573,7 +7719,7 @@ class TradingOrchestrator:
                 )
                 closed_resp = await client.get(
                     f"{database_service_url}/api/v1/perps/paper-trades",
-                    params={"status": "CLOSED", "limit": 200},
+                    params={"status": "CLOSED", "limit": perps_memory_limit},
                 )
                 closed_trades = (
                     (closed_resp.json() or {}).get("trades", [])
@@ -8043,6 +8189,11 @@ class TradingOrchestrator:
         ).strip().lower() not in {"0", "false", "no", "off"}
         min_win_rate = float(promotion_cfg.get("min_win_rate", 0.70) or 0.70)
         min_realized = float(promotion_cfg.get("min_realized_pnl_usd", 10.0) or 10.0)
+        min_profit_factor = float(promotion_cfg.get("min_profit_factor", 1.2) or 1.2)
+        require_positive_holdout = promotion_cfg.get("require_positive_holdout", True)
+        max_winner_contribution = float(
+            promotion_cfg.get("max_winner_contribution", 0.35) or 0.35
+        )
         max_candidates = int(promotion_cfg.get("max_candidates", 12) or 12)
         limit = int(promotion_cfg.get("fetch_limit", 1000) or 1000)
         strategies = {
@@ -8081,15 +8232,17 @@ class TradingOrchestrator:
                 )
                 return []
             rows = (resp.json() or {}).get("trades") or []
+            try:
+                from core.shadow_episode_summary import (
+                    shadow_promotion_cohort_identity,
+                    shadow_promotion_cohorts_from_trades,
+                )
+            except ImportError:
+                from shadow_episode_summary import (
+                    shadow_promotion_cohort_identity,
+                    shadow_promotion_cohorts_from_trades,
+                )
             if use_episode_metrics:
-                try:
-                    from core.shadow_episode_summary import (
-                        shadow_promotion_cohorts_from_trades,
-                    )
-                except ImportError:
-                    from shadow_episode_summary import (
-                        shadow_promotion_cohorts_from_trades,
-                    )
                 cohorts = shadow_promotion_cohorts_from_trades(rows, cutoff=cutoff)
             else:
                 for row in rows:
@@ -8107,21 +8260,19 @@ class TradingOrchestrator:
                     if exit_time < cutoff:
                         continue
 
-                    metadata = self._adaptive_trade_metadata(row)
-                    coin = pair_to_hyperliquid_coin(str(row.get("coin") or ""))
-                    strategy = str(row.get("source_strategy") or "").strip().lower()
-                    side = str(row.get("position_side") or "").strip().lower()
-                    regime = str(metadata.get("market_regime") or "").strip().lower()
+                    key, identity = shadow_promotion_cohort_identity(row)
+                    coin = pair_to_hyperliquid_coin(identity["coin"])
+                    strategy = identity["strategy"]
+                    side = identity["side"]
+                    regime = identity["regime"]
                     if not coin or not strategy or side not in {"long", "short"}:
                         continue
-                    key = (coin, strategy, side, regime)
+                    key = (coin, key[1], side, regime)
                     cohort = cohorts.setdefault(
                         key,
                         {
+                            **identity,
                             "coin": coin,
-                            "strategy": strategy,
-                            "side": side,
-                            "regime": regime,
                             "episodes": 0,
                             "closed": 0,
                             "wins": 0,
@@ -8164,7 +8315,25 @@ class TradingOrchestrator:
                 continue
             win_rate = float(cohort.get("wins") or 0) / float(sample_count)
             realized = float(cohort.get("realized") or 0.0)
-            if sample_count < min_sample or win_rate < min_win_rate or realized < min_realized:
+            profit_factor = cohort.get("profit_factor")
+            holdout_realized = float(cohort.get("holdout_realized") or 0.0)
+            training_realized = float(cohort.get("training_realized") or 0.0)
+            winner_contribution = cohort.get("max_winner_contribution")
+            if (
+                sample_count < min_sample
+                or win_rate < min_win_rate
+                or realized < min_realized
+                or profit_factor is None
+                or float(profit_factor) < min_profit_factor
+                or (
+                    require_positive_holdout is not False
+                    and (training_realized <= 0 or holdout_realized <= 0)
+                )
+                or (
+                    winner_contribution is not None
+                    and float(winner_contribution) > max_winner_contribution
+                )
+            ):
                 continue
             eligible.append(
                 {
@@ -8191,11 +8360,21 @@ class TradingOrchestrator:
                 {
                     "coin": coin_key,
                     "strategy": str(item.get("strategy") or "").strip().lower(),
+                    "strategy_version": str(
+                        item.get("strategy_version") or "unversioned"
+                    ),
+                    "strategy_config_hash": str(
+                        item.get("strategy_config_hash") or "unknown"
+                    ),
                     "side": str(item.get("side") or "").strip().lower(),
                     "regime": str(item.get("regime") or "").strip().lower(),
                     "closed": int(item.get("closed") or 0),
                     "win_rate": float(item.get("win_rate") or 0.0),
                     "realized": float(item.get("realized") or 0.0),
+                    "profit_factor": float(item.get("profit_factor") or 0.0),
+                    "training_realized": float(item.get("training_realized") or 0.0),
+                    "holdout_realized": float(item.get("holdout_realized") or 0.0),
+                    "max_winner_contribution": item.get("max_winner_contribution"),
                 }
             )
         result = self._merge_hyperliquid_coins(
@@ -8428,6 +8607,14 @@ class TradingOrchestrator:
                 continue
             entry_fee = perp_side_fee(notional, fee_rate)
             setup_risk = setup_risk_metadata_from_signal(candidate)
+            strategy_cfg = (
+                ((self._config or {}).get("strategies_hyperliquid") or {}).get(strategy)
+                or {}
+            )
+            entry_evidence = build_strategy_entry_evidence(
+                candidate,
+                strategy_config=strategy_cfg,
+            )
             trade_id = str(uuid.uuid4())
             metadata = {
                 "accounting_excluded": True,
@@ -8448,6 +8635,8 @@ class TradingOrchestrator:
                 "downstream_block_reason": None,
                 "downstream_block_message": None,
                 "downstream_gate_trace": [],
+                "entry_evidence": entry_evidence,
+                **entry_evidence,
             }
             payload = {
                 "trade_id": trade_id,
@@ -8483,12 +8672,25 @@ class TradingOrchestrator:
                 json=payload,
             )
             if response.status_code in (200, 201):
-                shadow_open_trade_ids.add(trade_id)
+                response_payload = response.json() or {}
+                persisted_trade_id = str(
+                    response_payload.get("trade_id") or trade_id
+                )
+                shadow_open_trade_ids.add(persisted_trade_id)
                 shadow_fingerprints.add(fingerprint)
                 shadow_open_keys.add(open_key)
+                if response_payload.get("status") == "duplicate":
+                    logger.info(
+                        "[HyperliquidShadow] Reused existing %s %s strategy=%s fingerprint=%s",
+                        side,
+                        coin,
+                        strategy,
+                        fingerprint,
+                    )
+                    continue
                 recorded.append(
                     {
-                        "trade_id": trade_id,
+                        "trade_id": persisted_trade_id,
                         "strategy": strategy,
                         "side": side,
                         "fingerprint": fingerprint,
@@ -8543,11 +8745,14 @@ class TradingOrchestrator:
                 block_reason = None if executed else (primary_reason or "unknown_block")
                 block_message = None if executed else (message or block_reason)
             else:
-                execution_status = "not_selected"
-                block_reason = "cross_strategy_selection"
-                block_message = (
-                    f"Executable lane selected {selected_strategy or 'no strategy'}"
-                )
+                if selected_strategy:
+                    execution_status = "not_selected"
+                    block_reason = "cross_strategy_selection"
+                    block_message = f"Executable lane selected {selected_strategy}"
+                else:
+                    execution_status = "blocked"
+                    block_reason = primary_reason or "no_executable_signal"
+                    block_message = message or block_reason
             metadata = dict(record.get("metadata") or {})
             metadata.update(
                 {
@@ -8667,14 +8872,15 @@ class TradingOrchestrator:
                                 coin,
                                 exc,
                             )
+                    resolved_exit_cfg = paper_perp_exit_config_from_yaml(
+                        cfg,
+                        trading_cfg,
+                        strategy_name=str(trade.get("source_strategy") or ""),
+                    )
                     exit_eval = evaluate_paper_perp_exit(
                         trade,
                         current_price,
-                        paper_perp_exit_config_from_yaml(
-                            cfg,
-                            trading_cfg,
-                            strategy_name=str(trade.get("source_strategy") or ""),
-                        ),
+                        resolved_exit_cfg,
                     )
                     if not exit_reason:
                         exit_reason = exit_eval.exit_reason
@@ -8684,6 +8890,12 @@ class TradingOrchestrator:
                         "metadata": exit_eval.metadata,
                     }
                     if exit_reason:
+                        payload["metadata"] = freeze_perp_close_evidence(
+                            exit_eval.metadata,
+                            side=side,
+                            entry_price=entry_price,
+                            exit_policy=resolved_exit_cfg,
+                        )
                         execution_price = current_price
                         if exit_eval.exit_reason and exit_reason == exit_eval.exit_reason:
                             execution_price = float(exit_eval.exit_price or current_price)
@@ -8764,6 +8976,19 @@ class TradingOrchestrator:
                 selector_coins,
             )
             self._last_hyperliquid_entry_scan_coins = list(hl_coins)
+            prefetch_settings = hyperliquid_signal_prefetch_settings(cfg)
+            self._last_perp_signal_prefetch = {
+                "requested": len(hl_coins),
+                "prefetch_ok": 0,
+                "prefetch_missed": 0,
+                "scanned_ok": 0,
+                "scanned_missed": 0,
+                "fallback_recovered": 0,
+                "failure_sample": [],
+                "inline_fallback": bool(prefetch_settings.get("inline_fallback", True)),
+                "skipped": bool(fast_signal_by_coin),
+                "health": "unknown",
+            }
             if not hl_coins:
                 logger.warning(
                     "[HyperliquidPaper] No HL selector output; skipping entry cycle"
@@ -8775,26 +9000,38 @@ class TradingOrchestrator:
 
             available_balance = await self._fetch_hyperliquid_available_balance()
 
+            setup_memory_perps_cfg = setup_memory_config(self._config or {}, "perps")
+            perps_memory_limit = min(
+                1000,
+                max(1, int(setup_memory_perps_cfg.get("closed_trade_fetch_limit") or 1000)),
+            )
             async with httpx.AsyncClient(timeout=30.0) as client:
                 open_path = (
                     "/api/v1/perps/live-trades/open"
                     if execution_mode == "live"
                     else "/api/v1/perps/paper-trades/open"
                 )
+                closed_path = (
+                    "/api/v1/perps/live-trades"
+                    if execution_mode == "live"
+                    else "/api/v1/perps/paper-trades"
+                )
                 open_resp = await client.get(f"{database_service_url}{open_path}")
                 open_trades = (open_resp.json() or {}).get("trades", []) if open_resp.status_code == 200 else []
                 closed_resp = await client.get(
-                    f"{database_service_url}/api/v1/perps/paper-trades",
-                    params={"status": "CLOSED", "limit": 200},
+                    f"{database_service_url}{closed_path}",
+                    params={"status": "CLOSED", "limit": perps_memory_limit},
                 )
+                closed_history_available = closed_resp.status_code == 200
                 closed_trades = (
                     (closed_resp.json() or {}).get("trades", [])
-                    if closed_resp.status_code == 200
+                    if closed_history_available
                     else []
                 )
                 shadow_open_trade_ids: Set[str] = set()
                 shadow_fingerprints: Set[str] = set()
                 shadow_open_keys: Set[Tuple[str, str, str]] = set()
+                shadow_closed_trades: List[Dict[str, Any]] = []
                 if execution_mode == "paper" and bool(
                     (cfg.get("shadow_strategy_evaluation") or {}).get("enabled", False)
                 ):
@@ -8811,6 +9048,8 @@ class TradingOrchestrator:
                             metadata = self._adaptive_trade_metadata(row)
                             if not bool(metadata.get("shadow_trade")):
                                 continue
+                            if str(row.get("status") or "").upper() == "CLOSED":
+                                shadow_closed_trades.append(row)
                             fingerprint = str(
                                 metadata.get("shadow_signal_fingerprint") or ""
                             )
@@ -8892,7 +9131,6 @@ class TradingOrchestrator:
                     prefetch_conc = max(
                         1, min(int(self._loop_perp_entry_check_concurrency or 8), 16)
                     )
-                    prefetch_sem = asyncio.Semaphore(prefetch_conc)
                     coin_filter_set = (
                         {
                             pair_to_hyperliquid_coin(str(c))
@@ -8901,65 +9139,54 @@ class TradingOrchestrator:
                         if coin_filter
                         else None
                     )
-
-                    async def _prefetch_hl_signals(coin_raw: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-                        coin_key = pair_to_hyperliquid_coin(str(coin_raw))
-                        if coin_filter_set is not None and coin_key not in coin_filter_set:
-                            return coin_key, None
-                        if deadline is not None and time.monotonic() >= deadline:
-                            return coin_key, None
-                        async with prefetch_sem:
-                            try:
-                                if signal_source == "hyperliquid_strategies":
-                                    signals_url = (
-                                        f"{strategy_service_url}/api/v1/signals/hyperliquid/{coin_key}"
-                                    )
-                                else:
-                                    spot_ex, spot_pair = find_mirror_spot_pair(
-                                        coin_key, mirror_exchanges, self.pair_selections
-                                    )
-                                    if not spot_ex or not spot_pair:
-                                        return coin_key, None
-                                    strategy_pair = spot_pair.replace("/", "")
-                                    signals_url = (
-                                        f"{strategy_service_url}/api/v1/signals/"
-                                        f"{spot_ex}/{strategy_pair}"
-                                    )
-                                signals_resp = await client.get(signals_url, timeout=8.0)
-                                if signals_resp.status_code == 200:
-                                    payload = signals_resp.json()
-                                    if isinstance(payload, dict):
-                                        return coin_key, payload
-                            except Exception as prefetch_exc:
-                                logger.debug(
-                                    "[HyperliquidPaper] Prefetch signal failed for %s: %s",
-                                    coin_key,
-                                    prefetch_exc,
-                                )
-                        return coin_key, None
-
                     logger.info(
                         "[HyperliquidPaper] Prefetching entry signals for %d coins "
-                        "(concurrency=%d)",
+                        "(concurrency=%d timeout=%.0fs retries=%d)",
                         len(hl_coins),
                         prefetch_conc,
+                        prefetch_settings["timeout_seconds"],
+                        prefetch_settings["retries"],
                     )
-                    prefetch_results = await asyncio.gather(
-                        *(_prefetch_hl_signals(c) for c in hl_coins),
-                        return_exceptions=True,
+                    prefetched_signals, prefetch_stats = await prefetch_hyperliquid_entry_signals(
+                        client,
+                        coins=hl_coins,
+                        signal_source=signal_source,
+                        strategy_service_url=strategy_service_url,
+                        mirror_exchanges=mirror_exchanges,
+                        pair_selections=self.pair_selections,
+                        hl_cfg=cfg,
+                        deadline=deadline,
+                        coin_filter_set=coin_filter_set,
+                        concurrency=prefetch_conc,
                     )
-                    for item in prefetch_results:
-                        if (
-                            isinstance(item, tuple)
-                            and len(item) == 2
-                            and isinstance(item[1], dict)
-                        ):
-                            prefetched_signals[item[0]] = item[1]
                     logger.info(
                         "[HyperliquidPaper] Prefetched %d/%d coin signal payloads",
-                        len(prefetched_signals),
-                        len(hl_coins),
+                        prefetch_stats.get("ok", len(prefetched_signals)),
+                        prefetch_stats.get("requested", len(hl_coins)),
                     )
+                    self._last_perp_signal_prefetch.update(
+                        {
+                            "prefetch_ok": int(prefetch_stats.get("ok") or 0),
+                            "prefetch_missed": int(prefetch_stats.get("missed") or 0),
+                            "failure_sample": [
+                                {"coin": coin_key, "reason": reason}
+                                for coin_key, reason in list(
+                                    (prefetch_stats.get("failure_reasons") or {}).items()
+                                )[:5]
+                            ],
+                        }
+                    )
+                    missed = int(prefetch_stats.get("missed") or 0)
+                    if missed > 0:
+                        sample = list((prefetch_stats.get("failure_reasons") or {}).items())[:5]
+                        logger.warning(
+                            "[HyperliquidPaper] Signal prefetch missed %d/%d coins; "
+                            "inline fallback=%s sample=%s",
+                            missed,
+                            prefetch_stats.get("requested", len(hl_coins)),
+                            prefetch_settings["inline_fallback"],
+                            sample,
+                        )
 
                 for coin in hl_coins:
                     if deadline is not None and time.monotonic() >= deadline:
@@ -9014,7 +9241,6 @@ class TradingOrchestrator:
                         signals_data = signals_data_from_fast_perp_payload(
                             fast_payload, coin
                         )
-                        recorder.set_signals(signals_data)
                         logger.info(
                             "[HyperliquidPaper] Fast-signal entry path %s %s "
                             "strategy=%s conf=%.2f",
@@ -9025,7 +9251,50 @@ class TradingOrchestrator:
                         )
                     else:
                         signals_data = prefetched_signals.get(coin) or {}
+                        if not signals_data and prefetch_settings.get("inline_fallback", True):
+                            fallback_payload, fallback_reason = (
+                                await fetch_hyperliquid_entry_signal_payload(
+                                    client,
+                                    coin_key=coin,
+                                    signal_source=signal_source,
+                                    strategy_service_url=strategy_service_url,
+                                    mirror_exchanges=mirror_exchanges,
+                                    pair_selections=self.pair_selections,
+                                    timeout_seconds=prefetch_settings["timeout_seconds"],
+                                    retries=prefetch_settings["retries"],
+                                    retry_delay_seconds=prefetch_settings[
+                                        "retry_delay_seconds"
+                                    ],
+                                )
+                            )
+                            if isinstance(fallback_payload, dict):
+                                signals_data = fallback_payload
+                                prefetched_signals[coin] = fallback_payload
+                                self._last_perp_signal_prefetch["fallback_recovered"] = (
+                                    int(
+                                        self._last_perp_signal_prefetch.get(
+                                            "fallback_recovered"
+                                        )
+                                        or 0
+                                    )
+                                    + 1
+                                )
+                            elif fallback_reason not in {"coin_filter", "no_mirror_pair"}:
+                                logger.warning(
+                                    "[HyperliquidPaper] Inline signal fallback miss %s: %s",
+                                    coin,
+                                    fallback_reason,
+                                )
                         if not signals_data:
+                            pf_stats = self._last_perp_signal_prefetch
+                            pf_stats["scanned_missed"] = (
+                                int(pf_stats.get("scanned_missed") or 0) + 1
+                            )
+                            failure_sample = pf_stats.setdefault("failure_sample", [])
+                            if len(failure_sample) < 8:
+                                failure_sample.append(
+                                    {"coin": coin, "reason": "signal_prefetch_miss"}
+                                )
                             await recorder.finish(
                                 outcome="not_scanned",
                                 primary_reason="signal_prefetch_miss",
@@ -9033,6 +9302,9 @@ class TradingOrchestrator:
                             )
                             continue
 
+                    self._last_perp_signal_prefetch["scanned_ok"] = (
+                        int(self._last_perp_signal_prefetch.get("scanned_ok") or 0) + 1
+                    )
                     recorder.set_signals(signals_data)
                     promoted_cohorts = self._hyperliquid_shadow_promoted_cohorts.get(coin) or []
                     if promoted_cohorts:
@@ -9180,7 +9452,7 @@ class TradingOrchestrator:
                             str(s).strip().lower()
                             for s in (
                                 cfg.get("live_strategy_allowlist")
-                                or ["rsi_stoch_reversal_5m"]
+                                or ["rsi_stoch_reversal_15m"]
                             )
                         ]
                         if src_strat.lower() not in allow:
@@ -9244,6 +9516,39 @@ class TradingOrchestrator:
                                 f"pnl={float(cohort.get('realized') or 0.0):.2f}"
                             ),
                         )
+                    market_regime = str(
+                        (signals_data.get("market_regime") or "")
+                    ).lower()
+                    coin_strategy_deny = hyperliquid_coin_strategy_entry_deny(
+                        coin,
+                        mirrored,
+                        market_regime,
+                        cfg,
+                    )
+                    if coin_strategy_deny.get("blocked"):
+                        deny_message = str(
+                            coin_strategy_deny.get("message")
+                            or coin_strategy_deny.get("reason")
+                            or ""
+                        )
+                        logger.info(
+                            "[HyperliquidPaper] Blocked PAPER %s %s: %s",
+                            side,
+                            coin,
+                            deny_message,
+                        )
+                        recorder.add_gate(
+                            "coin_strategy_entry_deny",
+                            False,
+                            deny_message,
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="coin_strategy_entry_deny",
+                            message=deny_message,
+                        )
+                        continue
+                    recorder.add_gate("coin_strategy_entry_deny", True, "denylist clear")
                     side_block = hyperliquid_coin_side_entry_block(
                         coin,
                         side,
@@ -9390,7 +9695,7 @@ class TradingOrchestrator:
                     recorder.add_gate("edge_gate", True, "expected move covers fees")
 
                     streak_cfg = _hyperliquid_strategy_coin_loss_streak_cfg(
-                        cfg, mirrored.get("strategy") or ""
+                        cfg, mirrored.get("strategy") or "", coin
                     )
                     streak_block = hyperliquid_strategy_coin_loss_streak_entry_block(
                         coin,
@@ -9663,6 +9968,50 @@ class TradingOrchestrator:
                         )
                         continue
 
+                    perp_strategy_name = str(mirrored.get("strategy") or "")
+                    setup_memory_strategy_cfg = (
+                        ((self._config or {}).get("strategies_hyperliquid") or {}).get(
+                            perp_strategy_name.strip().lower()
+                        )
+                        or {}
+                    )
+                    setup_memory_decision = evaluate_setup_memory(
+                        {
+                            **dict(mirrored or {}),
+                            "coin": coin,
+                            "position_side": side,
+                            "market_regime": market_regime,
+                        },
+                        market_type="perps",
+                        real_closed_trades=closed_trades,
+                        shadow_closed_trades=shadow_closed_trades,
+                        config=self._config or {},
+                        strategy_config=setup_memory_strategy_cfg,
+                        market_regime=market_regime,
+                        history_available=closed_history_available,
+                    )
+                    if setup_memory_decision.enabled:
+                        recorder.add_gate(
+                            "setup_memory",
+                            setup_memory_decision.action != "block",
+                            setup_memory_decision.reason,
+                            details=setup_memory_decision.to_dict(),
+                        )
+                    if setup_memory_decision.action == "block":
+                        logger.info(
+                            "[SetupMemory] Blocked PERP %s %s strategy=%s: %s",
+                            side,
+                            coin,
+                            perp_strategy_name or "unknown",
+                            setup_memory_decision.reason,
+                        )
+                        await recorder.finish(
+                            outcome="skipped",
+                            primary_reason="setup_memory",
+                            message=setup_memory_decision.reason,
+                        )
+                        continue
+
                     size_multiplier = (
                         float(specialist_gate.get("sizeMultiplier"))
                         if specialist_gate.get("sizeMultiplier") is not None
@@ -9670,6 +10019,16 @@ class TradingOrchestrator:
                         if standalone_gate.get("sizeMultiplier") is not None
                         else paper_perp_position_size_multiplier(mirrored, cfg)
                     )
+                    if setup_memory_decision.action == "size_down":
+                        size_multiplier *= setup_memory_decision.size_multiplier
+                        logger.warning(
+                            "[SetupMemory] PERP %s %s strategy=%s sizing *= %.2f: %s",
+                            side,
+                            coin,
+                            perp_strategy_name or "unknown",
+                            setup_memory_decision.size_multiplier,
+                            setup_memory_decision.reason,
+                        )
                     regime_size_mult = regime_gate.get("sizeMultiplier")
                     if regime_size_mult is not None:
                         size_multiplier *= float(regime_size_mult)
@@ -9945,6 +10304,7 @@ class TradingOrchestrator:
                                 hv_size_mult,
                             )
                     strategy_notional_cap = strategy_max_notional(perp_strategy_name, cfg)
+                    leverage = adaptive_perp_leverage(mirrored, cfg)
                     strategy_margin_cap = strategy_notional_cap / max(leverage, 1e-9)
                     effective_max_notional = max(max_notional, strategy_notional_cap)
                     effective_max_margin = max(max_margin, strategy_margin_cap)
@@ -9958,17 +10318,62 @@ class TradingOrchestrator:
                         size_multiplier=size_multiplier,
                         strategy=perp_strategy_name,
                     )
-                    if risk_notional is not None and risk_notional > 0:
+                    fixed_paper_cfg = cfg.get("fixed_paper_notional") or {}
+                    fixed_paper_enabled = (
+                        isinstance(fixed_paper_cfg, dict)
+                        and fixed_paper_cfg.get("enabled", False) is not False
+                        and str(fixed_paper_cfg.get("enabled", False)).lower()
+                        not in {"0", "false", "no", "off"}
+                    )
+                    fixed_paper_target = 0.0
+                    if fixed_paper_enabled:
+                        try:
+                            fixed_paper_target = max(
+                                0.0,
+                                float(fixed_paper_cfg.get("target_usd", 500.0) or 500.0),
+                            )
+                        except (TypeError, ValueError):
+                            fixed_paper_target = 500.0
+                    if fixed_paper_target > 0:
+                        lane_notional_multiplier = perp_lane_notional_multiplier(
+                            perp_strategy_name,
+                            side,
+                            market_regime,
+                            cfg,
+                        )
+                        notional = fixed_paper_target * lane_notional_multiplier
+                        margin_used = notional / max(leverage, 1e-9)
+                        logger.warning(
+                            "[HyperliquidPaper] Fixed paper sizing: %s %s strategy=%s "
+                            "notional=$%.2f margin=$%.2f leverage=%.2fx "
+                            "(lane multiplier %.3f; adaptive multiplier %.3f retained for audit only)",
+                            side,
+                            coin,
+                            perp_strategy_name,
+                            notional,
+                            margin_used,
+                            leverage,
+                            lane_notional_multiplier,
+                            size_multiplier,
+                        )
+                    elif risk_notional is not None and risk_notional > 0:
                         notional = min(risk_notional, scaled_max_notional)
                         margin_used = min(notional / leverage, scaled_max_margin)
                         notional = min(notional, margin_used * leverage)
                     else:
                         margin_used = min(scaled_max_margin, scaled_max_notional / leverage)
                         notional = min(scaled_max_notional, margin_used * leverage)
-                    min_notional = strategy_min_notional(perp_strategy_name, cfg)
+                    dynamic_floor = dynamic_min_notional(
+                        mirrored,
+                        cfg,
+                        size_multiplier=size_multiplier,
+                    )
+                    min_notional = float(dynamic_floor.get("minNotional") or 0.0)
                     if min_notional > 0 and notional < min_notional:
                         min_margin = min_notional / max(leverage, 1e-9)
                         can_floor_to_min = (
+                            risk_notional is None
+                            and
                             available_balance is not None
                             and min_margin <= available_balance
                             and min_notional <= effective_max_notional
@@ -10009,7 +10414,9 @@ class TradingOrchestrator:
                                 primary_reason="min_notional",
                                 message=(
                                     f"Blocked by min notional: computed ${notional:.2f} "
-                                    f"after strategy/PnL sizing, below required ${min_notional:.2f}"
+                                    f"after strategy/PnL sizing, below dynamic fee/edge "
+                                    f"minimum ${min_notional:.2f} "
+                                    f"({dynamic_floor.get('reason')})"
                                 ),
                             )
                             continue
@@ -10059,6 +10466,16 @@ class TradingOrchestrator:
                         service_recommended = {}
                     setup_risk = setup_risk_metadata_from_signal(mirrored)
                     hl_selected = selected_mirrored_signal_metadata(mirrored)
+                    strategy_cfg = (
+                        ((self._config or {}).get("strategies_hyperliquid") or {}).get(
+                            str(mirrored.get("strategy") or "").strip().lower()
+                        )
+                        or {}
+                    )
+                    entry_evidence = build_strategy_entry_evidence(
+                        mirrored,
+                        strategy_config=strategy_cfg,
+                    )
                     payload = {
                         "trade_id": trade_id,
                         "venue": "hyperliquid",
@@ -10093,6 +10510,9 @@ class TradingOrchestrator:
                             "hl_selector": True,
                             "signal_source": signal_source,
                             "position_size_multiplier": size_multiplier,
+                            "lane_notional_multiplier": lane_notional_multiplier
+                            if fixed_paper_target > 0
+                            else 1.0,
                             "stop_distance_pct": stop_dist_pct,
                             "risk_based_notional": risk_notional,
                             "stable_regime": (signals_data or {}).get("stable_regime"),
@@ -10108,10 +10528,15 @@ class TradingOrchestrator:
                                 )
                                 == side
                             ),
+                            "setup_memory": setup_memory_decision.to_dict(),
+                            "ta_evidence": ta_evidence_from_signal(mirrored),
+                            "entry_evidence": entry_evidence,
+                            **entry_evidence,
                             **_perp_entry_atr_metadata(mirrored, price),
                         },
                     }
                     if str(payload["source_strategy"]) in {
+                        "rsi_stoch_reversal_15m",
                         "rsi_stoch_reversal_5m",
                         "rsi_stoch_reversal_1m",
                     }:
@@ -10811,7 +11236,7 @@ class TradingOrchestrator:
 
     def _hl_rsi_stoch_params(self) -> Tuple[Dict[str, Any], bool]:
         strat_root = (self._config or {}).get("strategies_hyperliquid") or {}
-        rsi_cfg = strat_root.get("rsi_stoch_reversal_5m") or {}
+        rsi_cfg = strat_root.get("rsi_stoch_reversal_15m") or {}
         params = rsi_cfg.get("parameters") or {}
         return params, bool(params.get("allow_short", False))
 
@@ -11063,7 +11488,7 @@ class TradingOrchestrator:
                 per_strategy_age = cfg.get("strategy_redis_max_age_seconds") or {}
                 fast_strategies = [
                     str(x).strip().lower()
-                    for x in (cfg.get("strategies") or ["rsi_stoch_reversal_5m"])
+                    for x in (cfg.get("strategies") or ["rsi_stoch_reversal_15m"])
                     if str(x).strip()
                 ]
                 await self._refresh_entry_guard_sources()
@@ -11959,7 +12384,7 @@ class TradingOrchestrator:
                 )
 
                 strategy_key = str(
-                    fast_lane_payload.get("strategy") or "rsi_stoch_reversal_5m"
+                    fast_lane_payload.get("strategy") or "rsi_stoch_reversal_15m"
                 ).strip().lower()
                 signals_data = spot_signals_data_from_fast_payload(
                     fast_lane_payload,
@@ -11989,13 +12414,13 @@ class TradingOrchestrator:
                 strategy_pair = pair.replace('/', '')
 
                 # CONDITION CHECK 2: Get Strategy Signals. Keep this bounded by the
-                # outer pair worker deadline, but retry once for transient strategy
-                # service read timeouts so one slow OHLCV fetch does not skip a pair.
+                # outer pair worker deadline. Fail fast so one slow OHLCV fetch does
+                # not extend the whole exchange scan or overlap the next cycle.
                 logger.info(f"🔍 [CONDITION 2] Fetching strategy signals for {strategy_pair} on {exchange_name}")
                 signals_url = f"{strategy_service_url}/api/v1/signals/{exchange_name}/{strategy_pair}"
                 signals_data = None
-                signal_attempts = 2
-                signal_timeout = max(1.0, min(self._loop_spot_entry_pair_timeout_seconds, 15.0))
+                signal_attempts = 1
+                signal_timeout = max(1.0, min(self._loop_spot_entry_pair_timeout_seconds, 8.0))
                 for attempt in range(signal_attempts):
                     try:
                         async with httpx.AsyncClient(timeout=signal_timeout) as client:
@@ -12131,6 +12556,7 @@ class TradingOrchestrator:
             consensus_excluded_strategies = {
                 "macd_momentum",
                 "rsi_oversold_checklist",
+                "weekly_fibonacci_spot",
                 "macd_ema_vwap_scalper",
                 "supertrend",
                 "swing_hull_rsi_ema",
@@ -12213,6 +12639,7 @@ class TradingOrchestrator:
                 "small_size_momentum_scalp",
             )
             setup_standalone_names = (
+                "weekly_fibonacci_spot",
                 "dual_sma_daytrade",
                 "arc_daytrade",
                 "ema50_breakout_pullback",
@@ -12989,6 +13416,7 @@ class TradingOrchestrator:
                 "macd_momentum",
                 "rsi_oversold_override",
                 "rsi_oversold_checklist",
+                "weekly_fibonacci_spot",
                 "macd_ema_vwap_scalper",
                 "supertrend",
                 "swing_hull_rsi_ema",
@@ -13308,6 +13736,111 @@ class TradingOrchestrator:
                     "[AdaptiveSizing] %s %s position reduced: $%.2f -> $%.2f (mult=%.2f)",
                     exchange_name, pair, original_value, position_value_usdc, pair_loss_mult
                 )
+            spot_strategy_cfg = (
+                ((self._config or {}).get("strategies") or {}).get(
+                    str(strategy_name or "").strip().lower()
+                )
+                or {}
+            )
+            setup_memory_decision = None
+            try:
+                closed_spot_trades: List[Dict[str, Any]] = []
+                spot_history_available = False
+                spot_memory_cfg = setup_memory_config(self._config or {}, "spot")
+                spot_memory_limit = int(
+                    spot_memory_cfg.get("closed_trade_fetch_limit") or 2000
+                )
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    memory_resp = await client.get(
+                        f"{database_service_url}/api/v1/trades",
+                        params={
+                            "status": "CLOSED",
+                            "exchange": exchange_name,
+                            "limit": spot_memory_limit,
+                            "sort_by": "exit_time",
+                            "sort_order": "desc",
+                        },
+                    )
+                    if memory_resp.status_code == 200:
+                        closed_spot_trades = (memory_resp.json() or {}).get("trades", []) or []
+                        spot_history_available = True
+                setup_memory_decision = evaluate_setup_memory(
+                    {
+                        **dict(signal or {}),
+                        "strategy": strategy_name,
+                        "pair": pair,
+                        "signal": signal.get("signal") or "buy",
+                    },
+                    market_type="spot",
+                    real_closed_trades=closed_spot_trades,
+                    shadow_closed_trades=[],
+                    config=self._config or {},
+                    strategy_config=spot_strategy_cfg,
+                    history_available=spot_history_available,
+                )
+            except Exception as memory_err:
+                logger.warning(
+                    "[SetupMemory] Spot evaluation failed for %s %s strategy=%s: %s",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    memory_err,
+                )
+            if setup_memory_decision and setup_memory_decision.enabled:
+                await self._record_entry_gate_event(
+                    exchange_name,
+                    pair,
+                    "setup_memory",
+                    {
+                        "strategies": {strategy_name: signal},
+                        "market_regime": signal.get("market_regime"),
+                        "stable_regime": signal.get("stable_regime"),
+                    },
+                    signal.get("resolved_policy"),
+                    {
+                        "strategy": strategy_name,
+                        "action": setup_memory_decision.action,
+                        "reason": setup_memory_decision.reason,
+                        "match_level": setup_memory_decision.match_level,
+                        "matched_count": setup_memory_decision.matched_count,
+                        "loss_count": setup_memory_decision.loss_count,
+                        "win_count": setup_memory_decision.win_count,
+                        "win_rate": setup_memory_decision.win_rate,
+                        "expectancy": setup_memory_decision.expectancy,
+                        "profit_factor": setup_memory_decision.profit_factor,
+                        "size_multiplier": setup_memory_decision.size_multiplier,
+                        "setup_fingerprint": setup_memory_decision.setup_fingerprint,
+                        "evidence": setup_memory_decision.evidence,
+                    },
+                    event_type=(
+                        "entry_rejected"
+                        if setup_memory_decision.action == "block"
+                        else "entry_gate_evaluated"
+                    ),
+                )
+            if setup_memory_decision and setup_memory_decision.action == "block":
+                logger.info(
+                    "[SetupMemory] Blocked SPOT %s %s strategy=%s: %s",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    setup_memory_decision.reason,
+                )
+                return
+            if setup_memory_decision and setup_memory_decision.action == "size_down":
+                original_value = position_value_usdc
+                position_value_usdc *= setup_memory_decision.size_multiplier
+                logger.warning(
+                    "[SetupMemory] SPOT %s %s strategy=%s size reduced: "
+                    "$%.2f -> $%.2f (mult=%.2f; %s)",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    original_value,
+                    position_value_usdc,
+                    setup_memory_decision.size_multiplier,
+                    setup_memory_decision.reason,
+                )
             # PnL-FIX v5 — Diversification budget cap.
             # Evidence: an API3/USD trade was sized at ≈$2,333 on $9k available,
             # because confluence's `position_size_percentage: 0.25` ignored the
@@ -13342,6 +13875,31 @@ class TradingOrchestrator:
                 logger.warning(
                     f"[Redis Queue] Could not apply diversification cap "
                     f"(strategy={strategy_name}, exchange={exchange_name}): {_diversify_err}"
+                )
+
+            # Explicit simulation experiment: accepted paper spot entries use
+            # comparable exposure. This is deliberately applied last so legacy
+            # percentage, expectancy, and diversification haircuts cannot make
+            # paper results incomparable. Never apply it outside simulation.
+            fixed_simulation_position = 0.0
+            if str((trading_cfg or {}).get("mode") or "").lower() == "simulation":
+                try:
+                    fixed_simulation_position = max(
+                        0.0,
+                        float((trading_cfg or {}).get("fixed_simulation_position_usd", 0.0) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    fixed_simulation_position = 0.0
+            if fixed_simulation_position > 0:
+                original_value = position_value_usdc
+                position_value_usdc = min(fixed_simulation_position, available_balance)
+                logger.warning(
+                    "[PaperSpotSizing] %s %s %s fixed simulation size: $%.2f -> $%.2f",
+                    exchange_name,
+                    pair,
+                    strategy_name,
+                    original_value,
+                    position_value_usdc,
                 )
 
             logger.info(f"[Redis Queue] Strategy: {strategy_name}, Position: ${position_value_usdc:.2f}")
@@ -13447,6 +14005,16 @@ class TradingOrchestrator:
             
             # Generate trade ID
             trade_id = str(uuid.uuid4())
+            signal = dict(signal or {})
+            signal["entry_evidence"] = build_strategy_entry_evidence(
+                {
+                    **signal,
+                    "strategy": strategy_name,
+                },
+                strategy_config=spot_strategy_cfg,
+            )
+            if setup_memory_decision is not None:
+                signal["setup_memory"] = setup_memory_decision.to_dict()
             
             # Create PENDING trade record first
             await self.redis_order_manager.create_pending_trade_record(

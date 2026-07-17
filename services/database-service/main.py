@@ -52,6 +52,7 @@ import uvicorn
 import os
 from hyperliquid_ledger import compute_hyperliquid_balance_amounts
 from perp_paper_pnl_report import build_paper_pnl_report
+from strategy_trade_evidence import normalize_perp_close_update
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
 
 # Import centralized trade closure service
@@ -2618,6 +2619,26 @@ async def create_perp_paper_trade(trade: PerpPaperTrade):
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not initialized")
     try:
+        metadata = trade.metadata or {}
+        shadow_fingerprint = str(metadata.get("shadow_signal_fingerprint") or "").strip()
+        if metadata.get("shadow_trade") is True and shadow_fingerprint:
+            existing = await db_manager.execute_single_query(
+                """
+                SELECT trade_id, status
+                FROM trading.perp_paper_trades
+                WHERE COALESCE(metadata->>'shadow_trade', 'false') = 'true'
+                  AND metadata->>'shadow_signal_fingerprint' = %s
+                ORDER BY entry_time ASC
+                LIMIT 1
+                """,
+                (shadow_fingerprint,),
+            )
+            if existing:
+                return {
+                    "trade_id": existing.get("trade_id"),
+                    "status": "duplicate",
+                    "shadow_signal_fingerprint": shadow_fingerprint,
+                }
         query = """
             INSERT INTO trading.perp_paper_trades (
                 trade_id, venue, coin, pair, source_exchange, source_pair,
@@ -2769,6 +2790,8 @@ async def get_perp_paper_shadow_summary(
         f"""
         SELECT
             source_strategy,
+            COALESCE(metadata->>'strategy_version', 'unversioned') AS strategy_version,
+            COALESCE(metadata->>'strategy_config_hash', 'unknown') AS strategy_config_hash,
             position_side,
             COALESCE(metadata->>'market_regime', 'unknown') AS market_regime,
             COALESCE(metadata->>'shadow_edge_passed', 'unknown') AS edge_gate_passed,
@@ -2801,6 +2824,8 @@ async def get_perp_paper_shadow_summary(
           {time_filter}
         GROUP BY
             source_strategy,
+            COALESCE(metadata->>'strategy_version', 'unversioned'),
+            COALESCE(metadata->>'strategy_config_hash', 'unknown'),
             position_side,
             COALESCE(metadata->>'market_regime', 'unknown'),
             COALESCE(metadata->>'shadow_edge_passed', 'unknown'),
@@ -2809,6 +2834,8 @@ async def get_perp_paper_shadow_summary(
             COALESCE(metadata->>'shadow_exit_policy_version', 'legacy')
         ORDER BY
             source_strategy,
+            strategy_version,
+            strategy_config_hash,
             position_side,
             market_regime,
             real_execution_status,
@@ -2832,12 +2859,14 @@ async def get_perp_paper_shadow_summary(
             if gross_losses > 0
             else None
         )
-        first_entry = item.pop("first_entry_time", None)
-        last_activity = item.pop("last_activity_time", None)
+        first_entry = item.get("first_entry_time")
+        last_activity = item.get("last_activity_time")
         if first_entry is not None:
+            item["first_entry_time"] = first_entry.isoformat()
             if window_start is None or first_entry < window_start:
                 window_start = first_entry
         if last_activity is not None:
+            item["last_activity_time"] = last_activity.isoformat()
             if window_end is None or last_activity > window_end:
                 window_end = last_activity
         summary.append(item)
@@ -2853,6 +2882,9 @@ async def get_perp_paper_shadow_summary(
             exit_time,
             realized_pnl,
             fees,
+            funding,
+            exit_reason,
+            venue,
             metadata
         FROM trading.perp_paper_trades
         WHERE COALESCE(metadata->>'shadow_trade', 'false') = 'true'
@@ -3190,6 +3222,46 @@ async def create_perp_live_trade(trade: PerpLiveTrade):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/perps/live-trades")
+async def get_perp_live_trades(
+    status: Optional[str] = None,
+    coin: Optional[str] = None,
+    position_side: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """List isolated live perpetual trades for runtime guardrails and audit."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where_conditions = []
+        params: List[Any] = []
+        if status:
+            where_conditions.append("status = %s")
+            params.append(normalize_status(status, "trade"))
+        if coin:
+            where_conditions.append("coin = %s")
+            params.append(coin.upper())
+        if position_side:
+            where_conditions.append("position_side = %s")
+            params.append(position_side.lower())
+        where_sql = (" WHERE " + " AND ".join(where_conditions)) if where_conditions else ""
+        rows = await db_manager.fetch_all(
+            f"""
+            SELECT *
+            FROM trading.perp_live_trades
+            {where_sql}
+            ORDER BY entry_time DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params + [limit, offset]),
+        )
+        return {"trades": rows or []}
+    except Exception as e:
+        logger.error(f"Failed to list live perp trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/perps/live-trades/open")
 async def get_open_perp_live_trades(coin: Optional[str] = None):
     if not db_manager:
@@ -3218,6 +3290,21 @@ async def update_perp_live_trade(trade_id: str, update_data: Dict[str, Any]):
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not initialized")
     try:
+        update_data = dict(update_data or {})
+        if str(update_data.get("status") or "").upper() == "CLOSED":
+            existing = await db_manager.execute_single_query(
+                """
+                SELECT status, entry_price, position_side, metadata
+                FROM trading.perp_live_trades
+                WHERE trade_id = %s
+                """,
+                (trade_id,),
+            )
+            update_data = normalize_perp_close_update(
+                existing or {},
+                update_data,
+                metadata_field="metadata_patch",
+            )
         fields = []
         params: List[Any] = []
         for key in (
@@ -3282,7 +3369,8 @@ async def get_rsi_stoch_paper_readiness():
             """,
             (),
         )
-        return evaluate_live_readiness(rows or [], promo)
+        strategy = str(promo.get("strategy") or "rsi_stoch_reversal_15m")
+        return evaluate_live_readiness(rows or [], promo, strategy=strategy)
     except Exception as e:
         logger.error(f"Paper readiness check failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -3294,6 +3382,21 @@ async def update_perp_paper_trade(trade_id: str, update_data: Dict[str, Any]):
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not initialized")
     try:
+        update_data = dict(update_data or {})
+        if str(update_data.get("status") or "").upper() == "CLOSED":
+            existing = await db_manager.execute_single_query(
+                """
+                SELECT status, entry_price, position_side, metadata
+                FROM trading.perp_paper_trades
+                WHERE trade_id = %s
+                """,
+                (trade_id,),
+            )
+            update_data = normalize_perp_close_update(
+                existing or {},
+                update_data,
+                metadata_field="metadata",
+            )
         allowed = {
             "current_price", "exit_price", "status", "exit_time", "unrealized_pnl",
             "realized_pnl", "fees", "funding", "exit_reason", "metadata",

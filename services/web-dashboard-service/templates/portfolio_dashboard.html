@@ -36,6 +36,7 @@
             <span class="pi-pill" id="hl-engine-pill">Engine: …</span>
             <span class="pi-pill" id="hl-orchestrator-pill">Orchestrator: …</span>
             <span class="pi-pill" id="perp-entry-cycle-top">Entry: N/A</span>
+            <span class="pi-pill" id="perp-signal-prefetch-top" title="Hyperliquid entry signal prefetch health">Signals: …</span>
             <span class="pi-pill" id="perp-exit-cycle-top">Exit: N/A</span>
             <button type="button" class="pi-theme-toggle" id="theme-toggle" title="Theme: System">
                 <i class="fas fa-circle-half-stroke"></i><span>System</span>
@@ -99,6 +100,80 @@
                     <span>Win rate</span>
                     <strong id="perp-win-rate">0.0%</strong>
                 </article>
+            </div>
+        </section>
+
+        <section class="pi-panel pi-progress-why" id="progress-why-panel">
+            <div class="pi-panel-head">
+                <div>
+                    <p class="pi-eyebrow">Rolling 30 days</p>
+                    <h2>Progress &amp; Why</h2>
+                </div>
+                <div class="pi-head-actions">
+                    <span class="pi-muted" id="progress-why-status">Loading…</span>
+                    <a class="pi-page-btn" href="/strategy-performance" id="progress-why-charts-link">
+                        <i class="fas fa-chart-line" aria-hidden="true"></i>
+                        Longer charts
+                    </a>
+                </div>
+            </div>
+            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
+                <article class="pi-kpi">
+                    <span>Avg daily PnL</span>
+                    <strong id="progress-avg-daily">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Gap to $20/day</span>
+                    <strong id="progress-gap">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Today realized</span>
+                    <strong id="progress-today">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Drawdown vs 5%</span>
+                    <strong id="progress-drawdown">0.0%</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>DD budget left</span>
+                    <strong id="progress-dd-budget">5.0%</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Win rate (30d)</span>
+                    <strong id="progress-win-rate">0.0%</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Fees (30d)</span>
+                    <strong id="progress-fees">$0.00</strong>
+                </article>
+                <article class="pi-kpi">
+                    <span>Open risk</span>
+                    <strong id="progress-open-risk">$0.00</strong>
+                </article>
+            </div>
+            <p class="pi-adaptive-note" id="progress-why-summary">
+                Tracking rolling average daily PnL versus the $20 target and 5% drawdown budget.
+            </p>
+            <div class="pi-table-wrap">
+                <table class="pi-table pi-adaptive-table pi-horizontal-table">
+                    <thead>
+                        <tr>
+                            <th>Strategy</th>
+                            <th>Status</th>
+                            <th>Size</th>
+                            <th>7d PnL</th>
+                            <th>30d PnL</th>
+                            <th>PF</th>
+                            <th>Expectancy</th>
+                            <th>Trades</th>
+                            <th>Next</th>
+                            <th>Why</th>
+                        </tr>
+                    </thead>
+                    <tbody id="progress-why-lanes-body">
+                        <tr><td colspan="10" class="pi-empty">Loading lane status…</td></tr>
+                    </tbody>
+                </table>
             </div>
         </section>
 
@@ -249,6 +324,7 @@
                     Every unique directional setup passing its strategy-owned gates receives the same $200 paper notional.
                     <strong>Episode</strong> columns dedupe repeated scans on the same strategy/coin/side while a setup is still live — use episode PnL for tuning, not raw row counts.
                     Real outcome and downstream block show why the executable portfolio did or did not take it.
+                    First entry and latest activity show the date and hour covered by each cohort in your local time.
                     Shadow positions remain accounting-excluded and never affect PnL, margin, or execution limits.
                 </p>
             </div>
@@ -259,6 +335,8 @@
                             <th>Strategy</th>
                             <th>Side</th>
                             <th>Regime</th>
+                            <th>First entry</th>
+                            <th>Latest activity</th>
                             <th>Exit policy</th>
                             <th>Real outcome</th>
                             <th>Downstream block</th>
@@ -276,7 +354,7 @@
                         </tr>
                     </thead>
                     <tbody id="shadow-results-body">
-                        <tr><td colspan="17" class="pi-empty">Loading shadow strategy results...</td></tr>
+                        <tr><td colspan="19" class="pi-empty">Loading shadow strategy results...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -750,6 +828,6 @@
     </main>
 
     <script src="/static/js/portfolio-panel-collapse.js?v=20260610-topbar-nav"></script>
-    <script src="/static/js/portfolio-dashboard.js?v=20260623-dashboard-cache-bust"></script>
+    <script src="/static/js/portfolio-dashboard.js?v=20260709-progress-why"></script>
 </body>
 </html>

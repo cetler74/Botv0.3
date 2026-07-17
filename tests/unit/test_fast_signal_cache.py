@@ -20,7 +20,7 @@ from strategy.fast_signal_cache import (
 
 def test_redis_key_format():
     assert redis_key("binance", "BTCUSDC") == (
-        "trading:fast_signal:rsi_stoch_reversal_5m:binance:BTCUSDC"
+        "trading:fast_signal:rsi_stoch_reversal_15m:binance:BTCUSDC"
     )
     assert redis_key(
         "hyperliquid",
@@ -45,7 +45,7 @@ def test_merge_rsi_stoch_spot_buy_into_signals():
         "indicators": {"rsi": 28.0, "stoch_rsi_k": 35.0, "stoch_rsi_d": 20.0},
     }
     assert merge_rsi_stoch_spot_buy_into_signals(signals_data, fast)
-    rsi = signals_data["strategies"]["rsi_stoch_reversal_5m"]
+    rsi = signals_data["strategies"]["rsi_stoch_reversal_15m"]
     assert rsi["signal"] == "buy"
     assert rsi["confidence"] == 0.72
 
@@ -69,7 +69,7 @@ def test_fast_payload_from_hl_strategy_signal():
         "signal": "short",
         "confidence": 0.72,
         "strength": 0.7,
-        "strategy": "rsi_stoch_reversal_5m",
+        "strategy": "rsi_stoch_reversal_15m",
         "state": {
             "indicators": {
                 "stoch_rsi_k": 85.0,
@@ -161,7 +161,7 @@ def test_validate_rsi_stoch_uses_separate_closed_bar_age_budget():
 def test_spot_signals_data_from_fast_payload_builds_standalone_envelope():
     fast = {
         "signal": "buy",
-        "strategy": "rsi_stoch_reversal_5m",
+        "strategy": "rsi_stoch_reversal_15m",
         "confidence": 0.72,
         "strength": 0.70,
         "analyzed_at": "2026-06-13T17:13:58+00:00",
@@ -173,10 +173,12 @@ def test_spot_signals_data_from_fast_payload_builds_standalone_envelope():
     signals = spot_signals_data_from_fast_payload(fast, "bybit", "MOVE/USDC")
     assert signals["consensus"]["signal"] == "hold"
     assert signals["market_regime"] == "reversal_zone"
-    assert signals["strategies"]["rsi_stoch_reversal_5m"]["signal"] == "buy"
+    assert signals["strategies"]["rsi_stoch_reversal_15m"]["signal"] == "buy"
     assert signals["fast_signal"]["source"] == "redis"
 
 
 def test_daytrade_fast_strategies_include_standalone_playbooks():
-    assert "ema50_breakout_pullback" in DAYTRADE_FAST_STRATEGIES
     assert "supply_demand_3step" in DAYTRADE_FAST_STRATEGIES
+    assert "dual_sma_daytrade" in DAYTRADE_FAST_STRATEGIES
+    assert "ema50_breakout_pullback" not in DAYTRADE_FAST_STRATEGIES
+    assert "arc_daytrade" not in DAYTRADE_FAST_STRATEGIES
