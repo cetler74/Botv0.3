@@ -288,7 +288,14 @@ function renderCyclePill(id, label, phase, health) {
   const ranAt = phaseData.completed_at || phaseData.started_at;
   const cycle = Number(phaseData.cycle_count || 0);
   const cycleText = cycle > 0 ? ` · cycle ${cycle}` : '';
-  el.textContent = `${label}: ${formatRelativeTime(ranAt)} · ${status.replace(/_/g, ' ')}${cycleText}`;
+  let suffix = '';
+  const prefetch = (phaseData.metadata || {}).signal_prefetch || {};
+  if (id.includes('entry') && !prefetch.skipped && Number(prefetch.requested || 0) > 0) {
+    const scanned = Number(prefetch.scanned_ok ?? prefetch.prefetch_ok ?? 0);
+    const requested = Number(prefetch.requested || 0);
+    suffix = ` · sig ${scanned}/${requested}`;
+  }
+  el.textContent = `${label}: ${formatRelativeTime(ranAt)} · ${status.replace(/_/g, ' ')}${cycleText}${suffix}`;
   el.classList.remove('ok', 'warn', 'bad');
   if (status === 'error' || phaseData.last_error) {
     el.classList.add('bad');
@@ -299,6 +306,71 @@ function renderCyclePill(id, label, phase, health) {
   } else {
     el.classList.add('warn');
   }
+  const prefHealth = String(prefetch.health || '');
+  if (prefHealth === 'degraded') {
+    el.classList.remove('ok');
+    el.classList.add('warn');
+  } else if (prefHealth === 'failed') {
+    el.classList.remove('ok');
+    el.classList.add('bad');
+  }
+}
+
+function signalPrefetchTooltip(prefetch) {
+  const pf = prefetch || {};
+  if (pf.skipped) return 'Fast-entry path; batch prefetch skipped.';
+  const lines = [
+    `Requested: ${pf.requested ?? '?'}`,
+    `Batch prefetch OK: ${pf.prefetch_ok ?? '?'}`,
+    `Scanned with signals: ${pf.scanned_ok ?? '?'}`,
+    `Unscanned (prefetch miss): ${pf.scanned_missed ?? 0}`,
+    `Inline fallback recovered: ${pf.fallback_recovered ?? 0}`,
+    `Health: ${pf.health || 'unknown'}`,
+  ];
+  if (pf.loop_incomplete) {
+    lines.push('Entry loop ended before all coins were evaluated (deadline/timebox).');
+  }
+  const sample = Array.isArray(pf.failure_sample) ? pf.failure_sample : [];
+  if (sample.length) {
+    lines.push(
+      `Sample misses: ${sample.map((row) => `${row.coin || '?'} (${row.reason || '?'})`).join(', ')}`,
+    );
+  }
+  return lines.join('\n');
+}
+
+function renderSignalPrefetchPill(phase) {
+  const el = document.getElementById('perp-signal-prefetch-top');
+  if (!el) return;
+  const pf = (phase?.metadata || {}).signal_prefetch || {};
+  el.classList.remove('ok', 'warn', 'bad');
+  if (pf.skipped) {
+    el.textContent = 'Signals: fast path';
+    el.title = signalPrefetchTooltip(pf);
+    el.classList.add('ok');
+    return;
+  }
+  const requested = Number(pf.requested || 0);
+  if (!requested) {
+    el.textContent = 'Signals: N/A';
+    el.title = 'No perp entry signal prefetch data yet.';
+    el.classList.add('warn');
+    return;
+  }
+  const scanned = Number(pf.scanned_ok ?? pf.prefetch_ok ?? 0);
+  const batchOk = Number(pf.prefetch_ok ?? 0);
+  const missed = Number(pf.scanned_missed ?? 0);
+  let label = `Signals: ${scanned}/${requested}`;
+  if (batchOk < requested && missed === 0 && Number(pf.fallback_recovered || 0) > 0) {
+    label += ` (prefetch ${batchOk}/${requested})`;
+  }
+  el.textContent = label;
+  el.title = signalPrefetchTooltip(pf);
+  const health = String(pf.health || 'unknown');
+  if (health === 'ok') el.classList.add('ok');
+  else if (health === 'degraded') el.classList.add('warn');
+  else if (health === 'failed') el.classList.add('bad');
+  else el.classList.add('warn');
 }
 
 function cycleShortText(phase) {
@@ -314,6 +386,7 @@ function renderCycleStatus(data) {
   renderCyclePill('perp-entry-cycle', 'Perps entry last run', cycles.perp_entry, details.perp_entry);
   renderCyclePill('perp-exit-cycle', 'Perps exit/update last run', cycles.perp_exit_update, details.perp_exit_update);
   renderCyclePill('perp-entry-cycle-top', 'Entry', cycles.perp_entry, details.perp_entry);
+  renderSignalPrefetchPill(cycles.perp_entry);
   renderCyclePill('perp-exit-cycle-top', 'Exit', cycles.perp_exit_update, details.perp_exit_update);
   setText(
     'trading-status',
@@ -1236,9 +1309,16 @@ function renderHyperliquidTopbar(data) {
   const orchEl = document.getElementById('hl-orchestrator-pill');
   if (orchEl) {
     const st = health.orchestrator || 'unknown';
-    orchEl.textContent = `Orchestrator: ${st.includes('healthy') ? 'OK' : st}`;
-    orchEl.classList.toggle('ok', st.includes('healthy'));
-    orchEl.classList.toggle('bad', st.includes('unreachable'));
+    const perpEntry = (data.tradingStatus?.cycle_health?.details || {}).perp_entry || {};
+    const pref = perpEntry.signal_prefetch || {};
+    const prefHealth = String(pref.health || '');
+    let orchLabel = st.includes('healthy') ? 'OK' : st;
+    if (prefHealth === 'degraded' && st.includes('healthy')) orchLabel = 'OK · sig warn';
+    if (prefHealth === 'failed' && st.includes('healthy')) orchLabel = 'OK · sig fail';
+    orchEl.textContent = `Orchestrator: ${orchLabel}`;
+    orchEl.classList.toggle('ok', st.includes('healthy') && prefHealth !== 'failed');
+    orchEl.classList.toggle('warn', st.includes('healthy') && prefHealth === 'degraded');
+    orchEl.classList.toggle('bad', st.includes('unreachable') || prefHealth === 'failed');
   }
 }
 
@@ -1468,6 +1548,64 @@ function formatReportWindow(start, end) {
     return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   };
   return `${fmt(start)} → ${fmt(end)}`;
+}
+
+function renderProgressWhy(data) {
+  const progress = data.progressWhy || {};
+  const kpis = progress.kpis || {};
+  const targets = progress.targets || {};
+  const body = document.getElementById('progress-why-lanes-body');
+  const target = Number(targets.dailyProfitUsd ?? 20);
+  const maxDd = Number(targets.maxDrawdownPct ?? 5);
+  const onTrack = Boolean(kpis.onTrack);
+
+  setText('progress-avg-daily', money(kpis.avgDailyPnl30d), kpis.avgDailyPnl30d);
+  setText('progress-gap', money(kpis.gapToTargetUsd), -Number(kpis.gapToTargetUsd || 0));
+  setText('progress-today', money(kpis.todayRealizedPnl), kpis.todayRealizedPnl);
+  setText('progress-drawdown', pct(kpis.maxDrawdownPct), -Number(kpis.maxDrawdownPct || 0));
+  setText('progress-dd-budget', pct(kpis.drawdownBudgetRemainingPct));
+  setText('progress-win-rate', pct(kpis.winRate30d));
+  setText('progress-fees', money(kpis.fees30d));
+  setText('progress-open-risk', money(kpis.openRiskUsd));
+  setText(
+    'progress-why-status',
+    onTrack ? `On track vs $${target}/day · DD ≤ ${maxDd}%` : `Off track vs $${target}/day · DD budget ${maxDd}%`,
+  );
+  const summary = document.getElementById('progress-why-summary');
+  if (summary) {
+    summary.textContent = onTrack
+      ? `Rolling ${targets.rollingDays || 30}d average is at or above the daily target with drawdown inside the ${maxDd}% budget.`
+      : `Need $${Number(kpis.gapToTargetUsd || 0).toFixed(2)}/day more on average to hit $${target}; drawdown budget remaining ${Number(kpis.drawdownBudgetRemainingPct || 0).toFixed(2)}%.`;
+  }
+  const charts = document.getElementById('progress-why-charts-link');
+  if (charts && progress.chartsDeepLink) charts.setAttribute('href', progress.chartsDeepLink);
+
+  if (!body) return;
+  const lanes = Array.isArray(progress.lanes) ? progress.lanes : [];
+  if (!lanes.length) {
+    body.innerHTML = '<tr><td colspan="10" class="pi-empty">No lane evidence in the rolling window.</td></tr>';
+    return;
+  }
+  body.innerHTML = lanes.map((lane) => `
+    <tr>
+      <td>
+        <div>${escapeHtml(lane.strategy || 'unknown')}</div>
+        <div class="pi-muted">${escapeHtml(lane.version || 'unversioned')}</div>
+      </td>
+      <td><span class="pi-pill">${escapeHtml(lane.status || 'unknown')}</span></td>
+      <td>${num(lane.sizeMultiplier ?? 1, 2)}×</td>
+      <td class="${cls(lane.pnl7d)}">${money(lane.pnl7d)}</td>
+      <td class="${cls(lane.pnl30d)}">${money(lane.pnl30d)}</td>
+      <td>${fmtProfitFactor(lane.profitFactor)}</td>
+      <td class="${cls(lane.expectancy)}">${money(lane.expectancy)}</td>
+      <td>${num(lane.tradeCount ?? 0, 0)}</td>
+      <td><strong>${escapeHtml(lane.nextAction || '—')}</strong></td>
+      <td>
+        <div class="pi-adaptive-why">${escapeHtml(lane.why || '')}</div>
+        <div class="pi-muted">${escapeHtml(lane.continueCriteria || '')}</div>
+      </td>
+    </tr>
+  `).join('');
 }
 
 function renderPaperPnlReport(data) {
@@ -2024,7 +2162,7 @@ function renderShadowStrategyResults(payload) {
     rawLink.href = `/api/v1/perps/paper-shadow-summary${qs}`;
   }
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="17" class="pi-empty">No shadow opportunities in this window. Try a wider period or wait for eligible strategy setups.</td></tr>';
+    body.innerHTML = '<tr><td colspan="19" class="pi-empty">No shadow opportunities in this window. Try a wider period or wait for eligible strategy setups.</td></tr>';
     return;
   }
   body.innerHTML = rows.map((row) => {
@@ -2054,6 +2192,8 @@ function renderShadowStrategyResults(payload) {
     const exitPolicyLabel = exitPolicyVersion === '2' ? 'Independent v2' : 'Legacy';
     const exitPolicyClass = exitPolicyVersion === '2' ? 'ok' : 'muted';
     const episodePnl = row.episode_realized_pnl != null ? row.episode_realized_pnl : row.realized_pnl;
+    const firstEntry = row.first_entry_time ? formatAdaptiveTime(row.first_entry_time) : 'n/a';
+    const latestActivity = row.last_activity_time ? formatAdaptiveTime(row.last_activity_time) : 'n/a';
     const duplicateHint = closed > episodeClosed && episodeClosed > 0
       ? ` title="Raw rows include ${closed - episodeClosed} duplicate scan(s) in this cohort"`
       : '';
@@ -2061,6 +2201,8 @@ function renderShadowStrategyResults(payload) {
       <td data-label="Strategy"><strong>${escapeHtml(row.source_strategy || 'unknown')}</strong></td>
       <td data-label="Side">${signalChip(row.position_side)}</td>
       <td data-label="Regime">${escapeHtml(row.market_regime || 'unknown')}</td>
+      <td data-label="First entry"><time datetime="${escapeHtml(row.first_entry_time || '')}">${escapeHtml(firstEntry)}</time></td>
+      <td data-label="Latest activity"><time datetime="${escapeHtml(row.last_activity_time || '')}">${escapeHtml(latestActivity)}</time></td>
       <td data-label="Exit policy"><span class="pi-tag ${exitPolicyClass}">${exitPolicyLabel}</span></td>
       <td data-label="Real outcome"><span class="pi-tag ${executionClass}">${escapeHtml(executionLabels[executionStatus] || executionStatus)}</span></td>
       <td data-label="Downstream block">${escapeHtml(blockReason)}</td>
@@ -2101,6 +2243,7 @@ async function loadDashboard() {
   safeRender('topbar', renderHyperliquidTopbar, data);
   safeRender('hero', renderHero, data);
   safeRender('entryRules', renderEntryRulesHint, data);
+  safeRender('progressWhy', renderProgressWhy, data);
   safeRender('pnlReport', renderPaperPnlReport, data);
   safeRender('adaptiveControl', renderAdaptiveControl, data);
   safeRender('supplyDemandAudit', renderSupplyDemandAudit, data);
@@ -2243,7 +2386,7 @@ document.addEventListener('DOMContentLoaded', () => {
     console.error(err);
     setText('shadow-results-meta', 'Unavailable');
     const body = document.getElementById('shadow-results-body');
-    if (body) body.innerHTML = '<tr><td colspan="11" class="pi-empty">Failed to load shadow strategy results.</td></tr>';
+    if (body) body.innerHTML = '<tr><td colspan="19" class="pi-empty">Failed to load shadow strategy results.</td></tr>';
   });
   setInterval(() => loadDashboard().catch(console.error), 30000);
   setInterval(() => loadShadowStrategyResults().catch(console.error), 30000);

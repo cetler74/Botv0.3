@@ -30,10 +30,14 @@ def evaluate_live_readiness(
     rows: List[Dict[str, Any]],
     promotion_cfg: Dict[str, Any],
     *,
-    strategy: str = "rsi_stoch_reversal_5m",
+    strategy: str = "rsi_stoch_reversal_15m",
+    validation_manifest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Return {ready, reasons, metrics} for rsi_stoch paper trades vs promotion thresholds.
+    Return {ready, reasons, metrics} for paper trades vs promotion thresholds.
+
+    Offline walk-forward approval is required when configured; backtest completion
+    alone never sets ready=True.
     """
     cfg = promotion_cfg or {}
     lookback_hours = float(cfg.get("lookback_hours", 168) or 168)
@@ -43,8 +47,9 @@ def evaluate_live_readiness(
     min_wr = float(cfg.get("min_win_rate", 0.52) or 0.52)
     max_consec = int(cfg.get("max_consecutive_losses", 4) or 4)
     require_24h = bool(cfg.get("require_positive_last_24h", True))
+    require_manifest = bool(cfg.get("require_validation_manifest", True))
 
-    strat_lc = str(strategy or "rsi_stoch_reversal_5m").strip().lower()
+    strat_lc = str(strategy or "rsi_stoch_reversal_15m").strip().lower()
     filtered = [
         r
         for r in rows
@@ -67,6 +72,39 @@ def evaluate_live_readiness(
     pf = agg.get("profitFactor")
     pf_val = float(pf) if pf is not None else None
     consec = _consecutive_losses(closed)
+
+    if require_manifest:
+        try:
+            from progress_why import load_validation_manifest, normalize_validation_manifest
+        except ImportError:  # pragma: no cover
+            from core.progress_why import (
+                load_validation_manifest,
+                normalize_validation_manifest,
+            )
+        manifest = normalize_validation_manifest(
+            validation_manifest
+            if isinstance(validation_manifest, dict)
+            else load_validation_manifest()
+        )
+        approved = {
+            str(x).strip().lower()
+            for x in (manifest.get("approved_strategies") or [])
+            if str(x).strip()
+        }
+        rejected = {
+            str(x).strip().lower()
+            for x in (manifest.get("rejected_strategies") or [])
+            if str(x).strip()
+        }
+        gates = manifest.get("target_gates") if isinstance(manifest.get("target_gates"), dict) else {}
+        if strat_lc in rejected:
+            reasons.append(f"validation_manifest rejected {strat_lc}")
+        elif strat_lc not in approved:
+            reasons.append(f"validation_manifest missing approval for {strat_lc}")
+        if gates and not bool(gates.get("all_passed")):
+            reasons.append("validation_manifest target_gates.all_passed is false")
+        if bool(manifest.get("promotion_performed")):
+            reasons.append("validation_manifest already marked promotion_performed")
 
     if n_closed < min_closed:
         reasons.append(f"closed_trades {n_closed} < {min_closed}")
@@ -101,6 +139,7 @@ def evaluate_live_readiness(
         "profit_factor": pf_val,
         "consecutive_losses": consec,
         "last_24h_realized_pnl_usd": pnl_24h,
+        "require_validation_manifest": require_manifest,
     }
     return {
         "ready": len(reasons) == 0,

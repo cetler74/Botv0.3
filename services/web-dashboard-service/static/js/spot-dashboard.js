@@ -627,6 +627,64 @@ function formatReportWindow(start, end) {
   return `${fmt(start)} → ${fmt(end)}`;
 }
 
+function renderProgressWhy(data) {
+  const progress = data.progressWhy || {};
+  const kpis = progress.kpis || {};
+  const targets = progress.targets || {};
+  const body = document.getElementById('progress-why-lanes-body');
+  const target = Number(targets.dailyProfitUsd ?? 20);
+  const maxDd = Number(targets.maxDrawdownPct ?? 5);
+  const onTrack = Boolean(kpis.onTrack);
+
+  setText('progress-avg-daily', money(kpis.avgDailyPnl30d), kpis.avgDailyPnl30d);
+  setText('progress-gap', money(kpis.gapToTargetUsd), -Number(kpis.gapToTargetUsd || 0));
+  setText('progress-today', money(kpis.todayRealizedPnl), kpis.todayRealizedPnl);
+  setText('progress-drawdown', pct(kpis.maxDrawdownPct), -Number(kpis.maxDrawdownPct || 0));
+  setText('progress-dd-budget', pct(kpis.drawdownBudgetRemainingPct));
+  setText('progress-win-rate', pct(kpis.winRate30d));
+  setText('progress-fees', money(kpis.fees30d));
+  setText('progress-open-risk', money(kpis.openRiskUsd));
+  setText(
+    'progress-why-status',
+    onTrack ? `On track vs $${target}/day · DD ≤ ${maxDd}%` : `Off track vs $${target}/day · DD budget ${maxDd}%`,
+  );
+  const summary = document.getElementById('progress-why-summary');
+  if (summary) {
+    summary.textContent = onTrack
+      ? `Rolling ${targets.rollingDays || 30}d average is at or above the daily target with drawdown inside the ${maxDd}% budget.`
+      : `Need $${Number(kpis.gapToTargetUsd || 0).toFixed(2)}/day more on average to hit $${target}; drawdown budget remaining ${Number(kpis.drawdownBudgetRemainingPct || 0).toFixed(2)}%.`;
+  }
+  const charts = document.getElementById('progress-why-charts-link');
+  if (charts && progress.chartsDeepLink) charts.setAttribute('href', progress.chartsDeepLink);
+
+  if (!body) return;
+  const lanes = Array.isArray(progress.lanes) ? progress.lanes : [];
+  if (!lanes.length) {
+    body.innerHTML = '<tr><td colspan="10" class="pi-empty">No lane evidence in the rolling window.</td></tr>';
+    return;
+  }
+  body.innerHTML = lanes.map((lane) => `
+    <tr>
+      <td>
+        <div>${escapeHtml(lane.strategy || 'unknown')}</div>
+        <div class="pi-muted">${escapeHtml(lane.version || 'unversioned')}</div>
+      </td>
+      <td><span class="pi-pill">${escapeHtml(lane.status || 'unknown')}</span></td>
+      <td>${num(lane.sizeMultiplier ?? 1, 2)}×</td>
+      <td class="${cls(lane.pnl7d)}">${money(lane.pnl7d)}</td>
+      <td class="${cls(lane.pnl30d)}">${money(lane.pnl30d)}</td>
+      <td>${fmtProfitFactor(lane.profitFactor)}</td>
+      <td class="${cls(lane.expectancy)}">${money(lane.expectancy)}</td>
+      <td>${num(lane.tradeCount ?? 0, 0)}</td>
+      <td><strong>${escapeHtml(lane.nextAction || '—')}</strong></td>
+      <td>
+        <div class="pi-adaptive-why">${escapeHtml(lane.why || '')}</div>
+        <div class="pi-muted">${escapeHtml(lane.continueCriteria || '')}</div>
+      </td>
+    </tr>
+  `).join('');
+}
+
 function pnlBreakdownLabel(row) {
   if (state.pnlTab === 'exchange') return exchangeLabel(row.label);
   return row.label;
@@ -981,6 +1039,7 @@ async function loadDashboard() {
   state.payload = data;
   safeRender('topbar', renderTopbar, data);
   safeRender('hero', renderHero, data);
+  safeRender('progressWhy', renderProgressWhy, data);
   safeRender('spotPnlReport', renderSpotPnlReport, data);
   safeRender('supplyDemandAudit', renderSupplyDemandAudit, data);
   safeRender('arcAudit', renderArcAudit, data);

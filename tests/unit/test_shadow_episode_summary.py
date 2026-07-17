@@ -4,6 +4,7 @@ from core.shadow_episode_summary import (
     enrich_shadow_summary_cohorts,
     independent_closed_episode_rows,
     shadow_summary_totals,
+    shadow_promotion_cohorts_from_trades,
 )
 
 
@@ -158,3 +159,29 @@ def test_shadow_summary_totals_reports_inflation_ratio():
     assert totals["raw"]["closed_count"] == 2
     assert totals["episode"]["closed_count"] == 1
     assert totals["episode_inflation_ratio"] == 2.0
+    assert totals["episode"]["expectancy"] == 1.0
+    assert totals["episode"]["max_drawdown"] == 0.0
+
+
+def test_promotion_cohort_includes_profit_factor_holdout_and_concentration():
+    rows = []
+    for index, pnl in enumerate([1.0, -0.5, 1.0, 1.0, -0.5, 1.0]):
+        rows.append(
+            _shadow_row(
+                strategy="arc_daytrade",
+                coin="SOL",
+                side="short",
+                entry=f"2026-06-2{index}T10:00:00+00:00",
+                exit_time=f"2026-06-2{index}T11:00:00+00:00",
+                pnl=pnl,
+                regime="trending_up",
+            )
+        )
+    cohort = shadow_promotion_cohorts_from_trades(rows)[
+        ("SOL", "arc_daytrade", "short", "trending_up")
+    ]
+    assert cohort["episodes"] == 6
+    assert cohort["profit_factor"] == 4.0
+    assert cohort["training_realized"] > 0
+    assert cohort["holdout_realized"] > 0
+    assert cohort["max_winner_contribution"] == 0.25

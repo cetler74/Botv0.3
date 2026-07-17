@@ -13,6 +13,7 @@ import httpx
 import redis.asyncio as redis
 
 from hyperliquid_perps import encode_setup_risk_entry_reason, setup_risk_metadata_from_signal
+from core.strategy_trade_evidence import encode_strategy_evidence_entry_reason
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,10 @@ class RedisOrderManager:
         summary = (signal.get("strategy_gate_summary") or "").strip()
         if summary:
             base = f"{base} TA: {summary}"
+        base = encode_strategy_evidence_entry_reason(
+            base,
+            signal.get("entry_evidence") or {},
+        )
         setup = setup_risk_metadata_from_signal(signal)
         return encode_setup_risk_entry_reason(base, setup)
 
@@ -93,7 +98,7 @@ class RedisOrderManager:
                 "side": "buy" if signal.get("signal") == "buy" else "sell",
                 "amount": sanitized_position_size,
                 "strategy": strategy_name,
-                "entry_reason": f"{strategy_name} strategy signal: {signal.get('signal', 'buy')} (confidence: {signal.get('confidence', 0):.2f})"
+                "entry_reason": self._build_entry_reason(strategy_name, signal),
             }
             
             # Submit to order queue
@@ -461,6 +466,9 @@ class RedisOrderManager:
                     "consensus_confidence": signal.get("consensus_confidence"),
                     "consensus_agreement": signal.get("consensus_agreement"),
                     "setup_risk": setup_risk_metadata_from_signal(signal),
+                    "setup_memory": signal.get("setup_memory") or {},
+                    "entry_evidence": signal.get("entry_evidence") or {},
+                    **(signal.get("entry_evidence") or {}),
                 },
             }
             

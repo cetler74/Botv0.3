@@ -12,15 +12,13 @@ from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-STRATEGY_KEY = "rsi_stoch_reversal_5m"
+STRATEGY_KEY = "rsi_stoch_reversal_15m"
 ORB_STRATEGY_KEY = "orb_5m_scalp"
 RSI_STOCH_REVERSAL_STRATEGIES = frozenset(
-    {"rsi_stoch_reversal_5m", "rsi_stoch_reversal_1m"}
+    {"rsi_stoch_reversal_15m"}
 )
 DAYTRADE_FAST_STRATEGIES = frozenset(
     {
-        "ema50_breakout_pullback",
-        "arc_daytrade",
         "dual_sma_daytrade",
         "supply_demand_3step",
     }
@@ -29,7 +27,7 @@ DEFAULT_TTL_SECONDS = 45
 ORB_FAST_TTL_SECONDS = 960
 DAYTRADE_FAST_TTL_SECONDS = 45
 HOLD_TTL_SECONDS = 15
-RSI_STOCH_BAR_MAX_AGE_SECONDS = 360
+RSI_STOCH_BAR_MAX_AGE_SECONDS = 960
 
 
 def _normalize_hyperliquid_symbol(symbol: str) -> str:

@@ -17,7 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY services/database-service/*.py ./
 COPY core/hyperliquid_ledger.py ./hyperliquid_ledger.py
 COPY core/perp_paper_pnl_report.py ./perp_paper_pnl_report.py
+COPY core/strategy_trade_evidence.py ./strategy_trade_evidence.py
 COPY core/hyperliquid_live_readiness.py ./hyperliquid_live_readiness.py
+COPY core/progress_why.py ./progress_why.py
 COPY core/supply_demand_audit_summary.py ./supply_demand_audit_summary.py
 COPY core/dual_sma_audit_summary.py ./dual_sma_audit_summary.py
 COPY core/arc_audit_summary.py ./arc_audit_summary.py

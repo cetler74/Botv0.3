@@ -29,7 +29,7 @@ from core.hyperliquid_market import normalize_hyperliquid_coin
 from strategy.market_regime_detector import MarketRegimeDetector, MarketRegime
 
 RSI_STOCH_REVERSAL_STRATEGIES = frozenset(
-    {"rsi_stoch_reversal_5m", "rsi_stoch_reversal_1m"}
+    {"rsi_stoch_reversal_15m"}
 )
 
 
@@ -49,7 +49,7 @@ def _uses_fast_signal_cache(strategy_name: str) -> bool:
 
 
 def _rsi_stoch_default_entry_timeframe(strategy_name: str) -> str:
-    return "1m" if str(strategy_name or "").strip().lower().endswith("_1m") else "5m"
+    return "15m"
 
 
 def _strategy_entry_timeframe(strategy_name: str, strategy_data: Any = None) -> str:
@@ -74,14 +74,12 @@ def _strategy_signal_timeframes(strategy_name: str, strategy_data: Any = None) -
 
     def add(tf: Any) -> None:
         value = str(tf or "").strip().lower()
-        if value and value not in ordered:
+        if value in {"1h", "15m", "1m"} and value not in ordered:
             ordered.append(value)
 
     # Strategy configuration keeps ``target_timeframes`` at the strategy root,
-    # while several older strategies keep timeframe hints under ``parameters``.
-    # Read both shapes. Missing the root value made the daytrade fast publisher
-    # evaluate EMA50 with its generic fallback frame, so the 4h-only engine
-    # returned ``missing_timeframe:4h`` even though the exchange had 4h candles.
+    # while several wrappers keep timeframe hints under ``parameters``. Read
+    # both shapes, then admit only the canonical execution frames.
     for tf in cfg.get("target_timeframes") or []:
         add(tf)
     for tf in params.get("target_timeframes") or []:
@@ -314,16 +312,14 @@ class StrategyPerformance(BaseModel):
     max_drawdown: float
     period: str
 
-DEFAULT_ANALYSIS_TIMEFRAMES = ['1h', '4h', '15m', '5m', '1m', '1d', '1w']
+DEFAULT_ANALYSIS_TIMEFRAMES = ['1h', '15m']
 
 
 def _ohlcv_fetch_limit(timeframe: str) -> int:
     """Return enough closed candles for the strictest enabled spot setup on a timeframe."""
     tf = str(timeframe or "").lower()
-    if tf in ("5m", "1m"):
-        # SMA reclaim uses SMA200 on the 5m entry frame and rejects <210 candles.
-        # We drop the currently-building bar after fetch, so request a safe buffer.
-        return 240
+    if tf == "1m":
+        return 180
     if tf in ("1h", "15m"):
         return 240
     if tf == "1d":
@@ -337,18 +333,8 @@ def _ohlcv_fetch_limit(timeframe: str) -> int:
     return 110
 
 class AnalysisRequest(BaseModel):
-    # PnL-FIX v4: Default timeframes updated to the union of all strategies'
-    # declared target_timeframes in config.yaml:
-    #   - heikin_ashi:          [4h, 1h, 15m]
-    #   - engulfing_multi_tf:   [4h, 1h, 15m]
-    #   - vwma_hull:            [4h, 1h, 15m]
-    #   - multi_timeframe_confluence: [1h, 15m]
-    # The previous default ['1h', '15m', '5m'] never fetched 4h, which meant
-    # vwma_hull silently skipped its 4h macro-bullish HARD VETO (PnL-FIX v3)
-    # and engulfing_multi_tf fell back to using 1h as a pseudo-macro. ``5m``
-    # wasn't declared by any strategy — dropping it removes one wasted call.
-    # Order matters: ``timeframes[0]`` is the "primary" used for market-regime
-    # detection, so keep 1h first (4h regimes would react too slowly).
+    # Executable strategies use 1h context plus configured 15m/1m entry frames.
+    # Keep 1h first because ``timeframes[0]`` drives regime detection.
     timeframes: List[str] = DEFAULT_ANALYSIS_TIMEFRAMES
     strategies: Optional[List[str]] = None
     include_indicators: bool = True
@@ -384,6 +370,7 @@ strategy_manager = None
 fast_signal_redis_client = None
 hyperliquid_strategy_manager = None
 hl_signal_cache: Dict[str, Any] = {}
+_hl_coin_analyze_sem: Optional[asyncio.Semaphore] = None
 config_service_url = os.getenv("CONFIG_SERVICE_URL", "http://config-service:8001")
 exchange_service_url = os.getenv("EXCHANGE_SERVICE_URL", "http://exchange-service:8003")
 # Compose DNS uses the service name `database-service` (hyphen). A legacy default used
@@ -1091,6 +1078,10 @@ class StrategyManager:
                 'module': 'rsi_oversold_checklist_strategy',
                 'class': 'RSIOversoldChecklistStrategy'
             },
+            'weekly_fibonacci_spot': {
+                'module': 'weekly_fibonacci_spot_strategy',
+                'class': 'WeeklyFibonacciSpotStrategy'
+            },
             'rsi_oversold_override': {
                 'module': 'rsi_oversold_override_strategy',
                 'class': 'RSIOversoldOverrideStrategy'
@@ -1143,13 +1134,17 @@ class StrategyManager:
                 'module': 'sma_reclaim_bull_flag_strategy',
                 'class': 'SmaReclaimBullFlagStrategy',
             },
-            'rsi_stoch_reversal_5m': {
-                'module': 'rsi_stoch_reversal_5m_strategy',
-                'class': 'RsiStochReversal5mStrategy',
+            'rsi_stoch_reversal_15m': {
+                'module': 'rsi_stoch_reversal_15m_strategy',
+                'class': 'RsiStochReversal15mStrategy',
             },
-            'rsi_stoch_reversal_1m': {
-                'module': 'rsi_stoch_reversal_1m_strategy',
-                'class': 'RsiStochReversal1mStrategy',
+            'donchian_atr_pullback': {
+                'module': 'donchian_atr_pullback_strategy',
+                'class': 'DonchianAtrPullbackStrategy',
+            },
+            'vwap_rsi_mean_reversion': {
+                'module': 'vwap_rsi_mean_reversion_strategy',
+                'class': 'VwapRsiMeanReversionStrategy',
             },
             'supply_demand_3step': {
                 'module': 'supply_demand_3step_strategy',
@@ -1233,7 +1228,11 @@ class StrategyManager:
                 across concurrent analyses.
         """
         try:
-            timeframes = list(timeframes or DEFAULT_ANALYSIS_TIMEFRAMES)
+            timeframes = [
+                tf
+                for tf in (timeframes or DEFAULT_ANALYSIS_TIMEFRAMES)
+                if str(tf).lower() in {"1h", "15m", "1m"}
+            ] or list(DEFAULT_ANALYSIS_TIMEFRAMES)
             # Get market data for all timeframes
             market_data = await self._get_market_data_for_strategy(
                 exchange_name, pair, timeframes
@@ -1289,6 +1288,18 @@ class StrategyManager:
                     and "rsi_oversold_checklist" not in applicable_strategies
                 ):
                     applicable_strategies.append("rsi_oversold_checklist")
+                if (
+                    "weekly_fibonacci_spot" in strategies
+                    and strategies["weekly_fibonacci_spot"].get("enabled", False)
+                    and "weekly_fibonacci_spot" not in applicable_strategies
+                ):
+                    applicable_strategies.append("weekly_fibonacci_spot")
+                if (
+                    "rsi_stoch_reversal_15m" in strategies
+                    and strategies["rsi_stoch_reversal_15m"].get("enabled", False)
+                    and "rsi_stoch_reversal_15m" not in applicable_strategies
+                ):
+                    applicable_strategies.append("rsi_stoch_reversal_15m")
                 if (
                     "macd_ema_vwap_scalper" in strategies
                     and strategies["macd_ema_vwap_scalper"].get("enabled", False)
@@ -1694,6 +1705,17 @@ class StrategyManager:
                         'is_primary': False,
                     })
                     continue
+                if strategy_name == "weekly_fibonacci_spot":
+                    valid_signals.append({
+                        'strategy': strategy_name,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'strength': strength,
+                        'weight': 0.0,
+                        'regime': selected_for_regime,
+                        'is_primary': False,
+                    })
+                    continue
                 if strategy_name == "macd_momentum":
                     valid_signals.append({
                         'strategy': strategy_name,
@@ -2005,7 +2027,11 @@ class StrategyManager:
         """Get market data for strategy analysis"""
         try:
             market_data = {}
-            timeframes = list(timeframes or DEFAULT_ANALYSIS_TIMEFRAMES)
+            timeframes = [
+                tf
+                for tf in (timeframes or DEFAULT_ANALYSIS_TIMEFRAMES)
+                if str(tf).lower() in {"1h", "15m", "1m"}
+            ] or list(DEFAULT_ANALYSIS_TIMEFRAMES)
             # Hard freshness gate: do not analyze on stale OHLCV snapshots.
             # If exchange data lags too much, we skip that timeframe and fail-safe to no entry.
             tf_seconds_map = {
@@ -2427,7 +2453,7 @@ async def _fast_signal_enabled() -> bool:
     from strategy.fast_signal_cache import DAYTRADE_FAST_STRATEGIES
 
     try:
-        spot_cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
+        spot_cfg = (strategies or {}).get("rsi_stoch_reversal_15m") or {}
         hl_cfg = {}
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(f"{config_service_url}/api/v1/config/strategies-hyperliquid")
@@ -2438,7 +2464,6 @@ async def _fast_signal_enabled() -> bool:
         hl_on = False
         for strategy_name in (
             *RSI_STOCH_REVERSAL_STRATEGIES,
-            "orb_5m_scalp",
             *DAYTRADE_FAST_STRATEGIES,
         ):
             cfg = (hl_cfg or {}).get(strategy_name) or {}
@@ -2486,7 +2511,7 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
         return {}, False
 
     def _spot_rsi_params() -> tuple:
-        cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
+        cfg = (strategies or {}).get("rsi_stoch_reversal_15m") or {}
         params = cfg.get("parameters") or {}
         return params, bool(params.get("allow_short", False))
 
@@ -2503,7 +2528,7 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
 
                 fast_signal_redis_client = await create_redis_client()
 
-            spot_cfg = (strategies or {}).get("rsi_stoch_reversal_5m") or {}
+            spot_cfg = (strategies or {}).get("rsi_stoch_reversal_15m") or {}
             spot_enabled = bool(spot_cfg.get("enabled"))
             hl_enabled: Dict[str, Any] = {}
             try:
@@ -2556,11 +2581,11 @@ async def rsi_stoch_reversal_5m_fast_loop() -> None:
                             result = await strategy_manager.analyze_pair(
                                 exchange,
                                 pair,
-                                ["5m"],
-                                strategy_allowlist=["rsi_stoch_reversal_5m"],
+                                ["1h", "15m"],
+                                strategy_allowlist=["rsi_stoch_reversal_15m"],
                             )
                             strat = (result.get("strategies") or {}).get(
-                    "rsi_stoch_reversal_5m"
+                    "rsi_stoch_reversal_15m"
                             ) or {}
                             sig = str(strat.get("signal") or "hold").lower()
                             conf = float(strat.get("confidence") or 0)
@@ -3057,7 +3082,13 @@ async def get_hyperliquid_signals(coin: str):
     cache_key = f"hl_{symbol}_{int(datetime.utcnow().timestamp() / 300)}"
     if cache_key in hl_signal_cache:
         return hl_signal_cache[cache_key]
-    results = await hyperliquid_strategy_manager.analyze_coin(symbol)
+    global _hl_coin_analyze_sem
+    if _hl_coin_analyze_sem is None:
+        _hl_coin_analyze_sem = asyncio.Semaphore(
+            max(1, min(int(os.getenv("HL_COIN_ANALYZE_CONCURRENCY", "6")), 10))
+        )
+    async with _hl_coin_analyze_sem:
+        results = await hyperliquid_strategy_manager.analyze_coin(symbol)
     if not results:
         raise HTTPException(status_code=404, detail=f"No HL signals for {symbol}")
     try:
@@ -3079,7 +3110,7 @@ async def analyze_hyperliquid_coin(coin: str, request: AnalysisRequest):
     symbol = _normalize_hl_coin_path(coin)
     results = await hyperliquid_strategy_manager.analyze_coin(
         symbol,
-        request.timeframes or ["1h", "4h", "15m", "5m"],
+        request.timeframes or DEFAULT_ANALYSIS_TIMEFRAMES,
         strategy_allowlist=request.strategies,
     )
     if not results:

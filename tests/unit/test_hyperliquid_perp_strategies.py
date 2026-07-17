@@ -9,7 +9,7 @@ from strategy.hyperliquid.macd_momentum_perp import MacdMomentumPerpStrategy
 import strategy.hyperliquid.sma_reclaim_bull_flag_perp as sma_reclaim_perp_module
 from strategy.hyperliquid.mapping import HYPERLIQUID_STRATEGY_MAPPING
 from strategy.hyperliquid.intraday_base_perp import IntradayPerpBaseStrategy
-from strategy.hyperliquid.rsi_stoch_reversal_1m_perp import RsiStochReversal1mPerpStrategy
+from strategy.hyperliquid.rsi_stoch_reversal_15m_perp import RsiStochReversal15mPerpStrategy
 from strategy.hyperliquid.sma_reclaim_bull_flag_perp import SmaReclaimBullFlagPerpStrategy
 from strategy.hyperliquid.vwma_hull_perp import VwmaHullPerpStrategy
 from strategy.playbooks.rsi_stoch_reversal_5m_engine import EngineResult as RsiStochEngineResult
@@ -173,7 +173,7 @@ def test_all_mapped_strategies_have_modules():
         assert cls
 
 
-def test_all_enabled_hyperliquid_strategies_are_short_capable():
+def test_enabled_hyperliquid_strategies_honor_directional_configuration():
     config_path = Path(__file__).resolve().parents[2] / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
     hl_cfg = cfg.get("strategies_hyperliquid", {})
@@ -185,7 +185,12 @@ def test_all_enabled_hyperliquid_strategies_are_short_capable():
         if name in LONG_ONLY_HL_STRATEGIES:
             assert strategy_cfg.get("parameters", {}).get("allow_short") is False
             continue
-        assert strategy_cfg.get("parameters", {}).get("allow_short") is True
+        parameters = strategy_cfg.get("parameters", {})
+        allow_long = parameters.get("allow_long") is True
+        allow_short = parameters.get("allow_short") is True
+        assert allow_long or allow_short, f"{name} has no executable direction enabled"
+        if not allow_short:
+            continue
 
         module = importlib.import_module(module_name)
         strategy_cls = getattr(module, class_name)
@@ -208,32 +213,32 @@ def test_hl_rsi_stoch_blocks_high_volatility_shorts_only():
     assert "high_volatility" in params.get("short_blocked_regimes", [])
 
 
-def test_hl_rsi_stoch_1m_registered_and_has_unblocked_breakout_high_vol_short():
-    module_name, class_name = HYPERLIQUID_STRATEGY_MAPPING["rsi_stoch_reversal_1m"]
+def test_hl_rsi_stoch_15m_registered_and_legacy_aliases_removed():
+    module_name, class_name = HYPERLIQUID_STRATEGY_MAPPING["rsi_stoch_reversal_15m"]
     module = importlib.import_module(module_name)
-    assert getattr(module, class_name) is RsiStochReversal1mPerpStrategy
+    assert getattr(module, class_name) is RsiStochReversal15mPerpStrategy
+    assert "rsi_stoch_reversal_1m" not in HYPERLIQUID_STRATEGY_MAPPING
+    assert "rsi_stoch_reversal_5m" not in HYPERLIQUID_STRATEGY_MAPPING
 
     config_path = Path(__file__).resolve().parents[2] / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
     params = (
         cfg.get("strategies_hyperliquid", {})
-        .get("rsi_stoch_reversal_1m", {})
+        .get("rsi_stoch_reversal_15m", {})
         .get("parameters", {})
     )
 
     assert params.get("allow_long") is True
     assert params.get("allow_short") is True
-    assert str(params.get("entry_timeframe")) == "1m"
-    assert str(params.get("confirmation_timeframe")) == "5m"
+    assert str(params.get("entry_timeframe")) == "15m"
+    assert str(params.get("confirmation_timeframe")) == "1h"
     assert params.get("require_confirmation") is True
-    assert float(params.get("min_stoch_cross_gap")) == pytest.approx(4.0)
-    assert float(params.get("min_expected_move_pct")) == pytest.approx(0.8)
-    assert "breakout" not in params.get("blocked_regimes", [])
-    assert "high_volatility" not in params.get("short_blocked_regimes", [])
+    assert "breakout" in params.get("blocked_regimes", [])
+    assert "high_volatility" in params.get("short_blocked_regimes", [])
 
 
 @pytest.mark.asyncio
-async def test_rsi_stoch_1m_perp_maps_engine_signals_and_passes_required_timeframes(monkeypatch):
+async def test_rsi_stoch_15m_perp_maps_engine_signals_and_passes_required_timeframes(monkeypatch):
     captured = {}
 
     def fake_eval(market_data, params, **kwargs):
@@ -258,7 +263,7 @@ async def test_rsi_stoch_1m_perp_maps_engine_signals_and_passes_required_timefra
         "strategy.hyperliquid.rsi_stoch_reversal_5m_perp.evaluate_rsi_stoch_reversal_5m",
         fake_eval,
     )
-    strat = RsiStochReversal1mPerpStrategy(
+    strat = RsiStochReversal15mPerpStrategy(
         config={"parameters": {"allow_long": True, "allow_short": True}},
         exchange=None,
         database=None,
@@ -266,14 +271,14 @@ async def test_rsi_stoch_1m_perp_maps_engine_signals_and_passes_required_timefra
     await strat.initialize("BTC")
 
     short_signal, short_conf, _ = await strat.generate_signal(
-        {"1m": _synthetic_ohlcv(), "5m": _synthetic_ohlcv()}, pair="BTC"
+        {"1h": _synthetic_ohlcv(), "15m": _synthetic_ohlcv()}, pair="BTC"
     )
     long_signal, long_conf, _ = await strat.generate_signal(
-        {"1m": _synthetic_ohlcv(), "5m": _synthetic_ohlcv()}, pair="BTC"
+        {"1h": _synthetic_ohlcv(), "15m": _synthetic_ohlcv()}, pair="BTC"
     )
 
-    assert captured["keys"] == ["1m", "5m"]
-    assert captured["entry_timeframe"] == "1m"
+    assert captured["keys"] == ["1h", "15m"]
+    assert captured["entry_timeframe"] == "15m"
     assert short_signal == "short"
     assert short_conf == pytest.approx(0.72)
     assert long_signal == "long"

@@ -51,55 +51,49 @@ def _load_strategy_service_main():
 def test_ohlcv_fetch_limit_covers_sma200_entry_frames():
     mod = _load_strategy_service_main()
 
-    assert mod._ohlcv_fetch_limit("5m") >= 211
-    assert mod._ohlcv_fetch_limit("1m") >= 211
     assert mod._ohlcv_fetch_limit("15m") >= 211
     assert mod._ohlcv_fetch_limit("1h") >= 211
-    assert mod._ohlcv_fetch_limit("1d") >= 211
-    assert mod._ohlcv_fetch_limit("1w") >= 211
-    assert mod._ohlcv_fetch_limit("4h") == 150
+    assert mod._ohlcv_fetch_limit("1m") >= 130
+    assert mod.DEFAULT_ANALYSIS_TIMEFRAMES == ["1h", "15m"]
 
 
-def test_rsi_stoch_strategy_family_resolves_1m_fast_route():
+def test_rsi_stoch_strategy_family_resolves_versioned_15m_route_only():
     mod = _load_strategy_service_main()
 
-    assert mod._is_rsi_stoch_reversal_strategy("rsi_stoch_reversal_5m") is True
-    assert mod._is_rsi_stoch_reversal_strategy("rsi_stoch_reversal_1m") is True
+    assert mod._is_rsi_stoch_reversal_strategy("rsi_stoch_reversal_15m") is True
+    assert mod._is_rsi_stoch_reversal_strategy("rsi_stoch_reversal_5m") is False
+    assert mod._is_rsi_stoch_reversal_strategy("rsi_stoch_reversal_1m") is False
     assert mod._is_rsi_stoch_reversal_strategy("macd_momentum") is False
-    assert (
-        mod._strategy_entry_timeframe(
-            "rsi_stoch_reversal_1m",
-            {"parameters": {"entry_timeframe": "1m"}},
-        )
-        == "1m"
-    )
     assert mod._strategy_signal_timeframes(
-        "rsi_stoch_reversal_1m",
-        {"parameters": {"entry_timeframe": "1m", "confirmation_timeframe": "5m"}},
-    ) == ["1m", "5m"]
-    assert (
-        mod._strategy_entry_timeframe(
-            "rsi_stoch_reversal_1m",
-            {"config": {"parameters": {"entry_timeframe": "1m"}}},
-        )
-        == "1m"
-    )
+        "rsi_stoch_reversal_15m",
+        {"parameters": {"entry_timeframe": "15m", "confirmation_timeframe": "1h"}},
+    ) == ["15m", "1h"]
 
 
-def test_strategy_signal_timeframes_reads_root_target_timeframes():
+def test_strategy_signal_timeframes_rejects_noncanonical_root_timeframes():
     mod = _load_strategy_service_main()
 
     cfg = {
         "target_timeframes": ["4h"],
         "parameters": {"primary_timeframe": "4h"},
     }
-    assert mod._strategy_signal_timeframes("ema50_breakout_pullback", cfg) == ["4h"]
+    assert mod._strategy_signal_timeframes("ema50_breakout_pullback", cfg) == ["15m"]
 
     wrapped = {"config": cfg, "enabled": True}
-    assert mod._strategy_signal_timeframes("ema50_breakout_pullback", wrapped) == ["4h"]
+    assert mod._strategy_signal_timeframes("ema50_breakout_pullback", wrapped) == ["15m"]
 
 
-def test_rsi_stoch_1m_in_standalone_applicable_strategy_list():
+def test_strategy_signal_timeframes_allows_heikin_ashi_1m_scalper():
+    mod = _load_strategy_service_main()
+
+    cfg = {
+        "target_timeframes": ["1m"],
+        "parameters": {"entry_timeframe": "1m"},
+    }
+    assert mod._strategy_signal_timeframes("heikin_ashi_1m_scalper", cfg) == ["1m"]
+
+
+def test_rsi_stoch_15m_in_standalone_applicable_strategy_list():
     module_path = (
         Path(__file__).resolve().parents[2]
         / "services"
@@ -108,5 +102,4 @@ def test_rsi_stoch_1m_in_standalone_applicable_strategy_list():
     )
     source = module_path.read_text()
 
-    assert '"rsi_stoch_reversal_5m",' in source
-    assert '"rsi_stoch_reversal_1m",' in source
+    assert "rsi_stoch_reversal_15m" in source

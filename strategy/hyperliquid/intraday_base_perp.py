@@ -29,9 +29,9 @@ class IntradayPerpBaseStrategy(BasePerpStrategy):
         super().__init__(config, exchange, database, redis_client)
         self.exchange_name = exchange_name
         params = config.get("parameters", {}) if isinstance(config, dict) else {}
-        self.trend_timeframe = str(params.get("trend_timeframe", "15m")).lower()
-        self.entry_timeframe = str(params.get("entry_timeframe", "5m")).lower()
-        self.execution_timeframe = str(params.get("execution_timeframe", "1m")).lower()
+        self.trend_timeframe = str(params.get("trend_timeframe", "1h")).lower()
+        self.entry_timeframe = str(params.get("entry_timeframe", "15m")).lower()
+        self.execution_timeframe = str(params.get("execution_timeframe", "15m")).lower()
         self.session_tz = str(params.get("session_tz", "UTC"))
         self.rsi_period = int(params.get("rsi_period", 14))
         self.volume_window = int(params.get("volume_window", 20))

@@ -1,5 +1,7 @@
+import asyncio
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,9 +27,14 @@ from hyperliquid_perps import (  # noqa: E402
     hyperliquid_adaptive_entry_sizing_multiplier,
     hyperliquid_min_edge_gate,
     hyperliquid_daily_profit_target_halt,
+    hyperliquid_coin_strategy_entry_deny,
     hyperliquid_reentry_cooldown_check,
     hyperliquid_regime_direction_gate,
     hyperliquid_shadow_promotion_requirement,
+    hyperliquid_signal_prefetch_health,
+    hyperliquid_signal_prefetch_settings,
+    fetch_hyperliquid_entry_signal_payload,
+    prefetch_hyperliquid_entry_signals,
     hyperliquid_standalone_entry_gate,
     hyperliquid_strategy_pnl_multiplier,
     hyperliquid_strategy_side_performance,
@@ -43,6 +50,7 @@ from hyperliquid_perps import (  # noqa: E402
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
     perp_entry_atr_metadata,
+    perp_lane_notional_multiplier,
     perp_side_fee,
     pair_to_hyperliquid_coin,
     pnl_percentage,
@@ -52,6 +60,7 @@ from hyperliquid_perps import (  # noqa: E402
     executable_size_requalification_passes,
     select_mirrored_signal,
     setup_risk_metadata_from_signal,
+    ta_evidence_from_signal,
     sma_reclaim_bull_flag_specialist_gate,
     supply_demand_3step_specialist_gate,
     dual_sma_daytrade_specialist_gate,
@@ -60,11 +69,37 @@ from hyperliquid_perps import (  # noqa: E402
     strategy_min_size_multiplier,
     strategy_risk_per_trade_pct,
     hyperliquid_risk_based_notional,
+    dynamic_min_notional,
+    adaptive_perp_leverage,
     should_close_paper_perp,
     encode_setup_risk_entry_reason,
     parse_setup_risk_from_entry_reason,
     setup_risk_from_trade_metadata,
 )
+
+
+def test_ta_evidence_from_signal_is_bounded_and_finite():
+    evidence = ta_evidence_from_signal(
+        {
+            "details": {
+                "ta_evidence": {
+                    "bar_closed": True,
+                    "timeframes": ["1h", "15m", "5m"],
+                    "bar_times": {"1h": "2026-07-14T10:00:00+00:00"},
+                    "inputs": {
+                        "rsi": 48.0,
+                        "invalid": float("nan"),
+                        **{f"v{index}": float(index) for index in range(20)},
+                    },
+                }
+            }
+        }
+    )
+
+    assert evidence["bar_closed"] is True
+    assert evidence["timeframes"] == ["1h", "15m"]
+    assert "invalid" not in evidence["inputs"]
+    assert len(evidence["inputs"]) == 16
 
 
 def test_active_trade_rows_include_db_backed_paper_perps():
@@ -236,17 +271,60 @@ def test_hyperliquid_perps_use_centralized_exit_rules():
     assert hl_cfg["use_spot_exit_rules"] is True
     assert hl_cfg["fixed_stop_loss_enabled"] is True
     assert hl_cfg["profit_protection_fee_buffer"] == pytest.approx(0.0015)
-    assert hl_cfg["max_margin_per_trade"] == pytest.approx(100.0)
-    assert hl_cfg["max_notional_per_trade"] == pytest.approx(200.0)
+    assert hl_cfg["max_margin_per_trade"] == pytest.approx(250.0)
+    assert hl_cfg["max_notional_per_trade"] == pytest.approx(500.0)
     assert hl_cfg["max_open_positions"] == 15
     assert hl_cfg["strategy_open_position_limits"]["ema50_breakout_pullback"] == 4
-    assert hl_cfg["strategy_open_position_limits"]["supply_demand_3step"] == 4
+    assert hl_cfg["strategy_open_position_limits"]["supply_demand_3step"] == 2
     assert hl_cfg["shadow_cohort_promotion"]["require_promotion_for"] == [
         {
             "strategy": "supply_demand_3step",
             "side": "long",
+            "regimes": ["trending_up", "breakout", "high_volatility"],
+        },
+        {
+            "strategy": "supertrend",
+            "side": "short",
+            "regimes": ["trending_down", "high_volatility"],
+        },
+        {
+            "strategy": "supply_demand_3step",
+            "side": "short",
+            "regimes": ["trending_down", "high_volatility"],
+        },
+        {
+            "strategy": "rsi_stoch_reversal_15m",
+            "side": "long",
+            "regimes": [
+                "reversal_zone",
+                "sideways",
+                "breakout",
+            ],
+        },
+        {
+            "strategy": "rsi_stoch_reversal_15m",
+            "side": "short",
             "regimes": ["trending_up"],
-        }
+        },
+    ]
+    assert "sideways" in cfg["strategies_hyperliquid"]["supply_demand_3step"]["parameters"]["blocked_regimes"]
+    assert hl_cfg["strategy_regime_side_blocks"]["supply_demand_3step"]["sideways"] == [
+        "long",
+        "short",
+    ]
+    assert hl_cfg["dollar_loss_cap"]["strategy_hard_loss_pct"]["supply_demand_3step"] == pytest.approx(0.40)
+    assert hl_cfg["dollar_loss_cap"]["strategy_max_loss_usd"]["supply_demand_3step"] == pytest.approx(3.0)
+    assert hl_cfg["strategy_coin_loss_streak_cooldowns"]["supply_demand_3step"]["consecutive_losses"] == 1
+    assert hl_cfg["min_edge_gate"]["min_edge_pct"] == pytest.approx(0.65)
+    assert hl_cfg["daily_profit_target"]["target_usd"] == pytest.approx(20.0)
+    assert hl_cfg["shadow_cohort_promotion"]["use_episode_metrics"] is True
+    assert hl_cfg["shadow_cohort_promotion"]["min_episodes"] == 8
+    assert hl_cfg["cross_strategy_selection_bias"] == {}
+    assert hl_cfg["lane_notional_multipliers"] == {}
+    assert hl_cfg["consensus_executable_denylist"] == [
+        "rsi_stoch_reversal_15m",
+        "rsi_stoch_reversal_5m",
+        "rsi_stoch_reversal_1m",
     ]
     assert hl_cfg["shadow_strategy_evaluation"][
         "single_open_per_strategy_coin_side"
@@ -268,6 +346,23 @@ def test_hyperliquid_perps_use_centralized_exit_rules():
 def test_perp_side_fee():
     assert perp_side_fee(50.0, 0.001) == pytest.approx(0.05)
     assert perp_side_fee(0.0, 0.001) == 0.0
+
+
+def test_perp_lane_notional_multiplier_scopes_probation_to_exact_lane():
+    cfg = {
+        "lane_notional_multipliers": {
+            "rsi_stoch_reversal_5m": {"high_volatility": {"long": 0.35}}
+        }
+    }
+    assert perp_lane_notional_multiplier(
+        "rsi_stoch_reversal_5m", "long", "high_volatility", cfg
+    ) == pytest.approx(0.35)
+    assert perp_lane_notional_multiplier(
+        "rsi_stoch_reversal_5m", "short", "high_volatility", cfg
+    ) == pytest.approx(1.0)
+    assert perp_lane_notional_multiplier(
+        "supply_demand_3step", "short", "sideways", cfg
+    ) == pytest.approx(1.0)
 
 
 def test_hyperliquid_strategy_open_position_limit_block_counts_pending():
@@ -355,12 +450,12 @@ def test_select_mirrored_signal_does_not_use_generic_individual_when_consensus_h
     assert selected is None
 
 
-def test_select_mirrored_signal_rsi_stoch_no_longer_competes_in_standalone_lane():
+def test_select_mirrored_signal_rsi_stoch_competes_as_standalone_lane():
     payload = {
         "consensus": {"signal": "long", "confidence": 0.8, "agreement": 70},
         "strategies": {
             "macd_momentum": {"signal": "long", "confidence": 0.8, "strength": 0.7},
-            "rsi_stoch_reversal_5m": {
+            "rsi_stoch_reversal_15m": {
                 "signal": "short",
                 "confidence": 0.72,
                 "strength": 0.7,
@@ -370,15 +465,15 @@ def test_select_mirrored_signal_rsi_stoch_no_longer_competes_in_standalone_lane(
 
     selected = select_mirrored_signal(payload)
 
-    assert selected["signal"] == "long"
-    assert selected["strategy"] == "macd_momentum"
+    assert selected["signal"] == "short"
+    assert selected["strategy"] == "rsi_stoch_reversal_15m"
 
 
 def test_select_mirrored_signal_ranks_all_standalone_candidates_by_quality():
     payload = {
         "consensus": {"signal": "long", "confidence": 0.1, "agreement": 10},
         "strategies": {
-            "rsi_stoch_reversal_5m": {
+            "rsi_stoch_reversal_15m": {
                 "signal": "long",
                 "confidence": 0.70,
                 "strength": 0.65,
@@ -394,7 +489,7 @@ def test_select_mirrored_signal_ranks_all_standalone_candidates_by_quality():
 
     selected = select_mirrored_signal(payload)
 
-    assert selected["strategy"] == "orb_5m_scalp"
+    assert selected["strategy"] == "rsi_stoch_reversal_15m"
     assert selected["selection_score"] > 0
 
 
@@ -1978,7 +2073,47 @@ def test_regime_direction_gate_high_conviction_override():
     gate = hyperliquid_regime_direction_gate("short", "trending_up", 0.92, 0.85)
     assert gate["blocked"] is False
     assert gate["reason"] == "counter_trend_override_high_conviction"
-    assert gate["sizeMultiplier"] == pytest.approx(0.5)
+
+
+def test_regime_direction_gate_allows_configured_counter_trend_lane():
+    gate = hyperliquid_regime_direction_gate(
+        "short",
+        "trending_up",
+        0.74,
+        0.65,
+        {
+            "counter_trend_allowed_lanes": [
+                {
+                    "strategy": "arc_daytrade",
+                    "side": "short",
+                    "regimes": ["trending_up", "breakout"],
+                }
+            ]
+        },
+        strategy="arc_daytrade",
+    )
+    assert gate["blocked"] is False
+    assert gate["reason"] == "counter_trend_allowed_lane"
+
+
+def test_regime_direction_gate_allows_vwma_short_in_trending_down():
+    gate = hyperliquid_regime_direction_gate(
+        "short",
+        "trending_down",
+        0.90,
+        0.85,
+        {
+            "strategy_regime_side_blocks": {
+                "vwma_hull": {
+                    "trending_up": ["short"],
+                    "sideways": ["short"],
+                }
+            }
+        },
+        strategy="vwma_hull",
+    )
+    assert gate["blocked"] is False
+    assert gate["reason"] == "regime_direction_ok"
 
 
 # ---------------------------------------------------------------------------
@@ -2949,6 +3084,49 @@ def test_min_edge_gate_blocks_below_threshold():
     assert "min_edge_blocked" in result["reason"]
 
 
+def test_min_edge_gate_allows_configured_evidence_lane():
+    cfg = _edge_cfg()
+    cfg["min_edge_gate"]["evidence_exempt_lanes"] = [
+        {
+            "strategy": "arc_daytrade",
+            "side": "short",
+            "regimes": ["breakout", "high_volatility"],
+        }
+    ]
+    result = hyperliquid_min_edge_gate(
+        {
+            "strategy": "arc_daytrade",
+            "signal": "short",
+            "market_regime": "breakout",
+            "expected_move_pct": 0.10,
+        },
+        cfg,
+    )
+    assert result["blocked"] is False
+    assert result["reason"] == "min_edge_evidence_exempt_lane"
+
+
+def test_min_edge_gate_keeps_arc_trending_up_short_blocked():
+    cfg = _edge_cfg()
+    cfg["min_edge_gate"]["evidence_exempt_lanes"] = [
+        {
+            "strategy": "arc_daytrade",
+            "side": "short",
+            "regimes": ["breakout", "high_volatility"],
+        }
+    ]
+    result = hyperliquid_min_edge_gate(
+        {
+            "strategy": "arc_daytrade",
+            "signal": "short",
+            "market_regime": "trending_up",
+            "expected_move_pct": 0.10,
+        },
+        cfg,
+    )
+    assert result["blocked"] is True
+
+
 def test_min_edge_gate_reads_indicator_field():
     cfg = _edge_cfg()
     result = hyperliquid_min_edge_gate(
@@ -3002,7 +3180,7 @@ def test_promoted_cohort_selection_boost_requires_regime_match():
     assert boost == 0.0
 
 
-def test_select_mirrored_signal_applies_promoted_cohort_boost():
+def test_select_mirrored_signal_does_not_promote_disabled_ema50():
     payload = {
         "market_regime": "sideways",
         "consensus": {"signal": "hold", "confidence": 0.1, "agreement": 10},
@@ -3051,8 +3229,7 @@ def test_select_mirrored_signal_applies_promoted_cohort_boost():
         market_regime="sideways",
         promoted_cohorts=promoted,
     )
-    assert selected["strategy"] == "ema50_breakout_pullback"
-    assert selected["promoted_cohort_boost"] == pytest.approx(0.35)
+    assert selected is None
 
 
 def test_executable_size_requalification_blocks_until_sample_met():
@@ -3353,6 +3530,144 @@ def test_hyperliquid_regime_direction_gate_keeps_other_strategy_same_regime():
     assert result["blocked"] is False
 
 
+def test_supply_demand_sideways_blocked_by_strategy_regime_side_blocks():
+    cfg = {
+        "strategy_regime_side_blocks": {
+            "supply_demand_3step": {
+                "sideways": ["long", "short"],
+            }
+        }
+    }
+    short = hyperliquid_regime_direction_gate(
+        "short", "sideways", 0.80, 0.80, cfg, strategy="supply_demand_3step"
+    )
+    long = hyperliquid_regime_direction_gate(
+        "long", "sideways", 0.80, 0.80, cfg, strategy="supply_demand_3step"
+    )
+    assert short["blocked"] is True
+    assert long["blocked"] is True
+
+
+def test_dollar_loss_cap_honors_usd_backstop_alongside_pct():
+    from datetime import datetime, timezone
+
+    trade = {
+        "position_side": "short",
+        "entry_price": 100.0,
+        "position_size": 10.0,
+        "notional_size": 1000.0,
+        "leverage": 1.0,
+        "source_strategy": "supply_demand_3step",
+        "entry_time": datetime.now(timezone.utc).isoformat(),
+        "fees": 0.0,
+        "funding": 0.0,
+        "metadata": {},
+    }
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "fixed_stop_loss_enabled": False,
+            "use_spot_exit_rules": False,
+            "fee_rate_per_side": 0.0,
+            "dollar_loss_cap": {
+                "enabled": True,
+                "soft_loss_pct": 0.0,
+                "hard_loss_pct": 0.0,
+                "strategy_hard_loss_pct": {"supply_demand_3step": 0.40},
+                "strategy_max_loss_usd": {"supply_demand_3step": 3.0},
+            },
+            "trailing_stop": {"enabled": False},
+            "profit_protection": {"enabled": False},
+            "stagnant_loser_enabled": False,
+            "time_decay_exit": {"enabled": False},
+        },
+        {},
+        strategy_name="supply_demand_3step",
+    )
+    # Short adverse +0.35% on $1000 notional ≈ $3.50 loss → USD backstop fires
+    # before the 0.40% hard pct.
+    result = evaluate_paper_perp_exit(trade, 100.35, cfg)
+    assert result.exit_reason
+    assert "paper_loss_cap_$3.00" in result.exit_reason
+
+
+def test_shadow_promotion_requirement_does_not_block_unconfigured_short():
+    """Shorts without a matching require_promotion_for lane pass without promotion."""
+    cfg = {
+        "shadow_cohort_promotion": {
+            "require_promotion_for": [
+                {
+                    "strategy": "arc_daytrade",
+                    "side": "short",
+                    "regimes": ["trending_up", "breakout", "high_volatility"],
+                },
+            ]
+        }
+    }
+    result = hyperliquid_shadow_promotion_requirement(
+        "BTC",
+        {"strategy": "swing_hull_rsi_ema", "signal": "short"},
+        "trending_down",
+        cfg,
+        {},
+    )
+    assert result["blocked"] is False
+    assert result["reason"] == "shadow_promotion_not_required"
+
+
+def test_shadow_promotion_requirement_blocks_arc_short_without_promoted_cohort():
+    cfg = {
+        "shadow_cohort_promotion": {
+            "require_promotion_for": [
+                {
+                    "strategy": "arc_daytrade",
+                    "side": "short",
+                    "regimes": ["trending_up", "breakout", "high_volatility"],
+                },
+            ]
+        }
+    }
+    result = hyperliquid_shadow_promotion_requirement(
+        "BTC",
+        {"strategy": "arc_daytrade", "signal": "short"},
+        "trending_up",
+        cfg,
+        {},
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == "shadow_promotion_required_arc_daytrade_short_trending_up"
+
+
+def test_shadow_promotion_requirement_allows_promoted_short():
+    cfg = {
+        "shadow_cohort_promotion": {
+            "require_promotion_for": [
+                {
+                    "strategy": "arc_daytrade",
+                    "side": "short",
+                    "regimes": ["trending_up", "breakout", "high_volatility"],
+                },
+            ]
+        }
+    }
+    cohort = {
+        "strategy": "arc_daytrade",
+        "side": "short",
+        "regime": "trending_up",
+        "closed": 24,
+        "win_rate": 0.54,
+        "realized": 12.73,
+    }
+    result = hyperliquid_shadow_promotion_requirement(
+        "XYZ:BB",
+        {"strategy": "arc_daytrade", "signal": "short"},
+        "trending_up",
+        cfg,
+        {"XYZ:BB": [cohort]},
+    )
+    assert result["blocked"] is False
+    assert result["reason"] == "shadow_promoted_cohort_match"
+
+
 def test_shadow_promotion_requirement_blocks_unpromoted_risky_cohort():
     cfg = {
         "shadow_cohort_promotion": {
@@ -3554,3 +3869,329 @@ def test_specialist_entry_gate_selects_dual_sma():
     gate = specialist_entry_gate(signal, {"specialist_strategy_gates": {"dual_sma_daytrade": {}}})
     assert gate["isSpecialist"] is True
     assert gate["allowed"] is True
+
+
+def test_select_mirrored_signal_selects_rsi_stoch_as_standalone_before_consensus():
+    payload = {
+        "consensus": {"signal": "long", "confidence": 0.8, "agreement": 70},
+        "strategies": {
+            "rsi_stoch_reversal_15m": {
+                "signal": "long",
+                "confidence": 0.90,
+                "strength": 0.85,
+            },
+            "macd_momentum": {
+                "signal": "long",
+                "confidence": 0.72,
+                "strength": 0.70,
+            },
+        },
+    }
+    selected = select_mirrored_signal(payload, {})
+    assert selected["strategy"] == "rsi_stoch_reversal_15m"
+    assert selected["standalone_priority"] is True
+
+
+def test_coin_strategy_entry_deny_blocks_fartcoin_supply_demand_long():
+    result = hyperliquid_coin_strategy_entry_deny(
+        "FARTCOIN",
+        {"strategy": "supply_demand_3step", "signal": "long"},
+        "trending_up",
+        {
+            "coin_strategy_entry_denies": [
+                {
+                    "coin": "FARTCOIN",
+                    "strategy": "supply_demand_3step",
+                    "sides": ["long"],
+                }
+            ]
+        },
+    )
+    assert result["blocked"] is True
+    assert "FARTCOIN" in result["reason"]
+
+
+def test_coin_strategy_entry_deny_allows_supply_demand_short():
+    result = hyperliquid_coin_strategy_entry_deny(
+        "FARTCOIN",
+        {"strategy": "supply_demand_3step", "signal": "short"},
+        "trending_down",
+        {
+            "coin_strategy_entry_denies": [
+                {
+                    "coin": "FARTCOIN",
+                    "strategy": "supply_demand_3step",
+                    "sides": ["long"],
+                }
+            ]
+        },
+    )
+    assert result["blocked"] is False
+
+
+def test_strategy_entry_deny_without_coin_is_global():
+    result = hyperliquid_coin_strategy_entry_deny(
+        "SOL",
+        {"strategy": "breakout_retest_long", "signal": "long"},
+        "trending_up",
+        {"coin_strategy_entry_denies": [{"strategy": "breakout_retest_long"}]},
+    )
+    assert result["blocked"] is True
+
+
+def test_min_edge_gate_includes_fees_slippage_and_three_x_cost_buffer():
+    cfg = {
+        "fee_rate_per_side": 0.0001,
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.0,
+            "edge_multiplier": 3.0,
+            "estimated_round_trip_slippage_pct": 0.10,
+            "require_expected_move": True,
+        },
+    }
+    result = hyperliquid_min_edge_gate({"expected_move_pct": 0.35}, cfg)
+    assert result["estimatedCostPct"] == pytest.approx(0.12)
+    assert result["thresholdPct"] == pytest.approx(0.36)
+    assert result["blocked"] is True
+
+
+def test_dynamic_min_notional_scales_strategy_values_with_adaptive_size():
+    cfg = {
+        "fee_rate_per_side": 0.0001,
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.0,
+            "edge_multiplier": 1.0,
+            "estimated_round_trip_slippage_pct": 0.10,
+        },
+        "dynamic_notional_gate": {
+            "enabled": True,
+            "exchange_min_notional_usd": 10.0,
+            "minimum_viable_notional_usd": 40.0,
+            "min_expected_net_profit_usd": 0.25,
+            "max_dynamic_min_notional_usd": 200.0,
+            "strategy_overrides": {
+                "supply_demand_3step": {
+                    "minimum_viable_notional_usd": 50.0,
+                    "min_expected_net_profit_usd": 0.25,
+                }
+            },
+        },
+    }
+    result = dynamic_min_notional(
+        {
+            "strategy": "supply_demand_3step",
+            "expected_move_pct": 0.85,
+        },
+        cfg,
+        size_multiplier=0.35,
+    )
+
+    # Costs are 0.12%, leaving 0.73% expected net edge. The scaled $0.0875
+    # profit target needs ~$11.99 notional, so the scaled strategy floor wins.
+    assert result["netEdgePct"] == pytest.approx(0.73)
+    assert result["targetNetProfitUsd"] == pytest.approx(0.0875)
+    assert result["minNotional"] == pytest.approx(17.5)
+    assert 96.45 >= result["minNotional"]
+
+
+def test_dynamic_min_notional_raises_floor_when_net_edge_is_thin():
+    cfg = {
+        "fee_rate_per_side": 0.0001,
+        "min_edge_gate": {
+            "enabled": True,
+            "min_edge_pct": 0.0,
+            "edge_multiplier": 1.0,
+            "estimated_round_trip_slippage_pct": 0.10,
+        },
+        "dynamic_notional_gate": {
+            "enabled": True,
+            "exchange_min_notional_usd": 10.0,
+            "minimum_viable_notional_usd": 25.0,
+            "min_expected_net_profit_usd": 0.25,
+            "max_dynamic_min_notional_usd": 200.0,
+        },
+    }
+    result = dynamic_min_notional(
+        {"strategy": "test", "expected_move_pct": 0.22},
+        cfg,
+        size_multiplier=1.0,
+    )
+
+    # 0.22% expected move - 0.12% costs = 0.10% net edge; earning $0.25
+    # would need $250, capped at the configured $200 maximum floor.
+    assert result["netEdgePct"] == pytest.approx(0.10)
+    assert result["minNotional"] == pytest.approx(200.0)
+
+
+def test_adaptive_perp_leverage_uses_stop_distance_and_strategy_cap():
+    cfg = {
+        "default_leverage": 2.0,
+        "adaptive_leverage": {
+            "enabled": True,
+            "min": 1.0,
+            "max": 5.0,
+            "tight_stop_max_pct": 0.60,
+            "medium_stop_max_pct": 1.25,
+            "wide_stop_min_pct": 2.0,
+            "strategy_overrides": {
+                "supply_demand_3step": {"min": 1.0, "max": 3.0, "default": 2.0},
+                "rsi_stoch_reversal_5m": {"min": 1.0, "max": 5.0, "default": 3.0},
+            },
+        },
+    }
+    supply = {
+        "strategy": "supply_demand_3step",
+        "details": {"state": {"indicators": {"stop_loss_pct": 0.50}}},
+    }
+    rsi = {
+        "strategy": "rsi_stoch_reversal_5m",
+        "details": {"state": {"indicators": {"stop_loss_pct": 0.50}}},
+    }
+    wide = {
+        "strategy": "rsi_stoch_reversal_5m",
+        "details": {"state": {"indicators": {"stop_loss_pct": 2.50}}},
+    }
+
+    assert adaptive_perp_leverage(supply, cfg) == pytest.approx(3.0)
+    assert adaptive_perp_leverage(rsi, cfg) == pytest.approx(5.0)
+    assert adaptive_perp_leverage(wide, cfg) == pytest.approx(1.0)
+
+
+def test_shadow_promotion_requirement_blocks_rsi_stoch_without_promoted_cohort():
+    result = hyperliquid_shadow_promotion_requirement(
+        "WLD",
+        {"strategy": "rsi_stoch_reversal_5m", "signal": "long"},
+        "trending_up",
+        {
+            "shadow_cohort_promotion": {
+                "require_promotion_for": [
+                    {"strategy": "rsi_stoch_reversal_5m", "side": "long"},
+                ]
+            }
+        },
+        {},
+    )
+    assert result["blocked"] is True
+
+
+def test_supply_demand_specialist_gate_uses_side_specific_size_multiplier():
+    signal = {
+        "strategy": "supply_demand_3step",
+        "signal": "short",
+        "confidence": 0.76,
+        "strength": 0.70,
+        "details": {
+            "indicators": {
+                "setup": "supply_demand_3step",
+                "step1_pass": True,
+                "step2_pass": True,
+                "step3_pass": True,
+                "reward_risk": 2.8,
+            }
+        },
+    }
+    gate = supply_demand_3step_specialist_gate(
+        signal,
+        {
+            "specialist_strategy_gates": {
+                "supply_demand_3step": {
+                    "size_multiplier": 0.75,
+                    "size_multiplier_by_side": {"short": 1.0, "long": 0.75},
+                }
+            }
+        },
+    )
+    assert gate["allowed"] is True
+    assert gate["sizeMultiplier"] == pytest.approx(1.0)
+
+
+def test_hyperliquid_signal_prefetch_settings_reads_config_block():
+    settings = hyperliquid_signal_prefetch_settings(
+        {
+            "signal_prefetch": {
+                "timeout_seconds": 22,
+                "retries": 2,
+                "max_prefetch_seconds": 28,
+                "entry_evaluation_reserve_seconds": 12,
+            }
+        }
+    )
+    assert settings["timeout_seconds"] == pytest.approx(22.0)
+    assert settings["retries"] == 2
+    assert settings["max_prefetch_seconds"] == pytest.approx(28.0)
+    assert settings["entry_evaluation_reserve_seconds"] == pytest.approx(12.0)
+
+
+def test_hyperliquid_signal_prefetch_health_classifies_outcomes():
+    assert hyperliquid_signal_prefetch_health({"requested": 30, "scanned_missed": 0}) == "ok"
+    assert hyperliquid_signal_prefetch_health({"skipped": True}) == "ok"
+    assert hyperliquid_signal_prefetch_health({"requested": 30, "scanned_missed": 2}) == "degraded"
+    assert hyperliquid_signal_prefetch_health({"requested": 30, "scanned_missed": 10}) == "failed"
+    assert hyperliquid_signal_prefetch_health({}) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_fetch_hyperliquid_entry_signal_payload_retries_then_succeeds():
+    calls = {"n": 0}
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        async def get(self, url, timeout=20.0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("slow")
+            return _Resp(200, {"coin": "BTC", "strategies": {}})
+
+    payload, reason = await fetch_hyperliquid_entry_signal_payload(
+        _Client(),
+        coin_key="BTC",
+        signal_source="hyperliquid_strategies",
+        strategy_service_url="http://strategy-service:8004",
+        mirror_exchanges=[],
+        pair_selections={},
+        timeout_seconds=5.0,
+        retries=1,
+        retry_delay_seconds=0.0,
+    )
+    assert reason == "ok"
+    assert payload["coin"] == "BTC"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_prefetch_hyperliquid_entry_signals_respects_entry_reserve():
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"coin": "BTC", "strategies": {}}
+
+    class _Client:
+        async def get(self, url, timeout=20.0):
+            await asyncio.sleep(0.05)
+            return _Resp()
+
+    deadline = time.monotonic() + 0.2
+    prefetched, stats = await prefetch_hyperliquid_entry_signals(
+        _Client(),
+        coins=["BTC"],
+        signal_source="hyperliquid_strategies",
+        strategy_service_url="http://strategy-service:8004",
+        mirror_exchanges=[],
+        pair_selections={},
+        hl_cfg={"signal_prefetch": {"entry_evaluation_reserve_seconds": 15}},
+        deadline=deadline,
+        concurrency=1,
+    )
+    assert stats["requested"] == 1
+    assert stats["failure_reasons"].get("__deadline__") == "prefetch_budget_exhausted"
+    assert prefetched == {}

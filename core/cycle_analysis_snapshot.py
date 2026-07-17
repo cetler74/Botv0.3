@@ -359,14 +359,21 @@ class HlCoinCycleRecorder:
     def set_mirrored(self, mirrored: Optional[Mapping[str, Any]]) -> None:
         self.mirrored = dict(mirrored) if mirrored else None
 
-    def add_gate(self, step: str, passed: bool, message: str = "") -> None:
-        self.gate_chain.append(
-            {
-                "step": str(step),
-                "passed": bool(passed),
-                "message": str(message or ""),
-            }
-        )
+    def add_gate(
+        self,
+        step: str,
+        passed: bool,
+        message: str = "",
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        gate = {
+            "step": str(step),
+            "passed": bool(passed),
+            "message": str(message or ""),
+        }
+        if details:
+            gate["details"] = dict(details)
+        self.gate_chain.append(gate)
 
     def set_finish_callback(
         self,
