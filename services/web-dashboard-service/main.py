@@ -2393,11 +2393,12 @@ def _build_spot_pair_analysis(
     )
 
 
-def _build_spot_exit_rules(config_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Spot exit thresholds from global trading config (orchestrator-managed exits)."""
-    trading_cfg = _nested_config(config_payload, "trading")
-    trailing_cfg = trading_cfg.get("trailing_stop") or {}
-    profit_protection_cfg = trading_cfg.get("profit_protection") or {}
+def _exit_rules_from_trailing_pp(
+    trading_cfg: Dict[str, Any],
+    trailing_cfg: Dict[str, Any],
+    profit_protection_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Normalize trailing / PP / stop fields for dashboard protection UI."""
     sim_cfg = trading_cfg.get("simulation") or {}
     fee_rate = _safe_float(sim_cfg.get("fee_rate_per_side"), 0.001)
     fee_buffer = _safe_float(profit_protection_cfg.get("estimated_exit_fee"), fee_rate) * 2
@@ -2423,6 +2424,43 @@ def _build_spot_exit_rules(config_payload: Dict[str, Any]) -> Dict[str, Any]:
         "profitProtectionEnabled": bool(profit_protection_cfg.get("enabled", True)),
         "trailingStopEnabled": bool(trailing_cfg.get("enabled", True)),
     }
+
+
+def _build_spot_exit_rules(config_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Spot exit thresholds from global trading config (orchestrator-managed exits)."""
+    trading_cfg = _nested_config(config_payload, "trading")
+    trailing_cfg = trading_cfg.get("trailing_stop") or {}
+    profit_protection_cfg = trading_cfg.get("profit_protection") or {}
+    return _exit_rules_from_trailing_pp(trading_cfg, trailing_cfg, profit_protection_cfg)
+
+
+def _build_spot_exit_rules_by_strategy(config_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Per-strategy exit rules from trading.exit_profiles for spot dashboard cells."""
+    trading_cfg = _nested_config(config_payload, "trading")
+    base_trailing = dict(trading_cfg.get("trailing_stop") or {})
+    base_pp = dict(trading_cfg.get("profit_protection") or {})
+    profiles = trading_cfg.get("exit_profiles") or {}
+    by_strategy: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(profiles, dict):
+        return by_strategy
+
+    for _profile_name, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        trailing = dict(base_trailing)
+        pp = dict(base_pp)
+        profile_trailing = profile.get("trailing_stop")
+        if isinstance(profile_trailing, dict):
+            trailing = {**trailing, **profile_trailing}
+        profile_pp = profile.get("profit_protection")
+        if isinstance(profile_pp, dict):
+            pp = {**pp, **profile_pp}
+        rules = _exit_rules_from_trailing_pp(trading_cfg, trailing, pp)
+        for strategy in profile.get("strategies") or []:
+            key = str(strategy or "").strip().lower()
+            if key:
+                by_strategy[key] = rules
+    return by_strategy
 
 
 def _spot_portfolio_summary(portfolio_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2610,6 +2648,9 @@ async def get_spot_intelligence():
                     "leverage": "none",
                 },
                 "exitRules": spot_exit_rules,
+                "exitRulesByStrategy": _build_spot_exit_rules_by_strategy(
+                    config_payload if isinstance(config_payload, dict) else {}
+                ),
             },
             "spotTrades": {
                 "open": open_trades,

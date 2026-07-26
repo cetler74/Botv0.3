@@ -7,10 +7,7 @@ const STORAGE_KEYS = {
   pnlPageSize: 'hlPerpsPnlPageSize',
   adaptivePageSize: 'hlPerpsAdaptivePageSize',
   tradesPageSize: 'hlPerpsTradesPageSize',
-  sdPageSize: 'hlPerpsSdPageSize',
-  dsmaPageSize: 'hlPerpsDsmaPageSize',
   ebpPageSize: 'hlPerpsEbpPageSize',
-  orbPageSize: 'hlPerpsOrbPageSize',
 };
 
 const PAGE_SIZES = [10, 50, 100];
@@ -34,10 +31,7 @@ const state = {
     pnl: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.pnlPageSize) },
     adaptive: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.adaptivePageSize) },
     trades: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.tradesPageSize) },
-    sd: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.sdPageSize) },
-    dsma: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.dsmaPageSize) },
     ebp: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.ebpPageSize) },
-    orb: { page: 1, pageSize: loadPageSize(STORAGE_KEYS.orbPageSize) },
   },
   lastPrices: {},
   priceComparisonBaseline: {},
@@ -683,15 +677,10 @@ function tradeMetadata(t) {
   return raw;
 }
 
-function protectionStatusCell(label, detail, active = false) {
-  return `
-    <div class="pi-protection-cell">
-      <span class="pi-protection-state ${active ? 'active' : 'inactive'}">${escapeHtml(label)}</span>
-      <span class="pi-protection-detail">${detail}</span>
-    </div>`;
-}
-
 function exitRulesForTrade(t, data) {
+  if (window.ProtectionUI) {
+    return window.ProtectionUI.resolveExitRules(t, data, {});
+  }
   if (t.exitRules && typeof t.exitRules === 'object') {
     return t.exitRules;
   }
@@ -728,73 +717,24 @@ function unrealizedPnlCell({ unrealized, pctValue, isOpen, scope = 'margin' }) {
 }
 
 function protectionDetails(t, entryPrice, side, isOpen, data) {
-  if (!isOpen || !entryPrice) {
-    return { profitProtection: '—', trailingStop: '—', stopLoss: '—', liquidation: '—', sort: {} };
+  const ui = window.ProtectionUI;
+  if (!ui) {
+    return { profitProtection: '—', trailingStop: '—', stopLoss: '—', liquidation: '—', sort: {}, extras: '' };
   }
-  const rules = exitRulesForTrade(t, data);
-  const metadata = tradeMetadata(t);
-  const ppActivation = toDecimal(rules.profitProtectionActivationPct ?? 0.0035);
-  const trailActivation = toDecimal(rules.trailingActivationPct ?? 0.0035);
-  const breakeven = toDecimal(rules.breakevenFloorPct ?? 0.0035);
-  const trailStep = toDecimal(rules.tightenedTrailingStepPct ?? rules.trailingStepPct ?? 0.0025);
-  const trailArm = rules.trailArmPct != null
-    ? toDecimal(rules.trailArmPct)
-    : Math.max(trailActivation, breakeven + trailStep);
-  const ppArmPrice = sideTargetPrice(entryPrice, side, ppActivation, true);
-  const trailArmPrice = sideTargetPrice(entryPrice, side, trailArm, true);
-  const rawProtectionState = String(metadata.profit_protection || '').toLowerCase();
-  const protectionActive = Boolean(rawProtectionState && rawProtectionState !== 'inactive');
-  const trailState = String(metadata.trail_stop || '').toLowerCase() === 'active' ? 'active' : 'waiting';
-  const trigger = Number(metadata.trail_stop_trigger || t.trail_stop_trigger || 0);
-  const stopLossEnabled = Boolean(rules.fixedStopLossEnabled);
-  const stopLossDecimal = toDecimal(rules.stopLossPct ?? 0);
-  const stopLossSuffix = rules.stopLossSource === 'atr'
-    ? ' (ATR)'
-    : rules.stopLossSource === 'coin_override'
-      ? ' (coin)'
-      : '';
-  const stopLossPrice = stopLossEnabled ? sideTargetPrice(entryPrice, side, stopLossDecimal, false) : 0;
-  const margin = Number(t.margin_used ?? t.marginUsed ?? 0);
-  const notional = Number(t.notional_size ?? t.notionalSize ?? 0);
-  const liquidationMove = notional > 0 ? Math.max(0, margin / notional) : 0;
-  const estimatedLiquidation = liquidationMove > 0
-    ? sideTargetPrice(entryPrice, side, liquidationMove, false)
-    : 0;
-
-  return {
-    profitProtection: protectionStatusCell(
-      protectionActive ? 'active' : 'inactive',
-      protectionActive && trigger
-        ? `Exit: ${priceMoney(trigger)}`
-        : `Activates: ${priceMoney(ppArmPrice)} (+${decimalPct(ppActivation)})`,
-      protectionActive,
-    ),
-    trailingStop: protectionStatusCell(
-      trailState === 'active' ? 'active' : 'inactive',
-      trailState === 'active' && trigger
-        ? `Exit: ${priceMoney(trigger)}`
-        : `Activates: ${priceMoney(trailArmPrice)} (+${decimalPct(trailArm)})`,
-      trailState === 'active',
-    ),
-    stopLoss: protectionStatusCell(
-      stopLossEnabled ? 'enabled' : 'disabled',
-      stopLossEnabled && stopLossPrice
-        ? `Exit: ${priceMoney(stopLossPrice)} (-${decimalPct(stopLossDecimal)})${stopLossSuffix}`
-        : 'Trailing-only config',
-      stopLossEnabled,
-    ),
-    liquidation: protectionStatusCell(
-      'estimate',
-      estimatedLiquidation ? priceMoney(estimatedLiquidation) : '—',
-      false,
-    ),
-    sort: {
-      profitProtection: protectionActive ? 1 : 0,
-      trailingStop: trailState === 'active' ? 1 : 0,
-      stopLoss: stopLossEnabled ? stopLossPrice : -1,
-      liquidation: estimatedLiquidation,
-    },
+  // Prefer trade-level metadata.profit_protection for perps; fall back to top-level fields.
+  const enriched = {
+    ...t,
+    profit_protection: t.profit_protection || (tradeMetadata(t).profit_protection || ''),
+    trail_stop: t.trail_stop || (tradeMetadata(t).trail_stop || ''),
+    trail_stop_trigger: t.trail_stop_trigger || tradeMetadata(t).trail_stop_trigger || 0,
+    highest_price: t.highest_price || t.highestPrice || tradeMetadata(t).highest_price || 0,
   };
+  return ui.buildProtectionDetails(enriched, entryPrice, side, isOpen, data || {}, {
+    includeLiquidation: true,
+    defaultPpArm: 0.0035,
+    defaultTrailArm: 0.0035,
+    defaultStopPct: 0,
+  });
 }
 
 function normalizeTrade(t, data) {
@@ -962,10 +902,7 @@ function paginationRowCount(tableKey, data) {
       : Array.isArray(control.history) ? control.history : [];
     return adaptiveAuditRows(decisions, history).length;
   }
-  if (tableKey === 'sd') return auditTableRows(data.supplyDemandAudit).length;
-  if (tableKey === 'dsma') return auditTableRows(data.dualSmaAudit).length;
   if (tableKey === 'ebp') return auditTableRows(data.ema50BreakoutPullbackAudit).length;
-  if (tableKey === 'orb') return auditTableRows(data.orb5mScalpAudit).length;
   return tradesForFilter(data).length;
 }
 
@@ -1281,7 +1218,14 @@ const tradeColumns = [
   { key: 'notional', label: 'Notional exposure', sortType: 'number', defaultVisible: true, sortValue: (t) => t._notional, render: (t) => money(t._notional) },
   { key: 'realized', label: 'Realized', sortType: 'number', defaultVisible: true, sortValue: (t) => t._realized, render: (t) => `<span class="${cls(t._realized)}">${money(t._realized)}</span>` },
   { key: 'unrealized', label: 'Unrealized', sortType: 'number', defaultVisible: true, sortValue: (t) => t._unrealized, render: (t) => unrealizedPnlCell({ unrealized: t._unrealized, pctValue: t._unrealizedPct, isOpen: t._isOpen }) },
-  { key: 'profitProtection', label: 'Profit protection', sortType: 'number', defaultVisible: true, sortValue: (t) => t._protection.sort.profitProtection || 0, render: (t) => t._protection.profitProtection },
+  {
+    key: 'profitProtection',
+    label: 'Profit protection',
+    sortType: 'number',
+    defaultVisible: true,
+    sortValue: (t) => t._protection.sort.profitProtection || 0,
+    render: (t) => `${t._protection.profitProtection || ''}${t._protection.extras || ''}`,
+  },
   { key: 'trailingStop', label: 'Trailing stop', sortType: 'number', defaultVisible: true, sortValue: (t) => t._protection.sort.trailingStop || 0, render: (t) => t._protection.trailingStop },
   { key: 'stopLoss', label: 'Stop loss', sortType: 'number', defaultVisible: true, sortValue: (t) => t._protection.sort.stopLoss || 0, render: (t) => t._protection.stopLoss },
   { key: 'liquidation', label: 'Liq est.', sortType: 'number', defaultVisible: true, sortValue: (t) => t._protection.sort.liquidation || 0, render: (t) => t._protection.liquidation },
@@ -1498,6 +1442,10 @@ function renderPerpTrades(data) {
   const pt = data.perpTrades || {};
   const summary = (data.paperPerps || {}).summary || {};
   setText('perp-trades-meta', `${pt.totalOpen ?? 0} open · ${pt.totalClosed ?? summary.closed_trades ?? 0} closed`);
+  const legend = document.getElementById('perp-protection-legend');
+  if (legend && window.ProtectionUI) {
+    legend.innerHTML = window.ProtectionUI.protectionLegendHtml();
+  }
 
   document.querySelectorAll('[data-trade-filter]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.tradeFilter === state.tradeFilter);
@@ -1786,152 +1734,6 @@ function renderArcAudit(data) {
   }).join('');
 }
 
-function renderDualSmaAudit(data) {
-  const audit = data.dualSmaAudit || {};
-  const summary = audit.summary || {};
-  const rates = summary.gatePassRates || {};
-  setText('dsma-daily-rate', `${num(rates.daily || 0, 1)}%`);
-  setText('dsma-15m-rate', `${num(rates.confirm15m || 0, 1)}%`);
-  setText('dsma-5m-rate', `${num(rates.entry5m || 0, 1)}%`);
-  setText('dsma-eval-count', String(summary.totalEvaluations || audit.count || 0));
-  const note = document.getElementById('dsma-audit-summary');
-  if (note) {
-    note.textContent = summary.totalEvaluations
-      ? `${summary.totalEvaluations} evaluation(s) in the last 24h. Bias mix: ${JSON.stringify(summary.byDailyBias || {})}.`
-      : 'No dual-SMA evaluations in the last 24 hours.';
-  }
-  const body = document.getElementById('dsma-audit-body');
-  if (!body) return;
-  const allRows = auditTableRows(audit);
-  const meta = paginateRows(allRows, 'dsma');
-  const rows = meta.rows;
-  if (!allRows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>';
-    renderPagination('dsma', { ...meta, filteredCount: 0, totalPages: 1, page: 1 });
-    return;
-  }
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="pi-empty">No evaluations on this page.</td></tr>';
-    renderPagination('dsma', meta);
-    return;
-  }
-  body.innerHTML = rows.map((row) => {
-    const ext = num((row.extension_distance_pct || 0) * 100, 2);
-    const reason = strategyExecutionReason(
-      row,
-      row.entry_reason || row.entry_5m_reason || row.confirm_15m_reason || row.daily_reason || ''
-    );
-    return `<tr>
-      <td>${escapeHtml(row.symbol || '')}</td>
-      <td>${escapeHtml(row.daily_bias || '')}</td>
-      <td>${escapeHtml(row.trend_15m || '')}</td>
-      <td>${escapeHtml(row.entry_signal_5m || row.signal || 'hold')}</td>
-      <td>${ext}</td>
-      <td>${num(row.reward_risk || 0, 2)}</td>
-      <td class="pi-reason-cell">${escapeHtml(reason)}</td>
-    </tr>`;
-  }).join('');
-  renderPagination('dsma', meta);
-}
-
-function renderSupplyDemandAudit(data) {
-  const audit = data.supplyDemandAudit || {};
-  const summary = audit.summary || {};
-  const rates = summary.stepPassRates || {};
-  setText('sd-step1-rate', `${num(rates.step1 || 0, 1)}%`);
-  setText('sd-step2-rate', `${num(rates.step2 || 0, 1)}%`);
-  setText('sd-step3-rate', `${num(rates.step3 || 0, 1)}%`);
-  setText('sd-eval-count', String(summary.totalEvaluations || audit.count || 0));
-  const note = document.getElementById('sd-audit-summary');
-  if (note) {
-    note.textContent = summary.totalEvaluations
-      ? `${summary.totalEvaluations} evaluation(s) in the last 24h. Trend mix: ${JSON.stringify(summary.byTrendDirection || {})}.`
-      : 'No supply/demand evaluations in the last 24 hours.';
-  }
-  const body = document.getElementById('sd-audit-body');
-  if (!body) return;
-  const allRows = auditTableRows(audit);
-  const meta = paginateRows(allRows, 'sd');
-  const rows = meta.rows;
-  if (!allRows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="pi-empty">No evaluations loaded.</td></tr>';
-    renderPagination('sd', { ...meta, filteredCount: 0, totalPages: 1, page: 1 });
-    return;
-  }
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="pi-empty">No evaluations on this page.</td></tr>';
-    renderPagination('sd', meta);
-    return;
-  }
-  body.innerHTML = rows.map((row) => {
-    const steps = [
-      row.step1_pass ? '1✓' : '1✗',
-      row.step2_pass ? '2✓' : '2✗',
-      row.step3_pass ? '3✓' : '3✗',
-    ].join(' ');
-    const reason = strategyExecutionReason(
-      row,
-      row.entry_reason || row.step3_reason || row.step2_reason || row.step1_reason || ''
-    );
-    return `<tr>
-      <td>${escapeHtml(row.symbol || '')}</td>
-      <td>${escapeHtml(row.trend_direction || '')}</td>
-      <td>${escapeHtml(row.signal || 'hold')}</td>
-      <td>${num(row.reward_risk || 0, 2)}</td>
-      <td>${escapeHtml(steps)}</td>
-      <td class="pi-reason-cell">${escapeHtml(reason)}</td>
-    </tr>`;
-  }).join('');
-  renderPagination('sd', meta);
-}
-
-function renderOrb5mScalpAudit(data) {
-  const audit = data.orb5mScalpAudit || {};
-  const summary = audit.summary || {};
-  const rates = summary.gatePassRates || {};
-  setText('orb-breakout-rate', `${num(rates.breakout || 0, 1)}%`);
-  setText('orb-retest-rate', `${num(rates.retest || 0, 1)}%`);
-  setText('orb-rr-rate', String(summary.signalRewardRisk || 0));
-  setText('orb-eval-count', String(summary.totalEvaluations || audit.count || 0));
-  const note = document.getElementById('orb-audit-summary');
-  if (note) {
-    note.textContent = summary.totalEvaluations
-      ? `${summary.totalEvaluations} evaluation(s) in the last 24h. States: ${JSON.stringify(summary.setupStateCounts || {})}.`
-      : 'No ORB 5m scalp evaluations in the last 24 hours.';
-  }
-  const body = document.getElementById('orb-audit-body');
-  if (!body) return;
-  const allRows = auditTableRows(audit);
-  const meta = paginateRows(allRows, 'orb');
-  const rows = meta.rows;
-  if (!allRows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>';
-    renderPagination('orb', { ...meta, filteredCount: 0, totalPages: 1, page: 1 });
-    return;
-  }
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="pi-empty">No evaluations on this page.</td></tr>';
-    renderPagination('orb', meta);
-    return;
-  }
-  body.innerHTML = rows.map((row) => {
-    const reason = strategyExecutionReason(
-      row,
-      row.entry_reason || row.retest_reason || row.breakout_reason || row.rejection_reason || ''
-    );
-    return `<tr>
-      <td>${escapeHtml(row.symbol || '')}</td>
-      <td>${escapeHtml(row.setup_state || '')}</td>
-      <td>${escapeHtml(row.direction || '')}</td>
-      <td>${escapeHtml(row.signal || 'hold')}</td>
-      <td>${num(row.reward_risk || 0, 2)}</td>
-      <td>${num(row.or_mid || 0, 4)}</td>
-      <td class="pi-reason-cell">${escapeHtml(reason)}</td>
-    </tr>`;
-  }).join('');
-  renderPagination('orb', meta);
-}
-
 function renderEma50BreakoutPullbackAudit(data) {
   const audit = data.ema50BreakoutPullbackAudit || {};
   const summary = audit.summary || {};
@@ -2011,7 +1813,7 @@ function renderAdaptiveControl(data) {
     } else if (history.length) {
       summary.textContent = 'No live adaptive changes are active now. Recent released changes remain below for audit and future tuning.';
     } else {
-      summary.textContent = payload.note || 'No adaptive decisions have been recorded yet.';
+      summary.textContent = 'No adaptive decisions have been recorded yet.';
     }
   }
 
@@ -2246,11 +2048,8 @@ async function loadDashboard() {
   safeRender('progressWhy', renderProgressWhy, data);
   safeRender('pnlReport', renderPaperPnlReport, data);
   safeRender('adaptiveControl', renderAdaptiveControl, data);
-  safeRender('supplyDemandAudit', renderSupplyDemandAudit, data);
   safeRender('arcAudit', renderArcAudit, data);
-  safeRender('dualSmaAudit', renderDualSmaAudit, data);
   safeRender('ema50BreakoutPullbackAudit', renderEma50BreakoutPullbackAudit, data);
-  safeRender('orb5mScalpAudit', renderOrb5mScalpAudit, data);
   safeRender('watchlist', renderHyperliquidWatchlist, data);
   safeRender('trades', renderPerpTrades, data);
   safeRender('system', renderSystemStrip, data);
@@ -2359,17 +2158,8 @@ document.addEventListener('DOMContentLoaded', () => {
   bindPaginationControls('trades', () => {
     if (state.payload) renderPerpTrades(state.payload);
   });
-  bindPaginationControls('sd', () => {
-    if (state.payload) renderSupplyDemandAudit(state.payload);
-  });
-  bindPaginationControls('dsma', () => {
-    if (state.payload) renderDualSmaAudit(state.payload);
-  });
   bindPaginationControls('ebp', () => {
     if (state.payload) renderEma50BreakoutPullbackAudit(state.payload);
-  });
-  bindPaginationControls('orb', () => {
-    if (state.payload) renderOrb5mScalpAudit(state.payload);
   });
 
   loadDashboard().catch((err) => {

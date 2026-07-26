@@ -557,6 +557,7 @@ def _record_pair_strategy_snapshot(
                 "dual_sma_daytrade",
                 "arc_daytrade",
                 "ema50_breakout_pullback",
+                "ema20_ma50_spot_1h",
                 "rsi_stoch_reversal_5m",
             }:
                 standalone_like = True
@@ -712,6 +713,7 @@ def _record_pair_strategy_snapshot(
                 "dual_sma_daytrade",
                 "arc_daytrade",
                 "ema50_breakout_pullback",
+                "ema20_ma50_spot_1h",
                 "rsi_stoch_reversal_5m",
             }:
                 standalone_like = True
@@ -1162,6 +1164,10 @@ class StrategyManager:
                 'module': 'ema50_breakout_pullback_strategy',
                 'class': 'Ema50BreakoutPullbackStrategy',
             },
+            'ema20_ma50_spot_1h': {
+                'module': 'ema20_ma50_spot_1h_strategy',
+                'class': 'Ema20Ma50Spot1hStrategy',
+            },
             # Note: strategy_pnl_enhanced contains utility functions, not a strategy class
         }
         self._strategy_mapping = strategy_mapping
@@ -1328,6 +1334,7 @@ class StrategyManager:
                     "dual_sma_daytrade",
                     "arc_daytrade",
                     "ema50_breakout_pullback",
+                    "ema20_ma50_spot_1h",
                     "rsi_stoch_reversal_5m",
                     "rsi_stoch_reversal_1m",
                 ):

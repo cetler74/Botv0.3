@@ -41,6 +41,25 @@ SETUP_MEMORY_DEFAULTS: Dict[str, Any] = {
     "block_negative_expectancy_broad": False,
     "size_down_multiplier": 0.5,
     "closed_trade_fetch_limit": 2000,
+    "permanent": {
+        "enabled": True,
+        "exact_loss_streak": 3,
+        "exact_win_streak": 3,
+        "coin_regime_loss_streak": 4,
+        "coin_regime_win_streak": 4,
+        "size_up_multiplier": 1.25,
+        "include_shadow": True,
+    },
+}
+
+PERMANENT_DEFAULTS: Dict[str, Any] = {
+    "enabled": True,
+    "exact_loss_streak": 3,
+    "exact_win_streak": 3,
+    "coin_regime_loss_streak": 4,
+    "coin_regime_win_streak": 4,
+    "size_up_multiplier": 1.25,
+    "include_shadow": True,
 }
 
 
@@ -62,6 +81,7 @@ class SetupMemoryDecision:
     latest_loss_at: Optional[str] = None
     match_level: str = "none"
     evidence: List[Dict[str, Any]] = field(default_factory=list)
+    permanent: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +101,7 @@ class SetupMemoryDecision:
             "latestLossAt": self.latest_loss_at,
             "matchLevel": self.match_level,
             "evidence": self.evidence,
+            "permanent": self.permanent,
         }
 
 
@@ -96,14 +117,34 @@ def setup_memory_config(
     if not isinstance(raw, Mapping):
         raw = {}
     cfg = dict(SETUP_MEMORY_DEFAULTS)
+    cfg["permanent"] = dict(PERMANENT_DEFAULTS)
     for key, value in raw.items():
         if key not in {"spot", "perps"}:
-            cfg[key] = value
+            if key == "permanent" and isinstance(value, Mapping):
+                merged_perm = dict(PERMANENT_DEFAULTS)
+                merged_perm.update(dict(value))
+                cfg["permanent"] = merged_perm
+            else:
+                cfg[key] = value
     market_key = "perps" if str(market_type).lower() in {"perp", "perps"} else "spot"
     override = raw.get(market_key) or {}
     if isinstance(override, Mapping):
-        cfg.update(dict(override))
+        for key, value in override.items():
+            if key == "permanent" and isinstance(value, Mapping):
+                merged_perm = dict(cfg.get("permanent") or PERMANENT_DEFAULTS)
+                merged_perm.update(dict(value))
+                cfg["permanent"] = merged_perm
+            else:
+                cfg[key] = value
     return cfg
+
+
+def permanent_memory_config(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = cfg.get("permanent") if isinstance(cfg, Mapping) else None
+    out = dict(PERMANENT_DEFAULTS)
+    if isinstance(raw, Mapping):
+        out.update(dict(raw))
+    return out
 
 
 def _enabled(value: Any) -> bool:
@@ -321,6 +362,357 @@ def _loss_streak(rows: Sequence[Mapping[str, Any]]) -> int:
     return streak
 
 
+def _win_streak(rows: Sequence[Mapping[str, Any]]) -> int:
+    ordered = sorted(
+        rows,
+        key=lambda row: _parse_dt(row.get("windowTimestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    streak = 0
+    for row in ordered:
+        pnl = _safe_float(row.get("realizedPnl"))
+        if pnl > 0:
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _ordered_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        [dict(row) for row in rows],
+        key=lambda row: _parse_dt(row.get("windowTimestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def _exact_group_key(row: Mapping[str, Any], market_type: str) -> Tuple[str, ...]:
+    return (
+        market_type,
+        str(row.get("strategyKey") or "").lower(),
+        str(row.get("strategyVersion") or ""),
+        str(row.get("configHash") or ""),
+        str(row.get("side") or "").lower(),
+        str(row.get("coin") or "").upper(),
+        str(row.get("regime") or "").lower(),
+        str(row.get("why") or ""),
+    )
+
+
+def _coin_regime_group_key(row: Mapping[str, Any], market_type: str) -> Tuple[str, ...]:
+    return (
+        market_type,
+        str(row.get("strategyKey") or "").lower(),
+        str(row.get("side") or "").lower(),
+        str(row.get("coin") or "").upper(),
+        str(row.get("regime") or "").lower(),
+    )
+
+
+def _fingerprint_from_parts(
+    *,
+    market_type: str,
+    strategy_key: str,
+    strategy_version: str,
+    config_hash: str,
+    side: str,
+    coin: str,
+    regime: str,
+    why: str,
+) -> str:
+    return _fingerprint(
+        {
+            "marketType": market_type,
+            "strategyKey": strategy_key,
+            "strategyVersion": strategy_version,
+            "configHash": config_hash,
+            "side": side,
+            "coin": coin,
+            "regime": regime,
+            "why": why,
+        }
+    )
+
+
+def _cohort_fingerprint(match_level: str, row: Mapping[str, Any], market_type: str) -> str:
+    strategy_key = str(row.get("strategyKey") or "unknown").lower()
+    side = str(row.get("side") or "unknown").lower()
+    coin = str(row.get("coin") or "unknown").upper()
+    regime = str(row.get("regime") or "unknown").lower()
+    if match_level == "exact":
+        return _fingerprint_from_parts(
+            market_type=market_type,
+            strategy_key=strategy_key,
+            strategy_version=str(row.get("strategyVersion") or "unversioned"),
+            config_hash=str(row.get("configHash") or "unknown"),
+            side=side,
+            coin=coin,
+            regime=regime,
+            why=str(row.get("why") or "unknown"),
+        )
+    # Broader permanent key intentionally omits version/hash/why; those are
+    # stored on the record for supersede checks against the live signal.
+    return "|".join(
+        [
+            market_type,
+            strategy_key,
+            side,
+            coin,
+            regime,
+            "cohort",
+        ]
+    )
+
+
+def _evidence_slice(rows: Sequence[Mapping[str, Any]], limit: int = 20) -> List[Dict[str, Any]]:
+    return [
+        {
+            "tradeId": row.get("tradeId"),
+            "source": row.get("source"),
+            "realizedPnl": row.get("realizedPnl"),
+            "windowTimestamp": row.get("windowTimestamp"),
+            "exitBucket": row.get("exitBucket"),
+            "why": row.get("why"),
+        }
+        for row in rows[:limit]
+    ]
+
+
+def _source_mix(rows: Sequence[Mapping[str, Any]]) -> str:
+    sources = {str(row.get("source") or "real") for row in rows}
+    if sources == {"real"}:
+        return "real"
+    if sources == {"shadow"}:
+        return "shadow"
+    return "mixed"
+
+
+def _permanent_record(
+    *,
+    fingerprint: str,
+    match_level: str,
+    outcome: str,
+    market_type: str,
+    rows: Sequence[Mapping[str, Any]],
+    streak_count: int,
+) -> Dict[str, Any]:
+    head = rows[0] if rows else {}
+    return {
+        "fingerprint": fingerprint,
+        "matchLevel": match_level,
+        "outcome": outcome,
+        "marketType": market_type,
+        "strategyKey": str(head.get("strategyKey") or "unknown").lower(),
+        "strategyVersion": str(head.get("strategyVersion") or "unversioned"),
+        "configHash": str(head.get("configHash") or "unknown"),
+        "side": str(head.get("side") or "unknown").lower(),
+        "coin": str(head.get("coin") or "unknown").upper()
+        if market_type == "perps"
+        else str(head.get("coin") or "unknown"),
+        "regime": str(head.get("regime") or "unknown").lower(),
+        "why": str(head.get("why") or "unknown"),
+        "streakCount": int(streak_count),
+        "sourceMix": _source_mix(rows),
+        "evidence": _evidence_slice(rows),
+        "status": "active",
+    }
+
+
+def detect_permanent_setup_outcomes(
+    *,
+    market_type: str,
+    real_closed_trades: Iterable[Mapping[str, Any]] = (),
+    shadow_closed_trades: Iterable[Mapping[str, Any]] = (),
+    config: Optional[Mapping[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Scan closed real + shadow history for permanent win/loss streaks."""
+    cfg = setup_memory_config(config, market_type)
+    perm = permanent_memory_config(cfg)
+    if not _enabled(cfg.get("enabled")) or not _enabled(perm.get("enabled")):
+        return []
+
+    market = "perps" if str(market_type).lower() in {"perp", "perps"} else "spot"
+    real_rows = normalize_memory_rows(real_closed_trades, market_type=market)
+    include_shadow = _enabled(perm.get("include_shadow")) and _enabled(cfg.get("include_shadow"))
+    shadow_rows = (
+        normalize_memory_rows(
+            independent_closed_episode_rows(list(shadow_closed_trades or [])),
+            market_type=market,
+        )
+        if include_shadow
+        else []
+    )
+    all_rows = real_rows + shadow_rows
+    if not all_rows:
+        return []
+
+    exact_groups: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+    cohort_groups: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+    for row in all_rows:
+        exact_groups.setdefault(_exact_group_key(row, market), []).append(row)
+        cohort_groups.setdefault(_coin_regime_group_key(row, market), []).append(row)
+
+    detected: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def _consider(match_level: str, rows: Sequence[Mapping[str, Any]], loss_need: int, win_need: int) -> None:
+        ordered = _ordered_rows(rows)
+        if not ordered:
+            return
+        real_count = sum(1 for row in ordered if row.get("source") == "real")
+        shadow_count = sum(1 for row in ordered if row.get("source") == "shadow")
+        # Shadow-only cohorts still need a minimum episode floor.
+        if real_count == 0 and shadow_count < int(cfg.get("min_shadow_episodes") or 0):
+            return
+        loss_streak = _loss_streak(ordered)
+        win_streak = _win_streak(ordered)
+        fingerprint = _cohort_fingerprint(match_level, ordered[0], market)
+        if loss_need > 0 and loss_streak >= loss_need:
+            key = (fingerprint, "block", match_level)
+            detected[key] = _permanent_record(
+                fingerprint=fingerprint,
+                match_level=match_level,
+                outcome="block",
+                market_type=market,
+                rows=ordered,
+                streak_count=loss_streak,
+            )
+        if win_need > 0 and win_streak >= win_need:
+            key = (fingerprint, "promote", match_level)
+            # Block beats promote for the same fingerprint+level when both fire.
+            if (fingerprint, "block", match_level) in detected:
+                return
+            detected[key] = _permanent_record(
+                fingerprint=fingerprint,
+                match_level=match_level,
+                outcome="promote",
+                market_type=market,
+                rows=ordered,
+                streak_count=win_streak,
+            )
+
+    for rows in exact_groups.values():
+        _consider(
+            "exact",
+            rows,
+            int(perm.get("exact_loss_streak") or 0),
+            int(perm.get("exact_win_streak") or 0),
+        )
+    for rows in cohort_groups.values():
+        _consider(
+            "strategy_side_coin_regime",
+            rows,
+            int(perm.get("coin_regime_loss_streak") or 0),
+            int(perm.get("coin_regime_win_streak") or 0),
+        )
+    return list(detected.values())
+
+
+def _permanent_record_matches_identity(
+    record: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> bool:
+    if str(record.get("status") or "active").lower() not in {"active", ""}:
+        return False
+    if str(record.get("marketType") or record.get("market_type") or "").lower() != str(
+        identity.get("marketType") or ""
+    ).lower():
+        return False
+    if str(record.get("strategyKey") or record.get("strategy_key") or "").lower() != str(
+        identity.get("strategyKey") or ""
+    ).lower():
+        return False
+    if str(record.get("side") or "").lower() != str(identity.get("side") or "").lower():
+        return False
+    record_coin = str(record.get("coin") or "")
+    identity_coin = str(identity.get("coin") or "")
+    if identity.get("marketType") == "perps":
+        if record_coin.upper() != identity_coin.upper():
+            return False
+    elif record_coin != identity_coin:
+        return False
+
+    match_level = str(record.get("matchLevel") or record.get("match_level") or "")
+    # Version/hash mismatch invalidates the permanent record for live signals.
+    if str(record.get("strategyVersion") or record.get("strategy_version") or "") != str(
+        identity.get("strategyVersion") or ""
+    ):
+        return False
+    if str(record.get("configHash") or record.get("config_hash") or "") != str(
+        identity.get("configHash") or ""
+    ):
+        return False
+
+    if match_level == "exact":
+        return str(record.get("fingerprint") or "") == str(identity.get("setupFingerprint") or "")
+    if match_level == "strategy_side_coin_regime":
+        return str(record.get("regime") or "").lower() == str(identity.get("regime") or "").lower()
+    return False
+
+
+def match_permanent_setup_memory(
+    identity: Mapping[str, Any],
+    permanent_records: Iterable[Mapping[str, Any]],
+    *,
+    size_up_multiplier: float = 1.25,
+) -> Optional[SetupMemoryDecision]:
+    """Return a permanent block/promote decision if an active record matches."""
+    matched: List[Mapping[str, Any]] = [
+        record
+        for record in (permanent_records or [])
+        if _permanent_record_matches_identity(record, identity)
+    ]
+    if not matched:
+        return None
+
+    blocks = [r for r in matched if str(r.get("outcome") or "").lower() == "block"]
+    promotes = [r for r in matched if str(r.get("outcome") or "").lower() == "promote"]
+    chosen = None
+    action = "allow"
+    if blocks:
+        # Prefer exact blocks over broader cohort blocks.
+        blocks_sorted = sorted(
+            blocks,
+            key=lambda r: 0 if str(r.get("matchLevel") or r.get("match_level")) == "exact" else 1,
+        )
+        chosen = blocks_sorted[0]
+        action = "block"
+    elif promotes:
+        promotes_sorted = sorted(
+            promotes,
+            key=lambda r: 0 if str(r.get("matchLevel") or r.get("match_level")) == "exact" else 1,
+        )
+        chosen = promotes_sorted[0]
+        action = "size_up"
+    if chosen is None:
+        return None
+
+    match_level = str(chosen.get("matchLevel") or chosen.get("match_level") or "exact")
+    streak = int(chosen.get("streakCount") or chosen.get("streak_count") or 0)
+    reason = (
+        f"permanent {match_level} setup {chosen.get('outcome')} "
+        f"(streak={streak})"
+    )
+    size_multiplier = 1.0
+    if action == "size_up":
+        size_multiplier = max(1.0, _safe_float(size_up_multiplier, 1.25))
+    evidence = chosen.get("evidence") if isinstance(chosen.get("evidence"), list) else []
+    return SetupMemoryDecision(
+        action=action,
+        reason=reason,
+        enabled=True,
+        mode="blocking",
+        market_type=str(identity.get("marketType") or "perps"),
+        setup_fingerprint=str(identity.get("setupFingerprint") or ""),
+        size_multiplier=size_multiplier,
+        matched_count=streak,
+        loss_count=streak if action == "block" else 0,
+        win_count=streak if action == "size_up" else 0,
+        match_level=match_level,
+        evidence=list(evidence)[:20],
+        permanent=True,
+    )
+
+
 def evaluate_setup_memory(
     signal: Mapping[str, Any],
     *,
@@ -332,6 +724,7 @@ def evaluate_setup_memory(
     market_regime: str = "",
     now: Optional[datetime] = None,
     history_available: bool = True,
+    permanent_records: Iterable[Mapping[str, Any]] = (),
 ) -> SetupMemoryDecision:
     cfg = setup_memory_config(config, market_type)
     mode = str(cfg.get("mode") or "advisory").strip().lower()
@@ -350,6 +743,50 @@ def evaluate_setup_memory(
             market_type=identity["marketType"],
             setup_fingerprint=identity["setupFingerprint"],
         )
+
+    perm_cfg = permanent_memory_config(cfg)
+    if _enabled(perm_cfg.get("enabled")):
+        permanent_decision = match_permanent_setup_memory(
+            identity,
+            permanent_records,
+            size_up_multiplier=_safe_float(perm_cfg.get("size_up_multiplier"), 1.25),
+        )
+        if permanent_decision is not None:
+            action = permanent_decision.action
+            reason = permanent_decision.reason
+            effective_action = action
+            if mode == "advisory" and action == "block":
+                effective_action = "allow"
+                reason = f"advisory: would block; {reason}"
+            elif mode == "size_down" and action == "block":
+                effective_action = "size_down"
+                reason = f"size_down mode: would block; {reason}"
+            size_multiplier = permanent_decision.size_multiplier
+            if effective_action == "size_down":
+                size_multiplier = max(
+                    0.0, min(1.0, _safe_float(cfg.get("size_down_multiplier"), 0.5))
+                )
+            elif effective_action == "size_up":
+                size_multiplier = max(
+                    1.0, _safe_float(perm_cfg.get("size_up_multiplier"), 1.25)
+                )
+            elif effective_action == "allow":
+                size_multiplier = 1.0
+            return SetupMemoryDecision(
+                action=effective_action,
+                reason=reason,
+                enabled=True,
+                mode=mode,
+                market_type=identity["marketType"],
+                setup_fingerprint=identity["setupFingerprint"],
+                size_multiplier=size_multiplier,
+                matched_count=permanent_decision.matched_count,
+                loss_count=permanent_decision.loss_count,
+                win_count=permanent_decision.win_count,
+                match_level=permanent_decision.match_level,
+                evidence=permanent_decision.evidence,
+                permanent=True,
+            )
 
     if not history_available:
         action = "block" if mode == "blocking" else "allow"
@@ -483,17 +920,7 @@ def evaluate_setup_memory(
     if effective_action == "size_down":
         size_multiplier = max(0.0, min(1.0, _safe_float(cfg.get("size_down_multiplier"), 0.5)))
 
-    evidence = [
-        {
-            "tradeId": row.get("tradeId"),
-            "source": row.get("source"),
-            "realizedPnl": row.get("realizedPnl"),
-            "windowTimestamp": row.get("windowTimestamp"),
-            "exitBucket": row.get("exitBucket"),
-            "why": row.get("why"),
-        }
-        for row in chosen_rows[:20]
-    ]
+    evidence = _evidence_slice(chosen_rows)
     return SetupMemoryDecision(
         action=effective_action,
         reason=reason,
@@ -511,4 +938,5 @@ def evaluate_setup_memory(
         latest_loss_at=latest_loss_at.isoformat() if latest_loss_at else None,
         match_level=chosen_level,
         evidence=evidence,
+        permanent=False,
     )

@@ -17,6 +17,8 @@ def test_dashboard_renderer_surfaces_history_and_apply_status():
     assert "releaseReason" in js
     assert "intendedEffect" in js
     assert "control.error" in js
+    assert "No adaptive decisions have been recorded yet." in js
+    assert "payload.note" not in js
 
 
 def test_dashboard_template_has_reload_status_target():

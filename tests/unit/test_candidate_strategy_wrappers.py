@@ -109,4 +109,5 @@ def test_perp_wrappers_default_to_1h_bias_and_15m_entry():
 
 def test_candidate_strategies_are_registered_in_hl_mapping():
     assert "donchian_atr_pullback" in HYPERLIQUID_STRATEGY_MAPPING
+    assert "daily_box_break_retest" in HYPERLIQUID_STRATEGY_MAPPING
     assert "vwap_rsi_mean_reversion" in HYPERLIQUID_STRATEGY_MAPPING

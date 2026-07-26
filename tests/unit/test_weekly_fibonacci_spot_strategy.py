@@ -62,6 +62,7 @@ def test_weekly_fibonacci_buy_publishes_structural_risk():
     assert indicators["range_timeframe"] == "1h"
     assert indicators["range_bars"] == 168
     assert indicators["confirmation_timeframe"] == "15m"
+    assert indicators["setup"] == "weekly_fibonacci_spot"
     assert "168 closed 1h bars" in indicators["entry_reason"]
     assert "15m confirmation" in indicators["entry_reason"]
 

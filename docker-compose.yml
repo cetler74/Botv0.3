@@ -410,7 +410,8 @@ services:
       dockerfile: services/web-dashboard-service/Dockerfile
     container_name: trading-bot-web
     ports:
-      - "8006:8006"
+      # Localhost only — public access via cloudflared Quick Tunnel.
+      - "127.0.0.1:8006:8006"
     environment:
       - CONFIG_SERVICE_URL=http://config-service:8001
       - DATABASE_SERVICE_URL=http://database-service:8002
@@ -535,6 +536,23 @@ services:
       - trading-bot-network
     depends_on:
       - prometheus
+
+  # Temporary public HTTPS for web dashboards (*.trycloudflare.com).
+  # URL is ephemeral — recreate this container to rotate; see scripts/dashboard_tunnel_url.sh
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: trading-bot-cloudflared
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --url
+      - http://web-dashboard-service:8006
+    networks:
+      - trading-bot-network
+    depends_on:
+      web-dashboard-service:
+        condition: service_healthy
 
 networks:
   trading-bot-network:

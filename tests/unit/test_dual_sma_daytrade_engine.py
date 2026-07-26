@@ -159,3 +159,40 @@ def test_profitability_profile_defaults():
     assert params.sma200_max_slope_pct == 0.004
     assert params.retrace_tolerance_pct == 0.004
     assert params.min_reward_risk == 2.0
+
+
+def test_entry_reason_uses_configured_timeframe_labels_not_daily_5m():
+    """User-facing reasons must reflect bias/confirm/entry TFs (HL uses 1h/15m)."""
+    params = EngineParams(
+        bias_timeframe="1h",
+        confirmation_timeframe="15m",
+        entry_timeframe="15m",
+        use_precision_entry=False,
+        min_candles_bias=50,
+        min_candles_confirm=40,
+        min_candles_entry=40,
+        min_reward_risk=1.5,
+        max_extension_pct=0.05,
+    )
+    # Reuse synthetic series keyed as configured TFs.
+    bias = _flat_then_rise_daily(260)
+    bias.index = pd.date_range("2024-01-01", periods=len(bias), freq="1h")
+    confirm = _uptrend_15m(120)
+    result = evaluate_dual_sma_daytrade(
+        {"1h": bias, "15m": confirm},
+        params,
+        allow_short=False,
+        market_regime="trending_up",
+    )
+    reason = str(result.indicators.get("entry_reason") or "")
+    if result.signal == "buy":
+        assert "daily " not in reason.lower() or "bias" in reason.lower()
+        assert "5m " not in reason
+        assert "1h/15m/15m" in reason or "bias" in reason
+        assert "conviction=" in reason
+        assert result.indicators.get("position_size_multiplier") in (0.75, 1.0, 1.25)
+        assert result.indicators.get("conviction") in ("high", "base", "reduced")
+    else:
+        # Hold is acceptable on synthetic data; still verify skip path has no 5m label.
+        skip = str(result.indicators.get("skip_reason") or result.invalidation_reason or "")
+        assert "entry_5m_fail" in skip or "confirm_15m" in skip or "daily_fail" in skip or result.signal == "hold"

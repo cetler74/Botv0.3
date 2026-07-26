@@ -628,14 +628,46 @@ def evaluate_dual_sma_daytrade(
     target = entry.get("target_hint")
     entry_px = float(entry.get("entry_price") or 0)
 
+    # Conviction sizing hint (consumed by signal_position_size_multiplier).
+    # High: bias gap + directional confirm structure + stronger R:R + shallow extension.
+    max_ext = float(params.max_extension_pct or 0.012)
+    min_rr = float(params.min_reward_risk or 2.0)
+    extension_frac = float(entry.get("extension_distance_pct") or 0)
+    gap_abs = abs(float(daily.get("daily_gap_vs_sma200_pct") or 0))
+    confirm_reason = str(confirm.get("confirm_15m_reason") or "").lower()
+    structure_ok = any(
+        token in confirm_reason
+        for token in ("uptrend", "downtrend", "momentum", "pullback")
+    )
+    if (
+        rr >= min_rr * 1.25
+        and extension_frac <= max_ext * 0.5
+        and gap_abs >= 0.002
+        and structure_ok
+    ):
+        conviction = "high"
+        size_mult = 1.25
+    elif rr >= min_rr and extension_frac <= max_ext * 0.85 and structure_ok:
+        conviction = "base"
+        size_mult = 1.0
+    else:
+        conviction = "reduced"
+        size_mult = 0.75
+    base["conviction"] = conviction
+    base["conviction_ok"] = conviction != "reduced"
+    base["position_size_multiplier"] = size_mult
+    base["conviction_gap_abs"] = gap_abs
+    base["conviction_structure_ok"] = structure_ok
+
     if side == "long":
         if not params.allow_long:
             return _hold_payload("long_disabled", base)
         entry_reason = (
-            f"Dual-SMA LONG ({tf_label}): daily {daily['daily_bias']} {daily['daily_reason']}; "
-            f"15m {confirm['trend_15m']} {confirm['confirm_15m_reason']}; "
-            f"5m {entry['entry_5m_reason']} (ext {ext_pct:.2f}%); "
-            f"SL below swing {stop:.6f}; TP {target:.6f}; R:R {rr:.2f}"
+            f"Dual-SMA LONG ({tf_label}): bias {daily['daily_bias']} {daily['daily_reason']}; "
+            f"{confirm_tf} {confirm['trend_15m']} {confirm['confirm_15m_reason']}; "
+            f"{entry_tf} {entry['entry_5m_reason']} (ext {ext_pct:.2f}%); "
+            f"SL below swing {stop:.6f}; TP {target:.6f}; R:R {rr:.2f}; "
+            f"conviction={conviction}"
         )
         base["entry_reason"] = entry_reason
         base["side_intent"] = "long"
@@ -645,10 +677,11 @@ def evaluate_dual_sma_daytrade(
         if not allow_short or not params.allow_short:
             return _hold_payload("short_disabled", {**base, "entry_reason": ""})
         entry_reason = (
-            f"Dual-SMA SHORT ({tf_label}): daily {daily['daily_bias']} {daily['daily_reason']}; "
-            f"15m {confirm['trend_15m']} {confirm['confirm_15m_reason']}; "
-            f"5m {entry['entry_5m_reason']} (ext {ext_pct:.2f}%); "
-            f"SL above swing {stop:.6f}; TP {target:.6f}; R:R {rr:.2f}"
+            f"Dual-SMA SHORT ({tf_label}): bias {daily['daily_bias']} {daily['daily_reason']}; "
+            f"{confirm_tf} {confirm['trend_15m']} {confirm['confirm_15m_reason']}; "
+            f"{entry_tf} {entry['entry_5m_reason']} (ext {ext_pct:.2f}%); "
+            f"SL above swing {stop:.6f}; TP {target:.6f}; R:R {rr:.2f}; "
+            f"conviction={conviction}"
         )
         base["entry_reason"] = entry_reason
         base["side_intent"] = "short"

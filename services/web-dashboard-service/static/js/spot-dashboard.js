@@ -69,101 +69,17 @@ const priceMoney = (value) => {
   });
 };
 
-function toDecimal(value) {
-  const n = Number(value || 0);
-  return Math.abs(n) > 1 ? n / 100 : n;
-}
-
-function sideTargetPrice(entry, side, decimal, favorable = true) {
-  if (!entry || !decimal) return 0;
-  const s = String(side || 'long').toLowerCase();
-  if (s === 'short') return entry * (1 + (favorable ? -decimal : decimal));
-  return entry * (1 + (favorable ? decimal : -decimal));
-}
-
-function tradeMetadata(t) {
-  const raw = t.metadata ?? t.meta ?? {};
-  if (!raw) return {};
-  if (typeof raw === 'string') {
-    try { return JSON.parse(raw); } catch (_) { return {}; }
-  }
-  return raw;
-}
-
-function protectionStatusCell(label, detail, active = false) {
-  return `
-    <div class="pi-protection-cell">
-      <span class="pi-protection-state ${active ? 'active' : 'inactive'}">${escapeHtml(label)}</span>
-      <span class="pi-protection-detail">${detail}</span>
-    </div>`;
-}
-
-function spotExitRules(data) {
-  return ((data.spot || {}).exitRules) || {};
-}
-
 function spotProtectionDetails(t, entryPrice, isOpen, data) {
-  if (!isOpen || !entryPrice) {
-    return { profitProtection: '—', trailingStop: '—', stopLoss: '—', sort: {} };
+  const ui = window.ProtectionUI;
+  if (!ui) {
+    return { profitProtection: '—', trailingStop: '—', stopLoss: '—', sort: {}, extras: '' };
   }
-  const rules = spotExitRules(data);
-  const metadata = tradeMetadata(t);
-  const side = 'long';
-  const ppActivation = toDecimal(rules.profitProtectionActivationPct ?? 0.015);
-  const trailActivation = toDecimal(rules.trailingActivationPct ?? 0.018);
-  const breakeven = toDecimal(rules.breakevenFloorPct ?? 0.014);
-  const trailStep = toDecimal(rules.tightenedTrailingStepPct ?? rules.trailingStepPct ?? 0.003);
-  const trailArm = Math.max(trailActivation, breakeven + trailStep);
-  const ppArmPrice = sideTargetPrice(entryPrice, side, ppActivation, true);
-  const trailArmPrice = sideTargetPrice(entryPrice, side, trailArm, true);
-  const rawProtectionState = String(
-    t.profit_protection || metadata.profit_protection || '',
-  ).toLowerCase();
-  const protectionActive = Boolean(rawProtectionState && rawProtectionState !== 'inactive');
-  const trailState = String(t.trail_stop || metadata.trail_stop || '').toLowerCase() === 'active'
-    ? 'active'
-    : 'waiting';
-  const trigger = Number(
-    t.trail_stop_trigger || metadata.trail_stop_trigger || t.profit_protection_trigger || 0,
-  );
-  const stopLossEnabled = rules.fixedStopLossEnabled !== false;
-  const stopLossDecimal = toDecimal(rules.stopLossPct ?? 1.5);
-  const stopLossPrice = stopLossEnabled ? sideTargetPrice(entryPrice, side, stopLossDecimal, false) : 0;
-  const ppEnabled = rules.profitProtectionEnabled !== false;
-  const trailEnabled = rules.trailingStopEnabled !== false;
-
-  return {
-    profitProtection: !ppEnabled
-      ? protectionStatusCell('disabled', 'Profit protection off in config', false)
-      : protectionStatusCell(
-        protectionActive ? 'active' : 'inactive',
-        protectionActive && trigger
-          ? `Exit: ${priceMoney(trigger)}`
-          : `Activates: ${priceMoney(ppArmPrice)} (+${decimalPct(ppActivation)})`,
-        protectionActive,
-      ),
-    trailingStop: !trailEnabled
-      ? protectionStatusCell('disabled', 'Trailing stop off in config', false)
-      : protectionStatusCell(
-        trailState === 'active' ? 'active' : 'inactive',
-        trailState === 'active' && trigger
-          ? `Exit: ${priceMoney(trigger)}`
-          : `Activates: ${priceMoney(trailArmPrice)} (+${decimalPct(trailArm)})`,
-        trailState === 'active',
-      ),
-    stopLoss: protectionStatusCell(
-      stopLossEnabled ? 'enabled' : 'disabled',
-      stopLossEnabled && stopLossPrice
-        ? `Exit: ${priceMoney(stopLossPrice)} (-${decimalPct(stopLossDecimal)})`
-        : 'Stop loss off',
-      stopLossEnabled,
-    ),
-    sort: {
-      profitProtection: protectionActive ? 1 : 0,
-      trailingStop: trailState === 'active' ? 1 : 0,
-      stopLoss: stopLossEnabled ? stopLossPrice : -1,
-    },
-  };
+  return ui.buildProtectionDetails(t, entryPrice, 'long', isOpen, data || {}, {
+    spotDefaultPath: true,
+    defaultPpArm: 0.015,
+    defaultTrailArm: 0.018,
+    defaultStopPct: 0.015,
+  });
 }
 
 function loadStorage(key, fallback) {
@@ -565,7 +481,13 @@ const tradeColumns = [
   { key: 'notional', label: 'Value', sortType: 'number', sortValue: (t) => t._notional, render: (t) => money(t._notional) },
   { key: 'realized', label: 'Realized', sortType: 'number', sortValue: (t) => t._realized, render: (t) => `<span class="${cls(t._realized)}">${money(t._realized)}</span>` },
   { key: 'unrealized', label: 'Unrealized', sortType: 'number', sortValue: (t) => t._unrealized, render: (t) => `<span class="${cls(t._unrealized)}">${money(t._unrealized)}</span>` },
-  { key: 'profitProtection', label: 'Profit protection', sortType: 'number', sortValue: (t) => t._protection.sort.profitProtection || 0, render: (t) => t._protection.profitProtection },
+  {
+    key: 'profitProtection',
+    label: 'Profit protection',
+    sortType: 'number',
+    sortValue: (t) => t._protection.sort.profitProtection || 0,
+    render: (t) => `${t._protection.profitProtection || ''}${t._protection.extras || ''}`,
+  },
   { key: 'trailingStop', label: 'Trailing stop', sortType: 'number', sortValue: (t) => t._protection.sort.trailingStop || 0, render: (t) => t._protection.trailingStop },
   { key: 'stopLoss', label: 'Stop loss', sortType: 'number', sortValue: (t) => t._protection.sort.stopLoss || 0, render: (t) => t._protection.stopLoss },
   { key: 'strategy', label: 'Strategy', sortType: 'text', sortValue: (t) => t._strategy, render: (t) => `<span class="pi-muted-cell">${escapeHtml(t._strategy || '-')}</span>` },
@@ -811,6 +733,10 @@ function tradesForFilter(data) {
 function renderTrades(data) {
   const st = data.spotTrades || {};
   setText('spot-trades-meta', `${st.totalOpen || 0} open · ${st.totalClosed || 0} closed`);
+  const legend = document.getElementById('spot-protection-legend');
+  if (legend && window.ProtectionUI) {
+    legend.innerHTML = window.ProtectionUI.protectionLegendHtml();
+  }
   document.querySelectorAll('[data-trade-filter]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.tradeFilter === state.tradeFilter);
   });

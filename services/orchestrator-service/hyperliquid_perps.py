@@ -18,6 +18,17 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from strategy.hyperliquid.consensus import normalize_perp_entry_signal
 
+from profit_protection_state import (
+    evaluate_profit_protection_arm,
+    evaluate_tiered_profit_lock,
+    format_breach_exit_reason,
+    format_late_arm_exit_reason,
+    is_feature_enabled,
+    merge_trail_trigger_for_side,
+    resolve_profit_lock_floor_decimal,
+    should_breach_exit_for_status,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,11 +199,33 @@ def disabled_strategy_side_exit_reason(
     return None
 
 
+def adaptive_regime_side_exit_exempt_strategies(
+    hl_cfg: Optional[Mapping[str, Any]] = None,
+) -> set:
+    """Strategies that keep open positions through adaptive regime/side blocks.
+
+    Dual SMA shorts in trending_down are a primary earner; adaptive book-level
+    blocks must not force-close them (or block new Dual SMA entries).
+    """
+    raw = (hl_cfg or {}).get("adaptive_regime_side_exit_exempt_strategies")
+    if raw is None:
+        return {"dual_sma_daytrade"}
+    if not isinstance(raw, (list, tuple, set)):
+        return {"dual_sma_daytrade"}
+    return {str(item or "").strip().lower() for item in raw if str(item or "").strip()}
+
+
 def adaptive_blocked_regime_side_exit_reason(
     trade: Mapping[str, Any],
     hl_cfg: Mapping[str, Any],
 ) -> Optional[str]:
     """Close open paper positions when adaptive PnL control now blocks their regime/side."""
+    source = str(
+        trade.get("source_strategy") or trade.get("strategy") or ""
+    ).strip().lower()
+    if source and source in adaptive_regime_side_exit_exempt_strategies(hl_cfg):
+        return None
+
     metadata = _metadata_dict(trade)
     regime = str(
         metadata.get("market_regime")
@@ -800,7 +833,15 @@ def setup_risk_metadata_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         target_pct = _safe_float(meta.get("target_pct"), 0.0)
         if target_pct > 0:
             meta["target_pct"] = _normalize_published_setup_pct(target_pct)
-    meta["setup"] = str(meta.get("setup") or "sma_reclaim_bull_flag")
+    if not meta.get("setup"):
+        strategy_name = str(
+            signal.get("strategy")
+            or signal.get("source_strategy")
+            or meta.get("strategy")
+            or ""
+        ).strip().lower()
+        if strategy_name:
+            meta["setup"] = strategy_name
     return meta
 
 
@@ -855,6 +896,63 @@ def setup_risk_from_trade_metadata(trade: Mapping[str, Any]) -> Dict[str, Any]:
             return dict(nested)
     parsed = parse_setup_risk_from_entry_reason(str(trade.get("entry_reason") or ""))
     return parsed if isinstance(parsed, dict) else {}
+
+
+def paper_strategy_allowlist_block(
+    strategy: str,
+    hl_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Block real paper entries when paper_strategy_allowlist is non-empty and strategy is absent.
+
+    Empty / missing allowlist means no restriction (all enabled strategies may paper-enter).
+    Shadow evaluation is unaffected — callers should only invoke this on real paper opens.
+    """
+    raw = (hl_cfg or {}).get("paper_strategy_allowlist")
+    if raw is None:
+        return {"blocked": False, "reason": "paper_allowlist_unset"}
+    if not isinstance(raw, (list, tuple)):
+        return {"blocked": False, "reason": "paper_allowlist_invalid"}
+    allow = [str(s).strip().lower() for s in raw if str(s).strip()]
+    if not allow:
+        return {"blocked": False, "reason": "paper_allowlist_empty"}
+    key = str(strategy or "").strip().lower()
+    if key in allow:
+        return {"blocked": False, "reason": "paper_allowlist_ok", "allowlist": allow}
+    return {
+        "blocked": True,
+        "reason": "paper_allowlist",
+        "message": f"Strategy {strategy or 'unknown'} not on paper allowlist",
+        "allowlist": allow,
+    }
+
+
+def shadow_promotion_sample_thresholds(
+    strategy: str,
+    promotion_cfg: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, int]:
+    """Resolve min_closed / min_episodes, with optional per-strategy overrides.
+
+    Phase C swing lanes (e.g. donchian_atr_pullback) can require ≥20 episodes
+    while other strategies keep the global 8-episode floor.
+    """
+    cfg = promotion_cfg or {}
+    min_closed = int(cfg.get("min_closed", 8) or 8)
+    min_episodes = int(cfg.get("min_episodes", min_closed) or min_closed)
+    overrides = cfg.get("strategy_overrides") or {}
+    if isinstance(overrides, Mapping):
+        strat_cfg = overrides.get(str(strategy or "").strip().lower()) or {}
+        if isinstance(strat_cfg, Mapping):
+            if strat_cfg.get("min_closed") is not None:
+                try:
+                    min_closed = int(strat_cfg.get("min_closed") or min_closed)
+                except (TypeError, ValueError):
+                    pass
+            if strat_cfg.get("min_episodes") is not None:
+                try:
+                    min_episodes = int(strat_cfg.get("min_episodes") or min_episodes)
+                except (TypeError, ValueError):
+                    pass
+    return {"min_closed": max(1, min_closed), "min_episodes": max(1, min_episodes)}
 
 
 def strategy_risk_per_trade_pct(
@@ -1109,6 +1207,7 @@ class PaperPerpExitConfig:
     fee_rate_per_side: float = 0.001
     profit_protection_fee_buffer: float = 0.0015
     effective_profit_floor_decimal: float = 0.0035
+    early_profit_locks: Dict[str, Any] = field(default_factory=dict)
 
     # Phase 3 (2026-05-27): ATR-based stop loss override.
     # When enabled and trade metadata carries `entry_atr_pct`, the effective
@@ -1229,7 +1328,13 @@ def paper_perp_exit_config_from_yaml(
     except (TypeError, ValueError):
         fee_buffer = 0.0015
     fee_floor = max(0.0, (fee_rate_per_side * 2.0) + fee_buffer)
-    breakeven_floor = max(_dec("breakeven_floor_percentage", 0.0035), fee_floor)
+    # Lock floor honors guaranteed_min_profit / break_even_plus, then fee floor.
+    configured_lock_floor = resolve_profit_lock_floor_decimal(
+        trailing,
+        pp,
+        default_floor=0.0035,
+    )
+    breakeven_floor = max(configured_lock_floor, fee_floor)
     min_trigger_distance = max(_dec("min_trigger_distance_percentage", 0.0035), fee_floor)
     trailing_activation = max(_dec("activation_threshold", 0.0050), fee_floor)
     pp_activation = max(pp_activation, fee_floor)
@@ -1347,7 +1452,7 @@ def paper_perp_exit_config_from_yaml(
         max_holding_minutes=int(hl_cfg.get("max_holding_minutes", 240) or 240),
         max_holding_minutes_hard=max_hold_hard,
         overall_take_profit_pct=overall_pct,
-        trailing_enabled=bool(trailing.get("enabled", True)),
+        trailing_enabled=is_feature_enabled(trailing, default=True),
         trailing_activation_decimal=trailing_activation,
         trailing_step_decimal=step,
         tightened_step_decimal=tightened,
@@ -1355,11 +1460,12 @@ def paper_perp_exit_config_from_yaml(
         tighten_profit_threshold_decimal=_dec("tighten_profit_threshold", 0.0050),
         breakeven_floor_decimal=breakeven_floor,
         min_trigger_distance_decimal=min_trigger_distance,
-        profit_protection_enabled=bool(pp.get("enabled", True)),
+        profit_protection_enabled=is_feature_enabled(pp, default=True),
         profit_protection_activation_decimal=pp_activation,
         fee_rate_per_side=fee_rate_per_side,
         profit_protection_fee_buffer=fee_buffer,
         effective_profit_floor_decimal=fee_floor,
+        early_profit_locks=dict(pp.get("early_profit_locks") or {}),
         stop_loss_atr_enabled=atr_enabled,
         stop_loss_atr_mult=atr_mult,
         stop_loss_atr_min_pct=atr_min_pct,
@@ -3855,36 +3961,92 @@ def evaluate_paper_perp_exit(
     trailing_activation_pct = cfg.trailing_activation_decimal * 100.0
     pp_activation_pct = cfg.profit_protection_activation_decimal * 100.0
 
-    if (
-        cfg.profit_protection_enabled
-        and peak_pct >= pp_activation_pct
-        and not pp_status
-        and not trail_active
-    ):
-        if side == "short":
-            trigger_px = entry_price * (1.0 - cfg.breakeven_floor_decimal)
-        else:
-            trigger_px = entry_price * (1.0 + cfg.breakeven_floor_decimal)
-        metadata["trail_stop_trigger"] = trigger_px
+    tiered_lock = evaluate_tiered_profit_lock(
+        config=cfg.early_profit_locks,
+        peak_pct=peak_pct,
+        entry_price=entry_price,
+        current_price=current_price,
+        existing_trigger=metadata.get("trail_stop_trigger"),
+        side=side,
+    )
+    if tiered_lock.action == "late_exit":
+        metadata["early_profit_lock_tier"] = tiered_lock.tier_index
+        metadata["early_profit_lock_floor_pct"] = tiered_lock.floor_decimal * 100.0
+        return PaperPerpExitResult(
+            (
+                f"paper_early_profit_lock_late_breach_tier{tiered_lock.tier_index}"
+                f"@{pct:.2f}%_peak{peak_pct:.2f}%"
+                f"_floor{tiered_lock.floor_price:.6f}"
+                "|profit_protection_breach"
+            ),
+            metadata,
+            tiered_lock.floor_price,
+        )
+    if tiered_lock.action == "raise":
+        metadata["trail_stop_trigger"] = merge_trail_trigger_for_side(
+            metadata.get("trail_stop_trigger"),
+            tiered_lock.floor_price,
+            side=side,
+        )
+        metadata["profit_protection"] = "profit_guaranteed"
+        metadata["profit_protection_trigger"] = pct
+        metadata["early_profit_lock_tier"] = tiered_lock.tier_index
+        metadata["early_profit_lock_activation_pct"] = (
+            tiered_lock.activation_decimal * 100.0
+        )
+        metadata["early_profit_lock_floor_pct"] = tiered_lock.floor_decimal * 100.0
+        metadata["early_profit_lock_peak_pct"] = peak_pct
+        pp_status = "profit_guaranteed"
+
+    # Port spot can_arm / late-arm semantics: milestones may upgrade; never leave
+    # profit_guaranteed when mark is already through the floor.
+    arm_decision = evaluate_profit_protection_arm(
+        status=pp_status,
+        peak_pct=peak_pct,
+        activation_pct=pp_activation_pct,
+        entry_price=entry_price,
+        current_price=current_price,
+        floor_decimal=cfg.breakeven_floor_decimal,
+        trailing_active=trail_active,
+        enabled=cfg.profit_protection_enabled,
+        side=side,
+    )
+    if arm_decision.action == "late_exit":
+        return PaperPerpExitResult(
+            f"paper_{format_late_arm_exit_reason(pnl_percentage=pct, floor_price=arm_decision.floor_price, current_price=current_price)}",
+            metadata,
+            arm_decision.floor_price,
+        )
+    if arm_decision.action == "arm":
+        metadata["trail_stop_trigger"] = merge_trail_trigger_for_side(
+            metadata.get("trail_stop_trigger"),
+            arm_decision.floor_price,
+            side=side,
+        )
         metadata["profit_protection"] = "profit_guaranteed"
         metadata["profit_protection_trigger"] = pct
 
+    # Armed floor breach is always executable (no LOSS/NET stranding).
     if (
         cfg.profit_protection_enabled
-        and metadata.get("profit_protection") == "profit_guaranteed"
+        and should_breach_exit_for_status(metadata.get("profit_protection"))
         and not trail_active
     ):
         pp_trigger = float(metadata.get("trail_stop_trigger") or 0.0)
         if pp_trigger > 0:
-            if side == "long" and current_price <= pp_trigger:
-                return PaperPerpExitResult(
-                    f"paper_profit_protection_breach@{pct:.2f}%",
-                    metadata,
-                    pp_trigger,
+            breached = (
+                (side == "long" and current_price <= pp_trigger)
+                or (side == "short" and current_price >= pp_trigger)
+            )
+            if breached:
+                reason = format_breach_exit_reason(
+                    metadata.get("profit_protection"),
+                    pnl_percentage=pct,
+                    trigger_price=pp_trigger,
+                    current_price=current_price,
                 )
-            elif side == "short" and current_price >= pp_trigger:
                 return PaperPerpExitResult(
-                    f"paper_profit_protection_breach@{pct:.2f}%",
+                    f"paper_{reason}",
                     metadata,
                     pp_trigger,
                 )
@@ -4377,6 +4539,18 @@ def hyperliquid_regime_direction_gate(
     side = str(signal_side or "").lower()
     regime_key = str(regime or "").lower()
     strategy_key = str(strategy or "").strip().lower()
+    blocked_strategy_sides = (hl_cfg or {}).get("blocked_strategy_sides") or {}
+    if isinstance(blocked_strategy_sides, Mapping) and strategy_key:
+        configured_sides = {
+            str(value or "").strip().lower()
+            for value in (blocked_strategy_sides.get(strategy_key) or [])
+        }
+        if side in configured_sides:
+            return {
+                "blocked": True,
+                "reason": f"configured_strategy_side_block_{strategy_key}_{side}",
+                "sizeMultiplier": None,
+            }
     strategy_blocks = (hl_cfg or {}).get("strategy_regime_side_blocks") or {}
     if isinstance(strategy_blocks, dict) and strategy_key:
         raw_strategy_cfg = strategy_blocks.get(strategy_key) or strategy_blocks.get(strategy) or {}
@@ -4397,7 +4571,10 @@ def hyperliquid_regime_direction_gate(
         str(value or "").strip().lower()
         for value in (blocked_regime_sides.get(regime_key) or [])
     }
-    if side in configured_blocked_sides:
+    if (
+        side in configured_blocked_sides
+        and strategy_key not in adaptive_regime_side_exit_exempt_strategies(hl_cfg)
+    ):
         return {
             "blocked": True,
             "reason": f"configured_regime_side_block_{regime_key}_{side}",

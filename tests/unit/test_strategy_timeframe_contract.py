@@ -9,7 +9,7 @@ from strategy.hyperliquid.mapping import HYPERLIQUID_STRATEGY_MAPPING
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = yaml.safe_load((ROOT / "config" / "config.yaml").read_text())
-ALLOWED = {"1h", "15m", "1m"}
+ALLOWED = {"1h", "15m", "1m", "4h", "1d"}
 RSI_STOCH_15M_ALLOWED = {"1h", "15m"}
 LEGACY_RSI_STOCH_ALIASES = {
     "rsi_stoch_reversal_1m",

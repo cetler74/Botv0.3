@@ -18,6 +18,7 @@ Created: 2025-08-30
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import httpx
@@ -129,10 +130,17 @@ class OrderLifecycleManager:
         once the trail loop actually started running). Accept both list and
         dict-wrapped shapes for safety.
         """
+        # Rate-limit disconnect spam when DB flaps under dual trail/activation polls.
+        now_mono = time.monotonic()
+        backoff_until = getattr(self, "_open_trades_backoff_until", 0.0)
+        if now_mono < backoff_until:
+            return []
+
         try:
             response = await self.http_client_fast.get(f"{self.database_url}/api/v1/trades/open")
             response.raise_for_status()
             payload = response.json()
+            self._open_trades_fail_streak = 0
 
             if isinstance(payload, dict):
                 trades = payload.get("trades") or payload.get("data") or []
@@ -168,7 +176,17 @@ class OrderLifecycleManager:
             return open_trades_no_exit
 
         except Exception as e:
-            logger.error(f"❌ Error getting open trades: {e}")
+            streak = int(getattr(self, "_open_trades_fail_streak", 0) or 0) + 1
+            self._open_trades_fail_streak = streak
+            # Exponential backoff capped at 30s after repeated disconnects.
+            self._open_trades_backoff_until = now_mono + min(30.0, 5.0 * streak)
+            if streak <= 2 or streak % 10 == 0:
+                logger.error(
+                    "❌ Error getting open trades (streak=%s, backoff=%.0fs): %s",
+                    streak,
+                    min(30.0, 5.0 * streak),
+                    e,
+                )
             return []
     
     async def update_trade_exit_id(self, trade_id: str, exit_id: str) -> bool:

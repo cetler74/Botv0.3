@@ -157,13 +157,22 @@ class ActivationTriggerSystem:
                 # Update metrics
                 self.metrics['trades_monitored'] = len(self.activated_trades)
                 
-                # Wait before next check (frequent checks for precise activation)
-                await asyncio.sleep(2.0)  # Check every 2 seconds for responsive activation
+                # Safety-net poll; TrailingStopManager is primary when event-driven.
+                poll_seconds = float(
+                    ((self.config or {}).get("trading") or {})
+                    .get("trailing_stop", {})
+                    .get("activation_check_interval_seconds")
+                    or ((self.config or {}).get("trading") or {})
+                    .get("trailing_stop", {})
+                    .get("check_interval_seconds")
+                    or 10.0
+                )
+                await asyncio.sleep(max(2.0, poll_seconds))
                 
             except Exception as e:
                 logger.error(f"❌ Error in activation monitoring loop: {e}")
                 self.metrics['errors'] += 1
-                await asyncio.sleep(5.0)  # Longer wait on error
+                await asyncio.sleep(15.0)  # Back off harder on DB/network errors
     
     async def _check_for_new_activations(self):
         """Check for trades that need trailing stop activation"""

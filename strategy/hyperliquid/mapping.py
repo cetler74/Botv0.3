@@ -51,6 +51,10 @@ HYPERLIQUID_STRATEGY_MAPPING = {
         "strategy.hyperliquid.donchian_atr_pullback_perp",
         "DonchianAtrPullbackPerpStrategy",
     ),
+    "daily_box_break_retest": (
+        "strategy.hyperliquid.daily_box_break_retest_perp",
+        "DailyBoxBreakRetestPerpStrategy",
+    ),
     "vwap_rsi_mean_reversion": (
         "strategy.hyperliquid.vwap_rsi_mean_reversion_perp",
         "VwapRsiMeanReversionPerpStrategy",

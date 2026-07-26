@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Hyperliquid Paper Perps</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css?v=20260528" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260620-shadow-exit-policy">
+    <link rel="stylesheet" href="/static/css/portfolio-dashboard.css?v=20260719-protection-ui">
 </head>
 <body>
     <header class="pi-topbar">
@@ -432,67 +432,6 @@
             </div>
         </section>
 
-        <section class="pi-panel pi-supply-demand-audit" id="supply-demand-audit-panel">
-            <div class="pi-panel-head">
-                <div>
-                    <p class="pi-eyebrow">Price action · 3-step audit</p>
-                    <h2>Supply / Demand 3-Step</h2>
-                </div>
-                <span class="pi-muted" id="sd-audit-window">Last 24h</span>
-            </div>
-            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Step 1 pass</span>
-                    <strong id="sd-step1-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Step 2 pass</span>
-                    <strong id="sd-step2-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Step 3 pass</span>
-                    <strong id="sd-step3-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Evaluations</span>
-                    <strong id="sd-eval-count">0</strong>
-                </div>
-            </div>
-            <p class="pi-adaptive-note" id="sd-audit-summary">No supply/demand evaluations in the last 24 hours.</p>
-            <div class="pi-table-wrap">
-                <table class="pi-table pi-adaptive-table pi-horizontal-table">
-                    <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>Trend</th>
-                            <th>Signal</th>
-                            <th>R:R</th>
-                            <th>Steps</th>
-                            <th>Reason</th>
-                        </tr>
-                    </thead>
-                    <tbody id="sd-audit-body">
-                        <tr><td colspan="6" class="pi-empty">No evaluations loaded.</td></tr>
-                    </tbody>
-                </table>
-            </div>
-            <div class="pi-watchlist-pagination" id="sd-audit-pagination">
-                <p id="sd-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
-                <div class="pi-pagination-actions">
-                    <label class="pi-field-label" for="sd-page-size">
-                        Rows
-                        <select id="sd-page-size" class="pi-select" aria-label="Supply/demand audit rows per page">
-                            <option value="10" selected>10</option>
-                            <option value="50">50</option>
-                            <option value="100">100</option>
-                        </select>
-                    </label>
-                    <button type="button" class="pi-page-btn" id="sd-prev" aria-label="Previous supply/demand page">Prev</button>
-                    <button type="button" class="pi-page-btn" id="sd-next" aria-label="Next supply/demand page">Next</button>
-                </div>
-            </div>
-        </section>
-
         <section class="pi-panel pi-arc-audit" id="arc-audit-panel">
             <div class="pi-panel-head">
                 <div>
@@ -524,130 +463,6 @@
                         <tr><td colspan="6" class="pi-empty">No evaluations loaded.</td></tr>
                     </tbody>
                 </table>
-            </div>
-        </section>
-
-        <section class="pi-panel pi-dual-sma-audit" id="dual-sma-audit-panel">
-            <div class="pi-panel-head">
-                <div>
-                    <p class="pi-eyebrow">Dual-SMA · Daytrade audit</p>
-                    <h2>Dual SMA 20/200</h2>
-                </div>
-                <span class="pi-muted" id="dsma-audit-window">Last 24h</span>
-            </div>
-            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Daily pass</span>
-                    <strong id="dsma-daily-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">15m pass</span>
-                    <strong id="dsma-15m-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">5m pass</span>
-                    <strong id="dsma-5m-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Evaluations</span>
-                    <strong id="dsma-eval-count">0</strong>
-                </div>
-            </div>
-            <p class="pi-adaptive-note" id="dsma-audit-summary">No dual-SMA evaluations in the last 24 hours.</p>
-            <div class="pi-table-wrap">
-                <table class="pi-table pi-adaptive-table pi-horizontal-table">
-                    <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>Daily bias</th>
-                            <th>15m trend</th>
-                            <th>5m signal</th>
-                            <th>Ext %</th>
-                            <th>R:R</th>
-                            <th>Reason</th>
-                        </tr>
-                    </thead>
-                    <tbody id="dsma-audit-body">
-                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
-                    </tbody>
-                </table>
-            </div>
-            <div class="pi-watchlist-pagination" id="dsma-audit-pagination">
-                <p id="dsma-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
-                <div class="pi-pagination-actions">
-                    <label class="pi-field-label" for="dsma-page-size">
-                        Rows
-                        <select id="dsma-page-size" class="pi-select" aria-label="Dual-SMA audit rows per page">
-                            <option value="10" selected>10</option>
-                            <option value="50">50</option>
-                            <option value="100">100</option>
-                        </select>
-                    </label>
-                    <button type="button" class="pi-page-btn" id="dsma-prev" aria-label="Previous dual-SMA page">Prev</button>
-                    <button type="button" class="pi-page-btn" id="dsma-next" aria-label="Next dual-SMA page">Next</button>
-                </div>
-            </div>
-        </section>
-
-        <section class="pi-panel pi-orb-scalp-audit" id="orb-scalp-audit-panel">
-            <div class="pi-panel-head">
-                <div>
-                    <p class="pi-eyebrow">ORB · 5m scalp audit</p>
-                    <h2>ORB 5m Scalp (Casper SMC)</h2>
-                </div>
-                <span class="pi-muted" id="orb-audit-window">Last 24h</span>
-            </div>
-            <div class="pi-kpi-grid pi-adaptive-kpi-grid">
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Breakout pass</span>
-                    <strong id="orb-breakout-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Retest pass</span>
-                    <strong id="orb-retest-rate">0%</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Signal R:R</span>
-                    <strong id="orb-rr-rate">0</strong>
-                </div>
-                <div class="pi-kpi">
-                    <span class="pi-kpi-label">Evaluations</span>
-                    <strong id="orb-eval-count">0</strong>
-                </div>
-            </div>
-            <p class="pi-adaptive-note" id="orb-audit-summary">No ORB 5m scalp evaluations in the last 24 hours.</p>
-            <div class="pi-table-wrap">
-                <table class="pi-table pi-adaptive-table pi-horizontal-table">
-                    <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>State</th>
-                            <th>Direction</th>
-                            <th>Signal</th>
-                            <th>R:R</th>
-                            <th>OR mid</th>
-                            <th>Reason</th>
-                        </tr>
-                    </thead>
-                    <tbody id="orb-audit-body">
-                        <tr><td colspan="7" class="pi-empty">No evaluations loaded.</td></tr>
-                    </tbody>
-                </table>
-            </div>
-            <div class="pi-watchlist-pagination" id="orb-audit-pagination">
-                <p id="orb-page-info" class="pi-muted pi-page-info">Showing 0 of 0</p>
-                <div class="pi-pagination-actions">
-                    <label class="pi-field-label" for="orb-page-size">
-                        Rows
-                        <select id="orb-page-size" class="pi-select" aria-label="ORB 5m scalp audit rows per page">
-                            <option value="10" selected>10</option>
-                            <option value="50">50</option>
-                            <option value="100">100</option>
-                        </select>
-                    </label>
-                    <button type="button" class="pi-page-btn" id="orb-prev" aria-label="Previous ORB page">Prev</button>
-                    <button type="button" class="pi-page-btn" id="orb-next" aria-label="Next ORB page">Next</button>
-                </div>
             </div>
         </section>
 
@@ -788,6 +603,7 @@
                 <button type="button" class="pi-filter-btn" data-trade-filter="closed">Closed</button>
                 <button type="button" class="pi-filter-btn" data-trade-filter="all">All</button>
             </div>
+            <div id="perp-protection-legend" class="pi-protection-legend-wrap" aria-label="Protection state legend"></div>
             <div class="pi-table-tools">
                 <details class="pi-column-menu" data-column-menu="trades">
                     <summary><i class="fas fa-table-columns"></i> Columns</summary>
@@ -828,6 +644,7 @@
     </main>
 
     <script src="/static/js/portfolio-panel-collapse.js?v=20260610-topbar-nav"></script>
-    <script src="/static/js/portfolio-dashboard.js?v=20260709-progress-why"></script>
+    <script src="/static/js/protection-ui.js?v=20260719-protection-ui"></script>
+    <script src="/static/js/portfolio-dashboard.js?v=20260725-remove-audit-panels"></script>
 </body>
 </html>

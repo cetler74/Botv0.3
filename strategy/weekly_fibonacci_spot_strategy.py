@@ -145,6 +145,7 @@ class WeeklyFibonacciSpotStrategy(BaseStrategy):
             )
             self.state.indicators.update(
                 {
+                    "setup": "weekly_fibonacci_spot",
                     "entry_reason": entry_reason if buy else "",
                     "entry_price": price,
                     "stop_hint": stop_hint,

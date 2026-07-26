@@ -49,6 +49,8 @@ from hyperliquid_perps import (  # noqa: E402
     is_caution_window,
     paper_perp_exit_config_from_yaml,
     paper_perp_position_size_multiplier,
+    paper_strategy_allowlist_block,
+    shadow_promotion_sample_thresholds,
     perp_entry_atr_metadata,
     perp_lane_notional_multiplier,
     perp_side_fee,
@@ -263,6 +265,39 @@ def test_adaptive_blocked_regime_side_exit_reason_closes_matching_open_position(
     ) is None
 
 
+def test_adaptive_blocked_regime_side_exit_exempts_dual_sma():
+    trade = {
+        "source_strategy": "dual_sma_daytrade",
+        "position_side": "short",
+        "metadata": {"market_regime": "trending_down"},
+    }
+    cfg = {
+        "adaptive_regime_side_exit_exempt_strategies": ["dual_sma_daytrade"],
+        "_adaptive_pnl_control": {
+            "decisions": [
+                {
+                    "type": "block_recent_regime_side",
+                    "action": "block",
+                    "targetType": "regime_side",
+                    "target": "trending_down",
+                    "side": "short",
+                }
+            ]
+        },
+        "blocked_regime_sides": {"trending_down": ["short"]},
+    }
+    assert adaptive_blocked_regime_side_exit_reason(trade, cfg) is None
+    gate = hyperliquid_regime_direction_gate(
+        "short",
+        "trending_down",
+        0.74,
+        0.72,
+        cfg,
+        strategy="dual_sma_daytrade",
+    )
+    assert gate.get("blocked") is False
+
+
 def test_hyperliquid_perps_use_centralized_exit_rules():
     config_path = Path(ROOT) / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
@@ -306,6 +341,26 @@ def test_hyperliquid_perps_use_centralized_exit_rules():
             "side": "short",
             "regimes": ["trending_up"],
         },
+        {
+            "strategy": "donchian_atr_pullback",
+            "side": "long",
+            "regimes": ["trending_up", "breakout", "high_volatility"],
+        },
+        {
+            "strategy": "donchian_atr_pullback",
+            "side": "short",
+            "regimes": ["trending_down", "breakout", "high_volatility"],
+        },
+        {
+            "strategy": "daily_box_break_retest",
+            "side": "long",
+            "regimes": ["trending_up", "breakout", "high_volatility"],
+        },
+        {
+            "strategy": "daily_box_break_retest",
+            "side": "short",
+            "regimes": ["trending_down", "breakout", "high_volatility"],
+        },
     ]
     assert "sideways" in cfg["strategies_hyperliquid"]["supply_demand_3step"]["parameters"]["blocked_regimes"]
     assert hl_cfg["strategy_regime_side_blocks"]["supply_demand_3step"]["sideways"] == [
@@ -316,15 +371,33 @@ def test_hyperliquid_perps_use_centralized_exit_rules():
     assert hl_cfg["dollar_loss_cap"]["strategy_max_loss_usd"]["supply_demand_3step"] == pytest.approx(3.0)
     assert hl_cfg["strategy_coin_loss_streak_cooldowns"]["supply_demand_3step"]["consecutive_losses"] == 1
     assert hl_cfg["min_edge_gate"]["min_edge_pct"] == pytest.approx(0.65)
-    assert hl_cfg["daily_profit_target"]["target_usd"] == pytest.approx(20.0)
+    assert hl_cfg["daily_profit_target"]["target_usd"] == pytest.approx(25.0)
     assert hl_cfg["shadow_cohort_promotion"]["use_episode_metrics"] is True
     assert hl_cfg["shadow_cohort_promotion"]["min_episodes"] == 8
+    assert hl_cfg["shadow_cohort_promotion"]["lookback_hours"] == 336
+    assert hl_cfg["shadow_cohort_promotion"]["strategy_overrides"]["donchian_atr_pullback"][
+        "min_episodes"
+    ] == 20
+    assert hl_cfg["paper_strategy_allowlist"] == ["dual_sma_daytrade"]
+    assert hl_cfg["adaptive_regime_side_exit_exempt_strategies"] == ["dual_sma_daytrade"]
+    assert hl_cfg["strategy_coin_loss_streak_cooldowns"]["dual_sma_daytrade"]["per_coin"]["LIT"][
+        "cooldown_hours"
+    ] == 24
+    assert cfg["strategies_hyperliquid"]["donchian_atr_pullback"]["enabled"] is True
+    assert cfg["strategies_hyperliquid"]["donchian_atr_pullback"]["parameters"][
+        "min_reward_risk"
+    ] == pytest.approx(2.5)
+    assert cfg["strategies"]["rsi_oversold_checklist"]["enabled"] is False
+    assert cfg["strategies"]["weekly_fibonacci_spot"]["parameters"]["min_reward_risk"] == pytest.approx(
+        2.5
+    )
     assert hl_cfg["cross_strategy_selection_bias"] == {}
     assert hl_cfg["lane_notional_multipliers"] == {}
     assert hl_cfg["consensus_executable_denylist"] == [
         "rsi_stoch_reversal_15m",
         "rsi_stoch_reversal_5m",
         "rsi_stoch_reversal_1m",
+        "daily_box_break_retest",
     ]
     assert hl_cfg["shadow_strategy_evaluation"][
         "single_open_per_strategy_coin_side"
@@ -718,6 +791,35 @@ def test_paper_perp_position_size_multiplier_moderate_profile():
     ) == pytest.approx(1.0)
 
 
+def test_paper_strategy_allowlist_block_dual_sma_only():
+    cfg = {"paper_strategy_allowlist": ["dual_sma_daytrade"]}
+    ok = paper_strategy_allowlist_block("dual_sma_daytrade", cfg)
+    assert ok["blocked"] is False
+    blocked = paper_strategy_allowlist_block("supply_demand_3step", cfg)
+    assert blocked["blocked"] is True
+    assert blocked["reason"] == "paper_allowlist"
+    assert "allowlist" in blocked
+    empty = paper_strategy_allowlist_block("supply_demand_3step", {"paper_strategy_allowlist": []})
+    assert empty["blocked"] is False
+    unset = paper_strategy_allowlist_block("supply_demand_3step", {})
+    assert unset["blocked"] is False
+
+
+def test_shadow_promotion_sample_thresholds_per_strategy_override():
+    cfg = {
+        "min_closed": 8,
+        "min_episodes": 8,
+        "strategy_overrides": {
+            "donchian_atr_pullback": {"min_closed": 20, "min_episodes": 20},
+        },
+    }
+    dual = shadow_promotion_sample_thresholds("dual_sma_daytrade", cfg)
+    assert dual["min_episodes"] == 8
+    don = shadow_promotion_sample_thresholds("donchian_atr_pullback", cfg)
+    assert don["min_episodes"] == 20
+    assert don["min_closed"] == 20
+
+
 def test_sma_reclaim_bull_flag_specialist_gate_bypasses_consensus_when_setup_passes():
     signal = {
         "strategy": "sma_reclaim_bull_flag",
@@ -805,6 +907,25 @@ def test_setup_risk_metadata_from_signal_extracts_stop_and_target():
     meta = setup_risk_metadata_from_signal(signal)
     assert meta["stop_pct"] == pytest.approx(2.0)
     assert meta["target_pct"] == pytest.approx(4.0)
+
+
+def test_setup_risk_metadata_uses_signal_strategy_not_sma_reclaim_default():
+    signal = {
+        "strategy": "weekly_fibonacci_spot",
+        "details": {
+            "state": {
+                "indicators": {
+                    "entry_price": 0.05556,
+                    "stop_hint": 0.05393,
+                    "target_hint": 0.05914,
+                    "reward_risk": 2.19,
+                }
+            }
+        },
+    }
+    meta = setup_risk_metadata_from_signal(signal)
+    assert meta.get("setup") == "weekly_fibonacci_spot"
+    assert meta.get("setup") != "sma_reclaim_bull_flag"
 
 
 def test_setup_risk_metadata_prefers_hints_over_decimal_target_pct():
@@ -2814,6 +2935,8 @@ def test_profit_protection_arms_before_trailing_activation():
     cfg = paper_perp_exit_config_from_yaml(
         {
             "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.0,
+            "profit_protection_fee_buffer": 0.0,
             "trailing_stop": {
                 "enabled": True,
                 "activation_threshold": 0.0075,
@@ -2828,15 +2951,137 @@ def test_profit_protection_arms_before_trailing_activation():
         "entry_price": 100.0,
         "position_side": "short",
         "entry_time": datetime.utcnow().isoformat(),
-        "metadata": {},
+        # Peak deeper than floor so arm is valid (not late-breach).
+        "metadata": {"lowest_price": 99.40},
     }
-    # Peak ~0.40% — above PP threshold but below trailing activation (0.75%).
-    result = evaluate_paper_perp_exit(trade, 99.60, cfg)
+    # Mark still better than floor (99.50): peak ~0.60% >= PP 0.35%, trail act 0.75%.
+    result = evaluate_paper_perp_exit(trade, 99.45, cfg)
+    assert result.exit_reason is None
     assert result.metadata.get("profit_protection") == "profit_guaranteed"
     assert result.metadata.get("trail_stop") != "active"
     assert float(result.metadata.get("trail_stop_trigger") or 0) == pytest.approx(
         100.0 * (1.0 - cfg.breakeven_floor_decimal)
     )
+
+
+def test_paper_pp_arms_from_setup_partial_milestone():
+    """Milestones must not permanently block profit_guaranteed (spot can_arm port)."""
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.0,
+            "profit_protection_fee_buffer": 0.0,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0200,
+                "step_percentage": 0.0050,
+                "breakeven_floor_percentage": 0.0050,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0100},
+        },
+        {},
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {
+            "highest_price": 101.2,
+            "profit_protection": "setup_partial",
+            "trail_stop_trigger": 100.1,
+        },
+    }
+    result = evaluate_paper_perp_exit(trade, 101.2, cfg)
+    assert result.exit_reason is None
+    assert result.metadata.get("profit_protection") == "profit_guaranteed"
+    assert float(result.metadata.get("trail_stop_trigger") or 0) == pytest.approx(100.5)
+
+
+def test_paper_pp_late_arm_exits_instead_of_zombie():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.0,
+            "profit_protection_fee_buffer": 0.0,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0200,
+                "step_percentage": 0.0050,
+                "breakeven_floor_percentage": 0.0100,
+            },
+            "profit_protection": {"enabled": True, "activation_threshold": 0.0120},
+        },
+        {},
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {"highest_price": 101.3},
+    }
+    # Peak qualifies (+1.3%) but mark already through +1.0% floor.
+    result = evaluate_paper_perp_exit(trade, 100.50, cfg)
+    assert result.exit_reason
+    assert "profit_protection_late_breach" in result.exit_reason
+    assert result.metadata.get("profit_protection") != "profit_guaranteed"
+
+
+def test_paper_pp_floor_honors_guaranteed_min_profit_knob():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.0,
+            "profit_protection_fee_buffer": 0.0,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0200,
+                "breakeven_floor_percentage": 0.0050,
+            },
+            "profit_protection": {
+                "enabled": True,
+                "activation_threshold": 0.0100,
+                "guaranteed_min_profit": 0.0120,
+                "break_even_plus": 0.0100,
+            },
+        },
+        {},
+    )
+    assert cfg.breakeven_floor_decimal == pytest.approx(0.0120)
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 101.5, cfg)
+    assert result.metadata.get("profit_protection") == "profit_guaranteed"
+    assert float(result.metadata.get("trail_stop_trigger") or 0) == pytest.approx(101.2)
+
+
+def test_paper_pp_disabled_does_not_arm():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "use_spot_exit_rules": True,
+            "fee_rate_per_side": 0.0,
+            "profit_protection_fee_buffer": 0.0,
+            "trailing_stop": {
+                "enabled": False,
+                "activation_threshold": 0.0200,
+                "breakeven_floor_percentage": 0.0050,
+            },
+            "profit_protection": {"enabled": False, "activation_threshold": 0.0050},
+        },
+        {},
+    )
+    trade = {
+        "entry_price": 100.0,
+        "position_side": "long",
+        "entry_time": datetime.utcnow().isoformat(),
+        "metadata": {},
+    }
+    result = evaluate_paper_perp_exit(trade, 101.5, cfg)
+    assert result.metadata.get("profit_protection") != "profit_guaranteed"
+    assert result.exit_reason is None
 
 
 def test_wld_long_profit_protection_arms_at_configured_threshold_before_trail():
@@ -2899,9 +3144,9 @@ def test_config_yaml_carries_perp_trailing_and_stagnant_flags():
     config_path = Path(ROOT) / "config" / "config.yaml"
     cfg = yaml.safe_load(config_path.read_text())
     hl = cfg["trading"]["hyperliquid_perps"]
-    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0100)
-    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0100)
-    assert hl["trailing_stop"]["breakeven_floor_percentage"] == pytest.approx(0.0080)
+    assert hl["profit_protection"]["activation_threshold"] == pytest.approx(0.0035)
+    assert hl["trailing_stop"]["activation_threshold"] == pytest.approx(0.0055)
+    assert hl["trailing_stop"]["breakeven_floor_percentage"] == pytest.approx(0.0025)
     assert hl["stagnant_loser_enabled"] is True
     assert hl["structural_exits"]["enabled"] is True
     assert "vwma_hull" in hl["structural_exits"]["strategies"]
@@ -4195,3 +4440,108 @@ async def test_prefetch_hyperliquid_entry_signals_respects_entry_reserve():
     assert stats["requested"] == 1
     assert stats["failure_reasons"].get("__deadline__") == "prefetch_budget_exhausted"
     assert prefetched == {}
+
+
+def test_dual_sma_long_can_be_blocked_across_all_regimes():
+    result = hyperliquid_regime_direction_gate(
+        "long",
+        "unknown",
+        0.90,
+        0.90,
+        {"blocked_strategy_sides": {"dual_sma_daytrade": ["long"]}},
+        strategy="dual_sma_daytrade",
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == "configured_strategy_side_block_dual_sma_daytrade_long"
+
+
+def test_dual_sma_tiered_scratch_exits_after_peak_giveback():
+    hl_cfg = {
+        "fee_rate_per_side": 0.0001,
+        "profit_protection_fee_buffer": 0.0015,
+        "fixed_stop_loss_enabled": False,
+        "stagnant_loser_enabled": False,
+        "exit_profiles": {
+            "dual_sma_daytrade": {
+                "strategies": ["dual_sma_daytrade"],
+                "profit_protection_fee_buffer": 0.0003,
+                "trailing_stop": {
+                    "enabled": True,
+                    "activation_threshold": 0.0075,
+                    "breakeven_floor_percentage": 0.0025,
+                    "min_trigger_distance_percentage": 0.0025,
+                },
+                "profit_protection": {
+                    "enabled": True,
+                    "activation_threshold": 0.0055,
+                    "guaranteed_min_profit": 0.0025,
+                    "break_even_plus": 0.0025,
+                    "early_profit_locks": {
+                        "enabled": True,
+                        "tiers": [
+                            {"activation": 0.0035, "floor": 0.0005},
+                            {"activation": 0.0055, "floor": 0.0025},
+                        ],
+                    },
+                },
+            }
+        },
+    }
+    cfg = paper_perp_exit_config_from_yaml(
+        hl_cfg, {}, strategy_name="dual_sma_daytrade"
+    )
+    assert cfg.profit_protection_fee_buffer == pytest.approx(0.0003)
+    trade = {
+        "position_side": "short",
+        "entry_price": 100.0,
+        "source_strategy": "dual_sma_daytrade",
+        "metadata": {"lowest_price": 99.60},
+    }
+    result = evaluate_paper_perp_exit(trade, 99.96, cfg)
+    assert result.exit_reason
+    assert "early_profit_lock_late_breach_tier0" in result.exit_reason
+    assert result.exit_price == pytest.approx(99.95)
+
+
+def test_dual_sma_second_tier_raises_short_floor_to_quarter_percent():
+    cfg = paper_perp_exit_config_from_yaml(
+        {
+            "fee_rate_per_side": 0.0001,
+            "profit_protection_fee_buffer": 0.0003,
+            "fixed_stop_loss_enabled": False,
+            "stagnant_loser_enabled": False,
+            "trailing_stop": {
+                "enabled": True,
+                "activation_threshold": 0.0075,
+                "breakeven_floor_percentage": 0.0025,
+            },
+            "profit_protection": {
+                "enabled": True,
+                "activation_threshold": 0.0055,
+                "guaranteed_min_profit": 0.0025,
+                "early_profit_locks": {
+                    "enabled": True,
+                    "tiers": [
+                        {"activation": 0.0035, "floor": 0.0005},
+                        {"activation": 0.0055, "floor": 0.0025},
+                    ],
+                },
+            },
+        },
+        {},
+        strategy_name="dual_sma_daytrade",
+    )
+    trade = {
+        "position_side": "short",
+        "entry_price": 100.0,
+        "source_strategy": "dual_sma_daytrade",
+        "metadata": {
+            "lowest_price": 99.40,
+            "trail_stop_trigger": 99.95,
+            "profit_protection": "profit_guaranteed",
+        },
+    }
+    result = evaluate_paper_perp_exit(trade, 99.70, cfg)
+    assert result.exit_reason is None
+    assert result.metadata["early_profit_lock_tier"] == 1
+    assert result.metadata["trail_stop_trigger"] == pytest.approx(99.75)

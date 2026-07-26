@@ -201,6 +201,20 @@ class AdaptivePnlDecisionSync(BaseModel):
     synced_at: Optional[datetime] = None
 
 
+class SetupMemoryPermanentSync(BaseModel):
+    records: List[Dict[str, Any]]
+    source: str = "orchestrator"
+    synced_at: Optional[datetime] = None
+
+
+class SetupMemoryPermanentRelease(BaseModel):
+    fingerprint: str
+    outcome: Optional[str] = None
+    match_level: Optional[str] = None
+    release_reason: str = "manual_release"
+    released_at: Optional[datetime] = None
+
+
 class SupplyDemandAnalysisLogIn(BaseModel):
     log_ts: datetime
     venue: str
@@ -1651,6 +1665,7 @@ async def initialize_database():
 
         # Auto-heal critical fee-tracking columns required by trade update flow.
         await ensure_trade_fee_columns(db_manager)
+        await ensure_trade_metadata_column(db_manager)
         await ensure_macd_analysis_log_table(db_manager)
         await ensure_supply_demand_analysis_log_table(db_manager)
         await ensure_dual_sma_analysis_log_table(db_manager)
@@ -1660,6 +1675,7 @@ async def initialize_database():
         await ensure_perp_paper_trades_table(db_manager)
         await ensure_perp_live_trades_table(db_manager)
         await ensure_hyperliquid_adaptive_pnl_decisions_table(db_manager)
+        await ensure_setup_memory_permanent_table(db_manager)
         
         # Initialize materializer (Phase 3)
         materializer = EventMaterializer(db_manager)
@@ -1689,6 +1705,20 @@ async def ensure_trade_fee_columns(manager: "DatabaseManager") -> None:
         logger.info("✅ Ensured fee-tracking columns exist on trading.trades")
     except Exception as e:
         logger.error(f"Failed ensuring fee-tracking columns on trading.trades: {e}")
+        raise
+
+
+async def ensure_trade_metadata_column(manager: "DatabaseManager") -> None:
+    """Ensure trading.trades.metadata JSONB exists for near-miss / setup analytics."""
+    try:
+        metadata_schema_patch = """
+            ALTER TABLE trading.trades
+            ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+        """
+        await manager.execute_query(metadata_schema_patch)
+        logger.info("✅ Ensured metadata JSONB column exists on trading.trades")
+    except Exception as e:
+        logger.error(f"Failed ensuring metadata column on trading.trades: {e}")
         raise
 
 
@@ -2186,6 +2216,58 @@ async def ensure_hyperliquid_adaptive_pnl_decisions_table(manager: "DatabaseMana
         logger.info("✅ Ensured hyperliquid_adaptive_pnl_decisions table exists")
     except Exception as e:
         logger.error(f"Failed ensuring hyperliquid_adaptive_pnl_decisions table: {e}")
+        raise
+
+
+async def ensure_setup_memory_permanent_table(manager: "DatabaseManager") -> None:
+    """Ensure durable table for permanent setup-memory block/promote outcomes."""
+    try:
+        table_sql = """
+            CREATE TABLE IF NOT EXISTS trading.setup_memory_permanent (
+                id BIGSERIAL PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                match_level TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                market_type TEXT NOT NULL,
+                strategy_key TEXT NOT NULL,
+                strategy_version TEXT,
+                config_hash TEXT,
+                side TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                regime TEXT,
+                why TEXT,
+                streak_count INT NOT NULL DEFAULT 0,
+                source_mix TEXT NOT NULL DEFAULT 'real',
+                evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                released_at TIMESTAMPTZ,
+                release_reason TEXT,
+                CONSTRAINT setup_memory_permanent_outcome_chk
+                    CHECK (outcome IN ('block', 'promote')),
+                CONSTRAINT setup_memory_permanent_match_level_chk
+                    CHECK (match_level IN ('exact', 'strategy_side_coin_regime')),
+                CONSTRAINT setup_memory_permanent_status_chk
+                    CHECK (status IN ('active', 'released', 'superseded'))
+            );
+        """
+        idx_sql = """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_setup_memory_permanent_active
+            ON trading.setup_memory_permanent (fingerprint, outcome, match_level)
+            WHERE status = 'active';
+            CREATE INDEX IF NOT EXISTS idx_setup_memory_permanent_status
+            ON trading.setup_memory_permanent (status);
+            CREATE INDEX IF NOT EXISTS idx_setup_memory_permanent_strategy
+            ON trading.setup_memory_permanent (market_type, strategy_key, side, coin);
+            CREATE INDEX IF NOT EXISTS idx_setup_memory_permanent_updated
+            ON trading.setup_memory_permanent (updated_at DESC);
+        """
+        await manager.execute_query(table_sql)
+        await manager.execute_query(idx_sql)
+        logger.info("✅ Ensured setup_memory_permanent table exists")
+    except Exception as e:
+        logger.error(f"Failed ensuring setup_memory_permanent table: {e}")
         raise
 
 # API Endpoints
@@ -3160,6 +3242,247 @@ async def get_hyperliquid_adaptive_pnl_decisions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/v1/setup-memory/permanent/sync")
+async def sync_setup_memory_permanent(payload: SetupMemoryPermanentSync):
+    """Upsert durable permanent setup-memory block/promote records."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        synced = 0
+        now = payload.synced_at or datetime.utcnow()
+        for record in payload.records or []:
+            fingerprint = str(
+                record.get("fingerprint") or record.get("setupFingerprint") or ""
+            ).strip()
+            match_level = str(record.get("matchLevel") or record.get("match_level") or "").strip()
+            outcome = str(record.get("outcome") or "").strip().lower()
+            market_type = str(
+                record.get("marketType") or record.get("market_type") or "perps"
+            ).strip().lower()
+            if not fingerprint or match_level not in {"exact", "strategy_side_coin_regime"}:
+                continue
+            if outcome not in {"block", "promote"}:
+                continue
+            status = str(record.get("status") or "active").strip().lower() or "active"
+            if status not in {"active", "released", "superseded"}:
+                status = "active"
+            strategy_key = str(
+                record.get("strategyKey") or record.get("strategy_key") or "unknown"
+            ).strip().lower()
+            side = str(record.get("side") or "unknown").strip().lower()
+            coin = str(record.get("coin") or "unknown").strip()
+            strategy_version = record.get("strategyVersion") or record.get("strategy_version")
+            config_hash = record.get("configHash") or record.get("config_hash")
+            regime = record.get("regime")
+            why = record.get("why")
+            streak_count = int(record.get("streakCount") or record.get("streak_count") or 0)
+            source_mix = str(record.get("sourceMix") or record.get("source_mix") or "real")
+            evidence = Json(record.get("evidence") or [])
+            existing = await db_manager.execute_single_query(
+                """
+                SELECT id FROM trading.setup_memory_permanent
+                WHERE fingerprint = %s AND outcome = %s AND match_level = %s
+                  AND status = 'active'
+                LIMIT 1
+                """,
+                (fingerprint, outcome, match_level),
+            )
+            if status in {"released", "superseded"}:
+                await db_manager.execute_query(
+                    """
+                    UPDATE trading.setup_memory_permanent
+                    SET status = %s,
+                        released_at = COALESCE(%s, NOW()),
+                        release_reason = %s,
+                        updated_at = %s
+                    WHERE fingerprint = %s AND outcome = %s AND match_level = %s
+                      AND status = 'active'
+                    """,
+                    (
+                        status,
+                        record.get("releasedAt") or record.get("released_at") or now,
+                        record.get("releaseReason")
+                        or record.get("release_reason")
+                        or status,
+                        now,
+                        fingerprint,
+                        outcome,
+                        match_level,
+                    ),
+                )
+            elif existing:
+                await db_manager.execute_query(
+                    """
+                    UPDATE trading.setup_memory_permanent
+                    SET strategy_key = %s,
+                        strategy_version = %s,
+                        config_hash = %s,
+                        side = %s,
+                        coin = %s,
+                        regime = %s,
+                        why = %s,
+                        streak_count = %s,
+                        source_mix = %s,
+                        evidence = %s,
+                        market_type = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        strategy_key,
+                        strategy_version,
+                        config_hash,
+                        side,
+                        coin,
+                        regime,
+                        why,
+                        streak_count,
+                        source_mix,
+                        evidence,
+                        market_type,
+                        now,
+                        existing.get("id"),
+                    ),
+                )
+            else:
+                await db_manager.execute_query(
+                    """
+                    INSERT INTO trading.setup_memory_permanent (
+                        fingerprint, match_level, outcome, market_type, strategy_key,
+                        strategy_version, config_hash, side, coin, regime, why,
+                        streak_count, source_mix, evidence, status, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        fingerprint,
+                        match_level,
+                        outcome,
+                        market_type,
+                        strategy_key,
+                        strategy_version,
+                        config_hash,
+                        side,
+                        coin,
+                        regime,
+                        why,
+                        streak_count,
+                        source_mix,
+                        evidence,
+                        status,
+                        now,
+                    ),
+                )
+            synced += 1
+        return {"status": "ok", "synced": synced, "syncedAt": now, "source": payload.source}
+    except Exception as e:
+        logger.error(f"Failed to sync setup memory permanent records: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/setup-memory/permanent")
+async def get_setup_memory_permanent(
+    status: Optional[str] = "active",
+    market_type: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """Read durable permanent setup-memory outcomes."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        where = []
+        params: List[Any] = []
+        if status:
+            where.append("status = %s")
+            params.append(status)
+        if market_type:
+            where.append("market_type = %s")
+            params.append(str(market_type).strip().lower())
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = await db_manager.execute_query(
+            f"""
+            SELECT
+                id,
+                fingerprint,
+                match_level AS "matchLevel",
+                outcome,
+                market_type AS "marketType",
+                strategy_key AS "strategyKey",
+                strategy_version AS "strategyVersion",
+                config_hash AS "configHash",
+                side,
+                coin,
+                regime,
+                why,
+                streak_count AS "streakCount",
+                source_mix AS "sourceMix",
+                evidence,
+                status,
+                created_at AS "createdAt",
+                updated_at AS "updatedAt",
+                released_at AS "releasedAt",
+                release_reason AS "releaseReason"
+            FROM trading.setup_memory_permanent
+            {where_sql}
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            tuple(params + [limit]),
+        )
+        total_row = await db_manager.execute_single_query(
+            f"SELECT COUNT(*) AS total FROM trading.setup_memory_permanent {where_sql}",
+            tuple(params) if params else (),
+        )
+        return {
+            "records": rows or [],
+            "total": total_row.get("total", 0) if total_row else len(rows or []),
+            "source": "postgres",
+        }
+    except Exception as e:
+        logger.error(f"Failed to get setup memory permanent records: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/setup-memory/permanent/release")
+async def release_setup_memory_permanent(payload: SetupMemoryPermanentRelease):
+    """Manually release an active permanent setup-memory record."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        fingerprint = str(payload.fingerprint or "").strip()
+        if not fingerprint:
+            raise HTTPException(status_code=400, detail="fingerprint is required")
+        now = payload.released_at or datetime.utcnow()
+        where = ["fingerprint = %s", "status = 'active'"]
+        params: List[Any] = [fingerprint]
+        if payload.outcome:
+            where.append("outcome = %s")
+            params.append(str(payload.outcome).strip().lower())
+        if payload.match_level:
+            where.append("match_level = %s")
+            params.append(str(payload.match_level).strip())
+        await db_manager.execute_query(
+            f"""
+            UPDATE trading.setup_memory_permanent
+            SET status = 'released',
+                released_at = %s,
+                release_reason = %s,
+                updated_at = %s
+            WHERE {' AND '.join(where)}
+            """,
+            (now, payload.release_reason, now, *params),
+        )
+        return {"status": "ok", "fingerprint": fingerprint, "releasedAt": now}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to release setup memory permanent record: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/v1/perps/live-trades")
 async def create_perp_live_trade(trade: PerpLiveTrade):
     """Create a live perpetual trade record (exchange fill tracked in metadata)."""
@@ -3596,6 +3919,18 @@ async def update_trade(trade_id: str, update_data: Dict[str, Any]):
         fee_related_update = False
         
         for key, value in update_data.items():
+            if key == "metadata_patch":
+                # Merge JSONB patch (near-miss / setup_milestone analytics).
+                if value is None:
+                    continue
+                if not isinstance(value, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="metadata_patch must be an object",
+                    )
+                set_clauses.append("metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb")
+                params.append(Json(value))
+                continue
             if key in ['exit_price', 'exit_id', 'exit_time', 'unrealized_pnl', 
                       'realized_pnl', 'highest_price', 'current_price', 'profit_protection', 
                       'profit_protection_trigger', 'trail_stop', 'trail_stop_trigger',
@@ -3605,10 +3940,22 @@ async def update_trade(trade_id: str, update_data: Dict[str, Any]):
                       'trigger_price', 'trigger_detected_price', 'trigger_price_source',
                       'trigger_feed_quality', 'trigger_detected_at', 'cancel_attempted_at',
                       'cancel_attempt_result', 'exit_submitted_at', 'exit_submit_route',
-                      'first_fill_at', 'slippage_bps_vs_trigger', 'exit_failure_reason']:
+                      'first_fill_at', 'slippage_bps_vs_trigger', 'exit_failure_reason',
+                      'metadata']:
                 # Normalize status values for consistency
                 if key == 'status':
                     value = normalize_status(value, "trade")
+                if key == "metadata":
+                    if value is None:
+                        value = {}
+                    if not isinstance(value, dict):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="metadata must be an object",
+                        )
+                    set_clauses.append("metadata = %s::jsonb")
+                    params.append(Json(value))
+                    continue
                 
                 # Track if this is a fee-related update
                 if key in ['entry_fee_amount', 'exit_fee_amount', 'status']:
@@ -3731,6 +4078,7 @@ async def get_trade_history(
                 trade_id,
                 pair,
                 exchange,
+                strategy,
                 entry_time,
                 entry_price,
                 position_size,
@@ -3739,6 +4087,7 @@ async def get_trade_history(
                 entry_reason,
                 exit_reason,
                 realized_pnl,
+                fees,
                 highest_price,
                 profit_protection,
                 profit_protection_trigger,

@@ -93,6 +93,16 @@ def test_strategy_signal_timeframes_allows_heikin_ashi_1m_scalper():
     assert mod._strategy_signal_timeframes("heikin_ashi_1m_scalper", cfg) == ["1m"]
 
 
+def test_strategy_signal_timeframes_allows_ema20_ma50_spot_1h():
+    mod = _load_strategy_service_main()
+
+    cfg = {
+        "target_timeframes": ["1h"],
+        "parameters": {"primary_timeframe": "1h"},
+    }
+    assert mod._strategy_signal_timeframes("ema20_ma50_spot_1h", cfg) == ["1h"]
+
+
 def test_rsi_stoch_15m_in_standalone_applicable_strategy_list():
     module_path = (
         Path(__file__).resolve().parents[2]
@@ -103,3 +113,4 @@ def test_rsi_stoch_15m_in_standalone_applicable_strategy_list():
     source = module_path.read_text()
 
     assert "rsi_stoch_reversal_15m" in source
+    assert "ema20_ma50_spot_1h" in source

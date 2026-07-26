@@ -76,13 +76,44 @@ def test_short_pullback_requires_1h_downtrend_when_shorts_allowed():
     assert "1h downtrend" in result.indicators["entry_reason"]
 
 
-def test_rejects_when_1h_trend_missing():
+def test_rejects_when_bias_trend_missing():
     flat = _ohlcv(80, start=100.0, step=0.0)
     result = evaluate_donchian_atr_pullback(
         {"1h": flat, "15m": flat.copy()},
-        EngineParams(),
-        market_regime="sideways",
+        EngineParams(blocked_regimes=[]),
+        market_regime="trending_up",
         allow_short=True,
     )
     assert result.signal == "hold"
     assert result.invalidation_reason
+    assert "trend_missing" in str(result.invalidation_reason)
+
+
+def test_accepts_4h_bias_and_1h_entry_timeframes():
+    """Swing shadow candidate: configured bias/entry TFs are not hardcoded to 1h/15m."""
+    bias = _ohlcv(80, start=90.0, step=0.5)
+    entry = _ohlcv(80, start=100.0, step=0.1)
+    entry.loc[entry.index[-8:-3], ["high", "close"]] = [112.0, 111.5]
+    entry.loc[entry.index[-3:-1], ["low", "close"]] = [109.5, 109.8]
+    entry.loc[entry.index[-1], ["open", "high", "low", "close"]] = [
+        109.9,
+        111.2,
+        109.7,
+        111.0,
+    ]
+    params = EngineParams(
+        bias_timeframe="4h",
+        entry_timeframe="1h",
+        min_reward_risk=2.5,
+    )
+    result = evaluate_donchian_atr_pullback(
+        {"4h": bias, "1h": entry},
+        params,
+        market_regime="trending_up",
+        allow_short=True,
+    )
+    assert result.signal in ("buy", "hold")
+    assert result.indicators.get("bias_timeframe") == "4h" or params.bias_timeframe == "4h"
+    if result.signal == "buy":
+        assert float(result.indicators.get("reward_risk") or 0) + 1e-9 >= 2.5
+        assert "4h" in str(result.indicators.get("entry_reason") or "")

@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Botv0.3 Runtime Architecture",
+    "subtitle": "Docker Compose trading stack — spot simulation + Hyperliquid paper perps",
+    "output": "botv03-runtime.html",
+    "viewBox": [1120, 860]
+  },
+  "layout": {
+    "mode": "grid",
+    "cols": 6,
+    "origin": [40, 100],
+    "gapX": 36,
+    "gapY": 72,
+    "cellW": 140,
+    "cellH": 64
+  },
+  "components": [
+    {
+      "id": "ops",
+      "type": "cloud",
+      "label": "Ops & Alerts",
+      "sublabel": "KPI / Telegram / MCP",
+      "row": 0,
+      "col": 0,
+      "size": [140, 64]
+    },
+    {
+      "id": "cfg",
+      "type": "backend",
+      "label": "Config Service",
+      "sublabel": "YAML API :8001",
+      "tag": "baked + reload",
+      "row": 0,
+      "col": 2,
+      "size": [140, 64]
+    },
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "Browser",
+      "row": 1,
+      "col": 0,
+      "size": [140, 64]
+    },
+    {
+      "id": "web",
+      "type": "frontend",
+      "label": "Web Dashboard",
+      "sublabel": "UI + BFF :8006",
+      "row": 1,
+      "col": 1,
+      "size": [140, 64]
+    },
+    {
+      "id": "orch",
+      "type": "backend",
+      "label": "Orchestrator",
+      "sublabel": "Cycles + risk :8005",
+      "tag": "~30s clock",
+      "row": 1,
+      "col": 2,
+      "size": [140, 64]
+    },
+    {
+      "id": "strat",
+      "type": "backend",
+      "label": "Strategy Service",
+      "sublabel": "Spot + HL signals",
+      "row": 1,
+      "col": 3,
+      "size": [140, 64]
+    },
+    {
+      "id": "exch",
+      "type": "backend",
+      "label": "Exchange Gateway",
+      "sublabel": "CCXT + HL reads",
+      "row": 1,
+      "col": 4,
+      "size": [140, 64]
+    },
+    {
+      "id": "spot",
+      "type": "external",
+      "label": "Spot Exchanges",
+      "sublabel": "Binance / Bybit / CDC",
+      "tag": "simulation",
+      "row": 1,
+      "col": 5,
+      "size": [140, 64]
+    },
+    {
+      "id": "redis",
+      "type": "messagebus",
+      "label": "Redis",
+      "sublabel": "queues · streams · cache",
+      "row": 2,
+      "col": 2,
+      "size": [140, 64]
+    },
+    {
+      "id": "oq",
+      "type": "messagebus",
+      "label": "Order Pipeline",
+      "sublabel": "queue + fill detect",
+      "row": 2,
+      "col": 3,
+      "size": [140, 64]
+    },
+    {
+      "id": "dbapi",
+      "type": "backend",
+      "label": "Database Service",
+      "sublabel": "REST over Postgres",
+      "row": 2,
+      "col": 4,
+      "size": [140, 64]
+    },
+    {
+      "id": "hl",
+      "type": "external",
+      "label": "Hyperliquid",
+      "sublabel": "perps MD / optional live",
+      "tag": "paper",
+      "row": 2,
+      "col": 5,
+      "size": [140, 64]
+    },
+    {
+      "id": "pg",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "trading_bot_futures",
+      "row": 3,
+      "col": 4,
+      "size": [140, 64]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "trading-bot-network (Docker Compose)",
+      "wraps": ["ops", "cfg", "web", "orch", "strat", "exch", "redis", "oq", "dbapi", "pg"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Live gate — allow_live_orders=false",
+      "wraps": ["hl"]
+    }
+  ],
+  "connections": [
+    { "from": "operator", "to": "web", "variant": "emphasis" },
+    { "from": "web", "to": "orch" },
+    { "from": "orch", "to": "strat", "variant": "emphasis" },
+    { "from": "strat", "to": "exch" },
+    { "from": "exch", "to": "spot", "variant": "emphasis" },
+    {
+      "from": "exch",
+      "to": "hl",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "orch",
+      "to": "redis",
+      "label": "enqueue",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 64
+    },
+    { "from": "redis", "to": "oq" },
+    {
+      "from": "oq",
+      "to": "exch",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "oq",
+      "to": "dbapi",
+      "variant": "dashed"
+    },
+    {
+      "from": "orch",
+      "to": "dbapi",
+      "label": "paper trades",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "orthogonal-h",
+      "via": [[460, 340], [814, 340]],
+      "labelAt": [640, 330]
+    },
+    {
+      "from": "dbapi",
+      "to": "pg",
+      "label": "SQL",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 48
+    },
+    {
+      "from": "cfg",
+      "to": "orch",
+      "label": "config",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 58
+    },
+    {
+      "from": "orch",
+      "to": "hl",
+      "label": "gated live",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "route": "orthogonal-h",
+      "via": [[460, 460], [920, 460]],
+      "labelAt": [700, 450]
+    },
+    {
+      "from": "ops",
+      "to": "cfg",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Happy path",
+      "items": [
+        "Orchestrator owns the ~30s trading clock",
+        "Strategy → Exchange → venues for market data",
+        "Spot orders: Redis → order pipeline → Exchange"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Modes today",
+      "items": [
+        "Spot: trading.mode = simulation",
+        "Hyperliquid: paper ledger in Postgres; live SDK gated off",
+        "Dashboard observes/controls — does not own the order path"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Config apply",
+      "items": [
+        "config.yaml baked into config / exchange / mcp / web images",
+        "apply_config.sh rebuilds, reloads, restarts strategy + orchestrator",
+        "docker compose restart alone leaves stale baked values"
+      ]
+    }
+  ]
+}

@@ -33,6 +33,7 @@ from hyperliquid_perps import (  # noqa: E402
     pair_to_hyperliquid_coin,
     position_sides_from_signal,
     select_mirrored_signal,
+    shadow_promotion_sample_thresholds,
 )
 from core.shadow_episode_summary import shadow_promotion_cohorts_from_trades  # noqa: E402
 
@@ -124,7 +125,8 @@ def _promoted_cohorts(
         training_realized = float(cohort.get("training_realized") or 0.0)
         holdout_realized = float(cohort.get("holdout_realized") or 0.0)
         winner_contribution = cohort.get("max_winner_contribution")
-        min_sample = min_episodes if use_episode_metrics else min_closed
+        thresholds = shadow_promotion_sample_thresholds(str(cohort.get("strategy") or ""), promotion)
+        min_sample = thresholds["min_episodes"] if use_episode_metrics else thresholds["min_closed"]
         if allowed_strategies and cohort["strategy"] not in allowed_strategies:
             continue
         if allowed_sides and cohort["side"] not in allowed_sides:

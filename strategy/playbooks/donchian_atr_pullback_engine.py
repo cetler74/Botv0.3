@@ -155,8 +155,10 @@ def evaluate_donchian_atr_pullback(
 
     bias = _bias_direction(bias_df, params)
     base["bias_direction"] = bias
+    bias_tf = str(params.bias_timeframe or "1h")
+    entry_tf = str(params.entry_timeframe or "15m")
     if bias == "none":
-        return _hold("1h_trend_missing", {**base, "step1_pass": False})
+        return _hold(f"{bias_tf}_trend_missing", {**base, "step1_pass": False})
 
     atr = _atr_series(entry_df, params.atr_period)
     if atr is None or pd.isna(atr.iloc[-1]) or float(atr.iloc[-1]) <= 0:
@@ -193,7 +195,7 @@ def evaluate_donchian_atr_pullback(
         pullback_low = float(recent["low"].min())
         reclaimed = entry_price > don_hi and float(last["close"]) > float(last["open"])
         if not broke:
-            return _hold("no_15m_donchian_breakout", {**base, "broke": False})
+            return _hold(f"no_{entry_tf}_donchian_breakout", {**base, "broke": False})
         if pullback_low >= don_hi:
             return _hold("no_pullback_after_breakout", {**base, "pullback_low": pullback_low})
         if not reclaimed:
@@ -209,7 +211,7 @@ def evaluate_donchian_atr_pullback(
             return _hold("reward_risk_below_min", {**base, "reward_risk": rr})
 
         reason = (
-            f"1h uptrend confirmed; 15m Donchian breakout above {don_hi:.4f} "
+            f"{bias_tf} uptrend confirmed; {entry_tf} Donchian breakout above {don_hi:.4f} "
             f"pulled back to {pullback_low:.4f} then reclaimed with ATR stop"
         )
         return EngineResult(
@@ -235,7 +237,7 @@ def evaluate_donchian_atr_pullback(
         pullback_high = float(recent["high"].max())
         reclaimed = entry_price < don_lo and float(last["close"]) < float(last["open"])
         if not broke:
-            return _hold("no_15m_donchian_breakout", {**base, "broke": False})
+            return _hold(f"no_{entry_tf}_donchian_breakout", {**base, "broke": False})
         if pullback_high <= don_lo:
             return _hold("no_pullback_after_breakout", {**base, "pullback_high": pullback_high})
         if not reclaimed:
@@ -251,7 +253,7 @@ def evaluate_donchian_atr_pullback(
             return _hold("reward_risk_below_min", {**base, "reward_risk": rr})
 
         reason = (
-            f"1h downtrend confirmed; 15m Donchian breakdown below {don_lo:.4f} "
+            f"{bias_tf} downtrend confirmed; {entry_tf} Donchian breakdown below {don_lo:.4f} "
             f"pulled back to {pullback_high:.4f} then reclaimed with ATR stop"
         )
         return EngineResult(

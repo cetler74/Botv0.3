@@ -666,32 +666,130 @@ html[data-theme="dark"] .pi-side-short { background: #3b1519; }
     font-weight: 800;
     text-transform: lowercase;
 }
-.pi-protection-state.active {
+.pi-protection-state.active,
+.pi-protection-state.enabled {
     background: #e8f7f0;
     color: var(--green);
+}
+.pi-protection-state.waiting,
+.pi-protection-state.estimate {
+    background: #eef2ff;
+    color: #3949ab;
+}
+.pi-protection-state.milestone {
+    background: #fff4e5;
+    color: #b45309;
+}
+.pi-protection-state.near-miss {
+    background: #fff7ed;
+    color: #c2410c;
+}
+.pi-protection-state.disabled {
+    background: #f3f4f6;
+    color: #6b7280;
 }
 .pi-protection-detail {
     color: var(--muted);
     font-size: 12px;
-    white-space: nowrap;
+    white-space: normal;
+    max-width: 280px;
 }
 .pi-protection-cell .pi-protection-state.inactive {
     background: #feecec;
     color: var(--red);
 }
+.pi-protection-legend-wrap {
+    margin: 0 0 10px;
+}
+.pi-protection-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    align-items: center;
+    font-size: 12px;
+    color: var(--muted);
+}
+.pi-protection-legend > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.pi-protection-legend .pi-protection-state {
+    font-style: normal;
+}
+.pi-protection-legend-marks {
+    opacity: 0.85;
+}
+.pi-protection-progress {
+    margin-top: 6px;
+}
+.pi-protection-progress-track {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    background: #e5e7eb;
+    overflow: visible;
+}
+.pi-protection-progress-current {
+    position: absolute;
+    top: -2px;
+    width: 4px;
+    height: 12px;
+    margin-left: -2px;
+    border-radius: 2px;
+    background: #2563eb;
+}
+.pi-protection-progress-peak {
+    position: absolute;
+    top: 0;
+    width: 2px;
+    height: 8px;
+    margin-left: -1px;
+    background: #f59e0b;
+}
+.pi-protection-progress-mark {
+    position: absolute;
+    top: -1px;
+    width: 2px;
+    height: 10px;
+    margin-left: -1px;
+    background: #9ca3af;
+}
+.pi-protection-progress-mark.pp { background: #16a34a; }
+.pi-protection-progress-mark.trail { background: #7c3aed; }
+.pi-protection-progress-mark.target { background: #0891b2; }
+.pi-protection-progress-mark.entry { background: #6b7280; }
 html[data-theme="dark"] .pi-protection-state,
 html[data-theme="dark"] .pi-protection-cell .pi-protection-state.inactive {
     background: var(--red-soft);
 }
-html[data-theme="dark"] .pi-protection-state.active {
+html[data-theme="dark"] .pi-protection-state.active,
+html[data-theme="dark"] .pi-protection-state.enabled {
     background: var(--green-soft);
+}
+html[data-theme="dark"] .pi-protection-state.waiting,
+html[data-theme="dark"] .pi-protection-state.estimate {
+    background: rgba(99, 102, 241, 0.25);
+    color: #c7d2fe;
+}
+html[data-theme="dark"] .pi-protection-state.milestone {
+    background: rgba(245, 158, 11, 0.22);
+    color: #fcd34d;
+}
+html[data-theme="dark"] .pi-protection-state.near-miss {
+    background: rgba(249, 115, 22, 0.22);
+    color: #fdba74;
+}
+html[data-theme="dark"] .pi-protection-progress-track {
+    background: rgba(255, 255, 255, 0.12);
 }
 @media (prefers-color-scheme: dark) {
     html:not([data-theme="light"]) .pi-protection-state,
     html:not([data-theme="light"]) .pi-protection-cell .pi-protection-state.inactive {
         background: var(--red-soft);
     }
-    html:not([data-theme="light"]) .pi-protection-state.active {
+    html:not([data-theme="light"]) .pi-protection-state.active,
+    html:not([data-theme="light"]) .pi-protection-state.enabled {
         background: var(--green-soft);
     }
 }

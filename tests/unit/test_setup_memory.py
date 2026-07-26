@@ -2,7 +2,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from core.setup_memory import evaluate_setup_memory
+from core.setup_memory import (
+    detect_permanent_setup_outcomes,
+    evaluate_setup_memory,
+    setup_identity_from_signal,
+)
 from core.strategy_trade_evidence import encode_strategy_evidence_entry_reason
 
 
@@ -455,3 +459,231 @@ def test_lookback_excludes_undated_legacy_rows():
 
     assert decision.action == "allow"
     assert decision.matched_count == 0
+
+
+def _loss_trades(count=3):
+    trades = []
+    for index in range(count):
+        trade = _perp_trade(-1.0 - index)
+        trade["trade_id"] = f"loss-{index}"
+        trade["entry_time"] = f"2026-07-10T{10 + index:02d}:00:00+00:00"
+        trade["exit_time"] = f"2026-07-10T{11 + index:02d}:00:00+00:00"
+        trades.append(trade)
+    return trades
+
+
+def _win_trades(count=3):
+    trades = []
+    for index in range(count):
+        trade = _perp_trade(1.0 + index)
+        trade["trade_id"] = f"win-{index}"
+        trade["entry_time"] = f"2026-07-10T{10 + index:02d}:00:00+00:00"
+        trade["exit_time"] = f"2026-07-10T{11 + index:02d}:00:00+00:00"
+        trades.append(trade)
+    return trades
+
+
+def test_detect_permanent_exact_loss_streak():
+    detected = detect_permanent_setup_outcomes(
+        market_type="perps",
+        real_closed_trades=_loss_trades(3),
+        config=_config(
+            permanent={
+                "enabled": True,
+                "exact_loss_streak": 3,
+                "exact_win_streak": 3,
+                "coin_regime_loss_streak": 99,
+                "coin_regime_win_streak": 99,
+            }
+        ),
+    )
+
+    blocks = [row for row in detected if row["outcome"] == "block"]
+    assert blocks
+    assert blocks[0]["matchLevel"] == "exact"
+    assert blocks[0]["streakCount"] >= 3
+
+
+def test_permanent_exact_loss_blocks_even_outside_lookback():
+    identity = setup_identity_from_signal(_signal(), market_type="perps")
+    permanent = [
+        {
+            "fingerprint": identity["setupFingerprint"],
+            "matchLevel": "exact",
+            "outcome": "block",
+            "marketType": "perps",
+            "strategyKey": identity["strategyKey"],
+            "strategyVersion": identity["strategyVersion"],
+            "configHash": identity["configHash"],
+            "side": identity["side"],
+            "coin": identity["coin"],
+            "regime": identity["regime"],
+            "why": identity["why"],
+            "streakCount": 3,
+            "status": "active",
+            "evidence": [],
+        }
+    ]
+
+    decision = evaluate_setup_memory(
+        _signal(),
+        market_type="perps",
+        real_closed_trades=[],
+        config=_config(
+            recent_loss_cooldown_hours=0,
+            exact_setup_loss_streak_block=0,
+            permanent={"enabled": True, "size_up_multiplier": 1.25},
+        ),
+        permanent_records=permanent,
+        now=datetime(2026, 7, 11, tzinfo=timezone.utc),
+    )
+
+    assert decision.action == "block"
+    assert decision.permanent is True
+    assert "permanent" in decision.reason
+
+
+def test_permanent_exact_win_sizes_up():
+    identity = setup_identity_from_signal(_signal(), market_type="perps")
+    permanent = [
+        {
+            "fingerprint": identity["setupFingerprint"],
+            "matchLevel": "exact",
+            "outcome": "promote",
+            "marketType": "perps",
+            "strategyKey": identity["strategyKey"],
+            "strategyVersion": identity["strategyVersion"],
+            "configHash": identity["configHash"],
+            "side": identity["side"],
+            "coin": identity["coin"],
+            "regime": identity["regime"],
+            "why": identity["why"],
+            "streakCount": 3,
+            "status": "active",
+            "evidence": [],
+        }
+    ]
+
+    decision = evaluate_setup_memory(
+        _signal(),
+        market_type="perps",
+        real_closed_trades=[],
+        config=_config(
+            permanent={"enabled": True, "size_up_multiplier": 1.25},
+        ),
+        permanent_records=permanent,
+        now=datetime(2026, 7, 11, tzinfo=timezone.utc),
+    )
+
+    assert decision.action == "size_up"
+    assert decision.permanent is True
+    assert decision.size_multiplier == pytest.approx(1.25)
+
+
+def test_permanent_block_beats_promote_on_same_fingerprint():
+    identity = setup_identity_from_signal(_signal(), market_type="perps")
+    permanent = [
+        {
+            "fingerprint": identity["setupFingerprint"],
+            "matchLevel": "exact",
+            "outcome": "promote",
+            "marketType": "perps",
+            "strategyKey": identity["strategyKey"],
+            "strategyVersion": identity["strategyVersion"],
+            "configHash": identity["configHash"],
+            "side": identity["side"],
+            "coin": identity["coin"],
+            "regime": identity["regime"],
+            "why": identity["why"],
+            "streakCount": 3,
+            "status": "active",
+        },
+        {
+            "fingerprint": identity["setupFingerprint"],
+            "matchLevel": "exact",
+            "outcome": "block",
+            "marketType": "perps",
+            "strategyKey": identity["strategyKey"],
+            "strategyVersion": identity["strategyVersion"],
+            "configHash": identity["configHash"],
+            "side": identity["side"],
+            "coin": identity["coin"],
+            "regime": identity["regime"],
+            "why": identity["why"],
+            "streakCount": 3,
+            "status": "active",
+        },
+    ]
+
+    decision = evaluate_setup_memory(
+        _signal(),
+        market_type="perps",
+        config=_config(permanent={"enabled": True}),
+        permanent_records=permanent,
+    )
+
+    assert decision.action == "block"
+    assert decision.permanent is True
+
+
+def test_permanent_version_mismatch_is_ignored():
+    identity = setup_identity_from_signal(_signal(), market_type="perps")
+    permanent = [
+        {
+            "fingerprint": identity["setupFingerprint"],
+            "matchLevel": "exact",
+            "outcome": "block",
+            "marketType": "perps",
+            "strategyKey": identity["strategyKey"],
+            "strategyVersion": "old-version",
+            "configHash": identity["configHash"],
+            "side": identity["side"],
+            "coin": identity["coin"],
+            "regime": identity["regime"],
+            "why": identity["why"],
+            "streakCount": 3,
+            "status": "active",
+        }
+    ]
+
+    decision = evaluate_setup_memory(
+        _signal(),
+        market_type="perps",
+        real_closed_trades=[],
+        config=_config(permanent={"enabled": True}),
+        permanent_records=permanent,
+    )
+
+    assert decision.action == "allow"
+    assert decision.permanent is False
+
+
+def test_detect_permanent_shadow_win_streak_with_episode_floor():
+    shadows = []
+    for index in range(10):
+        trade = _perp_trade(1.5 + index, shadow=True)
+        trade["trade_id"] = f"shadow-win-{index}"
+        day = 10 + index
+        trade["entry_time"] = f"2026-07-{day:02d}T10:00:00+00:00"
+        trade["exit_time"] = f"2026-07-{day:02d}T11:00:00+00:00"
+        shadows.append(trade)
+
+    detected = detect_permanent_setup_outcomes(
+        market_type="perps",
+        shadow_closed_trades=shadows,
+        config=_config(
+            min_shadow_episodes=10,
+            permanent={
+                "enabled": True,
+                "include_shadow": True,
+                "exact_loss_streak": 99,
+                "exact_win_streak": 3,
+                "coin_regime_loss_streak": 99,
+                "coin_regime_win_streak": 99,
+            },
+        ),
+    )
+
+    promotes = [row for row in detected if row["outcome"] == "promote"]
+    assert promotes
+    assert promotes[0]["sourceMix"] == "shadow"

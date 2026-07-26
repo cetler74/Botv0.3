@@ -282,18 +282,21 @@ class TrailingStopManager:
                         )
                         continue
 
-                    # Check if profit protection is blocking activation
+                    # Never wipe locked / milestone profit-protection floors.
+                    # Trail may activate alongside profit_guaranteed / setup_breakeven;
+                    # clearing those states created zombie unarmed trades.
                     profit_protection_status = getattr(trade, 'profit_protection', None)
-                    if profit_protection_status and profit_protection_status != 'inactive' and profit_pct < 1.0:
-                        logger.warning(f"[Trade {trade.id}] ⚠️ PROFIT PROTECTION BLOCKING: PnL {profit_pct:.2%} < 1.0% but profit_protection={profit_protection_status}")
-                        logger.warning(f"[Trade {trade.id}] 🔧 FORCING ACTIVATION: Trailing stop should activate between 0.7% and 1.0%")
-                        # Reset profit protection to allow trailing stop activation
-                        if self.database_service:
-                            await self.database_service.update_trade(trade.id, {
-                                'profit_protection': 'inactive'
-                            })
-                        logger.info(f"[Trade {trade.id}] ✅ RESET: profit_protection set to inactive to allow trailing stop")
-                    
+                    if profit_protection_status and str(profit_protection_status).lower() not in (
+                        "",
+                        "inactive",
+                        "trailing",
+                    ):
+                        logger.info(
+                            f"[Trade {trade.id}] Keeping profit_protection="
+                            f"{profit_protection_status} while activating trail "
+                            f"(PnL {profit_pct:.2%})"
+                        )
+
                     await self._activate_trailing_stop(trade, current_price)
                     
                     # CRITICAL: Once trailing stop is active, prevent profit protection from overriding it
