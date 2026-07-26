@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 
@@ -33,3 +34,36 @@ def test_adaptive_pnl_control_endpoint_omits_static_note():
     endpoint = endpoint.split("async def post_hyperliquid_adaptive_pnl_control_reevaluate():", 1)[0]
     assert '"note"' not in endpoint
     assert '"adaptiveConfig"' in endpoint
+
+
+def test_perp_entry_cycle_keeps_shared_http_client_open_until_finally():
+    tree = ast.parse(ORCH_PATH.read_text())
+    entry_cycle = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_run_hyperliquid_strategy_entries"
+    )
+
+    creates_shared_client = any(
+        isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "client" for target in node.targets)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "AsyncClient"
+        for node in ast.walk(entry_cycle)
+    )
+    closes_shared_client_in_finally = any(
+        isinstance(statement, ast.Await)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Attribute)
+        and isinstance(statement.value.func.value, ast.Name)
+        and statement.value.func.value.id == "client"
+        and statement.value.func.attr == "aclose"
+        for try_node in ast.walk(entry_cycle)
+        if isinstance(try_node, ast.Try)
+        for statement in ast.walk(ast.Module(body=try_node.finalbody, type_ignores=[]))
+    )
+
+    assert creates_shared_client
+    assert closes_shared_client_in_finally

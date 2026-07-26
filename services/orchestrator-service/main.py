@@ -9194,6 +9194,7 @@ class TradingOrchestrator:
         fast_signal_by_coin: Optional[Dict[str, Dict[str, Any]]] = None,
         execution_mode: str = "paper",
     ) -> None:
+        client: Optional[httpx.AsyncClient] = None
         try:
             signal_source = str(cfg.get("signal_source", "mirror_spot") or "mirror_spot").lower()
             leverage = float(cfg.get("default_leverage", 2.0) or 2.0)
@@ -9267,67 +9268,67 @@ class TradingOrchestrator:
                 1000,
                 max(1, int(setup_memory_perps_cfg.get("closed_trade_fetch_limit") or 1000)),
             )
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                open_path = (
-                    "/api/v1/perps/live-trades/open"
-                    if execution_mode == "live"
-                    else "/api/v1/perps/paper-trades/open"
+            client = httpx.AsyncClient(timeout=30.0)
+            open_path = (
+                "/api/v1/perps/live-trades/open"
+                if execution_mode == "live"
+                else "/api/v1/perps/paper-trades/open"
+            )
+            closed_path = (
+                "/api/v1/perps/live-trades"
+                if execution_mode == "live"
+                else "/api/v1/perps/paper-trades"
+            )
+            open_resp = await client.get(f"{database_service_url}{open_path}")
+            open_trades = (open_resp.json() or {}).get("trades", []) if open_resp.status_code == 200 else []
+            closed_resp = await client.get(
+                f"{database_service_url}{closed_path}",
+                params={"status": "CLOSED", "limit": perps_memory_limit},
+            )
+            closed_history_available = closed_resp.status_code == 200
+            closed_trades = (
+                (closed_resp.json() or {}).get("trades", [])
+                if closed_history_available
+                else []
+            )
+            shadow_open_trade_ids: Set[str] = set()
+            shadow_fingerprints: Set[str] = set()
+            shadow_open_keys: Set[Tuple[str, str, str]] = set()
+            shadow_closed_trades: List[Dict[str, Any]] = []
+            if execution_mode == "paper" and bool(
+                (cfg.get("shadow_strategy_evaluation") or {}).get("enabled", False)
+            ):
+                shadow_history_resp = await client.get(
+                    f"{database_service_url}/api/v1/perps/paper-trades",
+                    params={
+                        "include_accounting_excluded": True,
+                        "shadow_only": True,
+                        "limit": 1000,
+                    },
                 )
-                closed_path = (
-                    "/api/v1/perps/live-trades"
-                    if execution_mode == "live"
-                    else "/api/v1/perps/paper-trades"
-                )
-                open_resp = await client.get(f"{database_service_url}{open_path}")
-                open_trades = (open_resp.json() or {}).get("trades", []) if open_resp.status_code == 200 else []
-                closed_resp = await client.get(
-                    f"{database_service_url}{closed_path}",
-                    params={"status": "CLOSED", "limit": perps_memory_limit},
-                )
-                closed_history_available = closed_resp.status_code == 200
-                closed_trades = (
-                    (closed_resp.json() or {}).get("trades", [])
-                    if closed_history_available
-                    else []
-                )
-                shadow_open_trade_ids: Set[str] = set()
-                shadow_fingerprints: Set[str] = set()
-                shadow_open_keys: Set[Tuple[str, str, str]] = set()
-                shadow_closed_trades: List[Dict[str, Any]] = []
-                if execution_mode == "paper" and bool(
-                    (cfg.get("shadow_strategy_evaluation") or {}).get("enabled", False)
-                ):
-                    shadow_history_resp = await client.get(
-                        f"{database_service_url}/api/v1/perps/paper-trades",
-                        params={
-                            "include_accounting_excluded": True,
-                            "shadow_only": True,
-                            "limit": 1000,
-                        },
-                    )
-                    if shadow_history_resp.status_code == 200:
-                        for row in (shadow_history_resp.json() or {}).get("trades", []) or []:
-                            metadata = self._adaptive_trade_metadata(row)
-                            if not bool(metadata.get("shadow_trade")):
-                                continue
-                            if str(row.get("status") or "").upper() == "CLOSED":
-                                shadow_closed_trades.append(row)
-                            fingerprint = str(
-                                metadata.get("shadow_signal_fingerprint") or ""
-                            )
-                            if fingerprint:
-                                shadow_fingerprints.add(fingerprint)
-                                if str(row.get("status") or "").upper() == "OPEN":
-                                    trade_id = str(row.get("trade_id") or "")
-                                    if trade_id:
-                                        shadow_open_trade_ids.add(trade_id)
-                                    shadow_open_keys.add(
-                                        (
-                                            pair_to_hyperliquid_coin(str(row.get("coin") or "")),
-                                            str(row.get("source_strategy") or "").strip().lower(),
-                                            str(row.get("position_side") or "").strip().lower(),
-                                        )
+                if shadow_history_resp.status_code == 200:
+                    for row in (shadow_history_resp.json() or {}).get("trades", []) or []:
+                        metadata = self._adaptive_trade_metadata(row)
+                        if not bool(metadata.get("shadow_trade")):
+                            continue
+                        if str(row.get("status") or "").upper() == "CLOSED":
+                            shadow_closed_trades.append(row)
+                        fingerprint = str(
+                            metadata.get("shadow_signal_fingerprint") or ""
+                        )
+                        if fingerprint:
+                            shadow_fingerprints.add(fingerprint)
+                            if str(row.get("status") or "").upper() == "OPEN":
+                                trade_id = str(row.get("trade_id") or "")
+                                if trade_id:
+                                    shadow_open_trade_ids.add(trade_id)
+                                shadow_open_keys.add(
+                                    (
+                                        pair_to_hyperliquid_coin(str(row.get("coin") or "")),
+                                        str(row.get("source_strategy") or "").strip().lower(),
+                                        str(row.get("position_side") or "").strip().lower(),
                                     )
+                                )
             permanent_setup_records = await self._sync_and_load_setup_memory_permanent(
                 market_type="perps",
                 real_closed_trades=list(closed_trades or []),
@@ -10962,6 +10963,9 @@ class TradingOrchestrator:
                     )
         except Exception as e:
             logger.warning("[HyperliquidPaper] Signal mirror skipped: %s", e)
+        finally:
+            if client is not None:
+                await client.aclose()
     
     async def _update_trade_status(self, trade_id: str, status: str, reason: str = None) -> bool:
         """Update trade status with comprehensive lifecycle tracking"""
